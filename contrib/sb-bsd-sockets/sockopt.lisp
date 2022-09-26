@@ -106,12 +106,12 @@ Code for options that not every system has should be conditionalised:
 (define-socket-option-int
   sockopt-receive-buffer sockint::sol-socket sockint::so-rcvbuf)
 (define-socket-option-int
-  sockopt-priority sockint::sol-socket sockint::so-priority :linux
-  "Available only on Linux.")
+    sockopt-priority sockint::sol-socket sockint::so-priority :linux
+    "Available only on Linux.")
 
 (define-socket-option-int
-  sockopt-tcp-keepcnt :tcp sockint::tcp-keepcnt :linux
-  "Available only on Linux.")
+    sockopt-tcp-keepcnt :tcp sockint::tcp-keepcnt :linux
+    "Available only on Linux.")
 (define-socket-option-int
   sockopt-tcp-keepidle :tcp sockint::tcp-keepidle :linux
   "Available only on Linux.")
@@ -155,7 +155,14 @@ Code for options that not every system has should be conditionalised:
 (define-socket-option-bool
   sockopt-dont-route sockint::sol-socket sockint::so-dontroute)
 (define-socket-option-bool
-  sockopt-broadcast sockint::sol-socket sockint::so-broadcast)
+    sockopt-broadcast sockint::sol-socket sockint::so-broadcast)
+
+(define-socket-option-bool
+    sockopt-ip-multicast-loop :ip sockint::ip-multicast-loop)
+(define-socket-option-int
+    sockopt-ip-multicast-if :ip sockint::ip-multicast-if)
+(define-socket-option-int
+    sockopt-ip-multicast-ttl :ip sockint::ip-multicast-ttl)
 
 (define-socket-option-bool sockopt-tcp-nodelay :tcp sockint::tcp-nodelay)
 

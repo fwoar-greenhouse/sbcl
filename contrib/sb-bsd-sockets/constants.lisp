@@ -29,6 +29,14 @@
 
  (:integer sol-socket "SOL_SOCKET")
 
+ (:integer mcast-join-group "MCAST_JOIN_GROUP")
+ (:integer ip-multicast-loop "IP_MULTICAST_LOOP")
+ (:integer ipv6-multicast-loop "IPV6_MULTICAST_LOOP")
+ (:integer ip-multicast-if "IP_MULTICAST_IF")
+ (:integer ipv6-multicast-if "IPV6_MULTICAST_IF")
+ (:integer ip-multicast-ttl "IP_MULTICAST_TTL")
+ (:integer ipv6-multicast-hops "IPV6_MULTICAST_HOPS")
+
  ;; some of these may be linux-specific
  (:integer so-debug "SO_DEBUG"
            "Enable debugging in underlying protocol modules")
