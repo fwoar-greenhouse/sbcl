@@ -107,10 +107,9 @@
    "Returns a freshly allocated sequence of length LENGTH and of the
    same class as SEQUENCE. Elements of the new sequence are
    initialized to INITIAL-ELEMENT, if supplied, initialized to
-   INITIAL-CONTENTS if supplied, or identical to the elements of
-   SEQUENCE if neither is supplied. Signals a PROTOCOL-UNIMPLEMENTED
-   error if the sequence protocol is not implemented for the class of
-   SEQUENCE."))
+   INITIAL-CONTENTS if supplied, or undefined if neither is supplied.
+   Signals a PROTOCOL-UNIMPLEMENTED error if the sequence protocol is
+   not implemented for the class of SEQUENCE."))
 
 (defgeneric sequence:adjust-sequence
     (sequence length &key initial-element initial-contents)
@@ -144,7 +143,7 @@
     (declare (ignore args))
     (sequence:protocol-unimplemented 'sequence:adjust-sequence s))
   (:documentation
-   "Return destructively modified SEQUENCE or a freshly allocated
+   "Returns destructively modified SEQUENCE or a freshly allocated
    sequence of the same class as SEQUENCE of length LENGTH. Elements
    of the returned sequence are initialized to INITIAL-ELEMENT, if
    supplied, initialized to INITIAL-CONTENTS if supplied, or identical
@@ -509,7 +508,6 @@ dynamic extent."
              (declare (dynamic-extent args)
                       (ignore args))
              (incf min-length)))
-      (declare (dynamic-extent #'counting-visit))
       (%map-for-effect #'counting-visit sequences))
     ;; Map local function over SEQUENCES that steps through the result
     ;; sequence and stores results of applying FUNCTION.
@@ -521,7 +519,6 @@ dynamic extent."
                (declare (dynamic-extent args))
                (funcall setelt (apply function args) result state)
                (setq state (funcall step result state from-end))))
-        (declare (dynamic-extent #'one-element))
         (%map-for-effect #'one-element sequences))
       result)))
 
@@ -975,7 +972,6 @@ dynamic extent."
                        (replace sequence sequence :start2 end :start1 (- end c)
                                 :end1 (- (length sequence) c))))
                  (sequence:adjust-sequence sequence (- (length sequence) c))))
-          (declare (dynamic-extent #'finish))
           (do ()
               ((funcall endp2 sequence state2 limit2 from-end2) (finish))
             (let ((e (funcall elt2 sequence state2)))
@@ -1015,7 +1011,6 @@ dynamic extent."
                        (replace sequence sequence :start2 end :start1 (- end c)
                                 :end1 (- (length sequence) c))))
                  (sequence:adjust-sequence sequence (- (length sequence) c))))
-          (declare (dynamic-extent #'finish))
           (do ()
               ((funcall endp2 sequence state2 limit2 from-end2) (finish))
             (let ((e (funcall elt2 sequence state2)))
@@ -1055,7 +1050,6 @@ dynamic extent."
                        (replace sequence sequence :start2 end :start1 (- end c)
                                 :end1 (- (length sequence) c))))
                  (sequence:adjust-sequence sequence (- (length sequence) c))))
-          (declare (dynamic-extent #'finish))
           (do ()
               ((funcall endp2 sequence state2 limit2 from-end2) (finish))
             (let ((e (funcall elt2 sequence state2)))
@@ -1125,7 +1119,6 @@ dynamic extent."
                        (replace sequence sequence :start2 end :start1 (- end c)
                                 :end1 (- (length sequence) c))))
                  (sequence:adjust-sequence sequence (- (length sequence) c))))
-          (declare (dynamic-extent #'finish))
           (do ((end (or end (length sequence)))
                (step 0 (1+ step)))
               ((funcall endp2 sequence state2 limit2 from-end2) (finish))
@@ -1243,9 +1236,7 @@ dynamic extent."
                      (if (funcall predicate key2 key1)
                          (prog1 elt2 (step2) (pop/key2))
                          (prog1 elt1 (step1) (pop/key1)))))
-            (declare (dynamic-extent #'pop/no-key1 #'pop/no-key2
-                                     #'pop/key1 #'pop/key2
-                                     #'pop-one/no-key #'pop-one/key))
+            (declare (dynamic-extent #'pop-one/no-key #'pop-one/key))
             ;; Populate ENDP{1,2}, ELT{1,2} and maybe KEY{1,2}.
             (cond (key-function (pop/key1) (pop/key2))
                   (t (pop/no-key1) (pop/no-key2)))

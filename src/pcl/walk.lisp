@@ -31,7 +31,7 @@
 
 ;;;; forward references
 
-(defvar *key-to-walker-environment*)
+(defglobal *key-to-walker-environment* (make-symbol "*KEY-TO-WALKER-ENVIRONMENT*"))
 
 ;;;; environment hacking stuff, necessarily SBCL-specific
 
@@ -117,8 +117,7 @@
      ,@body))
 
 ;;; a unique tag to show that we're the intended caller of BOGO-FUN
-(defvar *bogo-fun-magic-tag*
-  '(:bogo-fun-magic-tag))
+(defconstant-eqx bogo-fun-magic-tag '(bogo-fun-magic-tag) #'constantly-t)
 
 ;;; The interface of BOGO-FUNs (previously implemented as
 ;;; FUNCALLABLE-INSTANCEs) is just these two operations, so we can do
@@ -134,11 +133,11 @@
 (defun walker-info-to-bogo-fun (walker-info)
   (lambda (magic-tag &rest rest)
     (aver (not rest)) ; else someone is using me in an unexpected way
-    (aver (eql magic-tag *bogo-fun-magic-tag*)) ; else ditto
+    (aver (eql magic-tag bogo-fun-magic-tag)) ; else ditto
     walker-info))
 (defun bogo-fun-to-walker-info (bogo-fun)
   (declare (type function bogo-fun))
-  (funcall bogo-fun *bogo-fun-magic-tag*))
+  (funcall bogo-fun bogo-fun-magic-tag))
 
 (defun with-augmented-environment-internal (env funs macros)
   ;; Note: In order to record the correct function definition, we
@@ -159,11 +158,8 @@
                                     (if (eq info :lexical-var)
                                         (cons name
                                               (if (var-special-p name env)
-                                                  (sb-c::make-global-var
-                                                   :kind :special
-                                                   :%source-name name)
-                                                  (sb-c::make-lambda-var
-                                                   :%source-name name)))
+                                                  (sb-c::make-global-var :special name)
+                                                  (sb-c::make-lambda-var name)))
                                         b)))
                                 (fourth (cadar macros)))))
      :funs (append (mapcar (lambda (f)
@@ -243,8 +239,6 @@
   `(with-augmented-environment
      (,var ,env :macros (walker-environment-bind-1 ,env ,.key-args))
      .,body))
-
-(defvar *key-to-walker-environment* (gensym))
 
 (defun env-lock (env)
   (environment-macro env *key-to-walker-environment*))
@@ -495,7 +489,6 @@
            (and (listp x) (eq (car x) 'quasiquote) (singleton-p (cdr x))))
          (recurse (x)
            (%quasiquoted-macroexpand-all x env depth)))
-    (declare (dynamic-extent #'recurse))
     (if (atom expr)
         (cond ((simple-vector-p expr) (map 'vector #'recurse expr))
               ((comma-p expr)
@@ -800,25 +793,35 @@ instead of
            (let ((type (car declaration))
                  (name (cadr declaration))
                  (args (cddr declaration)))
-             (if (walked-var-declaration-p type)
-                 (note-declaration `(,type
-                                     ,(or (var-lexical-p name env) name)
-                                     ,.args)
-                                   env)
-                 (let ((canonical (sb-c::canonized-decl-spec declaration)))
-                   (typecase canonical
-                     ((cons (eql type) cons)
-                      (destructuring-bind (type &rest vars) (cdr canonical)
-                        (loop for name in vars
-                              for symbol-macro = (and (symbolp name)
-                                                      (car (variable-symbol-macro-p name env)))
-                              do (if symbol-macro
-                                     (push (list* name 'sb-sys:macro
-                                                  `(the ,type ,(cddr symbol-macro)))
-                                           (cadddr (env-lock env)))
-                                     (note-declaration canonical env)))))
-                     (t
-                      (note-declaration canonical env)))))
+             (cond ((eq type 'special)
+                    (loop for name in (cdr declaration)
+                          for var = (or (var-lexical-p name env)
+                                        name)
+                          do
+                          (note-declaration `(special ,(or var name)) env)
+                          ;; Shadow
+                          (when (variable-symbol-macro-p name env)
+                            (note-var-binding name env))))
+                   ((walked-var-declaration-p type)
+                    (note-declaration `(,type
+                                        ,(or (var-lexical-p name env) name)
+                                        ,.args)
+                                      env))
+                   (t
+                    (let ((canonical (sb-c::canonized-decl-spec declaration)))
+                      (typecase canonical
+                        ((cons (eql type) cons)
+                         (destructuring-bind (type &rest vars) (cdr canonical)
+                           (loop for name in vars
+                                 for symbol-macro = (and (symbolp name)
+                                                         (car (variable-symbol-macro-p name env)))
+                                 do (if symbol-macro
+                                        (push (list* name 'sb-sys:macro
+                                                     `(the ,type ,(cddr symbol-macro)))
+                                              (cadddr (env-lock env)))
+                                        (note-declaration canonical env)))))
+                        (t
+                         (note-declaration canonical env))))))
              (push declaration declarations)))
          (recons body
                  form

@@ -23,17 +23,11 @@
 #include "breakpoint.h"
 #include "pseudo-atomic.h"
 
-os_vm_address_t
-arch_get_bad_addr(int signam, siginfo_t *siginfo, os_context_t *context)
-{
-    return (os_vm_address_t)siginfo->si_addr;
-}
-
 void arch_skip_instruction(os_context_t *context)
 {
     /* KLUDGE: Other platforms check for trap codes and skip inlined
      * trap/error parameters.  We should too. */
-    OS_CONTEXT_PC(context) += 4;
+    OS_CONTEXT_PC(context) += 8;
 }
 
 unsigned char *arch_internal_error_arguments(os_context_t *context)
@@ -87,10 +81,6 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
     unsigned char register_offset =
       *((unsigned char *)(OS_CONTEXT_PC(context)) + 5);
     handle_single_step_trap(context, trap, register_offset);
-    /* KLUDGE: arch_skip_instruction() only skips one instruction, and
-     * there is a following word to deal with as well, so skip
-     * twice. */
-    arch_skip_instruction(context);
     arch_skip_instruction(context);
 }
 
@@ -120,11 +110,7 @@ sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
              trap_instruction);
     }
 
-    uint32_t code = *((uint32_t *)(4 + OS_CONTEXT_PC(context)));
-
-    if (code == trap_PendingInterrupt) {
-      arch_skip_instruction(context);
-    }
+    unsigned char code = *((unsigned char *)(4 + OS_CONTEXT_PC(context)));
 
     handle_trap(context, code);
 }
@@ -146,7 +132,7 @@ void arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
     // allocate successive entries downward
     char *reloc_addr =
-        (char*)ALIEN_LINKAGE_TABLE_SPACE_END - (index + 1) * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+        (char*)ALIEN_LINKAGE_SPACE_END - (index + 1) * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
     if (datap) {
       *(unsigned long *)reloc_addr = (unsigned long)target_addr;
       return;

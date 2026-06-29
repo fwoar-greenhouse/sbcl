@@ -22,15 +22,6 @@
 
 #define INSN_LEN sizeof(unsigned int)
 
-os_vm_address_t
-arch_get_bad_addr(int signam, siginfo_t *siginfo, os_context_t *context)
-{
-    /* Classic CMUCL comment:
-
-       Finding the bad address on the mips is easy. */
-    return (os_vm_address_t)siginfo->si_addr;
-}
-
 static inline unsigned int
 os_context_register(os_context_t *context, int offset)
 {
@@ -495,7 +486,7 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
     // allocate successive entries downward
     char *reloc_addr =
-        (char*)ALIEN_LINKAGE_TABLE_SPACE_END - (index + 1) * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+        (char*)ALIEN_LINKAGE_SPACE_END - (index + 1) * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
     *(unsigned int *)reloc_addr = (unsigned int)target_addr;
 }
 

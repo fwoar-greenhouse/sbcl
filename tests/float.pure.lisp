@@ -133,8 +133,7 @@
     (mapc #'test '(sin cos tan))))
 
 (with-test (:name (:addition-overflow :bug-372)
-            :fails-on (or (and :arm64 (not :darwin))
-                          :arm
+            :fails-on (or :no-float-traps
                           (and :ppc :openbsd)
                           (and :ppc :darwin)
                           (and :x86 :netbsd)))
@@ -155,8 +154,7 @@
 ;; the preceeding "pure" test files aren't as free of side effects as
 ;; we might like.
 (with-test (:name (:addition-overflow :bug-372 :take-2)
-            :fails-on (or (and :arm64 (not :darwin))
-                          :arm
+            :fails-on (or :no-float-traps
                           (and :ppc :openbsd)
                           (and :ppc :darwin)
                           (and :x86 :netbsd)))
@@ -191,7 +189,7 @@
                              (+ x0 x1 x6 x7) (+ x2 x3 x4 x5)))))))
 
 (with-test (:name (:nan :comparison)
-            :fails-on (or :sparc))
+            :fails-on :sparc)
   (sb-int:with-float-traps-masked (:invalid)
     (macrolet ((test (form)
                  (let ((nform (subst '(/ 0.0 0.0) 'nan form)))
@@ -238,7 +236,7 @@
       (test (not (> nan 1.0))))))
 
 (with-test (:name (:nan :comparison :non-float)
-            :fails-on (or :sparc))
+            :fails-on :sparc)
   (sb-int:with-float-traps-masked (:invalid)
     (let ((nan (/ 0.0 0.0))
           (reals (list 0 1 -1 1/2 -1/2 (expt 2 300) (- (expt 2 300))))
@@ -316,6 +314,15 @@
     (assert (< (first nvals) 0))
     (assert (= (length (remove-duplicates pvals)) 1))
     (assert (> (first pvals) 0))))
+
+(with-test (:name (:log :same-base-different-precision))
+  (let ((twos (list 2 2.0f0 2.0d0 #c(2.0f0 0.0f0) #c(2.0d0 0.0d0))))
+    (let ((result (loop for number in twos
+                        append (loop for base in twos
+                                     for result = (log number base)
+                                     if (/= (realpart result) 1)
+                                     collect (list number base result)))))
+      (assert (null result)))))
 
 ;; Bug reported by Eric Marsden on July 15 2009. The compiler
 ;; used not to constant fold calls with arguments of type
@@ -670,9 +677,16 @@
         ((1) (values `(or single-float ,long (complex single-float) (complex ,long)) t)
          :test #'car-type-equal))
       (checked-compile-and-assert () '(lambda (x y) (ctu:compiler-derived-type (atan x y)))
-        ((1 2) (values `(or ,long single-float (complex ,long) (complex single-float)) t) :test #'car-type-equal)))))
+        ((1 2) (values `(float ,(- pi) ,pi)
+                       t)
+         :test #'car-type-equal)))))
 
-(with-test (:name :comparison-transform-overflow)
+;; figure out whether the floating-point environment is as expected
+(handler-case (eval '(* 1.0e30 1.0e30))
+  (division-by-zero () (push :skip-=-xform-test *features*)) ; strange result
+  (floating-point-overflow ())) ; normal result
+
+(with-test (:name :comparison-transform-overflow :skipped-on :skip-=-xform-test)
   (checked-compile-and-assert
    ()
    `(lambda (a)
@@ -778,12 +792,13 @@
     (assert (floatp (funcall f 3)))
     (assert-error (funcall f #c(1 2)))))
 
-(with-test (:name :imagpart-real-negative-zero-derived-type)
+(with-test (:name :imagpart-real-negative-zero)
   (checked-compile-and-assert
    ()
    `(lambda (x)
-      (eql (imagpart (the real x)) -0.0))
-   ((-1.0) t)))
+      (eql (imagpart (the real x)) 0.0))
+   ((-1.0) t))
+  (assert (eql (imagpart (opaque-identity -1.0)) 0.0)))
 
 (with-test (:name :negative-zero-in-ranges)
   (checked-compile-and-assert
@@ -810,3 +825,68 @@
 (with-test (:name :rational-not-bignum)
   (assert (equal (type-of (eval '(rational -4.3973217e12)))
                  (type-of -4397321682944))))
+
+(with-test (:name :single-to-double-comparsion)
+  (assert (= (count 'sb-kernel:%double-float
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (single-float x))
+                        (= x 1d0))
+                     nil))
+             0)))
+
+(with-test (:name :float-to-known-comparison)
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (float x)
+                                 (optimize speed))
+                        (= x 1d0))
+                     nil))
+             1))
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x y)
+                        (declare (float x)
+                                 ((signed-byte 8) y)
+                                 (optimize speed))
+                        (= x y))
+                     nil))
+             1))
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (float x)
+                                 (optimize (speed 1)))
+                        (= x 1d0))
+                     nil))
+             0)))
+
+(with-test (:name :tan-single-float-type-derivation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (tan (the (single-float -1.5707964 1.5707964) x)))
+    ((1.5707964) -2.2877332e7)))
+
+(with-test (:name :truncate-float-derive-type)
+  (assert-type (lambda (p)
+                 #1=(declare ((rational (10126179022772429283) (10126179022772429285)) p))
+                 (values (truncate p 2d0)))
+               (eql 5063089511386214400))
+  (assert-type (lambda (p)
+                 #1#
+                 (values (ftruncate p 2d0)))
+               (eql 5.063089511386214d18)))
+
+(with-test (:name :truncate-big-float)
+  (multiple-value-bind (q r) (truncate (opaque-identity 1f30)
+                                       (opaque-identity 49.12944))
+    (assert (= q 20354393599312814931347243008))
+    (assert (= r #-x86 7.5557864e22 #+x86 4.971228e22))))
+
+(with-test (:name :round-big-float)
+  (multiple-value-bind (q r) (round (opaque-identity (+ most-positive-fixnum 0.6d0))
+                                    (opaque-identity 1d0))
+    (assert (plusp q))
+    (assert (typep r 'double-float))))

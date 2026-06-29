@@ -4,8 +4,7 @@
 
 (defun alloc-stuff () (copy-list '(1 2 3 4 5)))
 
-(with-test (:name (:interrupt-thread :interrupt-consing-child)
-                  :broken-on :win32)
+(with-test (:name (:interrupt-thread :interrupt-consing-child))
   (let* ((thread (make-thread (lambda () (loop (alloc-stuff)))))
          (killer (make-thread
                   (lambda ()
@@ -22,8 +21,10 @@
   (sb-ext:gc :full t))
 
 #+(or x86 x86-64) ;; x86oid-only, see internal commentary.
-(with-test (:name (:interrupt-thread :interrupt-consing-child :again)
-                  :broken-on :win32)
+(with-test (:name (:interrupt-thread :interrupt-consing-child :again))
+ (symbol-macrolet ((pseudoatomic-bits
+                    (sb-sys:sap-int (sb-vm::current-thread-offset-sap
+                                     sb-vm::thread-pseudo-atomic-bits-slot))))
   (let ((c (make-thread (lambda () (loop (alloc-stuff))))))
     ;; NB this only works on x86: other ports don't have a symbol for
     ;; pseudo-atomic atomicity
@@ -36,7 +37,7 @@
                           (force-output)
                           (assert (thread-alive-p *current-thread*))
                           (assert
-                           (not (logbitp 0 SB-KERNEL:*PSEUDO-ATOMIC-BITS*))))))
+                           (not (logbitp 0 pseudoatomic-bits))))))
     (process-all-interrupts c)
     (terminate-thread c)
-    (wait-for-threads (list c))))
+    (wait-for-threads (list c)))))

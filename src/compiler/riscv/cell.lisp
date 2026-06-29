@@ -37,7 +37,7 @@
   (:temporary (:sc non-descriptor-reg) temp)
   (:info name offset lowtag)
   (:ignore name)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (result :scs (descriptor-reg) :from :load))
   (:generator 5
     (inst addi lip object (- (* offset n-word-bytes) lowtag))
@@ -55,7 +55,7 @@
          (old :scs (descriptor-reg any-reg))
          (new :scs (descriptor-reg any-reg)))
   (:temporary (:sc non-descriptor-reg) temp)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (result :scs (descriptor-reg any-reg)
                     :from :load))
   (:policy :fast-safe)
@@ -92,7 +92,7 @@
          (value :scs (descriptor-reg any-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:sc any-reg) tls-slot)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:generator 4
     (load-tls-index tls-slot symbol)
     (inst add lip thread-base-tn tls-slot)
@@ -122,7 +122,7 @@
 #+sb-thread
 (define-vop (symbol-value checked-cell-ref)
   (:translate symbol-value)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:variant-vars check-boundp)
   (:variant t)
   (:generator 9
@@ -154,7 +154,7 @@
   (:info target not-p)
   (:policy :fast-safe)
   (:temporary (:scs (descriptor-reg)) value)
-  #+sb-thread (:temporary (:scs (interior-reg)) lip)
+  #+sb-thread (:temporary (:scs (non-descriptor-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:translate boundp)
   #+sb-thread
@@ -190,12 +190,26 @@
   (:policy :fast)
   (:translate symbol-value))
 
-;;; On unithreaded builds these are just copies of the non-global versions.
-(define-vop (%set-symbol-global-value set))
-(define-vop (symbol-global-value symbol-value)
+(define-vop (%set-symbol-global-value cell-set)
+  (:variant symbol-value-slot other-pointer-lowtag))
+
+(define-vop (fast-symbol-global-value cell-ref)
+  (:variant symbol-value-slot other-pointer-lowtag)
+  (:policy :fast)
   (:translate symbol-global-value))
-(define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate symbol-global-value))
+
+(define-vop (symbol-global-value)
+  (:policy :fast-safe)
+  (:translate symbol-global-value)
+  (:args (object :scs (descriptor-reg) :to (:result 1)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 9
+    (let ((err-lab (generate-error-code vop 'unbound-symbol-error object)))
+      (loadw value object symbol-value-slot other-pointer-lowtag)
+      (inst xori tmp-tn value unbound-marker-widetag)
+      (inst beq tmp-tn zero-tn err-lab))))
 
 #+64-bit
 (progn
@@ -220,20 +234,7 @@
   (:translate symbol-package-id)
   (:policy :fast-safe)
   (:generator 1 ; ASSUMPTION: symbol-package-bits = 16
-   (inst lhu result symbol (+ (ash symbol-name-slot word-shift)
-                              (- other-pointer-lowtag)
-                              6)))) ; little-endian
-(define-vop ()
-  (:policy :fast-safe)
-  (:translate symbol-name)
-  (:args (symbol :scs (descriptor-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:temporary (:sc non-descriptor-reg) pa-flag)
-  (:generator 5
-    (pseudo-atomic (pa-flag)
-      (loadw result symbol symbol-name-slot other-pointer-lowtag)
-      (inst slli result result sb-impl::package-id-bits)
-      (inst srli result result sb-impl::package-id-bits))))
+   (inst lhu result symbol (- 2 other-pointer-lowtag)))) ; little-endian
 ) ; end PROGN
 
 ;;;; Fdefinition (fdefn) objects.
@@ -254,7 +255,7 @@
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
   (:generator 3
     (load-type type function (- fun-pointer-lowtag))
@@ -291,7 +292,7 @@
   (:temporary (:scs (descriptor-reg) :offset l1-offset) value-temp)
   (:temporary (:scs (non-descriptor-reg) :offset nl0-offset) tls-index)
   (:temporary (:scs (non-descriptor-reg) :offset nl1-offset) bsp-temp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:generator 5
      (load-tls-index tls-index symbol)
      (inst bne tls-index zero-tn TLS-VALID)
@@ -326,7 +327,7 @@
 (define-vop (unbind)
   (:temporary (:scs (descriptor-reg)) value)
   (:temporary (:scs (any-reg)) tls-index bsp-temp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 0
     (load-binding-stack-pointer bsp-temp)
     (loadw tls-index bsp-temp (- binding-symbol-slot binding-size))
@@ -358,7 +359,7 @@
   (:temporary (:scs (descriptor-reg)) symbol value)
   (:temporary (:scs (any-reg)) bsp)
   #+sb-thread
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 0
     (load-binding-stack-pointer bsp)
     (move where arg)

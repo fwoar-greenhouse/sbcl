@@ -13,10 +13,25 @@
 (in-package "SB-VM")
 
 (defun symbol-slot-ea (symbol slot)
-  (ea (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
-             (if (static-symbol-p symbol)
-                 (+ nil-value (static-symbol-offset symbol) offset)
-                 (make-fixup symbol :immobile-symbol offset)))))
+  (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
+    (if (static-symbol-p symbol)
+        (ea (+ (static-symbol-offset symbol) offset) null-tn)
+        (ea (make-fixup symbol :immobile-symbol offset)))))
+
+(defmacro symbol-value-slot-ea (sym)    ; SYM is a TN
+  `(ea (- (* symbol-value-slot n-word-bytes) other-pointer-lowtag)
+       ,sym))
+
+;;; The GC card table base is either an imm8 displacement from NULL-TN, or that
+;;; plus one backend page if #+sb-safepoint. The reason for sliding the table up
+;;; with #+sb-safepoint is that the safepoint trap address wants to be an imm8 away
+;;; from NIL, as there are far more safepoint instructions than GC barriers.
+(defun mark-gc-card (addr-or-card-index &optional (compute t))
+  (when compute
+    (inst shr addr-or-card-index gencgc-card-shift)
+    ;; :DWORD suffices because gc_allocate_ptes() asserts mask to be < 32 bits
+    (inst and :dword addr-or-card-index card-index-mask))
+  (inst mov :byte (ea nil-cardtable-disp null-tn addr-or-card-index) CARD-MARKED))
 
 ;;; TODOs:
 ;;; 1. Sometimes people write constructors like
@@ -33,30 +48,19 @@
 ;;;    be younger than the newly constructed thing.
 ;;; 2. hash-table k/v pair should mark once only.
 ;;;    (the vector elements are certainly on the same card)
-(defun emit-gengc-barrier (object cell-address scratch-reg &optional value-tn-ref value-tn allocator)
-  #-soft-card-marks (declare (ignore object cell-address scratch-reg value-tn-ref value-tn allocator))
+(defun emit-gengc-barrier (object cell-address scratch-reg &optional value-tn-ref allocator)
+  #-soft-card-marks (declare (ignore object cell-address scratch-reg value-tn-ref allocator))
   #+soft-card-marks
   (progn
-  (when (sc-is object constant immediate)
-    (aver (symbolp (tn-value object))))
-  (multiple-value-bind (require #+debug-gc-barriers why-not)
-      (require-gengc-barrier-p object value-tn-ref value-tn allocator)
-    (cond (require
+    (when (sc-is object constant immediate)
+      (aver (symbolp (tn-value object))))
+    (cond ((or (eq value-tn-ref t)
+               (require-gengc-barrier-p object value-tn-ref allocator))
            (if cell-address ; for SIMPLE-VECTOR, the page holding the specific element index gets marked
                (inst lea scratch-reg cell-address)
                ;; OBJECT could be a symbol in immobile space
                (inst mov scratch-reg (encode-value-if-immediate object)))
-           (inst shr scratch-reg gencgc-card-shift)
-           ;; gc_allocate_ptes() asserts mask to be < 32 bits, which is hugely generous.
-           (inst and :dword scratch-reg card-index-mask)
-           ;; I wanted to use thread-tn as the source of the store, but it isn't 256-byte-aligned
-           ;; due to presence of negatively indexed thread header slots.
-           ;; Probably word-alignment is enough, because we can just check the lowest bit,
-           ;; borrowing upon the idea from PSEUDO-ATOMIC which uses RBP-TN as the source.
-           ;; I'd like to measure to see if using a register is actually better.
-           ;; If all threads store 0, it might be easier on the CPU's store buffer.
-           ;; Otherwise, it has to remember who "wins". 0 makes it indifferent.
-           (inst mov :byte (ea gc-card-table-reg-tn scratch-reg) CARD-MARKED))
+           (mark-gc-card scratch-reg))
           #+debug-gc-barriers
           (t
            (flet ((encode (x)
@@ -69,40 +73,52 @@
                          (if (integerp value)
                              (constantize value)
                              value))))))
-             (cond (value-tn
-                    (unless (and (sc-is value-tn immediate)
-                                 (typep (tn-value value-tn) '(or integer boolean)))
-                      (inst push (if (eq why-not :consecutive)
-                                     0
-                                     1))
-                      (inst push (encode object))
-                      (inst push (encode value-tn))
+             (when value-tn-ref
+               (loop do
+                     (unless (and (sc-is (tn-ref-tn value-tn-ref) immediate)
+                                  (typep (tn-value (tn-ref-tn value-tn-ref)) '(or integer boolean)))
+                       (inst push 1)
+                       (inst push (encode object))
+                       (inst push (encode (tn-ref-tn value-tn-ref)))
+                       (invoke-asm-routine 'call 'check-barrier sb-assem::*current-vop*))
+                     (setf value-tn-ref (tn-ref-across value-tn-ref))
+                     while value-tn-ref)))))))
 
-                      (invoke-asm-routine 'call 'check-barrier sb-assem::*current-vop*)))
-                   (value-tn-ref
-                    (loop do
-                          (unless (and (sc-is (tn-ref-tn value-tn-ref) immediate)
-                                       (typep (tn-value (tn-ref-tn value-tn-ref)) '(or integer boolean)))
-                            (inst push (if (eq why-not :consecutive)
-                                           0
-                                           1))
-                            (inst push (encode object))
-                            (inst push (encode (tn-ref-tn value-tn-ref)))
-                            (invoke-asm-routine 'call 'check-barrier sb-assem::*current-vop*))
-                          (setf value-tn-ref (tn-ref-across value-tn-ref))
-                          while value-tn-ref)))))))))
+(defun symbol-set-barrier-p (symbol newval-tn-ref)
+  (if (and (sc-is symbol immediate) (static-symbol-p (tn-value symbol)))
+      nil
+      (require-gengc-barrier-p symbol newval-tn-ref)))
+
+;;; There are 3 unused bits in the symbol-hash slot which I had intended
+;;; to use to indicate whether a symbol is in fixedobj space and whether the
+;;; containing card was marked since the last GC, to avoid repetitive
+;;; work - just do a bit test and skip.
+;;; Initially I'd like to just get this correct, and then see if it's worth
+;;; doing that optimization which will complicate the GC a little.
+(defun emit-symbol-write-barrier (vop symbol temp newval-tn-ref)
+  (declare (ignorable vop temp))
+  (when (symbol-set-barrier-p symbol newval-tn-ref)
+    #+immobile-space
+    (progn (inst push symbol)
+           (if (sc-is symbol immediate)
+               (invoke-asm-routine 'call 'mark-symbol-card vop)
+               (invoke-asm-routine 'call 'mark-card vop)))
+    #-immobile-space
+    (progn
+      #+permgen
+      (progn (inst push symbol)
+             (invoke-asm-routine 'call 'gc-remember-symbol vop))
+      (emit-gengc-barrier symbol nil temp newval-tn-ref))))
 
 #-soft-card-marks
 (defun emit-code-page-gengc-barrier (object scratch-reg)
   (inst mov scratch-reg object)
-  (inst shr scratch-reg gencgc-card-shift)
-  (inst and :dword scratch-reg card-index-mask)
-  (inst mov :byte (ea gc-card-table-reg-tn scratch-reg) CARD-MARKED))
+  (mark-gc-card scratch-reg))
 
 (defun emit-store (ea value val-temp &optional (tag-immediate t))
   (sc-case value
    (immediate
-      (let ((bits (encode-value-if-immediate value tag-immediate)))
+      (let ((bits (immediate-tn-repr value tag-immediate)))
         ;; Try to move imm-to-mem if BITS fits
         (acond ((or (and (fixup-p bits)
                          ;; immobile-object fixups must fit in 32 bits
@@ -110,8 +126,9 @@
                          bits)
                     (plausible-signed-imm32-operand-p bits))
                 (inst mov :qword ea it))
+               ((tn-p bits) (inst mov ea bits)) ; null-tn
                (t
-                (inst mov val-temp bits)
+                (move-immediate val-temp bits)
                 (inst mov ea val-temp)))))
    (constant
       (inst mov val-temp value)
@@ -129,7 +146,7 @@
   (:temporary (:sc unsigned-reg) val-temp)
   (:vop-var vop)
   (:generator 4
-    (emit-gengc-barrier object nil val-temp (vop-nth-arg 1 vop) value)
+    (emit-gengc-barrier object nil val-temp (vop-nth-arg 1 vop))
     (let ((ea (object-slot-ea object offset lowtag)))
       (emit-store ea value val-temp))))
 
@@ -160,22 +177,6 @@
       (move result value)
       (inst neg result)))
     (inst xadd :lock (object-slot-ea object offset lowtag) result)))
-
-(define-vop (atomic-inc-symbol-global-value cell-xadd)
-  (:translate %atomic-inc-symbol-global-value)
-  ;; The function which this vop translates will not
-  ;; be used unless the variable is proclaimed as fixnum.
-  ;; All stores are checked in a safe policy, so this
-  ;; vop is safe because it increments a known fixnum.
-  (:policy :fast-safe)
-  (:arg-types * tagged-num)
-  (:variant symbol-value-slot other-pointer-lowtag))
-
-(define-vop (atomic-dec-symbol-global-value cell-xsub)
-  (:translate %atomic-dec-symbol-global-value)
-  (:policy :fast-safe)
-  (:arg-types * tagged-num)
-  (:variant symbol-value-slot other-pointer-lowtag))
 
 (macrolet
     ((def-atomic (fun-name inherit slot)
@@ -238,21 +239,24 @@
           ;; to select byte 1 of the header word.
           (ash 1 (- stable-hash-required-flag 8)))))
 
-(defmacro compute-splat-bits (value)
+(defun compute-splat-bits (value)
   ;; :SAFE-DEFAULT means any unspecific value that is safely a default.
   ;; Heap allocation uses 0 since that costs nothing.
   ;; If the user wanted a specific value, it could have been explicitly given.
-  `(if (typep ,value 'sb-vm:word)
-       ,value
-       (case ,value
-         (:unbound (unbound-marker-bits))
-         ((nil) (bug "Should not see SPLAT NIL"))
+  (if (typep value 'sb-vm:word)
+      value
+      (case value
+         (:unbound unbound-marker-widetag)
+         ((nil) null-tn)
          (t #+ubsan unwritten-vector-element-marker
             #-ubsan 0))))
 
 ;;; This logic was formerly in ALLOCATE-VECTOR-ON-STACK.
 ;;; Choosing amongst 3 vops gets potentially better register allocation
 ;;; by not wasting registers in the cases that don't use them.
+;;; (Actually now that :UNUSED-IF is an option, these can probably
+;;; all be combined into one vop which can indicate which temps aren't
+;;; used. When these vops were first written, it wasn't an option)
 (define-vop (splat-word)
   (:policy :fast-safe)
   (:translate splat)
@@ -262,29 +266,32 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 1
    (progn words) ; don't put it in :ignore, which gets inherited
-   (inst mov :qword
-         (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag) vector)
-         (compute-splat-bits value))
+   (let ((bits (compute-splat-bits value)))
+     (aver (or (tn-p bits) (plausible-signed-imm32-operand-p bits)))
+     (inst mov :qword (object-slot-ea vector vector-data-offset other-pointer-lowtag) bits))
    (move result vector)))
 
 (define-vop (splat-small splat-word)
   (:arg-types * (:constant (integer 2 10)) (:constant t))
-  (:temporary (:sc complex-double-reg) zero)
+  (:temporary (:sc complex-double-reg) pattern)
   (:generator 5
    (let ((bits (compute-splat-bits value)))
-     (if (= bits 0)
-         (inst xorpd zero zero)
-         (inst movdqa zero
-               (register-inline-constant :oword (logior (ash bits 64) bits)))))
-   (let ((data-addr (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                        vector)))
-     (multiple-value-bind (double single) (truncate words 2)
-       (dotimes (i double)
-         (inst movapd data-addr zero)
-         (setf data-addr (ea (+ (ea-disp data-addr) (* n-word-bytes 2))
-                             (ea-base data-addr))))
-       (unless (zerop single)
-         (inst movaps data-addr zero))))
+     (cond ((and (eq bits null-tn) (eql words 2)) ; don't use XMM register
+            (storew null-tn vector vector-data-offset other-pointer-lowtag)
+            (storew null-tn vector (1+ vector-data-offset) other-pointer-lowtag))
+           (t
+            (cond ((eq bits null-tn)
+                   (inst movaps pattern (ea (- list-pointer-lowtag) null-tn)))
+                  ((/= bits 0) (inst movddup pattern (register-inline-constant :qword bits)))
+                  (t (inst xorps pattern pattern)))
+            (let ((data-addr (object-slot-ea vector vector-data-offset other-pointer-lowtag)))
+              (multiple-value-bind (quo rem) (truncate words 2)
+                (dotimes (i quo)
+                  (inst movaps data-addr pattern) ; 1 byte shorter encoding than movapd
+                  (setf data-addr (ea (+ (ea-disp data-addr) (* n-word-bytes 2))
+                                      (ea-base data-addr))))
+                (unless (zerop rem)
+                  (inst movsd data-addr pattern)))))))
    (move result vector)))
 
 (define-vop (splat-any splat-word)
@@ -302,10 +309,9 @@
                :to (:result 0)) rax)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
-   (inst lea rdi (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                        vector))
+   (inst lea rdi (object-slot-ea vector vector-data-offset other-pointer-lowtag))
    (let ((bits (compute-splat-bits value)))
-     (cond ((and (= bits 0)
+     (cond ((and (eql bits 0)
                  (constant-tn-p words)
                  (typep (tn-value words) '(unsigned-byte 7)))
             (zeroize rax)
@@ -313,7 +319,7 @@
            (t
             ;; words could be in RAX, so read it first, then zeroize
             (inst mov rcx (or (and (constant-tn-p words) (tn-value words)) words))
-            (if (= bits 0) (zeroize rax) (inst mov rax bits)))))
+            (if (eql bits 0) (zeroize rax) (inst mov rax bits)))))
    (inst rep)
    (inst stos :qword)
    (move result vector)))

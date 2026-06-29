@@ -22,7 +22,7 @@
   (addr system-area-pointer)
   (bytes unsigned))
 
-(define-load-time-global *allocator-mutex* (sb-thread:make-mutex :name "Allocator"))
+(define-load-time-global *allocator-mutex* nil)
 
 (defun allocate-static-vector (widetag length words)
   (declare (type (unsigned-byte #.n-widetag-bits) widetag)
@@ -87,21 +87,22 @@
   (aver (eql code-boxed-size-slot 1)))
 
 ;;; Size-class segregation (implying which page we try to allocate to)
-;;; is done from lisp now, not C. There are 3 objects types we'll see,
-;;; each in its own size class (even if some are coincidentally the same size).
-;;;  - Symbols
-;;;  - FDEFNs
-;;;  - Layouts
-;;; The first two are truly fixed in size. Layouts occur in varying sizes.
+;;; is done from lisp now, not C. There are 2 objects types:
+;;;  - Symbols have exactly 1 size-class
+;;;  - Layouts have varying size-class
 (defun alloc-immobile-fixedobj (nwords header)
   (let* ((widetag (logand (truly-the fixnum header) widetag-mask))
-         (aligned-nwords (truly-the fixnum (align-up nwords 2)))
+         (aligned-nwords (truly-the fixnum (align-up (the fixnum nwords) 2)))
          (size-class
           ;; If you change this, then be sure to update tests/immobile-space.impure
           ;; which hardcodes a size class to not conflict with anything.
+          ;; There is too much magic in layout_size_class_nwords for me to
+          ;; attempt to rearrange these, that's why "2" is absent below.
+          ;; As a practical matter, the largest layout I've ever seen in a real
+          ;; application is 20 words (7 words of raw/tagged-slot bitmap),
+          ;; so we're not really hurting for more size classes.
           (ecase widetag
             (#.symbol-widetag 1)
-            (#.fdefn-widetag  2)
             (#.instance-widetag
              (cond ((<= aligned-nwords  8) (setq aligned-nwords  8) 3)
                    ((<= aligned-nwords 16) (setq aligned-nwords 16) 4)
@@ -109,21 +110,22 @@
                    ((<= aligned-nwords 32) (setq aligned-nwords 32) 6)
                    ((<= aligned-nwords 48) (setq aligned-nwords 48) 7)
                    (t (error "Oversized layout")))))))
-    (values (%primitive !alloc-immobile-fixedobj
-                        size-class
-                        aligned-nwords
-                        header))))
+    (values (%primitive alloc-immobile-fixedobj size-class aligned-nwords header))))
 
 (defun %alloc-immobile-symbol (name)
-  (let ((symbol (truly-the symbol
+  (let ((symbol (truly-the (and symbol (not null))
                  (or #+x86-64 (%primitive !fast-alloc-immobile-symbol)
                      (alloc-immobile-fixedobj
                       symbol-size
-                      (logior (ash (1- symbol-size) n-widetag-bits) symbol-widetag))))))
+                      #.(compute-object-header (1- symbol-size) symbol-widetag))))))
     ;; symbol-hash and package ID start out as 0
-    (%primitive set-slot symbol name 'make-symbol symbol-name-slot other-pointer-lowtag)
+    (with-pinned-objects (symbol)
+      ;; set-slot vop wasn't figuring out that it didn't need a GC barrier for NAME
+      (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address symbol))
+                             (- (ash symbol-name-slot word-shift) other-pointer-lowtag))
+            name))
     (%primitive set-slot symbol nil 'make-symbol symbol-info-slot other-pointer-lowtag)
-    (%set-symbol-global-value symbol (make-unbound-marker))
+    (%primitive %set-symbol-global-value symbol (make-unbound-marker))
     symbol))
 
 ) ; end PROGN
@@ -167,7 +169,7 @@
 
 (defun update-dynamic-space-code-tree (obj)
   (with-pinned-objects (obj)
-    (let ((addr (logandc2 (get-lisp-obj-address obj) other-pointer-lowtag))
+    (let ((addr (logandc2 (get-lisp-obj-address obj) lowtag-mask))
           (tree *dynspace-codeblob-tree*))
       (loop (let ((newtree (sb-brothertree:insert addr tree)))
               ;; check that it hasn't been promoted from gen0 -> gen1 already
@@ -176,41 +178,43 @@
               (let ((oldval (cas *dynspace-codeblob-tree* tree newtree)))
                 (if (eq oldval tree) (return) (setq tree oldval))))))))
 
+(define-load-time-global *code-alloc-count* 0) ; frlock: bump once on entry, again on exit
+(declaim (fixnum *code-alloc-count*))
+
 ;;; Allocate a code component with BOXED words in the header
 ;;; followed by UNBOXED bytes of raw data.
 ;;; BOXED must be the exact count of boxed words desired. No adjustments
 ;;; are made for alignment considerations or the fixed slots.
+;;; FIXME: it's not necessary that there be two different locks: *allocator-mutex*
+;;; and code_allocator_lock. The Lisp mutex should subsume the C mutex,
+;;; and we should acquire the Lisp one around the entire body of this function.
 (defun allocate-code-object (space boxed unboxed)
   (declare (ignorable space))
   (let* ((total-words
            (the (unsigned-byte 22) ; Enforce limit on total words as well
                 (align-up (+ boxed (ceiling unboxed n-word-bytes)) 2))))
+    (atomic-incf *code-alloc-count*)
     #+immobile-code
     (when (member space '(:immobile :auto))
       (let (addr code holder)
         ;; CODE needs to have a heap or TLS reference to it prior to adding it to the tree
         ;; since implicit pinning uses the tree to find pinned ojects.
         (declare (special holder))
-        (with-alien ((tlsf-alloc-codeblob (function unsigned system-area-pointer unsigned)
-                                          :extern)
+        (with-alien ((tlsf-alloc-codeblob
+                      (function unsigned system-area-pointer unsigned-int unsigned-int) :extern)
                      (tlsf-control system-area-pointer :extern))
           (with-system-mutex (*allocator-mutex* :without-gcing t)
             (unless (zerop (setq addr (alien-funcall tlsf-alloc-codeblob
-                                                     tlsf-control total-words)))
+                                                     tlsf-control total-words boxed)))
               (setf code (%make-lisp-obj (logior addr other-pointer-lowtag))
                     holder code))))
         ;; GC is allowed to run now because HOLDER references CODE
         (when code
-          (alien-funcall (extern-alien "memset" (function void system-area-pointer int unsigned))
-                         (sap+ (int-sap addr) n-word-bytes) 0 (ash (1- boxed) word-shift))
-          ;; BOXED-SIZE is a raw slot holding a byte count, but SET-SLOT takes its VALUE
-          ;; arg as a descriptor-reg, so just cleverly make it right by shifting.
-          (%primitive set-slot code (ash boxed (- word-shift n-fixnum-tag-bits))
-                      '(setf %code-boxed-size) code-boxed-size-slot other-pointer-lowtag)
           (aver (= (sap-ref-8 (int-sap addr) 0) code-header-widetag)) ; wasn't trashed
           (let ((tree *immobile-codeblob-tree*))
             (loop (when (eq tree (setq tree (cas *immobile-codeblob-tree* tree
                                                  (sb-brothertree:insert addr tree))))
+                    (atomic-incf *code-alloc-count*)
                     (return-from allocate-code-object (values code total-words)))))))
       (when (eq space :immobile)
         (error "Immobile code space exhausted")))
@@ -232,6 +236,7 @@
     ;; of the object so that we can find the function table.
     ;; But what about other things that create code objects?
     ;; It could be a subtle source of nondeterministic core images.
+      (atomic-incf *code-alloc-count*)
       (values code total-words))))
 
 ;; The freelist can only be read while holding a mutex because the codeblobs
@@ -277,3 +282,30 @@
           (alien-funcall tlsf-unalloc-codeblob tlsf-control addr)
           (setf (car scratchpad) (pop-1)))))
     t))
+
+#+permgen
+(progn
+(defun allocate-permgen-symbol (name)
+  (with-system-mutex (*allocator-mutex* :without-gcing t)
+    (let ((freeptr *permgen-space-free-pointer*))
+      (setf *permgen-space-free-pointer*
+            (sap+ freeptr (ash symbol-size word-shift)))
+      (aver (<= (sap-int *permgen-space-free-pointer*)
+                (+ permgen-space-start permgen-space-size)))
+      (setf (sap-ref-word freeptr 0) symbol-widetag)
+      (setf (sap-ref-lispobj freeptr (ash symbol-name-slot word-shift)) name
+            (sap-ref-lispobj freeptr (ash symbol-info-slot word-shift)) nil
+            (sap-ref-word freeptr (ash symbol-value-slot word-shift))
+            unbound-marker-widetag)
+      (%make-lisp-obj (sap-int (sap+ freeptr other-pointer-lowtag))))))
+(defun sb-kernel::allocate-permgen-layout (nwords)
+  (with-system-mutex (*allocator-mutex* :without-gcing t)
+    (let ((freeptr *permgen-space-free-pointer*))
+      (setf *permgen-space-free-pointer*
+            ;; round-to-odd, add the header word
+            (sap+ freeptr (ash (1+ (logior nwords 1)) word-shift)))
+      (aver (<= (sap-int *permgen-space-free-pointer*)
+                (+ permgen-space-start permgen-space-size)))
+      (setf (sap-ref-word freeptr 0)
+            (logior (ash nwords instance-length-shift) instance-widetag))
+      (%make-lisp-obj (sap-int (sap+ freeptr instance-pointer-lowtag)))))))

@@ -43,9 +43,7 @@
       (inst str value (@ vector offset))))
 
   (defun reg-in-sc (tn sc)
-    (make-random-tn :kind :normal
-                    :sc (sc-or-lose sc)
-                    :offset (tn-offset tn))))
+    (make-random-tn (sc-or-lose sc) (tn-offset tn))))
 
 (defmacro simd-mask-32 (value)
   `(inline-vop
@@ -69,7 +67,9 @@
              collect `(touch-object ,var))))
 
 (defmacro simd-string-case (a source destination index fallback)
-  `(let ((ascii-p (simd-mask-32 192))
+  `(let ((ascii-p (simd-mask-32 ,(if (char= a #\a)
+                                     223
+                                     191)))
          (a-mask (simd-mask-32 ,(char-code a)))
          (z-mask (simd-mask-32 25))
          (flip (simd-mask-32 #x20)))
@@ -511,4 +511,753 @@
       (inst b DONE)
       FALSE
       (inst mov res null-tn)
+      DONE)))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun check-ascii (input temp not-ascii-label &optional (size 1))
+    ;; Check for ASCII by looking at the largest byte
+    (multiple-value-bind (v-size size) (ecase size
+                                         (1 (values :16b :b))
+                                         (4 (values :4s :s)))
+      (inst umaxv temp input v-size)
+      (inst umov tmp-tn temp 0 size)
+      (inst cmp tmp-tn 127)
+      (inst b :hs not-ascii-label))))
+
+(defun simd-copy-utf8-to-character-string (start end string ibuf)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (string)
+    (let* ((head (sb-impl::buffer-head ibuf))
+           (tail (sb-impl::buffer-tail ibuf))
+           (left (- end start))
+           (result-characters (logand left -16))
+           (string-bytes (logand (- tail head) -16))
+           (n (min result-characters string-bytes))
+           (string-start (truly-the fixnum (* start 4)))
+           (copied
+             (inline-vop (((byte-array* sap-reg t) (sb-impl::buffer-sap ibuf))
+                          ((byte-array sap-reg t))
+                          ((32-bit-array sap-reg t) (vector-sap string))
+                          ((string-start any-reg) string-start)
+                          ((end unsigned-reg))
+                          ((head any-reg) head)
+                          ((n any-reg) n)
+                          ((bytes complex-double-reg))
+                          ((16-bits complex-double-reg))
+                          ((16-bits-2 complex-double-reg))
+                          ((32-bits complex-double-reg))
+                          ((32-bits-2 complex-double-reg))
+                          ((32-bits-3 complex-double-reg))
+                          ((32-bits-4 complex-double-reg))
+                          ((temp complex-double-reg)))
+                 ((res unsigned-reg unsigned-num))
+               (inst add byte-array* byte-array* (lsr head 1))
+               (inst mov byte-array byte-array*)
+               (inst add end byte-array* (lsr n 1))
+               (inst add 32-bit-array 32-bit-array (lsr string-start 1))
+               (inst b start)
+
+               LOOP
+               (inst ldr bytes (@ byte-array))
+               (check-ascii bytes temp DONE)
+
+               (inst add byte-array byte-array 16)
+
+               (inst ushll 16-bits :8h bytes :8b)
+               (inst ushll 32-bits :4s 16-bits :4h)
+
+               (inst ushll2 16-bits-2 :8h bytes :16b)
+               (inst ushll2 32-bits-2 :4s 16-bits :8h)
+
+               (inst ushll 32-bits-3 :4s 16-bits-2 :4h)
+               (inst ushll2 32-bits-4 :4s 16-bits-2 :8h)
+               (inst stp 32-bits 32-bits-2 (@ 32-bit-array 64 :post-index))
+               (inst stp 32-bits-3 32-bits-4 (@ 32-bit-array -32))
+
+               start
+               (inst cmp byte-array end)
+               (inst b :lt LOOP)
+
+               DONE
+               (inst sub res byte-array byte-array*))))
+      (setf (sb-impl::buffer-head ibuf) (+ head copied))
+      (+ start copied))))
+
+(defun simd-copy-utf8-to-base-string (start end string ibuf)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (string)
+    (let* ((head (sb-impl::buffer-head ibuf))
+           (tail (sb-impl::buffer-tail ibuf))
+           (n (logand (min (- end start)
+                           (- tail head))
+                      -16))
+           (copied
+             (inline-vop (((byte-array* sap-reg t) (sb-impl::buffer-sap ibuf))
+                          ((byte-array sap-reg t))
+                          ((char-array sap-reg t) (vector-sap string))
+                          ((bytes complex-double-reg))
+                          ((string-start any-reg) start)
+                          ((end unsigned-reg))
+                          ((head any-reg) head)
+                          ((n any-reg) n)
+                          ((temp complex-double-reg)))
+                 ((res unsigned-reg unsigned-num))
+               (inst add byte-array* byte-array* (lsr head 1))
+               (inst mov byte-array byte-array*)
+               (inst add end byte-array* (lsr n 1))
+               (inst add char-array char-array (lsr string-start 1))
+               (inst b start)
+
+               LOOP
+               (inst ldr bytes (@ byte-array))
+               (check-ascii bytes temp DONE)
+               (inst add byte-array byte-array 16)
+               (inst str bytes (@ char-array 16 :post-index))
+
+               start
+               (inst cmp byte-array end)
+               (inst b :lt LOOP)
+
+               DONE
+               (inst sub res byte-array byte-array*))))
+      (setf (sb-impl::buffer-head ibuf) (+ head copied))
+      (+ start copied))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun concat-ub (size ubs)
+    (let ((result 0))
+      (loop for ub in ubs
+            do (setf result (logior (ash result size) ub)))
+      result)))
+
+(defun simd-copy-utf8-crlf-to-base-string (start end string ibuf)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (let* ((head (sb-impl::buffer-head ibuf))
+         (tail (sb-impl::buffer-tail ibuf))
+         (n (logand (min (- end start)
+                         (- (- tail head) 16)) ;; read one more chunk
+                    (- 16)))
+         (shuffle-table (load-time-value (let ((table (make-array (* 256 8) :element-type '(unsigned-byte 8))))
+                                           (loop for row below 256
+                                                 do (loop with indexes = (loop for i below 8
+                                                                               unless (logbitp i row)
+                                                                               collect i)
+                                                          for column below 8
+                                                          for index = (or (pop indexes)
+                                                                          0)
+                                                          do
+                                                          (setf (aref table (+ (* row 8) column))
+                                                                index)))
+                                           table))))
+
+    (if (<= n 0)
+        start
+        (with-pinned-objects-in-registers (string)
+          (multiple-value-bind (new-head copied)
+              (inline-vop (((byte-array* sap-reg t) (sb-impl::buffer-sap ibuf))
+                           ((byte-array sap-reg t))
+                           ((char-array* sap-reg t) (vector-sap string))
+                           ((char-array sap-reg t))
+                           ((crlf-mask complex-double-reg))
+                           ((bytes complex-double-reg))
+                           ((next-bytes complex-double-reg))
+                           ((shifted complex-double-reg))
+                           ((temp complex-double-reg))
+                           ((temp2 complex-double-reg))
+                           ((temp3 complex-double-reg))
+                           ((string-start any-reg) start)
+                           ((end any-reg) n)
+                           ((head any-reg) head)
+                           ((bit-mask complex-double-reg))
+                           ((shuffle-table sap-reg) (vector-sap shuffle-table))
+                           ((shuffle-mask complex-double-reg))
+                           ((shuffle-mask2 complex-double-reg))
+                           ((count unsigned-reg)))
+                  ((new-head unsigned-reg positive-fixnum :from :load)
+                   (copied unsigned-reg positive-fixnum :from :load))
+                (inst mov tmp-tn #x0A0D)
+                (inst dup crlf-mask tmp-tn :8h)
+
+                (inst add byte-array byte-array* (lsr head 1))
+                (inst add end byte-array (lsr end 1))
+
+                (inst add char-array* char-array* (lsr string-start 1))
+                (inst mov char-array char-array*)
+
+                (load-inline-constant bit-mask :oword
+                                      (concat-ub 8 (append (loop for i downfrom 7 to 0
+                                                                 collect (ash 1 i))
+                                                           (loop for i downfrom 7 to 0
+                                                                 collect (ash 1 i)))))
+                (inst ldr next-bytes (@ byte-array))
+                (check-ascii next-bytes temp DONE)
+
+                LOOP
+                (inst s-mov bytes next-bytes)
+                (inst ldr next-bytes (@ byte-array 16))
+                (check-ascii next-bytes temp DONE)
+
+                (inst add byte-array byte-array 16)
+
+
+                ;; Shift bytes right to find CRLF starting at odd indexes
+                ;; and grab the first byte from the next vector to check if it
+                ;; it's an LF
+                (inst ext shifted bytes next-bytes 1 :16b)
+                ;; Compare both variants
+                (inst cmeq temp bytes crlf-mask :8h)
+                (inst cmeq temp2 shifted crlf-mask :8h)
+
+
+                ;; SLI retains the destination parts, matching elements
+                ;; will have FFFF, shifting and inserting will combine
+                ;; them with zeros producing just one FF
+                (inst sli temp temp2 :8h 8)
+
+                ;; Count matches
+                (inst ushr temp3 temp :16b 7)
+                (inst addv temp2 temp3 :8b)
+                (inst fmov count (reg-in-sc temp2 'single-reg))
+
+                ;; bit-mask has powers of two for each byte index,
+                ;; adding them together will produce an 8-bit mask.
+                (inst s-and temp2 temp bit-mask)
+
+                (inst addv temp temp2 :8b)
+                (inst fmov tmp-tn (reg-in-sc temp 'single-reg))
+                (inst ldr (reg-in-sc shuffle-mask 'double-reg) (@ shuffle-table (extend tmp-tn :lsl 3)))
+                (inst tbl temp (list bytes) shuffle-mask :8b)
+                (inst str (reg-in-sc temp 'double-reg) (@ char-array 8 :post-index))
+                (inst sub char-array char-array count)
+
+                ;; Second half
+
+                ;; Count matches
+                (inst ins temp3 0 temp3 1 :d)
+                (inst addv temp3 temp3 :8b)
+                (inst fmov count (reg-in-sc temp3 'single-reg))
+
+                (inst ins temp2 0 temp2 1 :d)
+                (inst addv temp2 temp2 :8b)
+                (inst fmov tmp-tn (reg-in-sc temp2 'single-reg))
+
+                (inst ldr (reg-in-sc shuffle-mask2 'double-reg) (@ shuffle-table (extend tmp-tn :lsl 3)))
+                (inst ins bytes 0 bytes 1 :d)
+                (inst tbl temp (list bytes) shuffle-mask2 :8b)
+                (inst str (reg-in-sc temp 'double-reg) (@ char-array 8 :post-index))
+                (inst sub char-array char-array count)
+
+                (inst cmp byte-array end)
+                (inst b :lt LOOP)
+
+                DONE
+                (inst sub copied char-array char-array*)
+                (inst sub new-head byte-array byte-array*))
+            (setf (sb-impl::buffer-head ibuf) new-head)
+            (truly-the index (+ start copied)))))))
+
+(defun simd-copy-utf8-crlf-to-character-string (start end string ibuf)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (let* ((head (sb-impl::buffer-head ibuf))
+         (tail (sb-impl::buffer-tail ibuf))
+         (n (logand (min (- end start)
+                         (- (- tail head) 16)) ;; read one more chunk
+                    (- 16)))
+         (shuffle-table (load-time-value (let ((table (make-array (* 256 8) :element-type '(unsigned-byte 8))))
+                                           (loop for row below 256
+                                                 do (loop with indexes = (loop for i below 8
+                                                                               unless (logbitp i row)
+                                                                               collect i)
+                                                          for column below 8
+                                                          for index = (or (pop indexes)
+                                                                          0)
+                                                          do
+                                                          (setf (aref table (+ (* row 8) column))
+                                                                index)))
+                                           table))))
+
+    (if (<= n 0)
+        start
+        (with-pinned-objects-in-registers (string)
+          (multiple-value-bind (new-head copied)
+              (inline-vop (((byte-array* sap-reg t) (sb-impl::buffer-sap ibuf))
+                           ((byte-array sap-reg t))
+                           ((char-array* sap-reg t) (vector-sap string))
+                           ((char-array sap-reg t))
+                           ((crlf-mask complex-double-reg))
+                           ((bytes complex-double-reg))
+                           ((next-bytes complex-double-reg))
+                           ((shifted complex-double-reg))
+                           ((temp complex-double-reg))
+                           ((temp2 complex-double-reg))
+                           ((temp3 complex-double-reg))
+                           ((string-start any-reg) start)
+                           ((end any-reg) n)
+                           ((head any-reg) head)
+                           ((bit-mask complex-double-reg))
+                           ((shuffle-table sap-reg) (vector-sap shuffle-table))
+                           ((shuffle-mask complex-double-reg))
+                           ((shuffle-mask2 complex-double-reg))
+                           ((16-bits complex-double-reg))
+                           ((16-bits-2 complex-double-reg))
+                           ((32-bits complex-double-reg))
+                           ((32-bits-2 complex-double-reg))
+                           ((count unsigned-reg)))
+                  ((new-head unsigned-reg positive-fixnum :from :load)
+                   (copied unsigned-reg positive-fixnum :from :load))
+                (inst mov tmp-tn #x0A0D)
+                (inst dup crlf-mask tmp-tn :8h)
+
+                (inst add byte-array byte-array* (lsr head 1))
+                (inst add end byte-array (lsr end 1))
+
+                (inst add char-array* char-array* (lsl string-start (- 2 1)))
+                (inst mov char-array char-array*)
+
+                (load-inline-constant bit-mask :oword
+                                      (concat-ub 8 (append (loop for i downfrom 7 to 0
+                                                                 collect (ash 1 i))
+                                                           (loop for i downfrom 7 to 0
+                                                                 collect (ash 1 i)))))
+                (inst ldr next-bytes (@ byte-array))
+                (check-ascii next-bytes temp DONE)
+
+                LOOP
+                (inst s-mov bytes next-bytes)
+                (inst ldr next-bytes (@ byte-array 16))
+                (check-ascii next-bytes temp DONE)
+
+                ;; Shift bytes right to find CRLF starting at odd indexes
+                ;; and grab the first byte from the next vector to check if it
+                ;; it's an LF
+                (inst ext shifted bytes next-bytes 1 :16b)
+                ;; Compare both variants
+                (inst cmeq temp bytes crlf-mask :8h)
+                (inst cmeq temp2 shifted crlf-mask :8h)
+
+
+                ;; SLI retains the destination parts, matching elements
+                ;; will have FFFF, shifting and inserting will combine
+                ;; them with zeros producing just one FF
+                (inst sli temp temp2 :8h 8)
+
+                ;; Count matches
+                (inst ushr temp3 temp :16b 7)
+                (inst addv temp2 temp3 :8b)
+                (inst fmov count (reg-in-sc temp2 'single-reg))
+
+                ;; bit-mask has powers of two for each byte index,
+                ;; adding them together will produce an 8-bit mask.
+                (inst s-and temp2 temp bit-mask)
+
+                (inst addv temp temp2 :8b)
+                (inst fmov tmp-tn (reg-in-sc temp 'single-reg))
+                (inst ldr (reg-in-sc shuffle-mask 'double-reg) (@ shuffle-table (extend tmp-tn :lsl 3)))
+                (inst tbl temp (list bytes) shuffle-mask :8b)
+
+                ;; Widen
+                (inst ushll 16-bits :8h temp :8b)
+                (inst ushll 32-bits :4s 16-bits :4h)
+                (inst ushll2 16-bits-2 :8h temp :16b)
+                (inst ushll2 32-bits-2 :4s 16-bits :8h)
+                (inst stp 32-bits 32-bits-2 (@ char-array 32 :post-index))
+                (inst sub char-array char-array (lsl count 2))
+
+                ;; Second half
+
+                ;; Count matches
+                (inst ins temp3 0 temp3 1 :d)
+                (inst addv temp3 temp3 :8b)
+                (inst fmov count (reg-in-sc temp3 'single-reg))
+
+                (inst ins temp2 0 temp2 1 :d)
+                (inst addv temp2 temp2 :8b)
+                (inst fmov tmp-tn (reg-in-sc temp2 'single-reg))
+
+                (inst ldr (reg-in-sc shuffle-mask2 'double-reg) (@ shuffle-table (extend tmp-tn :lsl 3)))
+                (inst ins bytes 0 bytes 1 :d)
+                (inst tbl temp (list bytes) shuffle-mask2 :8b)
+
+                (inst ushll 16-bits :8h temp :8b)
+                (inst ushll 32-bits :4s 16-bits :4h)
+                (inst ushll2 16-bits-2 :8h temp :16b)
+                (inst ushll2 32-bits-2 :4s 16-bits :8h)
+                (inst stp 32-bits 32-bits-2 (@ char-array 32 :post-index))
+                (inst sub char-array char-array (lsl count 2))
+
+                (inst cmp byte-array end)
+                (inst b :lt LOOP)
+
+                DONE
+                (inst sub copied char-array char-array*)
+                (inst sub new-head byte-array byte-array*))
+            (setf (sb-impl::buffer-head ibuf) new-head)
+            (truly-the index (+ start (ash copied -2))))))))
+
+(defun simd-copy-character-string-to-utf8 (start end string obuf)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (string)
+    (let* ((tail (sb-impl::buffer-tail obuf))
+           (buffer-left (- (sb-impl::buffer-length obuf) tail))
+           (string-left (- end start))
+           (n (logand (min buffer-left string-left) -16))
+           (string-start (truly-the fixnum (* start 4))))
+      (multiple-value-bind (copied last-newline)
+          (inline-vop (((byte-array* sap-reg t) (sb-impl::buffer-sap obuf))
+                       ((byte-array sap-reg t))
+                       ((32-bit-array sap-reg t) (vector-sap string))
+                       ((string-start any-reg) string-start)
+                       ((end unsigned-reg))
+                       ((tail any-reg) tail)
+                       ((n any-reg) n)
+                       ((newlines complex-double-reg))
+                       ((bytes complex-double-reg))
+                       ((bytes2 complex-double-reg))
+                       ((bytes3 complex-double-reg))
+                       ((bytes4 complex-double-reg))
+                       ((temp complex-double-reg))
+                       ((temp2 complex-double-reg))
+                       ((indexes))
+                       ((increment))
+                       ((last-newlines)))
+              ((res unsigned-reg unsigned-num)
+               (last-newline signed-reg signed-num))
+            (inst movi newlines 10 :4s)
+            (inst movi increment 4 :4s)
+            (inst mvni last-newlines 0 :4s)
+            (load-inline-constant indexes :oword (concat-ub 32 '(3 2 1 0)))
+            (inst add byte-array* byte-array* (lsr tail 1))
+            (inst mov byte-array byte-array*)
+            (inst add end byte-array* (lsr n 1))
+            (inst add 32-bit-array 32-bit-array (lsr string-start 1))
+            (inst b start)
+
+            LOOP
+            (inst ldp bytes bytes2 (@ 32-bit-array))
+            (inst ldp bytes3 bytes4 (@ 32-bit-array 32))
+
+            (inst s-orr temp bytes bytes2)
+            (inst s-orr temp2 bytes3 bytes4)
+            (inst s-orr temp temp temp2)
+            (check-ascii temp temp DONE 4)
+
+            ;; Find newlines
+            (loop for bytes in (list bytes bytes2 bytes3 bytes4)
+                  do
+                  (inst cmeq temp bytes newlines :4s)
+                  (inst bit last-newlines indexes temp)
+                  (inst s-add indexes indexes increment))
+
+            (inst add 32-bit-array 32-bit-array 64)
+
+            (inst uzp1 bytes2 bytes bytes2 :8h)
+            (inst uzp1 bytes4 bytes3 bytes4 :8h)
+            (inst uzp1 bytes4 bytes2 bytes4 :16b)
+            (inst str  bytes4 (@ byte-array 16 :post-index))
+            start
+            (inst cmp byte-array end)
+            (inst b :lt LOOP)
+
+            DONE
+            (inst sub res byte-array byte-array*)
+            (inst smaxv temp last-newlines :4s)
+            (inst smov last-newline temp 0 :s))
+        (setf (sb-impl::buffer-tail obuf) (+ tail copied))
+        (values (+ start copied)
+                (if (>= last-newline 0)
+                    (truly-the index (+ start last-newline))
+                    -1))))))
+
+(defun simd-position8 (element vector start end)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (vector)
+    (inline-vop (((vector* sap-reg t) (vector-sap vector))
+                 ((start any-reg) start)
+                 ((end* any-reg) end)
+                 ((element unsigned-reg) element)
+                 ((length))
+                 ((diff signed-reg))
+                 ((end))
+                 ((vector sap-reg t))
+                 ((vector-start))
+                 ((bytes complex-double-reg))
+                 ((cmp complex-double-reg))
+                 ((search)))
+        ((res descriptor-reg t :from :load))
+      (inst mov res null-tn)
+      (inst dup search element :16b)
+      (inst add vector vector* (lsr start 1))
+      (inst add end vector* (lsr end* 1))
+
+      (inst sub length end vector)
+      (inst cbz length done)
+
+      ;; Align up
+      (inst add diff length 15)
+      (inst and diff diff -16)
+
+      ;; How much to read before the start.
+      ;; Vector header and length are 16-byte long, so it's always safe.
+      (inst sub diff diff length)
+      (inst sub vector-start vector diff)
+
+      (inst ldr bytes (@ vector-start))
+      (inst cmeq cmp bytes search)
+      (inst shrn cmp cmp :8b 4)
+
+      (inst fmov length (reg-in-sc cmp 'double-reg))
+
+      ;; Discard the matching padding bits, multiplied by 4 because
+      ;; each matching byte is 4-bit long after shrn.
+      (inst lsl tmp-tn diff 2)
+      (inst lsr length length tmp-tn)
+
+      (inst cbnz length FOUND)
+
+      (inst add vector vector-start 16)
+
+      LOOP
+      (inst cmp vector end)
+      (inst b :eq DONE)
+      (inst ldr bytes (@ vector))
+      (inst cmeq cmp bytes search)
+      (inst shrn cmp cmp :8b 4)
+      (inst fmov length (reg-in-sc cmp 'double-reg))
+      (inst cbnz length FOUND)
+      (inst add vector vector 16)
+      (inst b LOOP)
+
+      FOUND
+      (inst rbit length length)
+      (inst clz length length)
+      (inst add vector vector (lsr length 2))
+
+      (inst sub length vector vector*)
+      (inst lsl res length n-fixnum-tag-bits)
+      DONE)))
+
+(defun simd-position8-from-end (element vector start end)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (vector)
+    (inline-vop (((vector* sap-reg t) (vector-sap vector))
+                 ((start* any-reg) start)
+                 ((end any-reg) end)
+                 ((element unsigned-reg) element)
+                 ((length))
+                 ((padded-length))
+                 ((start))
+                 ((padded))
+                 ((found-bits))
+                 ((vector sap-reg t))
+                 ((bytes complex-double-reg))
+                 ((cmp complex-double-reg))
+                 ((search)))
+        ((res descriptor-reg t :from :load))
+      (inst mov res null-tn)
+      (inst dup search element :16b)
+      (inst add vector vector* (lsr end 1))
+
+      (inst add start vector* (lsr start* 1))
+
+      (inst sub length vector start)
+      (inst cbz length done)
+
+      ;; Align the start to 16-bytes and then process the tail.
+      (inst add padded-length length 15)
+      (inst and padded-length padded-length -16)
+      (inst sub padded vector padded-length)
+
+      LOOP
+      (inst sub vector vector 16)
+      (inst cmp vector padded)
+      (inst b :le TAIL)
+
+      (inst ldr bytes (@ vector))
+      (inst cmeq cmp bytes search)
+      (inst shrn cmp cmp :8b 4)
+      (inst fmov found-bits (reg-in-sc cmp 'double-reg))
+      (inst cbnz found-bits FOUND)
+
+      (inst b LOOP)
+
+      TAIL
+      ;; Read past the start if needed.
+      ;; Vector header and length are 16-byte long, making it safe.
+      (inst ldr bytes (@ vector))
+      (inst cmeq cmp bytes search)
+      (inst shrn cmp cmp :8b 4)
+
+      ;; Clear the extra bits
+      (inst sub padded padded-length length)
+
+      (inst add padded padded 16)
+      (inst lsl padded padded 2)
+
+      (inst mov length -1)
+      (inst lsl padded length padded)
+
+      (inst fmov found-bits (reg-in-sc cmp 'double-reg))
+      (inst and found-bits found-bits padded)
+      (inst cbz found-bits DONE)
+
+
+      FOUND
+      (inst clz found-bits found-bits)
+      (inst eor found-bits found-bits 63)
+      (inst add vector vector (lsr found-bits 2))
+
+      (inst sub found-bits vector vector*)
+      (inst lsl res found-bits n-fixnum-tag-bits)
+      DONE)))
+
+(defun simd-position32 (element vector start end)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (vector)
+    (inline-vop (((vector* sap-reg t) (vector-sap vector))
+                 ((start any-reg) start)
+                 ((end* any-reg) end)
+                 ((element unsigned-reg) element)
+                 ((length))
+                 ((diff signed-reg))
+                 ((end))
+                 ((vector sap-reg t))
+                 ((vector-start))
+                 ((bytes complex-double-reg))
+                 ((cmp complex-double-reg))
+                 ((search)))
+        ((res descriptor-reg t :from :load))
+      (inst mov res null-tn)
+      (inst dup search element :4s)
+      (inst add vector vector* (lsl start 1))
+      (inst add end vector* (lsl end* 1))
+
+      (inst sub length end vector)
+      (inst cbz length done)
+
+      ;; Align up
+      (inst add diff length 15)
+      (inst and diff diff -16)
+
+      ;; How much to read before the start.
+      ;; Vector header and length are 16-byte long, so it's always safe.
+      (inst sub diff diff length)
+      (inst sub vector-start vector diff)
+
+      (inst ldr bytes (@ vector-start))
+      (inst cmeq cmp bytes search :4s)
+      (inst shrn cmp cmp :8b 4)
+
+      (inst fmov length (reg-in-sc cmp 'double-reg))
+
+      ;; Discard the matching padding bits, multiplied by 4 because
+      ;; each matching byte is 4-bit long after shrn.
+      (inst lsl tmp-tn diff 2)
+      (inst lsr length length tmp-tn)
+
+      (inst cbnz length FOUND)
+
+      (inst add vector vector-start 16)
+
+      LOOP
+      (inst cmp vector end)
+      (inst b :eq DONE)
+      (inst ldr bytes (@ vector))
+      (inst cmeq cmp bytes search :4s)
+      (inst shrn cmp cmp :8b 4)
+      (inst fmov length (reg-in-sc cmp 'double-reg))
+      (inst cbnz length FOUND)
+      (inst add vector vector 16)
+      (inst b LOOP)
+
+      FOUND
+      (inst rbit length length)
+      (inst clz length length)
+      (inst add vector vector (lsr length 2))
+
+      (inst sub length vector vector*)
+      (inst lsr res length 1)
+      DONE)))
+
+(defun simd-position32-from-end (element vector start end)
+  (declare (type index start end)
+           (optimize speed (safety 0)))
+  (with-pinned-objects-in-registers (vector)
+    (inline-vop (((vector* sap-reg t) (vector-sap vector))
+                 ((start* any-reg) start)
+                 ((end any-reg) end)
+                 ((element unsigned-reg) element)
+                 ((found-bits))
+                 ((start))
+                 ((length))
+                 ((padded))
+                 ((padded-length))
+                 ((vector sap-reg t))
+                 ((bytes complex-double-reg))
+                 ((cmp complex-double-reg))
+                 ((search)))
+        ((res descriptor-reg t :from :load))
+      (inst mov res null-tn)
+      (inst dup search element :4s)
+      (inst add vector vector* (lsl end 1))
+
+      (inst add start vector* (lsl start* 1))
+
+      (inst sub length vector start)
+      (inst cbz length done)
+
+      ;; Align the start to 16-bytes and then process the tail.
+      (inst add padded-length length 15)
+      (inst and padded-length padded-length -16)
+      (inst sub padded vector padded-length)
+
+      LOOP
+      (inst sub vector vector 16)
+      (inst cmp vector padded)
+      (inst b :le TAIL)
+      (inst ldr bytes (@ vector))
+      (inst cmeq cmp bytes search :4s)
+      (inst shrn cmp cmp :8b 4)
+      (inst fmov found-bits (reg-in-sc cmp 'double-reg))
+      (inst cbnz found-bits FOUND)
+      (inst b LOOP)
+
+      TAIL
+      ;; Read past the start if needed.
+      ;; Vector header and length are 16-byte long, making it safe.
+      (inst ldr bytes (@ vector))
+      (inst cmeq cmp bytes search :4s)
+      (inst shrn cmp cmp :8b 4)
+
+      ;; Clear the extra bits
+      (inst sub padded padded-length length)
+
+      (inst add padded padded 16)
+      (inst lsl padded padded 2)
+
+      (inst mov length -1)
+      (inst lsl padded length padded)
+
+      (inst fmov found-bits (reg-in-sc cmp 'double-reg))
+      (inst and found-bits found-bits padded)
+      (inst cbz found-bits DONE)
+
+
+
+      FOUND
+      (inst lsr found-bits found-bits 15)
+      (inst clz found-bits found-bits)
+      (inst eor found-bits found-bits 63)
+
+      (inst add vector vector (lsr found-bits 2))
+
+      (inst sub found-bits vector vector*)
+      (inst lsr res found-bits 1)
       DONE)))

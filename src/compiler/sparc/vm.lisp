@@ -34,14 +34,7 @@
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
                    (setf (svref *register-names* ,offset-sym)
-                        ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-                `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (defparameter ,name
-                    (list ,@(mapcar (lambda (name)
-                                      (symbolicate name "-OFFSET"))
-                                    regs))))))
+                        ,(symbol-name name))))))
   ;; c.f. src/runtime/sparc-lispregs.h
 
   ;; Globals.  These are difficult to extract from a sigcontext.
@@ -63,7 +56,7 @@
   (defreg nl4 12)                               ; %o4
   (defreg nl5 13)                               ; %o5
   (defreg nsp 14)                               ; %o6
-  (defreg nargs 15)                             ; %o7
+  (defreg lra 15)                               ; %o7
 
   ;; Locals.  These are preserved when we call into C.
   (defreg a0 16)                                ; %l0
@@ -73,7 +66,7 @@
   (defreg a4 20)                                ; %l4
   (defreg a5 21)                                ; %l5
   (defreg ocfp 22)                              ; %l6
-  (defreg lra 23)                               ; %l7
+  (defreg nargs 23)                               ; %l7
 
   ;; Ins.  These are preserved just like locals.
   (defreg cname 24)                             ; %i0
@@ -201,11 +194,6 @@
   (non-descriptor-reg registers
    :locations #.non-descriptor-regs)
 
-  ;; Pointers to the interior of objects.  Used only as an temporary.
-  (interior-reg registers
-   :locations (#.lip-offset))
-
-
   ;; **** Things that can go in the floating point registers.
 
   ;; Non-Descriptor single-floats.
@@ -272,13 +260,12 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
   (defregtn zero any-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
   (defregtn lip descriptor-reg)
+  (defregtn lra descriptor-reg)
   (defregtn thread any-reg)
 
   (defregtn nargs any-reg)
@@ -314,10 +301,6 @@
 
 ;;;; function call parameters
 
-;;; the SC numbers for register and stack arguments/return values.
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
   ;; offsets of special stack frame locations
@@ -334,11 +317,9 @@
 
 
 ;;; a list of TN's describing the register arguments
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar (lambda (n)
-            (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+            (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.

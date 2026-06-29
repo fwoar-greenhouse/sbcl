@@ -101,7 +101,6 @@ find . \( \
         -name '*.o' -o \
         -name '*.so' -o \
         -name '*.d' -o \
-        -name 'foo.c' -o \
         -name 'test-lab' -o \
         -name 'encodings.texi-temp' -o \
         -name 'stack-alignment-offset' -o \
@@ -110,7 +109,6 @@ find . \( \
         -name 'test.log' -o \
         -name 'a.out' -o \
         -name 'sbcl' -o \
-        -name 'ppc-linux-mcontext.h' -o \
         -name 'depend' -o \
         -name 'TAGS' -o \
         -name 'tags' -o \

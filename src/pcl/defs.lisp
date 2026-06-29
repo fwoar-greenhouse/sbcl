@@ -135,7 +135,7 @@
 ;;;
 ;;; FIXME: SB-KERNEL has fast-and-not-quite-precise type code for use
 ;;; in the compiler. Could we share some of it here?
-(defvar *in-*subtypep* nil)
+(sb-impl:define-thread-local *in-*subtypep* nil)
 
 (defun *subtypep (type1 type2)
   (if (equal type1 type2)
@@ -161,8 +161,7 @@
 (defun make-class-symbol (class-name)
   (pcl-symbolicate "*THE-CLASS-" class-name "*"))
 
-(defvar *standard-method-combination*)
-(defvar *or-method-combination*)
+(declaim (global *standard-method-combination* *or-method-combination*))
 
 (defun plist-value (object name)
   (getf (object-plist object) name))
@@ -577,7 +576,7 @@
 ;; nothing needs it, even if OBJECT persists. You might think that calling
 ;; gethash on a live key should get the identical specializer, but since
 ;; nothing referenced the old specializer, consing a new one is fine.
-(defglobal *eql-specializer-table*
+(define-load-time-global *eql-specializer-table*
   (sb-impl::make-system-hash-table :test 'eql :weakness :value :synchronized nil))
 
 (defun intern-eql-specializer (object)

@@ -15,13 +15,15 @@
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 (defun make-nlx-entry-arg-start-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn r9-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number r9-offset))
 
 ;;; Save and restore dynamic environment.
 (define-vop (current-stack-pointer)
-  (:results (res :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg descriptor-reg control-stack)))
   (:generator 1
-    (move res csp-tn)))
+    (if (sc-is res control-stack)
+        (store-stack-tn res csp-tn)
+        (move res csp-tn))))
 
 (define-vop (current-binding-pointer)
   (:results (res :scs (any-reg descriptor-reg)))

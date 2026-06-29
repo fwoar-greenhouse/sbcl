@@ -10,6 +10,16 @@
 ;;; Note that there is only one use of static-fun-offset outside this
 ;;; file (in genesis.lisp)
 
+(defmacro tail-call-fallback-fun (name)
+  `(progn
+     (inst addi lexenv-tn null-tn (static-fdefn-offset ',name))
+     (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
+     (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
+     (inst li nargs (fixnumize 2))
+     (inst mr ocfp cfp-tn)
+     (inst mr cfp-tn csp-tn)
+     (inst j lip 0)))
+
 (define-assembly-routine
   (generic-+
    (:cost 10)
@@ -27,7 +37,7 @@
    (:temp flag non-descriptor-reg nl3-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp ocfp any-reg ocfp-offset))
 
   ; Clear the damned "sticky overflow" bit in :cr0 and :xer
@@ -43,16 +53,10 @@
   (inst add temp2 temp2 temp)
   (with-fixed-allocation (res flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew temp2 res bignum-digits-offset other-pointer-lowtag))
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
-  DO-STATIC-FUN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg-+))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FUN (tail-call-fallback-fun two-arg-+)
 
   DONE
   (move res temp))
@@ -73,7 +77,7 @@
    (:temp temp non-descriptor-reg nl0-offset)
    (:temp temp2 non-descriptor-reg nl1-offset)
    (:temp flag non-descriptor-reg nl3-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -93,16 +97,10 @@
   (inst sub temp2 temp temp2)
   (with-fixed-allocation (res flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew temp2 res bignum-digits-offset other-pointer-lowtag))
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
-  DO-STATIC-FUN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg--))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FUN (tail-call-fallback-fun two-arg--)
 
   DONE
   (move res temp))
@@ -128,7 +126,7 @@
    (:temp lo non-descriptor-reg nl1-offset)
    (:temp hi non-descriptor-reg nl2-offset)
    (:temp pa-flag non-descriptor-reg nl3-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -172,16 +170,10 @@
       (storew lo res bignum-digits-offset other-pointer-lowtag)))
   ;; Out of here
   GO-HOME
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
-  DO-STATIC-FUN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg-*))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FUN (tail-call-fallback-fun two-arg-*)
 
   LOW-FITS-IN-FIXNUM
   (move res lo))
@@ -296,7 +288,7 @@
 
            (:res res descriptor-reg a0-offset)
 
-           (:temp lip interior-reg lip-offset)
+           (:temp lip any-reg lip-offset)
            (:temp nargs any-reg nargs-offset)
            (:temp ocfp any-reg ocfp-offset))
 
@@ -305,14 +297,7 @@
           (inst cmpw :cr1 x y)
           (inst beq DO-COMPARE)
 
-          DO-STATIC-FN
-          (inst addi lexenv-tn null-tn (static-fdefn-offset ',static-fn))
-          (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-          (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-          (inst li nargs (fixnumize 2))
-          (inst mr ocfp cfp-tn)
-          (inst mr cfp-tn csp-tn)
-          (inst j lip 0)
+          DO-STATIC-FN (tail-call-fallback-fun ,static-fn)
 
           DO-COMPARE
           (load-symbol res t)
@@ -338,7 +323,7 @@
                           (:res res descriptor-reg a0-offset)
 
                           (:temp lra descriptor-reg lra-offset)
-                          (:temp lip interior-reg lip-offset)
+                          (:temp lip any-reg lip-offset)
                           (:temp nargs any-reg nargs-offset)
                           (:temp ocfp any-reg ocfp-offset))
   (inst cmpw :cr1 x y)
@@ -350,16 +335,10 @@
 
   RETURN-NIL
   (inst mr res null-tn)
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
-  DO-STATIC-FN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'eql))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FN (tail-call-fallback-fun eql)
 
   RETURN-T
   (load-symbol res t))
@@ -376,7 +355,7 @@
 
    (:res res descriptor-reg a0-offset)
 
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -388,16 +367,10 @@
   (inst beq :cr1 RETURN-T)
 
   (inst mr res null-tn)
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
-  DO-STATIC-FN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg-=))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FN (tail-call-fallback-fun two-arg-=)
 
   RETURN-T
   (load-symbol res t))
@@ -414,7 +387,7 @@
                           (:res res descriptor-reg a0-offset)
 
                           (:temp lra descriptor-reg lra-offset)
-                          (:temp lip interior-reg lip-offset)
+                          (:temp lip any-reg lip-offset)
 
                           (:temp nargs any-reg nargs-offset)
                           (:temp ocfp any-reg ocfp-offset))
@@ -425,16 +398,10 @@
   (inst beq :cr1 RETURN-NIL)
 
   (load-symbol res t)
+  (inst mflr lra)
   (lisp-return lra lip :offset 2)
 
-  DO-STATIC-FN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg-/=))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst j lip 0)
-  (inst mr cfp-tn csp-tn)
+  DO-STATIC-FN (tail-call-fallback-fun two-arg-/=)
 
   RETURN-NIL
   (inst mr res null-tn))

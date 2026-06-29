@@ -90,6 +90,11 @@
                  (environment-live-tn res (lambda-environment fun)))
 
                 (debug-variable-p
+                 ;; :DEBUG-ENVIRONMENT TNs might be spilled before they are initialized,
+                 ;; putting unboxed values onto the stack.
+                 #-c-stack-is-control-stack
+                 (when (member sb-vm:any-reg-sc-number (primitive-type-scs type))
+                   (setf (tn-sc res) (sc-or-lose 'sb-vm::control-stack)))
                  ;; If it's a constant it may end up being never read,
                  ;; replaced by COERCE-FROM-CONSTANT.
                  ;; Yet it might get saved on the stack, but since it's
@@ -134,11 +139,11 @@
                          (clambda
                           (make-normal-tn *backend-t-primitive-type*)))))))
     (let ((res (make-ir2-environment
-                :closure ir2-environment-alist
-                :return-pc-pass #+fp-and-pc-standard-save
-                                old-pc
-                                #-fp-and-pc-standard-save
-                                (make-return-pc-passing-location (xep-p clambda)))))
+                ir2-environment-alist
+                #+fp-and-pc-standard-save
+                old-pc
+                #-fp-and-pc-standard-save
+                (make-return-pc-passing-location))))
       (setf (environment-info lambda-environment) res)
       (setf (ir2-environment-old-fp res)
             #-fp-and-pc-standard-save
@@ -172,11 +177,14 @@
   (declare (type tail-set tails))
   (let ((funs (tail-set-funs tails)))
     (or (loop for fun in funs
-              for fun-info = (info :function :info (functional-%source-name fun))
-              when
-              (and fun-info
-                   (ir1-attributep (fun-info-attributes fun-info) unboxed-return)
-                   (not (lambda-inline-expanded fun)))
+              for name = (functional-%source-name fun)
+              for fun-info = (info :function :info name)
+              for specialized = (unboxed-specialized-return-p name)
+              when specialized
+              do (return-from use-standard-returns (values :unboxed specialized))
+              when (and fun-info
+                        (ir1-attributep (fun-info-attributes fun-info) unboxed-return)
+                        (not (lambda-inline-expanded fun)))
               return :unboxed)
         (find-if #'xep-p funs)
         (some (lambda (fun) (policy fun (>= insert-debug-catch 2))) funs)
@@ -200,38 +208,6 @@
                              (not (all-returns-tail-calls-p dest)))
                     (return-from punt nil))))))))))
 
-;;; If policy indicates, give an efficiency note about our inability to
-;;; use the known return convention. We try to find a function in the
-;;; tail set with non-constant return values to use as context. If
-;;; there is no such function, then be more vague.
-(defun return-value-efficiency-note (tails)
-  (declare (type tail-set tails))
-  (let ((funs (tail-set-funs tails)))
-    (when (policy (lambda-bind (first funs))
-                  (> (max speed space)
-                     inhibit-warnings))
-      (dolist (fun funs
-                   (let ((*compiler-error-context* (lambda-bind (first funs))))
-                     (compiler-notify
-                      "Return value count mismatch prevents known return ~
-                       from these functions:~
-                       ~{~%  ~A~}"
-                      (mapcar #'leaf-source-name
-                              (remove-if-not #'leaf-has-source-name-p funs)))))
-        (let ((ret (lambda-return fun)))
-          (when ret
-            (let ((rtype (return-result-type ret)))
-              (multiple-value-bind (ignore count) (values-types rtype)
-                (declare (ignore ignore))
-                (when (eq count :unknown)
-                  (let ((*compiler-error-context* (lambda-bind fun)))
-                    (compiler-notify
-                     "Return type not fixed values, so can't use known return ~
-                      convention:~%  ~S"
-                     (type-specifier rtype)))
-                  (return)))))))))
-  (values))
-
 ;;; Return a RETURN-INFO structure describing how we should return
 ;;; from functions in the specified tail set. We use the unknown
 ;;; values convention if the number of values is unknown, or if it is
@@ -240,31 +216,23 @@
 (defun return-info-for-set (tails)
   (declare (type tail-set tails))
   (multiple-value-bind (types count) (values-types (tail-set-type tails))
-    (let ((ptypes (mapcar #'primitive-type types))
-          (use-standard (use-standard-returns tails)))
-      (when (and (eq count :unknown) (not use-standard)
-                 (not (eq (tail-set-type tails) *empty-type*)))
-        (return-value-efficiency-note tails))
-      (cond ((eq use-standard :unboxed)
-             (make-return-info :kind :unboxed
-                               :count count
-                               :primitive-types ptypes
-                               :types types
-                               :locations
-                               (let ((state (sb-vm::make-fixed-call-args-state)))
-                                 (loop for type in ptypes
-                                       collect (sb-vm::fixed-call-arg-location type state)))))
-            ((or (eq count :unknown) use-standard)
-             (make-return-info :kind :unknown
-                               :count count
-                               :primitive-types ptypes
-                               :types types))
-            (t
-             (make-return-info :kind :fixed
-                               :count count
-                               :primitive-types ptypes
-                               :types types
-                               :locations (mapcar #'make-normal-tn ptypes)))))))
+    (let ((ptypes (mapcar #'primitive-type types)))
+      (multiple-value-bind (use-standard specialized-xep-type) (use-standard-returns tails)
+        (cond ((eq use-standard :unboxed)
+               (make-return-info :unboxed
+                                 count
+                                 ptypes
+                                 types
+                                 (let ((state (sb-vm::make-fixed-call-args-state)))
+                                   (loop for type in (if specialized-xep-type
+                                                         (mapcar #'primitive-type (values-type-required specialized-xep-type))
+                                                         ptypes)
+                                         collect (sb-vm::fixed-call-arg-location type state)))))
+              ((or (eq count :unknown) use-standard)
+               (make-return-info :unknown count ptypes types))
+              (t
+               (make-return-info :fixed count ptypes types
+                                 (mapcar #'make-normal-tn ptypes))))))))
 
 ;;; If TAIL-SET doesn't have any INFO, then make a RETURN-INFO for it.
 (defun assign-return-locations (fun)
@@ -290,21 +258,21 @@
     (dolist (nlx (environment-nlx-info env))
       (setf (nlx-info-info nlx)
             (make-ir2-nlx-info
-             :home (when (member (cleanup-kind (nlx-info-cleanup nlx))
-                                 '(:block :tagbody))
-                     (if (nlx-info-safe-p nlx)
-                         (make-normal-tn *backend-t-primitive-type*)
-                         (make-stack-pointer-tn)))
-             :save-sp (unless (eq (cleanup-kind (nlx-info-cleanup nlx))
-                                  :unwind-protect)
-                        (make-nlx-sp-tn env))
-             :block-tn (environment-live-tn
-                        (make-normal-tn
-                         (primitive-type-or-lose
-                          (ecase (cleanup-kind (nlx-info-cleanup nlx))
-                            (:catch
-                                'catch-block)
-                            ((:unwind-protect :block :tagbody)
-                             'unwind-block))))
-                        env)))))
+             (when (member (cleanup-kind (nlx-info-cleanup nlx))
+                           '(:block :tagbody))
+               (if (nlx-info-safe-p nlx)
+                   (make-normal-tn *backend-t-primitive-type*)
+                   (make-stack-pointer-tn)))
+             (unless (eq (cleanup-kind (nlx-info-cleanup nlx))
+                         :unwind-protect)
+               (make-nlx-sp-tn env))
+             (environment-live-tn
+              (make-normal-tn
+               (primitive-type-or-lose
+                (ecase (cleanup-kind (nlx-info-cleanup nlx))
+                  (:catch
+                      'catch-block)
+                  ((:unwind-protect :block :tagbody)
+                   'unwind-block))))
+              env)))))
   (values))

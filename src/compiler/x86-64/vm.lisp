@@ -80,22 +80,52 @@
 ;;; shadow memory is pointed to by this register (RAX).
 (defconstant msan-temp-reg-number 0)
 
-;;; The encoding anomaly for r12 makes it a perfect choice for the card table base.
-;;; It will seldom be used with a constant displacement.
-(define-symbol-macro card-table-reg 12)
-(define-symbol-macro gc-card-table-reg-tn r12-tn)
+(export 'card-table-reg)
+(defconstant card-table-reg 12)
+(define-symbol-macro null-tn r12-tn)
 (define-symbol-macro card-index-mask (make-fixup nil :card-table-index-mask))
+
+(defconstant most-positive-fixnum-repr
+  #+sb-xc #.most-positive-fixnum-repr ; or else error "SB-KERNEL:%MASK-FIELD is undefined"
+  #-sb-xc (mask-field (byte 62 1) -1))
+
+(defconstant non-negative-fixnum-mask
+  (ldb (byte 64 0) (lognot most-positive-fixnum-repr)))
+
+(defconstant-eqx +popular-raw-constants+
+    `#(;; disallowed bits to match INDEX type
+       ,(ldb (byte 64 0) (lognot (ash (1- sb-xc:array-dimension-limit) n-fixnum-tag-bits)))
+       #x1FFFFFFFE         ; most-positive uint32_t as a fixnum
+       ,most-positive-fixnum-repr
+       #xFFFFFFFF00000000  ; (MASK-FIELD (BYTE 32 32) -1)
+       ,non-negative-fixnum-mask
+       #x100000000         ; (ASH 1 32)
+       #x3243F6A88858B087  ; for SB-INT:MIX
+       #x10E6D7AF34A204E2  ; "
+       ,(ash 1 63))        ; bits of MOST-NEGATIVE-FIXNUM
+  #'equalp)
+
+(eval-when (:compile-toplevel)
+  ;; Proper alignment of NIL depends on there being an odd number of global raw constants
+  ;; and an even number of words to static-space-end
+  (assert (oddp (length +popular-raw-constants+)))
+  (unless (evenp n-static-trailer-constants) (error "Please check alignment of NIL"))
+  #-sb-safepoint
+  (unless (<= nil-cardtable-disp 127) ; > 1-byte disp to reach card table is undesirable
+    (error "Consider reducing the number of elements in static-space-trailer")))
+
+(defconstant t-nil-offset ; (- NULL-TN THIS) = tagged pointer to T
+  (+ (- list-pointer-lowtag other-pointer-lowtag)
+     (pad-data-block symbol-size) ; size of T in bytes
+     (* (length +popular-raw-constants+) 8)
+     8)) ; additive fuzz factor
+(eval-when (:compile-toplevel :execute)
+  (unless (typep (- t-nil-offset) '(signed-byte 8))
+    (error "Too many raw constants for (&T - &NIL) to be imm8")))
 
 (macrolet ((defreg (name offset size)
              (declare (ignore size))
              `(defconstant ,(symbolicate name "-OFFSET") ,offset))
-           (defregset (name &rest regs)
-             ;; FIXME: this would be DEFCONSTANT-EQX were it not
-             ;; for all the style-warnings about earmuffs on a constant.
-             `(defglobal ,name
-                  (list ,@(mapcar (lambda (name)
-                                    (symbolicate name "-OFFSET"))
-                                  regs))))
            ;; Define general-purpose regs in a more concise way, as we seem
            ;; to (redundantly) want each register's offset for dword and qword
            ;; even though the value of the constant is the same.
@@ -161,14 +191,13 @@
   ;; the number of arguments/return values passed in registers
   (defconstant  register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
-  (eval-when (:compile-toplevel :load-toplevel :execute)
-    (defparameter *register-arg-names* '(rdx rdi rsi)))
+  (defconstant-eqx register-arg-names '(rdx rdi rsi) #'equal)
   (defregset    *register-arg-offsets* rdx rdi rsi)
   #-win32
   (defregset    *c-call-register-arg-offsets* rdi rsi rdx rcx r8 r9)
   #+win32
   (defregset    *c-call-register-arg-offsets* rcx rdx r8 r9)
-  (defregset *descriptor-args* rdx rdi rsi rbx rcx r8 r9 r10 r14 r15))
+  (defregset *descriptor-args* rdx rdi rsi rbx rcx r8 r9 r10 r14))
 
 ;;;; SB definitions
 
@@ -400,27 +429,26 @@
              `(progn
                 ,@(map 'list
                        (lambda (reg-name)
-                         `(define-load-time-global ,(symbolicate reg-name "-TN")
-                              (make-random-tn :kind :normal
-                                              :sc (sc-or-lose ',sc-name)
-                                              :offset ,(incf i))))
+                         `(defconstant-eqx ,(symbolicate reg-name "-TN")
+                              (make-random-tn (sc-or-lose ',sc-name) ,(incf i))
+                            #'constantly-t))
                        (symbol-value name-array))))
            (def-fpr-tns (sc-name &rest reg-names)
              (collect ((forms))
                (dolist (reg-name reg-names `(progn ,@(forms)))
                  (let ((tn-name (symbolicate reg-name "-TN"))
                        (offset-name (symbolicate reg-name "-OFFSET")))
-                   (forms `(define-load-time-global ,tn-name
-                               (make-random-tn :kind :normal
-                                               :sc (sc-or-lose ',sc-name)
-                                               :offset ,offset-name))))))))
+                   (forms `(defconstant-eqx ,tn-name
+                               (make-random-tn (sc-or-lose ',sc-name) ,offset-name)
+                             #'constantly-t)))))))
   (def-gpr-tns unsigned-reg +qword-register-names+)
   ;; RIP is not an addressable register, but this global var acts as
   ;; a moniker for it in an effective address so that the EA structure
   ;; does not need to accept a symbol (such as :RIP) for the base reg.
   ;; Because there is no :OFFSET, unanticipated use will be caught.
-  (define-load-time-global rip-tn
-      (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)))
+  (defconstant-eqx rip-tn
+      (make-random-tn (sc-or-lose 'unsigned-reg) nil)
+    #'constantly-t)
   (def-fpr-tns single-reg
       float0 float1 float2 float3 float4 float5 float6 float7
       float8 float9 float10 float11 float12 float13 float14 float15))
@@ -447,11 +475,12 @@
 (define-load-time-global *register-arg-tns*
   (mapcar (lambda (register-arg-name)
             (symbol-value (symbolicate register-arg-name "-TN")))
-          *register-arg-names*))
+          register-arg-names))
 
 ;;; If value can be represented as an immediate constant, then return
 ;;; the appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
+  (declare (notinline sb-c::producing-fasl-file))
   (typecase value
     ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
@@ -460,32 +489,40 @@
      (when (or (static-symbol-p value)
                ;; The cross-compiler always uses immobile-space if it exists.
                #+(and immobile-space sb-xc-host) t
-               ;; With #+immobile-symbols, all interned symbols are in immobile-space.
-               #+immobile-symbols (sb-xc:symbol-package value)
+               ;; With either of these two features, all interned symbols are
+               ;; as-if static
+               #+(or permgen immobile-symbols) (sb-xc:symbol-package value)
                #-sb-xc-host
                (if (immobile-space-obj-p value)
                    (or (= (generation-of value) +pseudo-static-generation+)
                        ;; If compiling to memory, the symbol's address alone suffices.
-                       (locally (declare (notinline sb-c::producing-fasl-file))
-                         (not (sb-c::producing-fasl-file))))))
+                       (not (sb-c::producing-fasl-file)))))
        immediate-sc-number))
     #+compact-instance-header (layout immediate-sc-number)
     (single-float
-       (if (eql value $0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
+       (if (eql value 0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
     (double-float
-       (if (eql value $0d0) fp-double-zero-sc-number fp-double-immediate-sc-number))
+       (if (eql value 0d0) fp-double-zero-sc-number fp-double-immediate-sc-number))
     ((complex single-float)
-       (if (eql value (complex $0f0 $0f0))
+       (if (eql value #c(0f0 0f0))
             fp-complex-single-zero-sc-number
             fp-complex-single-immediate-sc-number))
     ((complex double-float)
-       (if (eql value (complex $0d0 $0d0))
+       (if (eql value #c(0d0 0d0))
             fp-complex-double-zero-sc-number
             fp-complex-double-immediate-sc-number))
     ;; This case has to follow the numeric cases because proxy floating-point numbers
     ;; are host structs. Or we could implement and use something like SB-XC:TYPECASE
     (structure-object
      (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))
+    ((simple-string 0) ; Reference static empty string only when compiling to file
+     ;; or, if compiling to memory, the string is EQ to a baked-in static string,
+     ;; otherwise CLHS 3.2.4 is potentially violated
+     (when (or (sb-c::producing-fasl-file)
+               #-sb-xc-host (and (eq (heap-allocated-p value) :static)
+                                 (< (get-lisp-obj-address value)
+                                    (get-lisp-obj-address sb-lockless:+tail+))))
        immediate-sc-number))
     #+(and sb-simd-pack (not sb-xc-host))
     (simd-pack
@@ -503,31 +540,63 @@
 (defun boxed-immediate-sc-p (sc)
   (eql sc immediate-sc-number))
 
+(defstruct (nil-relative (:constructor nil-relative (disp)) (:copier nil))
+  (disp 0 :read-only t))
+
+(defconstant lflist-tail-value-nil-offset
+  (+ (- nil-value-offset) ; go back to the start of static space
+     ;; Skip over all static symbols except T which isn't in low static space
+     (* (1- (length +static-symbols+)) (pad-data-block symbol-size))
+     (ash 258 word-shift) ; **PRIMITIVE-OBJECT-LAYOUTS**
+     (ash 6 word-shift) ; 0-length simple-base-string and simple-character-string
+     instance-pointer-lowtag))
+
+(define-symbol-macro offset-of-static-simple-base-string-0
+    (+ lflist-tail-value-nil-offset (- instance-pointer-lowtag)
+       (ash -4 word-shift) other-pointer-lowtag))
+(define-symbol-macro offset-of-static-simple-ucs4-string-0
+    (+ lflist-tail-value-nil-offset (- instance-pointer-lowtag)
+       (ash -6 word-shift) other-pointer-lowtag))
+
+;;; Return the bits (descriptor or raw as specified) representing the CPU's
+;;; view of TN which is in the IMMEDIATE storage class. If the bits can only
+;;; be determined at load time, as with immobile layouts and symbols,
+;;; then return an absolute fixup which will get replaced by the bits.
+(defun immediate-tn-repr (tn &optional (tag t))
+  (let ((val (tn-value tn)))
+    (etypecase val
+      (integer  (if tag (fixnumize val) val))
+      (symbol (cond ((not val) null-tn)
+                    ((static-symbol-p val) (nil-relative (static-symbol-offset val)))
+                    (t (make-fixup val :immobile-symbol))))
+      #+(or immobile-space permgen)
+      (layout (make-fixup val :layout))
+      (character (if tag
+                     (logior (ash (char-code val) n-widetag-bits)
+                             character-widetag)
+                     (char-code val)))
+      (single-float
+       (let ((bits (single-float-bits val)))
+         (if tag
+             (dpb bits (byte 32 32) single-float-widetag)
+             bits)))
+      ((simple-string 0)
+       ;; objects following static symbols in memory:
+       ;;    (simple-character-string 0)
+       ;;    (simple-base-string 0)
+       ;;    lockfree list tail
+       (if (sb-xc:typep val 'base-string)
+           (nil-relative offset-of-static-simple-base-string-0)
+           (nil-relative offset-of-static-simple-ucs4-string-0)))
+      (structure-object
+       (if (eq val sb-lockless:+tail+)
+           (progn (aver tag) (nil-relative lflist-tail-value-nil-offset))
+           (bug "immediate structure-object ~S" val))))))
+
+;;; Return the bits of TN's representation if it has immediate SC,
+;;; otherwise return TN exactly as-is.
 (defun encode-value-if-immediate (tn &optional (tag t))
-  (if (sc-is tn immediate)
-      (let ((val (tn-value tn)))
-        (etypecase val
-          (integer  (if tag (fixnumize val) val))
-          (symbol   (if (static-symbol-p val)
-                        (+ nil-value (static-symbol-offset val))
-                        (make-fixup val :immobile-symbol)))
-          #+(or immobile-space permgen)
-          (layout
-           (make-fixup val :layout))
-          (character (if tag
-                         (logior (ash (char-code val) n-widetag-bits)
-                                 character-widetag)
-                         (char-code val)))
-          (single-float
-           (let ((bits (single-float-bits val)))
-             (if tag
-                 (dpb bits (byte 32 32) single-float-widetag)
-                 bits)))
-          (structure-object
-           (if (eq val sb-lockless:+tail+)
-               (progn (aver tag) (+ static-space-start lockfree-list-tail-value-offset))
-               (bug "immediate structure-object ~S" val)))))
-      tn))
+  (if (sc-is tn immediate) (immediate-tn-repr tn tag) tn))
 
 ;;;; miscellaneous function call parameters
 
@@ -553,7 +622,7 @@
   (* (frame-word-offset index) n-word-bytes))
 
 ;;; This is used by the debugger.
-(defconstant single-value-return-byte-offset 3)
+(defconstant single-value-return-byte-offset 0)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location. It returns a thing that can be printed with PRINC.
@@ -597,7 +666,7 @@
     ;; These locations are not saved by WITH-REGISTERS-PRESERVED
     ;; because Lisp can't treat them as general purpose.
     ;; By design they are also (i.e. must be) nonvolatile aross C call.
-    (aver (not (logbitp 12 locs)))
+    (aver (not (logbitp card-table-reg locs)))
     #-gs-seg (aver (not (logbitp 13 locs)))))
 
 #+sb-xc-host
@@ -607,3 +676,28 @@
 #+nil
 (define-cond-sc 32-bit-immediate immediate
   (typep (tn-value tn) '(signed-byte 32)))
+
+(defmacro sb-impl::symbol-allocator-macro (kind name)
+  (declare (ignorable kind))
+  #+permgen
+  `(truly-the symbol (if (eql ,kind 0) ; uninterned
+                         (sb-vm::%alloc-symbol ,name)
+                         (allocate-permgen-symbol ,name)))
+  #-permgen
+  `(truly-the symbol
+          ;; If no immobile-space, easy: all symbols go in dynamic-space
+          #-immobile-space (sb-vm::%alloc-symbol ,name)
+          ;; If #+immobile-symbols, then uninterned symbols go in dynamic space, but
+          ;; interned symbols go in immobile space. Good luck IMPORTing an uninterned symbol-
+          ;; it'll work at least superficially, but if used as a code constant, the symbol's
+          ;; address may violate the assumption that it's an imm32 operand.
+          #+immobile-symbols
+          (if (eql ,kind 0) (sb-vm::%alloc-symbol ,name) (sb-vm::%alloc-immobile-symbol ,name))
+          #+(and immobile-space (not immobile-symbols))
+          (if (or (eql ,kind 1) ; keyword
+                  (and (eql ,kind 2) ; random interned symbol
+                       (plusp (length ,name))
+                       (char= (char ,name 0) #\*)
+                       (char= (char ,name (1- (length ,name))) #\*)))
+              (sb-vm::%alloc-immobile-symbol ,name)
+              (sb-vm::%alloc-symbol ,name))))

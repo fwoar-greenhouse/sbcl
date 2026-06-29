@@ -172,36 +172,52 @@ the file system."
   (sb-c::note-name-defined name :function)
   name)
 
+(defun %defun-specialized-xep (name def specialized-xep specialized-type &optional extra-info)
+  (declare (type function def specialized-xep))
+  (aver (legal-fun-name-p name))
+  (when (and (fboundp name)
+             *type-system-initialized*)
+    (handler-bind (((satisfies sb-c::handle-condition-p)
+                     'sb-c::handle-condition-handler))
+      (warn 'redefinition-with-defun :name name :new-function def)))
+  (let ((xep-name (list* 'specialized-xep name specialized-type)))
+    (sb-c:%compiler-defun name nil nil extra-info specialized-type)
+    (setf (fdefinition xep-name) specialized-xep)
+    (setf-fdefinition def name nil)
+    (sb-c::%set-inline-expansion name nil nil extra-info)
+    (sb-c::note-name-defined name :function))
+  name)
+
 (macrolet
     ((cast-it ()
-       #-sb-unicode
-       '(if (and (simple-base-string-p s) (ok-space))
-           s
-           (replace (make-string (length s)) s))
-       #+sb-unicode
-       ;; whether a copy is needed depends both on contents and simplicity
-       '(let* ((base-p (base-string-p s))
-               (recast (and (not base-p) (every #'base-char-p s))))
-          (if (and (simple-string-p s) (not recast) (ok-space))
+       `(when s
+          #-sb-unicode
+          (if (and (simple-base-string-p s) (ok-space))
               s
-              (let ((n (length s)))
-                ;; I think this could be done with a single allocator
-                ;; and a length calculation. I don't care to do that.
-                (replace (if (or base-p recast)
-                             (make-string n :element-type 'base-char)
-                             (make-string n))
-                         s))))))
+              (replace (make-string (length s)) s))
+          #+sb-unicode
+          ;; whether a copy is needed depends both on contents and simplicity
+          (let* ((base-p (base-string-p s))
+                 (recast (and (not base-p) (every #'base-char-p s))))
+            (if (and (simple-string-p s) (not recast) (ok-space))
+                s
+                (let ((n (length s)))
+                  ;; I think this could be done with a single allocator
+                  ;; and a length calculation. I don't care to do that.
+                  (replace (if (or base-p recast)
+                               (make-string n :element-type 'base-char)
+                               (make-string n))
+                           s)))))))
 ;;; Ensure basicness if possible, and simplicity always
-(defun possibly-base-stringize (s)
-  (declare (string s))
-  (macrolet ((ok-space () 't))
-    (cast-it)))
+  (defun possibly-base-stringize (s)
+    (macrolet ((ok-space () 't))
+      (cast-it)))
 ;;; As above but copy dynamic-extent or other off-heap lisp strings
-(defun possibly-base-stringize-to-heap (s)
-  (declare (string s) (sb-c::tlab :system))
-  (macrolet ((ok-space () '(or (dynamic-space-obj-p s) (read-only-space-obj-p s))))
-    (cast-it)))
-) ; end MACROLET
+  (defun possibly-base-stringize-to-heap (s)
+    (declare (sb-c::tlab :system))
+    (macrolet ((ok-space () '(or (dynamic-space-obj-p s) (read-only-space-obj-p s))))
+      (cast-it)))
+  ) ; end MACROLET
 
 (in-package "SB-C")
 
@@ -245,7 +261,7 @@ version 1[.0.0...] or greater."
               (lisp-implementation-version)
               subversions))))
 
-(defvar sb-pcl::*!docstrings* nil)
+(declaim (global sb-pcl::*!docstrings*)) ; assigned in cold-init, and subject to MAKUNBOUND
 (defun (setf documentation) (string name doc-type)
   (declare (type (or null string) string))
   (push (list string name doc-type) sb-pcl::*!docstrings*)

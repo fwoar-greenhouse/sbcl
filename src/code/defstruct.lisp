@@ -45,8 +45,7 @@
          (if (functionp fun)
              (funcall fun ,@slot-vars)
              (funcall (setf (car cell)
-                            (%make-structure-instance-allocator ,dd ,slot-specs
-                                                                ',slot-vars))
+                            (%make-structure-instance-allocator ,dd ,slot-specs ',slot-vars))
                       ,@slot-vars)))))
 
 (sb-xc:defmacro %new-instance (layout size)
@@ -67,13 +66,15 @@
 (declaim (ftype (sfunction (defstruct-description list list) function)
                 %make-structure-instance-allocator))
 (defun %make-structure-instance-allocator (dd slot-specs slot-vars)
-  (values (compile nil
-                   `(lambda ,(loop for var in slot-vars
-                                   collect (if (consp var)
-                                               (third var)
-                                               var))
-                      (declare (optimize (sb-c:store-source-form 0)))
-                      (%make-structure-instance-macro ,dd ',slot-specs ,@slot-vars)))))
+  (let* ((args (make-gensym-list (length slot-vars)))
+         (vals (mapcar (lambda (v a) (if (typep v '(cons (member the the*)))
+                                         `(,(first v) ,(second v) ,a)
+                                         a))
+                       slot-vars args)))
+    (values (compile nil
+                     `(lambda ,args
+                        (declare (optimize (sb-c:store-source-form 0)))
+                        (%make-structure-instance-macro ,dd ',slot-specs ,@vals))))))
 
 (defun %make-funcallable-structure-instance-allocator (dd slot-specs)
   (when slot-specs
@@ -122,7 +123,7 @@
   ;; Packed integer with 4 subfields.
   ;; FIXNUM is ok for the host - it's guaranteed to be at least 16 signed bits
   ;; and we don't have structures whose slot indices run into the thousands.
-  (bits 0 :type fixnum :read-only t)
+  (bits 0 :type fixnum)
   (default nil :read-only t))                    ; default value expression
 (declaim (freeze-type defstruct-slot-description))
 
@@ -130,10 +131,13 @@
   ;; Ensure that rsd-index is representable in 3 bits. (Can easily be changed)
   (assert (<= (1+ (length *raw-slot-data*)) 8)))
 
-(defconstant sb-vm:dsd-index-shift   7)
+(defconstant sb-vm:dsd-index-shift   8)
 (defconstant sb-vm:dsd-raw-type-mask #b111)
+(defconstant dsd-default-error (ash 1 7))
+
 (defun pack-dsd-bits (index read-only safe-p always-boundp gc-ignorable rsd-index)
   (logior (ash index sb-vm:dsd-index-shift)
+          ;; (ash 1 7) meaning DEFAULT doesn't match TYPE is set during compilation of the constructor.
           (if read-only (ash 1 6) 0)
           (if safe-p (ash 1 5) 0)
           (if always-boundp (ash 1 4) 0)
@@ -205,15 +209,25 @@
   (acond ((dsd-raw-slot-data dsd) (raw-slot-data-raw-type it))
          (t)))
 
-(defun dsd-reader (dsd funinstancep)
+(defun dsd-primitives (dsd dd) ; return low-level (reader, writer) for this slot
+  (declare (type defstruct-slot-description dsd) (type defstruct-description dd))
   (acond ((dsd-raw-slot-data dsd)
           (values (raw-slot-data-reader-name it) (raw-slot-data-writer-name it)))
-         (funinstancep
+         ((eq (dd-type dd) 'funcallable-structure)
           (values '%funcallable-instance-info '%set-funcallable-instance-info))
+         ((eq (dd-name dd) 'layout)
+          (values '%instance-ref '%layout-slot-set))
+         (t
+          (values '%instance-ref '%instance-set))))
+
+(defun dsd-reader (dsd flag) ; for backward-compatibility
+  (sb-int:aver (not flag)) ; reject subtypes of FUNCALLABLE-STRUCTURE
+  (acond ((dsd-raw-slot-data dsd)
+          (values (raw-slot-data-reader-name it) (raw-slot-data-writer-name it)))
          (t
           (values '%instance-ref '%instance-set))))
 
-;;;; typed (non-class) structures
+;;;; Typed (non-class) structures
 
 ;;; Return a type specifier we can use for testing :TYPE'd structures.
 (defun dd-lisp-type (defstruct)
@@ -221,14 +235,14 @@
     (list 'list)
     (vector `(simple-array ,(dd-%element-type defstruct) (*)))))
 
-;;;; shared machinery for inline and out-of-line slot accessor functions
+;;;; Shared machinery for inline and out-of-line slot accessor functions
 
 ;;; Classic comment preserved for entertainment value:
 ;;;
 ;;; "A lie can travel halfway round the world while the truth is
 ;;; putting on its shoes." -- Mark Twain
 
-;;;; the legendary DEFSTRUCT macro itself (both CL:DEFSTRUCT and its
+;;;; The legendary DEFSTRUCT macro itself (both CL:DEFSTRUCT and its
 ;;;; close personal friend SB-XC:DEFSTRUCT)
 
 (defun %defstruct-package-locks (dd)
@@ -269,7 +283,7 @@
                                 ,(slot-access-transform :setf '(instance value) key))))
                         (sb-c:xdefun ,accessor-name :accessor ,source-form (instance)
                                      ,(slot-access-transform :read '(instance) key))))))
-      ;; Return fragements of code that CLOS can use.  We don't return
+      ;; Return fragments of code that CLOS can use.  We don't return
       ;; the toplevel DEFUNs because those generally perform an
       ;; unneeded type-check unless in safety 0.  These CLOS-related
       ;; lambdas don't need to check the type of the instance because
@@ -277,7 +291,7 @@
       ;; unbound markers through for the CLOS machinery to handle.
       ;;
       ;; FIXME: it seems like all these fragments should be packed
-      ;; into a single codebob which will have less overhead than
+      ;; into a single codeblob which will have less overhead than
       ;; separate blobs.  Afaict, the only way to do that is to return
       ;; one lambda that returns all the lambdas.
       (collect ((result))
@@ -285,7 +299,7 @@
           (binding* ((key (cons dd dsd))
                      (name (string (dsd-name dsd))) ; anonymize by stringification
                      ;; reader and writer are the primitive operations
-                     ((reader writer) (dsd-reader dsd (neq (dd-type dd) 'structure)))
+                     ((reader writer) (dsd-primitives dsd dd))
                      ;; accessor is the global defun
                      (accessor (dsd-accessor-name dsd)))
             (declare (dynamic-extent key))
@@ -304,13 +318,13 @@
                                 ;; so we can be concise rather than use SLOT-ACCESS-TRANSFORM
                                 ;; plus a rebinding of X with TRULY-THE.
                                 `(,reader (truly-the ,(dd-name dd) #2#) ,(dsd-index dsd))
-                                ;; Don't check X, but do check the the fetched value.
+                                ;; Don't check X, but do check the fetched value.
                                 (slot-access-transform :read `((truly-the ,(dd-name dd) #2#))
                                                        key :function t)))
                         `',accessor)))))))
 
-;;; shared logic for host macroexpansion for SB-XC:DEFSTRUCT and
-;;; cross-compiler macroexpansion for CL:DEFSTRUCT
+;;; Shared logic for host macroexpansion for SB-XC:DEFSTRUCT and
+;;; cross-compiler macroexpansion for CL:DEFSTRUCT.
 ;;; This monster has exactly one inline use in the final image,
 ;;; and we can drop the definition.
 ;;;
@@ -325,7 +339,7 @@
 ;;; Some caveats: (1) a non-toplevel defstruct compiled after already seeing
 ;;; the same, due to repeated compilation of a file perhaps, will use the known
 ;;; definition, since technically structures must not be incompatibly redefined.
-;;; (2) delayed DEFUNS don't get the right TLF index in their debug info.
+;;; (2) delayed DEFUNs don't get the right TLF index in their debug info.
 ;;; We could expand into the internal expansion of DEFUN with an extra argument
 ;;; for the source location, which would get whatever "here" is instead of random.
 ;;; In other words: `(progn (sb-impl::%defun struct-slot (...) ... ,(source-location))
@@ -354,18 +368,19 @@
                   ;; Rather than hit MAKE-DEFSTRUCT-DESCRIPTION's type-check
                   ;; on the NAME slot, we can be a little more clear.
                   (error "DEFSTRUCT: ~S is not a symbol." name)))
-         (flagbits (logior #+sb-xc-host (if (eq name 'layout) +dd-varylen+ 0)
+         (flagbits (logior #+sb-xc-host
+                           (if (member name '(sb-c::compiled-debug-info layout)) +dd-varylen+ 0)
                            (if null-env-p +dd-nullenv+ 0)))
          (dd (make-defstruct-description name flagbits))
          (*dsd-source-form* nil)
          ((inherits comparators) (parse-defstruct dd options slot-descriptions))
          (constructor-definitions
-          (mapcar (lambda (ctor)
-                    `(sb-c:xdefun ,(car ctor)
-                         :constructor
-                         nil
-                       ,@(structure-ctor-lambda-parts dd (cdr ctor))))
-                  (dd-constructors dd)))
+            (mapcar (lambda (ctor)
+                      `(sb-c:xdefun ,(car ctor)
+                           :constructor
+                           nil
+                           ,@(structure-ctor-lambda-parts dd (cdr ctor))))
+                    (dd-constructors dd)))
          (print-method
           (when (dd-print-option dd)
             (let* ((x (make-symbol "OBJECT"))
@@ -445,11 +460,11 @@
   ;; that compare more than one word at a time.
   (collect ((group1) (group2) (group3))
     (mapc (lambda (dsd comparator)
-            (let ((x `(truly-the ,(dsd-type dsd) (,(dsd-reader dsd nil) a ,(dsd-index dsd))))
-                  (y `(truly-the ,(dsd-type dsd) (,(dsd-reader dsd nil) b ,(dsd-index dsd)))))
+            (let ((x `(truly-the ,(dsd-type dsd) (,(dsd-primitives dsd dd) a ,(dsd-index dsd))))
+                  (y `(truly-the ,(dsd-type dsd) (,(dsd-primitives dsd dd) b ,(dsd-index dsd)))))
               (cond ((member comparator '(= char-equal))
                      (group1 `(,comparator ,x ,y))) ; bounded amount of testing
-                    ((member comparator '(bit-vector-=))
+                    ((member comparator '(bit-vector-=)) ; TODO: strings
                      ;; unbounded but not recursive. Try EQ first though
                      (group2
                       `((lambda (x y) (or (eq x y) (bit-vector-= x y))) ,x ,y)))
@@ -459,9 +474,13 @@
           comparators)
     ;; use a string for the name since it's not a global function
     `(named-lambda ,(format nil "~A-EQUALP" (dd-name dd)) (a b)
-       (declare (optimize (sb-c:store-source-form 0) (safety 0)) (type ,(dd-name dd) a b)
-                (ignorable a b)) ; if zero slots
-       (and ,@(group1) ,@(group2) ,@(group3)))))
+       (declare (optimize (sb-c:store-source-form 0) (safety 0))
+                (type ,(dd-name dd) a) (type instance b))
+       ;; The righthand arg must be tested for its type
+       (and (eq (%instance-layout b) (%instance-layout a))
+            (let ((b (truly-the ,(dd-name dd) b)))
+              (declare (ignorable b))
+              (and ,@(group1) ,@(group2) ,@(group3)))))))
 
 #+sb-xc-host
 (progn
@@ -525,7 +544,7 @@
                                   name-and-options slot-descriptions
                                   :target))))
 
-;;;; functions to generate code for various parts of DEFSTRUCT definitions
+;;;; Functions to generate code for various parts of DEFSTRUCT definitions
 
 ;;; First, a helper to determine whether a name names an inherited
 ;;; accessor.
@@ -546,10 +565,19 @@
             (and (typep ,argname ',ltype)
                  ,(cond
                    ((subtypep ltype 'list)
-                     `(do ((head (the ,ltype ,argname) (cdr head))
-                           (i 0 (1+ i)))
-                          ((or (not (consp head)) (= i ,name-index))
-                           (and (consp head) (eq ',name (car head))))))
+                    (if (zerop name-index)
+                        (if (null name)
+                            `(and (consp ,argname)
+                                  (eq (car ,argname) ',name))
+                            `(eq (car ,argname) ',name))
+                        `(do ((head (the ,ltype ,argname) (cdr head))
+                              (i 0 (1+ i)))
+                             ((if (,(if (null name)
+                                        'consp
+                                        'listp) head)
+                                  (>= i ,name-index)
+                                  (return))
+                              (eq ',name (car head))))))
                    ((subtypep ltype 'vector)
                     `(and (>= (length (the ,ltype ,argname))
                            ,(dd-length defstruct))
@@ -597,7 +625,7 @@
                             instead).~:@>" name (dsd-name slot))))))))
     (stuff)))
 
-;;;; parsing
+;;;; Parsing
 
 ;;; CLHS says that
 ;;;   A defstruct option can be either a keyword or a list of a keyword
@@ -651,7 +679,7 @@ requires exactly~;accepts at most~] one argument" keyword syntax-group)
               (error "Invalid syntax in DEFSTRUCT option ~S" option)))))
     (case keyword
       (:conc-name
-       ;; unlike (:predicate) and (:copier) which mean "yes" if supplied
+       ;; Unlike (:predicate) and (:copier) which mean "yes" if supplied
        ;; without their argument, (:conc-name) and :conc-name mean no conc-name.
        ;; Also note a subtle difference in :conc-name "" vs :conc-name NIL.
        ;; The former re-interns each slot name into *PACKAGE* which might
@@ -719,7 +747,7 @@ requires exactly~;accepts at most~] one argument" keyword syntax-group)
       (:named
        (error "The DEFSTRUCT option :NAMED takes no arguments."))
       (:initial-offset
-       (setf (dd-offset dd) arg)) ; FIXME: disallow (:INITIAL-OFFSET NIL)
+       (setf (dd-offset dd) (the index arg)))
       (:pure
        (setf (dd-flags dd) (logior (logandc2 (dd-flags dd) +dd-pure+)
                                    (if arg +dd-pure+ 0))))
@@ -750,7 +778,7 @@ requires exactly~;accepts at most~] one argument" keyword syntax-group)
     (case (dd-type dd)
       (structure
        (when (dd-offset dd)
-         (error ":OFFSET can't be specified unless :TYPE is specified."))
+         (error ":INITIAL-OFFSET can't be specified unless :TYPE is specified."))
        #-compact-instance-header
        (unless (dd-include dd)
          ;; FIXME: It'd be cleaner to treat no-:INCLUDE as defaulting
@@ -853,7 +881,7 @@ unless :NAMED is also specified.")))
     ;;   (DEFTYPE X () 'SINGLE-FLOAT) and later (DEFSTRUCT X (A 0 :TYPE X)).
     ;; This is probably undefined behavior, but at least we'll not crash.
     ;; Also make self-referential definitions not signal PARSE-UNKNOWN-TYPE
-    ;; on slots whose :TYPE option allows an instance of itself
+    ;; on slots whose :TYPE option allows an instance of itself.
     (when (dd-include dd)
       (setq ancestor-slot-comparator-list
             (frob-dd-inclusion-stuff proto-classoid dd option-bits)))
@@ -872,7 +900,7 @@ unless :NAMED is also specified.")))
 
 (defmacro dd-has-raw-slot-p (dd) `(eq (dd-%element-type ,dd) '*))
 
-;;;; stuff to parse slot descriptions
+;;;; Stuff to parse slot descriptions
 
 ;;; Decide whether TYPE as stored in a structure can be a raw slot.
 ;;; Return the index of the matching RAW-SLOT-DATA if it should be, NIL if not.
@@ -910,7 +938,7 @@ unless :NAMED is also specified.")))
                      &key (type nil type-p) (read-only nil ro-p))
              spec
            (when (dd-conc-name defstruct)
-             ;; the warning here is useful, but in principle we cannot
+             ;; The warning here is useful, but in principle we cannot
              ;; distinguish between legitimate and erroneous use of
              ;; these names when :CONC-NAME is NIL.  In the common
              ;; case (CONC-NAME non-NIL), there are alternative ways
@@ -1057,8 +1085,12 @@ unless :NAMED is also specified.")))
 
     (let* ((gc-ignorable
             (csubtypep ctype
-                       (specifier-type '(or fixnum boolean character
-                                            #+64-bit single-float))))
+                       ;; GC can only ignore booleans if their values
+                       ;; never change, even between images, so only
+                       ;; when static space is not relocatable.
+                       (specifier-type '(or fixnum character
+                                         #+64-bit single-float
+                                         #-relocatable-static-space boolean))))
            (dsd (make-dsd name type accessor-name
                           (pack-dsd-bits index read-only safe-p
                                          always-boundp gc-ignorable
@@ -1171,7 +1203,7 @@ unless :NAMED is also specified.")))
                 ;; XXX: notify?
                 ))))))))
 
-;;;; various helper functions for setting up DEFSTRUCTs
+;;;; Various helper functions for setting up DEFSTRUCTs
 
 ;;; This function is called at macroexpand time to compute the INHERITS
 ;;; vector for a structure type definition.
@@ -1232,7 +1264,7 @@ unless :NAMED is also specified.")))
                  (unless (dsd-read-only slot)
                    (fmakunbound `(setf ,(dsd-accessor-name slot)))))))
            (setq layout (classoid-layout classoid))))
-    ;; Don't want to (setf find-classoid) on a a built-in-classoid
+    ;; Don't want to (setf find-classoid) on a built-in-classoid
     (unless (and (built-in-classoid-p classoid)
                  (eq (find-classoid (dd-name dd) nil) classoid))
       (setf (find-classoid (dd-name dd)) classoid))
@@ -1255,7 +1287,7 @@ unless :NAMED is also specified.")))
                                 (external-unbound-handling nil))
   (binding* ((dd (car slot-key))
              (dsd (cdr slot-key))
-             ((reader writer) (dsd-reader dsd (neq (dd-type dd) 'structure)))
+             ((reader writer) (dsd-primitives dsd dd))
              (type-spec (dsd-type dsd))
              (index (dsd-index dsd)))
     (ecase operation
@@ -1373,7 +1405,7 @@ unless :NAMED is also specified.")))
         (warn "undeclaring functions for old subclasses of ~S:~%  ~S"
               (classoid-name classoid) (subs))))))
 
-;;; core compile-time setup of any class with a LAYOUT, used even by
+;;; Core compile-time setup of any class with a LAYOUT, used even by
 ;;; !DEFSTRUCT-WITH-ALTERNATE-METACLASS weirdosities
 (defun %compiler-set-up-layout (dd inherits)
   (multiple-value-bind (classoid layout old-layout)
@@ -1477,7 +1509,8 @@ unless :NAMED is also specified.")))
                            accessor-name
                            (dsd-name dsd))))))))
 
-    (awhen (remove-if-not #'sb-c::emitted-full-call-count fnames)
+    (awhen (and sb-c::*compilation-unit*
+                (remove-if-not #'sb-c::emitted-full-call-count fnames))
       (sb-c:compiler-style-warn
        'sb-c:inlining-dependency-failure
        ;; This message omits the http://en.wikipedia.org/wiki/Serial_comma
@@ -1489,7 +1522,7 @@ DEFSTRUCT should precede references to the affected functions, ~
 or they must be declared locally notinline at each call site.~@:>"
        :format-arguments (list (length it) (nreverse it) (dd-name dd))))))
 
-;;;; redefinition stuff
+;;;; Redefinition stuff
 
 ;;; Compare the slots of OLD and NEW, returning 3 lists of slot names:
 ;;;   1. Slots which have moved,
@@ -1654,9 +1687,18 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;;     read-only space. For others it is a fixnum.
 ;;;     In either case the GC need not observe the value.
 (defconstant funinstance-layout-bitmap
-  #-executable-funinstances                                     -6
-  #+(and executable-funinstances (not compact-instance-header)) -24
-  #+(and executable-funinstances compact-instance-header)       -8)
+  (macrolet ((untagged-slot-mask ()
+               (let ((objdef (find 'funcallable-instance sb-vm::*primitive-objects*
+                                   :key 'sb-vm::primitive-object-name))
+                     (mask 0))
+                 (dovector (slot (sb-vm::primitive-object-slots objdef) mask)
+                   (destructuring-bind (index name . rest) slot
+                     (declare (ignore rest))
+                     (when (or (string= name "TRAMPOLINE")
+                               (eql (string/= name "INSTWORD") 8)
+                               (string= name "LAYOUT"))
+                       (setf mask (logior mask (ash 1 (1- index))))))))))
+    (lognot (untagged-slot-mask))))
 
 ;;;
 ;;; Ordinary instance with only tagged slots:
@@ -1679,7 +1721,7 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;;      word1: (u) raw slots ...
 ;;;
 ;;; Notes:
-;;; 1. LAYOUT has to be scanned separately regardless of where stored.
+;;; 1. LAYOUT has to be scanned separately regardless of where stored
 ;;;    (compact header or not). Hence it is regarded as an untagged slot.
 ;;; 2. For funcallable objects these examples are exhaustive of all
 ;;;    possible bitmaps. The instance length can be anything,
@@ -1716,7 +1758,7 @@ or they must be declared locally notinline at each call site.~@:>"
     ;; If the structure has a custom GC scavenging method then always return
     ;; the minimal bitmap, and disallow arbitrary trailing slots.
     ;; The optimization for all-tagged (avoiding use of the bitmap)
-    ;; indicates in addition to no raw slots, no custom GC method either.
+    ;; indicates, in addition to no raw slots, no custom GC method either.
     ;; As of now this only pertains to lockfree-singly-linked-list nodes
     ;; and descendant types. (The lockfree list uses one pointer bit
     ;; as a pending-deletion flag. See "src/code/target-lflist.lisp")
@@ -1779,7 +1821,7 @@ or they must be declared locally notinline at each call site.~@:>"
     (setf (classoid-direct-superclasses classoid)
           (case (dd-name info)
             ;; Argh, could this case be any more opaque???
-            ;; It's ostensibly the set of types whose superclasse would come out wrong
+            ;; It's ostensibly the set of types whose superclasses would come out wrong
             ;; if we didn't fudge them manually. But the computation of the superclass
             ;; list is obfuscated. I think we have assertions about this somewhere.
             ;; But ideally we remove this junky case from the target image somehow
@@ -1877,7 +1919,7 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;; have processed the arglist. The correct variant (according to the
 ;;; DD-TYPE) should be called. The function is defined with the
 ;;; specified name and arglist. VARS and TYPES are used for argument
-;;; type declarations. VALUES are the values for the slots (in order.)
+;;; type declarations. VALUES are the values for the slots (in order).
 ;;;
 ;;; This is split into two functions:
 ;;;   * INSTANCE-CONSTRUCTOR-FORM has to deal with raw slots
@@ -2026,25 +2068,25 @@ or they must be declared locally notinline at each call site.~@:>"
                  `(function (,type ,dd-name) (values ,type &optional))  ; writer
                  `(function (,dd-name) (values ,type &optional))))))))) ; reader
      (t
-      type))))
+      (sb-kernel::maybe-reparse-specifier type)))))
 
 ;;; Given a DD and a constructor spec (a cons of name and pre-parsed
 ;;; BOA lambda list, or the symbol :DEFAULT), return the effective
 ;;; lambda list and the body of the lambda.
 (defun structure-ctor-lambda-parts
-    (dd args &aux (creator (ecase (dd-type dd)
-                             (structure #'instance-constructor-form)
-                             ((list vector) #'typed-constructor-form))))
+    (dd args &optional inline
+     &aux (creator (ecase (dd-type dd)
+                     (structure #'instance-constructor-form)
+                     ((list vector) #'typed-constructor-form))))
   (labels ((default-value (dsd &optional pretty)
              (let ((default (dsd-default dsd))
                    (type (dsd-type dsd))
                    (source-form (and (boundp '*dsd-source-form*)
                                      (cdr (assq dsd *dsd-source-form*)))))
                (cond ((and default
-                           (neq type t)
                            (not pretty))
                       `(the* (,type :source-form ,source-form
-                                    :context :initform
+                                    :context ,dsd
                                     :use-annotations t)
                              ,default))
                      ((and default source-form
@@ -2065,7 +2107,10 @@ or they must be declared locally notinline at each call site.~@:>"
         (return-from structure-ctor-lambda-parts
           `((&key ,@lambda-list)
             (declare (explicit-check)
-                     (sb-c::lambda-list (&key ,@(parse t))))
+                     (sb-c::lambda-list (&key ,@(parse t)))
+                     ;; #S with #n= depend on restartable type errors.
+                     ,@(unless inline
+                         `((optimize sb-c::compute-debug-fun))))
             ,(funcall creator dd
                       (mapcar (lambda (dsd arg)
                                 (let ((type (dsd-type dsd))
@@ -2073,7 +2118,9 @@ or they must be declared locally notinline at each call site.~@:>"
                                   (if (eq type t)
                                       var
                                       `(the* (,type :context
-                                              (struct-context ,(dd-name dd) . ,(dsd-name dsd)))
+                                              (struct-context ,(dd-name dd) . ,(dsd-name dsd))
+                                              ,@(unless inline ;; can't restart in user code due to value copying.
+                                                  '(:restart t)))
                                              ,var))))
                               (dd-slots dd) lambda-list))))))
     (destructuring-bind (llks &optional req opt rest keys aux) args
@@ -2085,7 +2132,13 @@ or they must be declared locally notinline at each call site.~@:>"
             (aux-vars name)
             (unless (typep binding '(cons t cons))
               (skipped-vars name))))
-        (macrolet ((rewrite (input key parse pretty)
+        (macrolet ((walk (input key parse)
+                     `(dolist (arg ,input)
+                        (multiple-value-bind (,@key var def sup-p) (,parse arg)
+                          (declare (ignore ,@key def))
+                          (vars var)
+                          (when sup-p (vars (car sup-p))))))
+                   (rewrite (input key parse pretty)
                      `(mapcar
                        (lambda (arg)
                          (multiple-value-bind (,@key var def sup-p) (,parse arg)
@@ -2093,8 +2146,6 @@ or they must be declared locally notinline at each call site.~@:>"
                            (rewrite-1 arg var sup-p ,pretty)))
                        ,input)))
           (labels ((rewrite-1 (arg var sup-p-var pretty)
-                     (vars var)
-                     (when sup-p-var (vars (car sup-p-var)))
                      (let* ((slot (unless (member var (aux-vars) :test #'string=)
                                     (find var (dd-slots dd)
                                           :key #'dsd-name :test #'string=)))
@@ -2111,21 +2162,26 @@ or they must be declared locally notinline at each call site.~@:>"
                              ,@sup-p-var)
                            arg)))        ; keep it as it was
                    (make-ll (opt rest keys aux-vars &optional pretty)
+                     (declare (ignore aux-vars))
                      ;; Can we substitute symbols that are not EQ to symbols
                      ;; naming slots, so we don't have to compare by STRING= later?
                      ;; Probably not because other symbols could reference them.
                      (setq opt (rewrite opt () parse-optional-arg-spec pretty))
-                     (when rest (vars (car rest) pretty))
                      (setq keys (rewrite keys (key) parse-key-arg-spec pretty))
-                     (dolist (arg aux-vars)
-                       (vars arg))
                      (sb-c::make-lambda-list
                       llks nil req opt rest keys
                       ;; &AUX vars which do not initialize a slot are not mentioned
                       ;; in the lambda list, though it's not clear what to do if
                       ;; subsequent bindings refer to the deleted ones.
                       ;; And worse, what if it's SETQd - is that even legal?
-                      (remove-if (lambda (x) (not (typep x '(cons t cons)))) aux))))
+                      (remove-if (lambda (x) (not (typep x '(cons t cons)))) aux)))
+                   (walk-ll (opt rest keys aux-vars)
+                     (walk opt () parse-optional-arg-spec)
+                     (when rest (vars (car rest)))
+                     (walk keys (key) parse-key-arg-spec)
+                     (dolist (arg aux-vars)
+                       (vars arg))))
+            (walk-ll opt rest keys (aux-vars))
             `(,(make-ll opt rest keys (aux-vars))
               (declare (explicit-check)
                        (sb-c::lambda-list ,(make-ll opt rest keys (aux-vars) t)))
@@ -2144,7 +2200,7 @@ or they must be declared locally notinline at each call site.~@:>"
                          (if (eq type t) initform `(the ,type ,initform)))))
                  (dd-slots dd))))))))))
 
-;;;; instances with ALTERNATE-METACLASS
+;;;; Instances with ALTERNATE-METACLASS
 ;;;;
 ;;;; The CMU CL support for structures with ALTERNATE-METACLASS was a
 ;;;; fairly general extension embedded in the main DEFSTRUCT code, and
@@ -2284,7 +2340,7 @@ or they must be declared locally notinline at each call site.~@:>"
 (defun !target-defstruct-altmetaclass (&rest args)
   (declare (ignore args)))
 
-;;;; finalizing bootstrapping
+;;;; Finalizing bootstrapping
 
 ;;; Set up DD and LAYOUT for STRUCTURE-OBJECT class itself.
 ;;;
@@ -2318,22 +2374,6 @@ or they must be declared locally notinline at each call site.~@:>"
     (when (typep ctor '(cons t (eql :default)))
       (car ctor))))
 
-#+sb-xc-host
-(defun %instance-ref (instance index)
-  (let* ((layout (%instance-layout instance))
-         (map (layout-index->accessor-map layout)))
-    (when (zerop (length map)) ; construct it on demand
-      (let ((slots (dd-slots (layout-%info layout))))
-        (setf map (make-array (1+ (reduce #'max slots :key #'dsd-index))
-                              :initial-element nil)
-              (layout-index->accessor-map layout) map)
-        (dolist (dsd slots)
-          (setf (aref map (dsd-index dsd)) (dsd-accessor-name dsd)))))
-    (funcall (aref map index) instance)))
-
-#+sb-xc-host
-(defun %raw-instance-ref/word (instance index) (%instance-ref instance index))
-
 ;;; It is possible to produce instances of structure-object which violate
 ;;; the assumption throughout the compiler that slot readers are safe
 ;;; unless dictated otherwise by the SAFE-P flag in the DSD.
@@ -2344,18 +2384,18 @@ or they must be declared locally notinline at each call site.~@:>"
                                                 environment)
   (declare (ignore environment))
   (if (typep object 'structure-object)
-      (let ((type (type-of object)))
+      (let ((dd (layout-dd (%instance-layout object))))
         (collect ((inits))
-          (dolist (dsd (dd-slots (layout-dd (%instance-layout object))))
+          (dolist (dsd (dd-slots dd))
             (declare (type defstruct-slot-description dsd))
             (let ((slot-name (dsd-name dsd)))
               (when (or (memq slot-name slot-names)
                         (not slot-names-p))
-                (let* ((accessor (dsd-reader dsd nil))
+                (let* ((accessor (dsd-primitives dsd dd))
                        (index (dsd-index dsd))
                        (value (funcall accessor object index)))
                   (inits `(setf (,accessor ,object ,index) ',value))))))
-          (values `(allocate-struct ',(the symbol type)) ;; no anonymous defstructs
+          (values `(allocate-struct ',(dd-name dd)) ;; no anonymous defstructs
                   `(progn ,@(inits)))))
       #-sb-xc-host
       (let ((class (class-of object)))
@@ -2382,6 +2422,7 @@ or they must be declared locally notinline at each call site.~@:>"
             sb-vm:instance-pointer-lowtag)))
 
 #+sb-xc-host
+(progn
 (defun write-structure-definitions-as-text (pathname)
   (with-open-file (output pathname :direction :output :if-exists :supersede)
     (dolist (root '(structure-object function))
@@ -2420,5 +2461,33 @@ or they must be declared locally notinline at each call site.~@:>"
             (t
              (error "Missing DD for ~S" pair))))))
     (format output ";; EOF~%")))
+
+(locally
+(declare (notinline sb-c::compiled-debug-info-p sb-c::compiled-debug-info-rest))
+;; Emulate variable-length structures for COMPILED-DEBUG-INFO.
+(defun %instance-length (instance)
+  (declare (notinline layout-length))
+  (let ((basic (layout-length (%instance-layout instance))))
+    (if (sb-c::compiled-debug-info-p instance)
+        (+ (1- basic)
+           (length (the simple-vector (sb-c::compiled-debug-info-rest instance))))
+        basic)))
+(defun %instance-ref (instance index)
+  (let* ((layout (%instance-layout instance))
+         (map (layout-index->accessor-map layout)))
+    (when (zerop (length map)) ; construct it on demand
+      (let ((slots (dd-slots (layout-%info layout))))
+        (setf map (make-array (1+ (reduce #'max slots :key #'dsd-index))
+                              :initial-element nil)
+              (layout-index->accessor-map layout) map)
+        (dolist (dsd slots)
+          (setf (aref map (dsd-index dsd)) (dsd-accessor-name dsd)))))
+    (if (and (sb-c::compiled-debug-info-p instance)
+             (>= index (1- (length map))))
+        (aref (sb-c::compiled-debug-info-rest instance) (- index (1- (length map))))
+        (funcall (aref map index) instance)))))
+
+(defun %raw-instance-ref/word (instance index) (%instance-ref instance index))
+) ; end PROGN
 
 (/show0 "code/defstruct.lisp end of file")

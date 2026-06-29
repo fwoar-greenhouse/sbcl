@@ -209,7 +209,12 @@
 (macrolet ((test (inxf expected &environment env)
              `(with-test (:name (,(macroexpand 'name env) ,inxf))
                 (with-open-file (s *test-path* :external-format ',inxf)
-                  (let* ((string (make-string 10000))
+                  (let* ((string (make-string 100000))
+                         (count (read-sequence string s)))
+                    (assert (equal (map 'list 'char-code (subseq string 0 count)) ,expected)))))
+             `(with-test (:name (,(macroexpand 'name env) ,inxf :base-string))
+                (with-open-file (s *test-path* :external-format ',inxf)
+                  (let* ((string (make-string 100000 :element-type 'base-char))
                          (count (read-sequence string s)))
                     (assert (equal (map 'list 'char-code (subseq string 0 count)) ,expected))))))
            (with-test-file ((id bytes) &body body)
@@ -259,14 +264,11 @@
     (tests 516)
     (tests 517)
 
-    (with-test (:name :fd-stream-bytes-per-buffer)
-      (assert (= sb-impl::+bytes-per-buffer+ 8192)))
-
-    (tests 8190)
-    (tests 8191)
-    (tests 8192)
-    (tests 8193)
-    (tests 8194)))
+    (tests #.(- sb-impl::+bytes-per-buffer+ 2))
+    (tests #.(- sb-impl::+bytes-per-buffer+ 1))
+    (tests #.sb-impl::+bytes-per-buffer+)
+    (tests #.(+ sb-impl::+bytes-per-buffer+ 1))
+    (tests #.(+ sb-impl::+bytes-per-buffer+ 3))))
 
 (macrolet ((test (inxf expected &optional (unread-expected expected) &environment env)
              `(progn
@@ -426,3 +428,38 @@
                              else if (= i 24) do (incf pos 2)
                              else do (incf pos 1))))))))
 (delete-file *test-path*)
+
+#+sb-unicode
+(defun random-string (stringlen percent-ascii &aux (unicode (- 100 percent-ascii)))
+  (let ((s (make-string stringlen)))
+    (dotimes (i stringlen s)
+      (setf (char s i)
+            (code-char (if (< (random 100.0) unicode)
+                           (loop (let ((c (max 1 (random char-code-limit))))
+                                   (when (sb-unicode:scalar-p c) (return c))))
+                           (max 1 (random 128))))))))
+
+(with-test (:name :optimized-utf8-decoder
+                  :skipped-on (:not :sb-unicode))
+  ;; some tests need 100% ascii so that it hits the special case for base-string
+  (dolist (percent-ascii '(100 50 10))
+    (dotimes (i 1000)
+      (let* ((string (random-string (random 1000) percent-ascii))
+             (octets (string-to-octets string :null-terminate t))
+             (readback1
+              (sb-ext:octets-to-string octets :end (1- (length octets))))
+             (readback2
+              (sb-sys:with-pinned-objects (octets)
+                (sb-unicode:utf8-decode-from-sap (sb-sys:vector-sap octets))))
+             (readback3
+              ;; doesn't take END or a displaced string. It could, but if you need
+              ;; such capability, the SAP interface will do.
+              (sb-unicode:utf8-decode-from-octets
+               (subseq octets 0 (1- (length octets))))))
+        (when (= percent-ascii 100)
+          (assert (not (sb-kernel:simple-base-string-p readback1)))
+          (assert (sb-kernel:simple-base-string-p readback2))
+          (assert (sb-kernel:simple-base-string-p readback3)))
+        (assert (string= string readback1))
+        (assert (string= string readback2))
+        (assert (string= string readback3))))))

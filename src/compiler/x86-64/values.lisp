@@ -48,6 +48,12 @@
           while moved
           do (inst add (tn-ref-tn moved) rdi))))
 
+(defun notany-nil-relative-p (vals)
+  (do ((tn-ref vals (tn-ref-across tn-ref)))
+      ((null tn-ref) t)
+    (when (nil-relative-p (encode-value-if-immediate (tn-ref-tn tn-ref)))
+      (return nil))))
+
 ;;; Push some values onto the stack, returning the start and number of values
 ;;; pushed as results. It is assumed that the Vals are wired to the standard
 ;;; argument locations. Nvals is the number of values to push.
@@ -59,7 +65,7 @@
   (:args (vals :more t :scs (descriptor-reg any-reg immediate constant)))
   (:results (start :from :load) (count))
   (:info nvals)
-  (:temporary (:scs (descriptor-reg)) temp)
+  (:temporary (:scs (descriptor-reg) :unused-if (notany-nil-relative-p vals)) temp)
   (:vop-var vop)
   (:generator 20
     (unless (eq (tn-kind start) :unused)
@@ -67,15 +73,10 @@
     (do ((tn-ref vals (tn-ref-across tn-ref)))
         ((null tn-ref))
       (let ((tn (tn-ref-tn tn-ref)))
-        (inst push (sc-case tn
-                     (constant
-                      (load-constant vop tn temp)
-                      temp)
-                     (t
-                      (let ((value (encode-value-if-immediate tn)))
-                        (if (integerp value)
-                            (constantize value)
-                            value)))))))
+        (inst push (let ((value (encode-value-if-immediate tn)))
+                     (cond ((integerp value) (constantize value))
+                           ((nil-relative-p value) (move-immediate temp value))
+                           (t value))))))
     (unless (eq (tn-kind count) :unused)
       (inst mov count (fixnumize nvals)))))
 
@@ -92,6 +93,7 @@
   (:vop-var vop)
   (:node-var node)
   (:save-p :compute-only)
+  (:check-type t)
   (:generator 0
     (move list arg)
 
@@ -102,7 +104,7 @@
                (not (csubtypep (tn-ref-type arg-ref) (specifier-type 'list))))
       (inst jmp type-check))
     LOOP
-    (inst cmp list nil-value)
+    (inst cmp list null-tn)
     (inst jmp :e DONE)
     (pushw list cons-car-slot list-pointer-lowtag)
     (loadw list list cons-cdr-slot list-pointer-lowtag)
@@ -146,8 +148,48 @@
         (inst lea loop-index (ea nil num (ash 1 (- word-shift n-fixnum-tag-bits)))))
     (unless (eq (tn-kind start) :unused)
       (inst mov start rsp-tn))
-    (inst test rcx-tn rcx-tn)
-    (inst jmp :z DONE)  ; check for 0 count?
+    (inst jrcxz DONE)  ; check for 0 count?
+
+    (inst sub rsp-tn loop-index)
+    (inst sub src loop-index)
+
+    LOOP
+    (inst mov temp (ea src loop-index))
+    (inst sub loop-index n-word-bytes)
+    (inst mov (ea rsp-tn loop-index) temp)
+    (inst jmp :nz LOOP)
+
+    DONE))
+
+(define-vop (%more-arg-values-skip)
+  (:args (context :scs (descriptor-reg any-reg) :target src)
+         (skip :scs (any-reg immediate))
+         (num :scs (any-reg)))
+  (:arg-types * positive-fixnum positive-fixnum)
+  (:temporary (:sc any-reg :from (:argument 0)) src)
+  (:temporary (:sc unsigned-reg) loop-index)
+  (:temporary (:sc descriptor-reg) temp)
+  (:results (start :scs (any-reg) :from :eval)
+            (count :scs (any-reg) :from :eval))
+  (:generator 20
+    (move loop-index num)
+    (unless (eq (tn-kind count) :unused)
+      (zeroize count))
+    (sc-case skip
+      (immediate
+       (inst lea src (ea (- (* (tn-value skip) n-word-bytes)) context))
+       (inst sub loop-index (fixnumize (tn-value skip))))
+      (any-reg
+       (inst neg skip)
+       (inst lea src (ea context skip (ash 1 (- word-shift n-fixnum-tag-bits))))
+       (inst neg skip)
+       (inst sub loop-index skip)))
+    (unless (eq (tn-kind start) :unused)
+      (inst mov start rsp-tn))
+    (unless (eq (tn-kind count) :unused)
+      (inst cmov :g count loop-index))
+    (inst jmp :le DONE)
+    (inst shl loop-index (- word-shift n-fixnum-tag-bits))
 
     (inst sub rsp-tn loop-index)
     (inst sub src loop-index)

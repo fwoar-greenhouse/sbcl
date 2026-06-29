@@ -25,7 +25,12 @@ sb-kernel::
          (,(find-classoid-cell 'step-condition) . sb-impl::invoke-stepper))))
 ;;;; And now a trick: splice those into the oldest *HANDLER-CLUSTERS*
 ;;;; which had a placeholder NIL reserved for this purpose.
-sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
+(defun splice-handler-clusters ()
+  sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**)))
+
+;;; Don't use the evaluator, it establishes its own dynamic-extent
+;;; bindings for *handler-clusters*
+(splice-handler-clusters)
 
 ;;;; Use the same settings as PROCLAIM-TARGET-OPTIMIZATION
 ;;;; I could not think of a trivial way to ensure that this stays functionally
@@ -38,7 +43,8 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
             (safety 2) (speed 2)
             ;; never insert stepper conditions
             (sb-c:insert-step-conditions 0)
-            (sb-c:alien-funcall-saves-fp-and-pc #+x86 3 #-x86 0)))
+            (sb-c:alien-funcall-saves-fp-and-pc #+x86 3 #-x86 0)
+            (sb-c:store-coverage-data #+sb-cover-for-internals 3 #-sb-cover-for-internals 0)))
 
 (locally
     (declare (notinline find-symbol)) ; don't ask
@@ -69,7 +75,7 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
                  '(sb-c::conset sb-kernel:args-type
                    sb-kernel:array-type
                    sb-kernel:character-set-type
-                   sb-kernel:numeric-type
+                   sb-kernel:numeric-union-type
                    sb-kernel:member-type)))))
 
 ;;; Assert that genesis preserved shadowing symbols.
@@ -80,40 +86,6 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
 
 ;;; Verify that compile-time floating-point math matches load-time.
 (defvar *compile-files-p*)
-(when (or (not (boundp '*compile-files-p*)) *compile-files-p*)
-  (with-open-file (stream "xfloat-math.lisp-expr" :if-does-not-exist nil)
-    (when stream
-      (format t "; Checking ~S~%" (pathname stream))
-      ;; Ensure that we're reading the correct variant of the file
-      ;; in case there is more than one set of floating-point formats.
-      (assert (eq (read stream) :default))
-      (sb-kernel::with-float-traps-masked (:overflow :divide-by-zero)
-        (let ((*readtable* (copy-readtable))
-              (*package* (find-package "SB-KERNEL")))
-          ;; The reasoning behind this limited-use variant of read-time-eval is that
-          ;; since it is too early to actually use EVAL in the interpreted fashion,
-          ;; EVAL would call COMPILE which is just ridiculous because it would mean
-          ;; compiling however many #. expression there are in this file
-          (set-dispatch-macro-character
-           #\# #\. (lambda (stream subchar arg)
-                     (declare (ignore subchar arg))
-                     (let ((expr (read stream t nil t)))
-                       (ecase (car expr)
-                         (sb-kernel::s (sb-kernel:make-single-float (second expr)))
-                         (sb-kernel::d
-                          (sb-kernel:make-double-float (second expr) (third expr)))))))
-          (dolist (expr (read stream))
-            (destructuring-bind (fun args . result) expr
-              (let ((result (if (eq (first result) 'sb-kernel::&values)
-                                (rest result)
-                                result))
-                    (actual (multiple-value-list (apply fun (sb-int:ensure-list args)))))
-                (unless (equalp actual result)
-                  (#+sb-devel-xfloat cerror #+sb-devel-xfloat ""
-                   #-sb-devel-xfloat format #-sb-devel-xfloat t
-                   "FLOAT CACHE LINE ~S vs COMPUTED ~S~%"
-                   expr actual))))))))))
-
 (when (if (boundp '*compile-files-p*) *compile-files-p* t)
   (with-open-file (output "output/cold-vop-usage.txt" :if-does-not-exist nil)
     (when output
@@ -187,9 +159,11 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
                     (ecase (if (boundp '*compile-files-p*) *compile-files-p* t)
                      ((t)
                       (let ((sb-c::*source-namestring* fullname)
+                            (sb-vm::*eager-tls-assignment* t)
                             (sb-c::*force-system-tlab*
                              (or (search "src/pcl" stem)
-                                 (search "src/code/aprof" stem)))
+                                 (search "src/code/aprof" stem)
+                                 (search "src/code/ntrace" stem)))
                             (sb-ext:*derive-function-types*
                               (unless (search "/pcl/" stem)
                                 t)))

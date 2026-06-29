@@ -74,9 +74,9 @@ COMMON_SRC = alloc.c arena.c backtrace.c breakpoint.c coalesce.c	\
 	coreparse.c dynbind.c funcall.c gc-common.c globals.c		\
 	hopscotch.c interr.c interrupt.c largefile.c main.c		\
 	math.c monitor.c murmur_hash.c os-common.c parse.c              \
-	perfecthash.c print.c                                           \
+	perfecthash.c print.c time.c                                    \
 	regnames.c runtime.c safepoint.c save.c                         \
-	sc-offset.c search.c stringspace.c thread.c time.c              \
+	sc-offset.c search.c stringspace.c thread.c stop-the-world.c    \
 	validate.c var-io.c vars.c wrap.c
 
 ifndef LISP_FEATURE_WIN32
@@ -99,22 +99,22 @@ endif
 
 targets: $(TARGET) $(OBJTARGET) $(LDB_TARGET) sbcl.mk
 
-LDB_OBJS = $(filter-out main.o interr.o runtime.o monitor.o thread.o safepoint.o,$(OBJS))
+LDB_OBJS = $(filter-out main.o interr.o runtime.o monitor.o thread.o stop-the-world.o safepoint.o,$(OBJS))
 ldb: $(LIBSBCL)
 	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-monitor.o monitor.c
 	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-interr.o interr.c
-	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-thread.o thread.c
-	$(CC) $(LINKFLAGS) -o ldb standalone-monitor.o standalone-interr.o standalone-thread.o \
+	$(CC) $(LINKFLAGS) -o ldb standalone-monitor.o standalone-interr.o \
 		$(LDB_OBJS) $(LIBS)
 
 $(TARGET): $(LIBSBCL)
 	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
 	$(SBCL_PAXCTL) $@
 
-# tests/heap-reloc/fake-mman.c assumes #+linux, so this recipe
-# only works on linux.
+# tests/heap-reloc/fake-mman.c supports linux and x86-64-darwin.
+# This recipe may or may not work for other arch/os combinations
 heap-reloc-test: ../../tests/heap-reloc/fake-mman.c $(OBJS)
-	$(CC) ${LINKFLAGS} -o $@ ../../tests/heap-reloc/fake-mman.c $(filter-out linux-mman.o,$(OBJS)) $(LIBS)
+	$(CC) ${LINKFLAGS} $(CPPFLAGS) -o $@ ../../tests/heap-reloc/fake-mman.c \
+		$(filter-out darwin-mman.o linux-mman.o,$(OBJS)) $(LIBS)
 
 # Enable compiling gencgc with even more assertions and/or
 # data collection, with COMPILING_TESTS. Not really used yet.
@@ -139,7 +139,7 @@ libsbcl.so: $(PIC_OBJS)
 %.pic.o: %.c
 	$(CC) -fPIC -c $(CPPFLAGS) $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
 %.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
-	$(CC) -c $(CPPFLAGS) $(CFLAGS) $< -o $@
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) $< -o $@ -DLIBSBCL
 
 SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/elftool.lisp
 shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
@@ -159,6 +159,20 @@ pie-shrinkwrap-sbcl: pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o $(PIC_OBJS
 	$(CC) -pie -o $@ $^ $(LIBS)
 semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
 	$(CC) $(LINKFLAGS) $(CFLAGS) -o $@ $^ $(LIBS)
+
+# simpler version of core embedding where the core is just a section of the ELF file.
+# tools-for-build/elftool could kinda do this but it didn't work as well as it
+# does using the ELF writer from C, because firstly the interface is less
+# polished and secondly it did not remove the need for -Wl,--export-dynamic.
+# Note about $(LIBS) - we don't really need -ldl except os-common does reference it
+# so removing it would break that. Also certain platforms need -lm and -lpthread
+# to get in there so using the same link options as for the ordinary "sbcl"
+# is just easiest.
+embedcore-sbcl: $(LIBSBCL)
+	../../run-sbcl.sh --no-sysinit --no-userinit \
+	    --eval '(save-lisp-and-die "wrappedcore.o" :executable :elf-object)'
+	$(CC) -no-pie $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
+ $(CFLAGS) -o $@ wrappedcore.o $^ $(LIBS)
 
 sbcl.mk: Config
 	( echo 'CC=$(CC)' ; \

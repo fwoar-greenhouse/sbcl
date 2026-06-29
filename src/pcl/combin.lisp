@@ -147,25 +147,10 @@
       `(combined-method ,(generic-function-name gf))))
 
 (defun maybe-trace-method (gf method fun fmf-p)
-  (let ((m-name (when (plusp (hash-table-count sb-debug::*traced-funs*))
-                  ;; KLUDGE: testing if *TRACE-FUNS* has anything anything to
-                  ;; avoid calling METHOD-TRACE-NAME during PCL bootstrapping
-                  ;; when the generic-function type is not yet defined.)
-                  (method-trace-name gf method))))
-    (when m-name
-      (sb-debug::retrace-local-funs m-name))
-    (let ((info (when m-name
-                  (or (gethash m-name sb-debug::*traced-funs*)
-                      (let ((gf-info (gethash (or (generic-function-name gf) gf)
-                                              sb-debug::*traced-funs*)))
-                        (when (and gf-info (sb-debug::trace-info-methods gf-info))
-                          (let ((copy (copy-structure gf-info)))
-                            (setf (sb-debug::trace-info-what copy) m-name)
-                            copy)))))))
-      (if info
-          (lambda (&rest args)
-            (apply #'sb-debug::trace-method-call info fun fmf-p args))
-          fun))))
+  (declare (ignore gf method fmf-p))
+  ;; Bootstrap definition that does nothing until the GENERIC-FUNCTION
+  ;; type is defined.
+  fun)
 
 (defun make-emf-from-method
     (gf method cm-args fmf-p &optional method-alist wrappers)
@@ -252,11 +237,20 @@
                                             method-alist wrappers)
             method))))
 
-(defvar *global-effective-method-gensyms* ())
-(defvar *rebound-effective-method-gensyms*)
+(defglobal *global-effective-method-gensyms* ())
 
 (defun get-effective-method-gensym ()
   (or (pop *rebound-effective-method-gensyms*)
+      ;; There's an obvious race here, but do we care? It may not matter much because:
+      ;; * despite the obvious possibilities of LENGTH getting computed before APPEND
+      ;;   occurs in another thread, and/or collision on the SETQ, the only ill
+      ;;   effect may be symbol names appearing out-of-order or duplicated.
+      ;; * each invocation of MAKE-EFFECTIVE-METHOD-FUNCTION-INTERNAL tries to work on
+      ;;   its own copy of the global list through rebinding, thus the aforementioned
+      ;;   race should not often occur.
+      ;; However, and this is important part: though the function name -GENSYM suggests
+      ;; that it creates _uninterned_ symbols, that's actually not so. They are _interned_
+      ;; symbols, so I think there is a real bug potentially.
       (let ((new (pcl-symbolicate "EFFECTIVE-METHOD-GENSYM-"
                                     (length *global-effective-method-gensyms*))))
         (setq *global-effective-method-gensyms*
@@ -278,16 +272,16 @@
              (let ((combin (generic-function-method-combination gf)))
                (and (long-method-combination-p combin)
                     (long-method-combination-args-lambda-list combin)))))
+          ;; FIXME: this name in the lambda almost completely defeats
+          ;; the fngen cache when compiling method combinations
+          ;; since no two expressions will be EQUAL. Perhaps we should
+          ;; teach fngen to remove the name?
           (name `(emf ,(generic-function-name gf))))
       (cond
         (mc-args-p
          (let* ((required (make-dfun-required-args nreq))
                 (gf-args (if applyp
-                             `(list* ,@required
-                                     (sb-c::%listify-rest-args
-                                      .dfun-more-context.
-                                      (the (and unsigned-byte fixnum)
-                                        .dfun-more-count.)))
+                             `(list* ,@required (sb-c::%rest-list .rest.))
                              `(list ,@required))))
            `(named-lambda ,name ,ll
               (declare (ignore .pv. .next-method-call.))
@@ -298,7 +292,7 @@
          `(named-lambda ,name ,ll
             (declare (ignore .pv. .next-method-call.))
             (declare (ignorable ,@(make-dfun-required-args nreq)
-                                ,@(when applyp '(.dfun-more-context. .dfun-more-count.))))
+                                ,@(when applyp '(.rest.))))
             ,effective-method))))))
 
 (defun expand-emf-call-method (gf form metatypes applyp env)
@@ -619,8 +613,9 @@
 (defun wrap-with-applicable-keyword-check (effective valid-keys keyargs-start)
   `(let ((.valid-keys. ',valid-keys)
          (.keyargs-start. ',keyargs-start))
-     (check-applicable-keywords
-      .keyargs-start. .valid-keys. .dfun-more-context. .dfun-more-count.)
+     (multiple-value-bind (.more-context. .more-count.) (sb-c::%rest-context .rest.)
+      (check-applicable-keywords
+       .keyargs-start. .valid-keys. .more-context. .more-count.))
      ,effective))
 
 ;;;; the STANDARD method combination type. This is coded by hand

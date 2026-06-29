@@ -374,9 +374,7 @@
          (unless (zerop ,bitmap)
            (loop named #:noname
                  do
-             (let ((.index. (truly-the
-                             (integer 0 (,sb-vm:n-word-bits))
-                             (%primitive sb-vm::unsigned-word-find-first-bit ,bitmap))))
+             (let ((.index. (count-trailing-zeros ,bitmap)))
                ;; BIAS is the bit index in the original LOCATIONS map
                ;; which is at index 0 in BITMAP
                (let ((,location (truly-the sb-vm:finite-sc-offset (+ .index. ,bias))))
@@ -472,7 +470,7 @@
 ;;;; register saving
 
 (declaim (start-block optimized-emit-saves emit-saves assign-tn-costs
-                      pack-save-tn))
+                      pack-save-tn pack-wired-tns))
 
 ;;; Do stuff to note that TN is spilled at VOP for the debugger's benefit.
 (defun note-spilled-tn (tn vop)
@@ -615,6 +613,7 @@
                    (let ((type (sb-c::lvar-fun-type (sb-c::combination-fun node))))
                      (and (fun-type-p type)
                           (eq (sb-kernel:fun-type-returns type) *empty-type*)))
+                   #-sb-xc-host
                    (or
                     (sb-c::combination-fun-info node)
                     (policy node (zerop safety)))))))
@@ -856,7 +855,8 @@
                     ;; will lead to race conditions in the debugger
                     ;; involving backtraces from asynchronous
                     ;; interrupts.
-                    (setf (tn-sc tn) (tn-sc save-tn))))
+                    (setf (tn-offset tn) (tn-offset save-tn)
+                          (tn-sc tn) (tn-sc save-tn))))
                 (decf (tn-cost tn) penalty))))))
 
       (do ((tn (ir2-component-normal-tns (component-info component))
@@ -871,6 +871,38 @@
               ((null ref))
             (incf cost (+ write-cost (vop-depth-cost (tn-ref-vop ref)))))
           (setf (tn-cost tn) cost))))))
+
+(defun pack-wired-tns (2comp &optional callback)
+  (flet (#-fp-and-pc-standard-save
+         (save-tn-p (tn)
+           (let ((save-tn (tn-save-tn tn)))
+             (and save-tn (eq (tn-kind save-tn) :specified-save)))))
+    ;; First, pack wired-tns without :specified-save
+    (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
+        ((null tn))
+      (unless (or (eq (tn-kind tn) :arg-pass)
+                  #-fp-and-pc-standard-save
+                  (save-tn-p tn))
+        (pack-wired-tn tn)
+        (when callback
+          (funcall callback tn))))
+    ;; Now that the conflicts are populated, unwire any conflicting
+    ;; specified-save tns to their save location
+    #-fp-and-pc-standard-save
+    (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
+        ((null tn))
+      ;; The return address register might be wired and span the whole
+      ;; environment, if it conflicts with something put it into its
+      ;; specified save and unwire
+      (cond ((not (save-tn-p tn)))
+            ((conflicts-in-sc tn (tn-sc tn) (tn-offset tn))
+             (sb-c::deletef-in tn-next (ir2-component-wired-tns 2comp) tn)
+             (setf (tn-offset tn) (tn-offset (tn-save-tn tn))
+                   (tn-sc tn) (tn-sc (tn-save-tn tn))))
+            (t
+             (pack-wired-tn tn)
+             (when callback
+               (funcall callback tn)))))))
 
 ;;; If we're not assigning costs, and on a system where it matters, go
 ;;; through and force TNs with specified save locations (OCFP and LRA
@@ -892,7 +924,8 @@
               ;; lead to some useless loads in some code, and
               ;; race conditions in the debugger involving
               ;; backtraces from asynchronous interrupts.
-              (setf (tn-sc tn) (tn-sc save-tn)))))))))
+              (setf (tn-offset tn) (tn-offset save-tn)
+                    (tn-sc tn) (tn-sc save-tn)))))))))
 
 (declaim (end-block))
 
@@ -1385,7 +1418,8 @@
 (declaim (inline %call-with-target-tns))
 (defun %call-with-target-tns (tn callee
                               &key (limit 10) (reads t) (writes t))
-  (declare (type tn tn) (type function callee) (type index limit))
+  (declare (type tn tn) (type function callee) (type index limit)
+           (dynamic-extent callee))
   (flet ((frob-slot (slot-function)
            (declare (type function slot-function))
            (let ((count limit)
@@ -1412,11 +1446,10 @@
                           &rest keys &key limit reads writes)
                          &body body)
   (declare (ignore limit reads writes))
-  (let ((callback (gensym "CALLBACK")))
-    `(flet ((,callback (,target-variable)
-              ,@body))
-       (declare (dynamic-extent #',callback))
-       (%call-with-target-tns ,source-tn #',callback ,@keys))))
+  `(%call-with-target-tns ,source-tn
+                          (lambda (,target-variable)
+                            ,@body)
+                          ,@keys))
 
 (defun find-ok-target-offset (tn sc)
   (declare (type tn tn) (type storage-class sc))
@@ -1760,10 +1793,7 @@
   (declare (type component component)
            (type ir2-component 2comp))
   ;; Pack wired TNs first.
-  (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
-      ((null tn))
-    (unless (eq (tn-kind tn) :arg-pass)
-      (pack-wired-tn tn)))
+  (pack-wired-tns 2comp)
 
   ;; Then, pack restricted TNs, ones that are live over the whole
   ;; component first (they cause no fragmentation).  Sort by TN cost

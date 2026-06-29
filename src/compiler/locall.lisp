@@ -46,13 +46,28 @@
        (policy (lexenv-policy (node-lexenv call))))
       ((null args))
     (let* ((var (car vars))
+           (arg (car args))
+           (arg-info (lambda-var-arg-info var))
            (name (or (and (lambda-var-arg-info var)
                           (arg-info-key (lambda-var-arg-info var)))
-                     (lambda-var-%source-name var))))
-      (assert-lvar-type (car args) (leaf-type var) policy
-                        (if (functional-kind-eq fun optional)
-                            (make-local-call-context fun name)
-                            name))
+                     (lambda-var-%source-name var)))
+           (type (leaf-type var)))
+      (block nil
+        (when (eq type *universal-type*)
+          (setf type (leaf-defined-type var))
+          ;; make-xep-lambda-expression will assert ftypes for optional
+          ;; arguments, avoding type checking default values, because
+          ;; ftypes are for calls and not definitions.
+          (case (and arg-info
+                     (arg-info-kind arg-info))
+            ((:optional :keyword)
+             (return))))
+        (assert-lvar-type arg
+                          type
+                          policy
+                          (if (functional-kind-eq fun optional)
+                              (make-local-call-context fun name)
+                              name)))
       (unless (leaf-refs var)
         (flush-dest (car args))
         (setf (car args) nil))))
@@ -174,12 +189,18 @@
      (let* ((n-supplied (gensym))
             (nargs (length (lambda-vars fun)))
             (temps (make-gensym-list nargs))
-            (info (info :function :info (functional-%source-name fun)))
-            (types (and info
-                        (ir1-attributep (fun-info-attributes info) fixed-args)
-                        (loop for var in (lambda-vars fun)
-                              for temp in temps
-                              collect `(type ,(type-specifier (lambda-var-type var)) ,temp)))))
+            (name (functional-%source-name fun))
+            (info (info :function :info name))
+            (types (or (and (or
+                             (and info
+                                  (ir1-attributep (fun-info-attributes info) fixed-args))
+                             (typep name '(cons (eql sb-impl::specialized-xep))))
+                            (loop for var in (lambda-vars fun)
+                                  for type in (fun-type-required (if (typep name '(cons (eql sb-impl::specialized-xep)))
+                                                                     (specifier-type `(function ,@(cddr name)))
+                                                                     (info :function :type name)))
+                                  for temp in temps
+                                  collect `(type ,(type-specifier type) ,temp))))))
 
        `(lambda (,n-supplied ,@temps)
           (declare (type index ,n-supplied)
@@ -195,7 +216,8 @@
             (n-supplied (gensym))
             (temps (make-gensym-list max))
             (main (optional-dispatch-main-entry fun))
-            (optional-vars (nthcdr min (lambda-vars main)))
+            (vars (lambda-vars main))
+            (optional-vars (nthcdr min vars))
             (keyp (optional-dispatch-keyp fun))
             (used-eps (nreverse
                        ;; Ignore only the entries at the tail, can't
@@ -213,47 +235,73 @@
                              collect (cons ep n)
                              and do (setf previous-unused (eq ep main))
                              else if (and last more)
-                             collect (cons main (1+ n))))))
-       `(lambda (,n-supplied ,@temps)
-          (declare (type index ,n-supplied)
-                   (ignorable ,n-supplied))
-          (cond
-            ,@(loop for ((ep . n) . next) on used-eps
-                    collect
-                    (cond (next
-                           `((eq ,n-supplied ,n)
-                             (%funcall ,ep ,@(subseq temps 0 n))))
-                          (more
-                           (with-unique-names (n-context n-count)
+                             collect (cons main (1+ n)))))
+            (optional-checked 0))
+       (flet ((check-types (n)
+                (loop for i below n
+                      for temp in temps
+                      for var in vars
+                      for info = (lambda-var-arg-info var)
+                      for type = (and (>= i optional-checked)
+                                      (cond ((and info
+                                                  (eq (arg-info-kind info) :optional)
+                                                  (neq (leaf-defined-type var) *universal-type*))
+                                             ;; Don't delegate to propagate-to-args or
+                                             ;; it will check default values too, but
+                                             ;; FTYPEs are for calls and not definitions.
+                                             (leaf-defined-type var))
+                                            ((neq (leaf-type var) *universal-type*)
+                                             (leaf-type var))))
+                      when type
+                      collect
+                      `(the* (,type
+                              :context ,(lambda-var-%source-name var))
+                             ,temp)
+                      finally (setf optional-checked n))))
+         `(lambda (,n-supplied ,@temps)
+            (declare (type index ,n-supplied)
+                     (ignorable ,n-supplied))
+            (cond
+              ,@(loop for ((ep . n) . next) on used-eps
+                      collect
+                      (cond (next
+                             `((progn
+                                 ,@(check-types n)
+                                 (eq ,n-supplied ,n))
+                               (%funcall ,ep ,@(subseq temps 0 n))))
+                            (more
+                             (with-unique-names (n-context n-count)
+                               `(t
+                                 ,@(check-types n)
+                                 ,(if (= max n)
+                                      `(multiple-value-bind (,n-context ,n-count)
+                                           (%more-arg-context ,n-supplied ,max)
+                                         (%funcall ,more ,@temps ,n-context ,n-count))
+                                      ;; The &rest var is unused, call the main entry point directly
+                                      `(%funcall ,ep
+                                                 ,@(loop for supplied-p = nil
+                                                         then (and info
+                                                                   (arg-info-supplied-p info))
+                                                         with vars = temps
+                                                         for x in (lambda-vars ep)
+                                                         for info = (lambda-var-arg-info x)
+                                                         collect
+                                                         (cond (supplied-p
+                                                                t)
+                                                               ((and info
+                                                                     (eq (arg-info-kind info)
+                                                                         :more-count))
+                                                                0)
+                                                               (t
+                                                                (pop vars)))))))))
+                            (t
                              `(t
-                               ,(if (= max n)
-                                    `(multiple-value-bind (,n-context ,n-count)
-                                         (%more-arg-context ,n-supplied ,max)
-                                       (%funcall ,more ,@temps ,n-context ,n-count))
-                                    ;; The &rest var is unused, call the main entry point directly
-                                    `(%funcall ,ep
-                                               ,@(loop for supplied-p = nil
-                                                       then (and info
-                                                                 (arg-info-supplied-p info))
-                                                       with vars = temps
-                                                       for x in (lambda-vars ep)
-                                                       for info = (lambda-var-arg-info x)
-                                                       collect
-                                                       (cond (supplied-p
-                                                              t)
-                                                             ((and info
-                                                                   (eq (arg-info-kind info)
-                                                                       :more-count))
-                                                              0)
-                                                             (t
-                                                              (pop vars)))))))))
-                          (t
-                           `(t
-                             ;; Arg-checking is performed before this step,
-                             ;; arranged by INIT-XEP-ENVIRONMENT,
-                             ;; perform the last action unconditionally,
-                             ;; and without this the function derived type will be bad.
-                             (%funcall ,ep ,@(subseq temps 0 n))))))))))))
+                               ,@(check-types n)
+                               ;; Arg-count checking is performed before this step,
+                               ;; arranged by INIT-XEP-ENVIRONMENT,
+                               ;; perform the last action unconditionally,
+                               ;; and without this the function derived type will be bad.
+                               (%funcall ,ep ,@(subseq temps 0 n)))))))))))))
 
 (defun can-ignore-optional-ep (n vars keyp)
   (let ((var (loop with i = n
@@ -382,12 +430,12 @@
 ;;; LAMBDAS.
 (defun locall-analyze-component (component)
   (declare (type component component))
-  (aver-live-component component)
   (loop
     (let* ((new (pop (component-new-functionals component)))
            (fun (or new (pop (component-reanalyze-functionals component)))))
       (unless fun
         (return))
+      (setf (functional-reanalyze fun) nil)
       (let ((kind (functional-kind fun)))
         (cond ((or (functional-somewhat-letlike-p fun)
                    (logtest kind (functional-kind-attributes deleted zombie))))
@@ -676,7 +724,48 @@
                            (optional-dispatch-entry-point-fun
                             fun (- call-args min-args)))))
           ((optional-dispatch-more-entry fun)
-           (convert-more-call ref call fun))
+           ;; If there are multiple calls to a local function with &rest
+           ;; and they all have the same number of arguments,
+           ;; make a new local function with fixed arguments in which
+           ;; the optional-dispatch entry will be inlined.
+           (cond ((and (cdr (leaf-refs fun))
+                       (or (not (functional-entry-fun fun))
+                           (not (leaf-refs (functional-entry-fun fun))))
+                       (not (functional-inlinep fun))
+                       (loop for var in (optional-dispatch-arglist fun)
+                             for info = (lambda-var-arg-info var)
+                             thereis (and info
+                                          (eq (arg-info-kind info) :rest)))
+                       (let (lengths
+                             unequal)
+                         (block nil
+                           (map-refs (lambda (dest lvar)
+                                       (if (and (combination-p dest)
+                                                (eq (combination-fun dest) lvar))
+                                           (let ((length (length (combination-args dest))))
+                                             (if lengths
+                                                 (if (/= length lengths)
+                                                     (setf unequal t))
+                                                 (setf lengths length)))
+                                           (return)))
+                                     fun)
+                           (unless unequal
+                             (with-ir1-environment-from-node call
+                               (let* ((vars (make-gensym-list lengths))
+                                      (shim (ir1-convert-lambda
+                                             `(lambda ,vars
+                                                (%funcall ,fun ,@vars))
+                                             :debug-name (lvar-fun-debug-name
+                                                          (basic-combination-fun call))))
+                                      (new-ref (car (leaf-refs fun))))
+                                 (substitute-leaf-if (lambda (x)
+                                                       (not (eq x new-ref)))
+                                                     shim fun)
+                                 (locall-analyze-fun-1 fun)
+                                 (locall-analyze-fun-1 shim)
+                                 t)))))))
+                 (t
+                  (convert-more-call ref call fun))))
           (t
            (warn-invalid-local-call call call-args
             'local-argument-mismatch
@@ -958,7 +1047,6 @@
   (let* ((call-block (node-block call))
          (bind-block (node-block (lambda-bind clambda)))
          (component (block-component call-block)))
-    (aver-live-component component)
     (let ((clambda-component (block-component bind-block)))
       (unless (eq clambda-component component)
         (aver (eq (component-kind component) :initial))
@@ -1109,18 +1197,21 @@
                        (lvar (node-lvar call)))
                    (unlink-blocks block (first (block-succ block)))
                    (link-blocks block next-block)
-                   (if (eq (node-derived-type this-call) *empty-type*)
-                       ;; Delay terminating the block, because there may be more calls
-                       ;; to be processed here and this may prematurely delete NEXT-BLOCK
-                       ;; before we attach more preceding blocks to it.
-                       ;; Although probably if one call to a function
-                       ;; is derived to be NIL all other calls would
-                       ;; be NIL too, but that may not be available at the same time.
-                       ;; (Or something is smart in the future to
-                       ;; derive different results from different
-                       ;; calls.)
-                       (push this-call maybe-terminate)
-                       (add-lvar-use this-call lvar))))
+                   (cond ((eq (node-derived-type this-call) *empty-type*)
+                          ;; Delay terminating the block, because there may be more calls
+                          ;; to be processed here and this may prematurely delete NEXT-BLOCK
+                          ;; before we attach more preceding blocks to it.
+                          ;; Although probably if one call to a function
+                          ;; is derived to be NIL all other calls would
+                          ;; be NIL too, but that may not be available at the same time.
+                          ;; (Or something is smart in the future to
+                          ;; derive different results from different
+                          ;; calls.)
+                          (push this-call maybe-terminate))
+                         (lvar
+                          (add-lvar-use this-call lvar)
+                          (setf (lvar-%derived-type lvar) nil)
+                          (assert-node-type this-call (node-derived-type call) **zero-typecheck-policy**)))))
                 (deleted)
                 ;; The called function might be an assignment in the
                 ;; case where we are currently converting that function.
@@ -1178,7 +1269,10 @@
            (aver (node-tail-p call))
            (setf (lambda-return call-fun) return)
            (setf (return-lambda return) call-fun)
-           (setf (lambda-return fun) nil)))
+           (setf (lambda-return fun) nil)
+           (let ((call-type (node-derived-type call)))
+             (do-uses (use (return-result return))
+               (derive-node-type use call-type)))))
     ;; Delayed because otherwise next-block could become deleted
     (dolist (call maybe-terminate-calls)
       (maybe-terminate-block call nil)))
@@ -1287,8 +1381,10 @@
        ;; locall.
        (when (and done-something
                   component
+                  (not (functional-reanalyze leaf))
                   (member leaf (component-lambdas component)))
-         (pushnew leaf (component-reanalyze-functionals component)))))
+         (setf (functional-reanalyze leaf) t)
+         (push leaf (component-reanalyze-functionals component)))))
   (values))
 
 ;;; This function is called when there is some reason to believe that

@@ -9,10 +9,6 @@
  * files for more information.
  */
 
-#ifndef GENCGC_IS_PRECISE
-#error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
-#endif
-
 /* Use AVX2 versions of code when we can, since blasting bytes faster
  * is always nice.
  * If used more widely, we should put these in runtime.h */
@@ -98,9 +94,9 @@ struct page {
      */
 #if CONDENSED_PAGE_TABLE
     // The low bit of the offset indicates the scale factor:
-    // 0 = double-lispwords, 1 = gc cards. Large objects are card-aligned,
+    // 0 = double-lispwords, 1 = gc cards. Large objects are page-aligned,
     // and this representation allows for a 32TB contiguous block using 32K
-    // card size. Larger allocations will have pages that can't directly
+    // page size. Larger allocations will have pages that can't directly
     // store the full offset. That has to be dealt with by the accessor.
     unsigned int scan_start_offset_;
 #else
@@ -146,21 +142,6 @@ struct page {
     generation_index_t gen;
 };
 extern struct page *page_table;
-extern page_index_t page_table_pages;
-
-/* Find the page index within the page_table for the given
- * address. Return -1 on failure. */
-static inline page_index_t find_page_index(void *addr)
-{
-    if (addr >= (void*)DYNAMIC_SPACE_START) {
-        page_index_t index = ((uintptr_t)addr -
-                              (uintptr_t)DYNAMIC_SPACE_START) / GENCGC_PAGE_BYTES;
-        if (index < page_table_pages)
-            return (index);
-    }
-    return (-1);
-}
-extern char *page_address(page_index_t);
 
 /* New objects are allocated to PAGE_TYPE_MIXED or PAGE_TYPE_CONS */
 /* If you change these constants, then possibly also change the following
@@ -307,7 +288,7 @@ struct __attribute__((packed)) corefile_pte {
  *
  */
 extern unsigned char *gc_card_mark;
-extern long gc_card_table_mask;
+extern sword_t gc_card_table_mask;
 #define addr_to_card_index(addr) ((((uword_t)addr)>>GENCGC_CARD_SHIFT) & gc_card_table_mask)
 #define page_to_card_index(n) addr_to_card_index(page_address(n))
 
@@ -344,9 +325,13 @@ extern void gc_close_collector_regions(int);
 /* The various sorts of pointer swizzling in SBCL. */
 enum source {
   SOURCE_NORMAL,
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+  // avoid a warning from some C compilers that LINKAGE_CELL is not handled
+  // in "switch (source_type)"
+  SOURCE_LINKAGE_CELL,
+#endif
   SOURCE_ZERO_TAG,              /* code, lflist */
   SOURCE_CLOSURE,
-  SOURCE_SYMBOL_NAME,
   SOURCE_FDEFN_RAW
 };
 
@@ -377,6 +362,38 @@ gc_general_alloc(struct alloc_region* region, sword_t nbytes, int page_type)
 }
 lispobj copy_potential_large_object(lispobj object, sword_t nwords,
                                    struct alloc_region*, int page_type);
+
+#define compacting_p() (from_space>=0)
+
+#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
+
+extern unsigned char* gc_page_pins;
+#define pinned_p(dummy1,dummy2) 0
+
+extern generation_index_t from_space, new_space;
+generation_index_t gc_gen_of(lispobj obj, int defaultval);
+static bool __attribute__((unused))
+from_space_p(lispobj obj)
+{
+    /* There'd be a cyclic dependency between pmrgc-impl.h and
+     * incremental-compact.h would we try to #include the latter. */
+    extern unsigned char *target_pages;
+    page_index_t page_index = find_page_index((void*)obj);
+    if (page_index == -1) return 0;
+    /* We can only move objects in or younger than the current
+     * generation, as we can't build a complete remset for older
+     * objects in a younger GC. */
+    return target_pages[page_index] && gc_gen_of(obj, 0) <= new_space;
+}
+
+static bool __attribute__((unused)) new_space_p(lispobj obj)
+{
+    gc_dcheck(compacting_p());
+    page_index_t page_index = find_page_index((void*)obj);
+    // NOTE: It is legal to access page_table at index -1,
+    // and the 'gen' of page -1 is an otherwise unused value.
+    return page_table[page_index].gen == new_space;
+}
 
 #define CHECK_COPY_PRECONDITIONS(object, nwords) \
     gc_dcheck(is_lisp_pointer(object)); \
@@ -557,7 +574,6 @@ extern char * gc_logfile;
 extern void log_generation_stats(char *logfile, char *header);
 extern void print_generation_stats(void);
 extern double generation_average_age(generation_index_t);
-#define PAGE_INDEX_FMT PRIdPTR
 static inline os_vm_size_t npage_bytes(page_index_t npages)
 {
     gc_assert(npages>=0);
@@ -600,7 +616,7 @@ set_page_scan_start_offset(page_index_t index, os_vm_size_t offset)
 {
     // If the offset is nonzero and page-aligned
     unsigned int lsb = offset !=0 && IS_ALIGNED(offset, GENCGC_PAGE_BYTES);
-    os_vm_size_t scaled = (offset >> (lsb ? GENCGC_CARD_SHIFT-1 : WORD_SHIFT)) | lsb;
+    os_vm_size_t scaled = (offset >> (lsb ? GENCGC_PAGE_SHIFT-1 : WORD_SHIFT)) | lsb;
     if (scaled > SCAN_START_OFS_MAX) {
         // Assert that if offset exceed the max representable value,
         // then it is a page-aligned offset, not a cons-aligned offset.
@@ -623,7 +639,7 @@ static os_vm_size_t scan_start_offset_iterated(page_index_t index)
         offset = page_table[lookback_page].scan_start_offset_;
         tot_offset_in_pages += offset >> 1;
     } while (offset == SCAN_START_OFS_MAX);
-    return (os_vm_size_t)tot_offset_in_pages << GENCGC_CARD_SHIFT;
+    return (os_vm_size_t)tot_offset_in_pages << GENCGC_PAGE_SHIFT;
 }
 
 static os_vm_size_t  __attribute__((unused)) page_scan_start_offset(page_index_t index)
@@ -631,7 +647,7 @@ static os_vm_size_t  __attribute__((unused)) page_scan_start_offset(page_index_t
     return page_table[index].scan_start_offset_ != SCAN_START_OFS_MAX
         ? (os_vm_size_t)(page_table[index].scan_start_offset_ & ~1)
           << ((page_table[index].scan_start_offset_ & 1) ?
-              (GENCGC_CARD_SHIFT-1) : WORD_SHIFT)
+              (GENCGC_PAGE_SHIFT-1) : WORD_SHIFT)
         : scan_start_offset_iterated(index);
 }
 
@@ -709,8 +725,6 @@ static inline page_index_t contiguous_block_final_page(page_index_t first) {
     while (!page_ends_contiguous_block_p(last, page_table[first].gen)) ++last;
     return last;
 }
-
-int gencgc_handle_wp_violation(void*, void*);
 
 
 // The flags control the behavior of sync_close_regions()
@@ -724,38 +738,6 @@ static inline void ensure_region_closed(struct alloc_region *alloc_region,
 {
     if (alloc_region->start_addr)
         gc_close_region(alloc_region, page_type);
-}
-
-#define compacting_p() (from_space>=0)
-
-#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
-
-extern unsigned char* gc_page_pins;
-#define pinned_p(dummy1,dummy2) 0
-
-extern generation_index_t from_space, new_space;
-generation_index_t gc_gen_of(lispobj obj, int defaultval);
-static bool __attribute__((unused))
-from_space_p(lispobj obj)
-{
-    /* There'd be a cyclic dependency between pmrgc-impl.h and
-     * incremental-compact.h would we try to #include the latter. */
-    extern unsigned char *target_pages;
-    page_index_t page_index = find_page_index((void*)obj);
-    if (page_index == -1) return 0;
-    /* We can only move objects in or younger than the current
-     * generation, as we can't build a complete remset for older
-     * objects in a younger GC. */
-    return target_pages[page_index] && gc_gen_of(obj, 0) <= new_space;
-}
-
-static bool __attribute__((unused)) new_space_p(lispobj obj)
-{
-    gc_dcheck(compacting_p());
-    page_index_t page_index = find_page_index((void*)obj);
-    // NOTE: It is legal to access page_table at index -1,
-    // and the 'gen' of page -1 is an otherwise unused value.
-    return page_table[page_index].gen == new_space;
 }
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -776,11 +758,9 @@ extern struct fixedobj_page *fixedobj_pages;
 #define fixedobj_page_obj_align(i) (fixedobj_pages[i].attr.parts.obj_align<<WORD_SHIFT)
 #endif
 
-extern page_index_t next_free_page;
-
 extern uword_t
-walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),
-                generation_index_t generation, uword_t extra);
+walk_generation(uword_t (*proc)(lispobj*,lispobj*,void*),
+                generation_index_t generation, void* extra);
 
 /* The minimum heap occupancy to force more aggressive collections above. */
 #define PANIC_THRESHOLD 0.9

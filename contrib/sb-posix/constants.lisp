@@ -68,7 +68,7 @@
            "background read attempted from control terminal." t)
  (:integer SIGTTOU "SIGTTOU"
            "background write attempted to control terminal." t)
- (:integer SIGIO "SIGIO"
+ #-haiku (:integer SIGIO "SIGIO"
            "I/O is possible on a descriptor (see fcntl(2))." t)
  (:integer SIGXCPU "SIGXCPU"
            "cpu time limit exceeded (see setrlimit(2))." t)
@@ -274,6 +274,7 @@
               #-(and linux largefile) "struct dirent"
               #-(or win32 android) (:ino-t ino "ino_t" "d_ino")
               #+android ((unsigned 64) ino "unsigned long long" "d_ino")
+              #-haiku
               (:c-string name "char *" "d_name"
                          ;; FIXME: sunos should really have :distrust-length
                          ;; t, but this is currently broken. -- Jim Wise 2010-08-31
@@ -309,7 +310,7 @@
               (c-string-pointer passwd "char *" "gr_passwd")
               (gid-t gid "gid_t" "gr_gid")
               ((* c-string) mem "char **" "gr_mem")))
-
+ #-(and win32 ucrt)
  (:structure alien-stat
              ("struct stat"
               (mode-t mode "mode_t" "st_mode")
@@ -338,6 +339,20 @@
               (off-t size "off_t" "st_size")
               #+android
               ((signed 64) size "long long" "st_size")
+              (time-t atime "time_t" "st_atime")
+              (time-t mtime "time_t" "st_mtime")
+              (time-t ctime "time_t" "st_ctime")))
+ #+(and win32 ucrt)
+ (:structure alien-stat
+             ("struct __stat64"
+              (dev-t dev "_dev_t" "st_dev")
+              (ino-t ino "_ino_t" "st_ino")
+              (mode-t mode "mode_t" "st_mode")
+              (nlink-t nlink "nlink_t" "st_nlink")
+              (uid-t uid "uid_t" "st_uid")
+              (gid-t gid "gid_t" "st_gid")
+              (dev-t rdev "_dev_t" "st_rdev")
+              ((signed 64) size "__int64" "st_size")
               (time-t atime "time_t" "st_atime")
               (time-t mtime "time_t" "st_mtime")
               (time-t ctime "time_t" "st_ctime")))
@@ -418,7 +433,9 @@
               (tcflag-t oflag "tcflag_t" "c_oflag")
               (tcflag-t cflag "tcflag_t" "c_cflag")
               (tcflag-t lflag "tcflag_t" "c_lflag")
-              ((array cc-t) cc "cc_t" "c_cc")))
+              ((array cc-t) cc "cc_t" "c_cc")
+              (speed-t ispeed "speed_t" "c_ispeed")
+              (speed-t ospeed "speed_t" "c_ospeed")))
 
  ;; utime(), utimes()
  #-win32
@@ -435,7 +452,7 @@
  (:structure alien-timeval
              ("struct timeval"
               (time-t sec "time_t" "tv_sec")
-              (suseconds-t usec "suseconds_t" "tv_usec")))
+              (signed usec nil "tv_usec")))
 
  (:integer veof "VEOF" nil t)
  (:integer veol "VEOL" nil t)

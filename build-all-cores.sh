@@ -34,15 +34,18 @@
   '(("arm"    ("arm" :little-endian :largefile))
     ("arm64"  ("arm64" :little-endian :sb-thread)
               ("arm64-darwin" :darwin :bsd :unix :mach-o :little-endian :sb-thread :darwin-jit)
-              ("arm64-reloc"  :little-endian :sb-thread :relocatable-static-space))
+              ("arm64-reloc"  :little-endian :sb-thread :relocatable-static-space :immobile-space)
+              ("arm64-immobile-space" :little-endian :sb-thread :immobile-space))
     ("mips"   ("mips" :largefile :little-endian))
+    ("loongarch64"
+	      ("loongarch64" :64-bit :little-endian :sb-thread))
     ("ppc"    ("ppc" :big-endian)
               ("ppc-thread" :big-endian :sb-thread))
     ("ppc64"  ("ppc64" :ppc64 :big-endian)) ; sb-thread is the default and required
     ("riscv"  ("riscv" :64-bit :little-endian :sb-thread))
     ("sparc"  ("sparc" :big-endian)
               ("sparc-sunos" :big-endian :unix :sunos :elf))
-    ("x86"    ("x86" :little-endian :largefile)
+    ("x86"    ("x86" :little-endian :largefile (not :sb-eval) :sb-fasteval)
               ("x86-ascii" :little-endian :largefile (not :sb-unicode))
               ("x86-thread" :little-endian :largefile :sb-thread)
               ("x86-linux" :little-endian :largefile :sb-thread :linux :unix :elf :sb-thread))
@@ -52,7 +55,7 @@
               ("x86-64-darwin" :darwin :bsd :unix :mach-o :little-endian :avx2 :gencgc
                                :sb-simd-pack :sb-simd-pack-256)
               ("x86-64-imm" :little-endian :avx2 :gencgc :sb-simd-pack :sb-simd-pack-256
-                            :immobile-space)
+                            :immobile-space (not :sb-unicode))
               ("x86-64-permgen" :little-endian :avx2 :gencgc :sb-simd-pack :sb-simd-pack-256
                                 :permgen))))
 
@@ -73,13 +76,16 @@
            (setq start (1+ end))))))))
 
 (defun add-os-features (arch features)
-  (if (intersection '(:unix :win32) features)
-      features
-      (let* ((arch-symbol (sb-int:keywordicate (string-upcase arch)))
-             (os-features (case arch-symbol
-                            ((:x86 :x86-64) '(:win32 :sb-thread :sb-safepoint))
-                            (t '(:unix :linux :elf)))))
-        (append os-features features))))
+  (cond ((find :unix features)
+         (append features '(:os-provides-clock-gettime)))
+        ((find :win32 features)
+         features)
+        (t
+         (let* ((arch-symbol (sb-int:keywordicate (string-upcase arch)))
+                (os-features (case arch-symbol
+                               ((:x86 :x86-64) '(:win32 :sb-thread :sb-safepoint))
+                               (t '(:unix :linux :elf :os-provides-clock-gettime)))))
+           (append os-features features)))))
 
 ;;; TODO: dependencies for each target based on build-order.lisp-expr
 (let
@@ -128,11 +134,13 @@ obj/xbuild/{cfg}.core: obj/xbuild/{cfg}/xc.core
                  "-k"
                  "-fcrossbuild-runner/Makefile"
                  ,@(corefiles))
-               :output t :error t
+               :input t :output t :error t
                :search t))
 (when (= (process-exit-code *process*) 0)
   (load "src/cold/shared" :verbose t)
-  ;; TODO: merge the xfloat-math files, unless we decide to get rid of them
+  (load "validate-float.lisp")
+  (dolist (pathname (directory "obj/xbuild/**/xfloat-math.lisp-expr"))
+    (check-float-file pathname))
   (dolist (nbits '(30 61 63))
     (let* ((filename (format nil "xperfecthash~D.lisp-expr" nbits))
            (sources (directory (format nil "obj/xbuild/*/from-xc/~A" filename))))

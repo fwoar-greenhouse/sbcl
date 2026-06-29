@@ -34,7 +34,7 @@ stale value, use MUTEX-OWNER instead."
   #+sb-thread (sb-vm::current-thread-offset-sap sb-vm::thread-this-slot)
   #-sb-thread (extern-alien "all_threads" system-area-pointer))
 
-#-sb-thread
+#+(and (not sb-thread) (not x86-64))
 (progn
   (declaim (inline sb-vm::current-thread-offset-sap))
   (defun sb-vm::current-thread-offset-sap (n)
@@ -200,6 +200,7 @@ Historically WITH-MUTEX also accepted a VALUE argument, which when provided
 was used as the new owner of the mutex instead of the current thread. This is
 no longer supported: if VALUE is provided, it must be either NIL or the
 current thread."
+  (declare (ignorable env))
 
   ;; ultrafutex does not use the CALL-WITH pattern, merely a special binding
   #+ultrafutex
@@ -259,6 +260,7 @@ WITH-RECURSIVE-LOCK returns the values of BODY.
 Unlike WITH-MUTEX, which signals an error on attempt to re-acquire an already
 held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
 
+  (declare (ignorable env))
   `(dx-flet ((with-recursive-lock-thunk () ,@body))
      ,(cond (#-sb-thread t
              #+sb-thread (or timeout (neq wait-p t))

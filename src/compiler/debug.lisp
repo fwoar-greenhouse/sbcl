@@ -621,7 +621,10 @@
                      (template-more-results-type info) "results")
       (check-tn-refs (vop-temps vop) vop t 0 t "temps")
       (unless (or (= (length (vop-codegen-info vop))
-                     (template-info-arg-count info))
+                     (+ (template-info-arg-count info)
+                        (if (vop-info-gc-barrier info)
+                            1
+                            0)))
                   ;; Allow these 2 allocator vops to take an undeclared info arg
                   (member (vop-info-name info) '(sb-vm::fixed-alloc sb-vm::var-alloc))
                   ;; FIXME: The current representation for conditional
@@ -1057,7 +1060,10 @@
           (creturn
            (write-string "return ")
            (print-lvar (return-result node))
-           (print-leaf (return-lambda node)))
+           (print-leaf (return-lambda node))
+           (when *debug-print-types*
+             (write-char #\space)
+             (princ (type-specifier (return-result-type node)))))
           (entry
            (format t "entry ~S" (entry-exits node)))
           (exit
@@ -1095,7 +1101,12 @@
                    (write-string "}"))))
              (write-char #\space)))
           (cdynamic-extent
-           (format t "dynamic extent ~S" (dynamic-extent-values node))))
+           (format t "dynamic extent ~S" (dynamic-extent-values node))
+           (let ((info (dynamic-extent-info node)))
+             (write-string " {info: ")
+             (when info
+               (print-lvar info))
+             (write-string "}"))))
         (when (and *debug-print-types*
                    (valued-node-p node))
           (write-char #\space)
@@ -1113,25 +1124,42 @@
       (format t "cleanup ~s~%" (cleanup-kind (block-end-cleanup block)))))
   (values))
 
+(defun tn-write-count (tn)
+  (loop for ref = (tn-writes tn) then (tn-ref-next ref)
+        while ref
+        count t))
+
+(defun tn-read-count (tn)
+  (loop for ref = (tn-reads tn) then (tn-ref-next ref)
+        while ref
+        count t))
+
 ;;; Print the guts of a TN. (logic shared between PRINT-OBJECT (TN T)
 ;;; and printers for compound objects which contain TNs)
 (defun print-tn-guts (tn &optional (stream *standard-output*))
   (declare (type tn tn))
-  (let ((leaf (tn-leaf tn)))
-    (cond (leaf
-           (print-leaf leaf stream)
-           (format stream "!~D" (tn-id tn)))
-          (t
-           (format stream "t~D" (tn-id tn))))
-    (when (and (tn-sc tn) (tn-offset tn))
-      (format stream "[~A]" (location-print-name tn)))
-    (format stream " ~s~@[ ~a~]~@[ ~a~]" (tn-kind tn)
-            (and *debug-print-types*
-                 (and (tn-sc tn)
-                      (sc-name (tn-sc tn))))
-            (and *debug-print-types*
-                 (and (tn-primitive-type tn)
-                      (primitive-type-name (tn-primitive-type tn)))))))
+  (flet ((print-tn-name (tn)
+           (let ((leaf (tn-leaf tn)))
+             (cond (leaf
+                    (print-leaf leaf stream)
+                    (format stream "!~D" (tn-id tn)))
+                   (t
+                    (format stream "t~D" (tn-id tn))))
+             (when (and (tn-sc tn) (tn-offset tn))
+               (format stream "[~A]" (location-print-name tn))))))
+    (print-tn-name tn)
+    (format stream " ~s" (tn-kind tn))
+    (when (eq (tn-kind tn) :alias)
+      (format stream " to ")
+      (print-tn-name (tn-save-tn tn)))
+    (when *debug-print-types*
+      (format stream "~@[ ~a~]~@[ ~a~]"
+              (and (tn-sc tn)
+                   (sc-name (tn-sc tn)))
+              (and (tn-primitive-type tn)
+                   (primitive-type-name (tn-primitive-type tn)))))
+    #+nil
+    (format stream "/r~aw~a/" (tn-read-count tn) (tn-write-count tn))))
 
 ;;; Print the TN-REFs representing some operands to a VOP, linked by
 ;;; TN-REF-ACROSS.
@@ -1266,9 +1294,8 @@
 (defun print-all-blocks (thing)
   (do-blocks (block (block-component (block-or-lose thing)))
     (handler-case (print-nodes block)
-      ;; (error (condition)
-      ;;   (format t "~&~A...~%" condition))
-      ))
+      (error (condition)
+        (format t "~&~A...~%" condition))))
   (values))
 
 (defvar *list-conflicts-table*)
@@ -1349,13 +1376,6 @@
                    (res (global-conflicts-tn gtn))))
                (res)))))))
 
-(defun nth-vop (thing n)
-  "Return the Nth VOP in the IR2-BLOCK pointed to by THING."
-  (let ((block (block-info (block-or-lose thing))))
-    (do ((i 0 (1+ i))
-         (vop (ir2-block-start-vop block) (vop-next vop)))
-        ((= i n) vop))))
-
 (defun show-transform-p (showp fun-name)
   (or (and (listp showp) (member fun-name showp :test 'equal))
       (eq showp t)))
@@ -1363,8 +1383,9 @@
 (defun show-transform (kind name new-form &optional combination)
   (let ((*print-length* 100)
         (*print-level* 50)
-        (*print-right-margin* 128))
-    (format *trace-output* "~&xform (~a) ~S ~% -> ~S~%"
+        (*print-right-margin* 128)
+        (*print-readably* nil))
+    (format *trace-output* "~&xform (~a) ~S~@[ -> ~S~]~% => ~S~%"
             kind
             (if combination
                 (cons name
@@ -1373,6 +1394,8 @@
                                         (lvar-value arg)
                                         (type-specifier (lvar-type arg)))))
                 name)
+            (and combination
+                 (type-specifier (node-derived-type combination)))
             new-form)))
 
 (defun show-type-derivation (combination type)
@@ -1482,6 +1505,14 @@ is replaced with replacement."
 (defun print-conset (conset &optional kind)
   (do-conset-elements (con conset)
     (print-constraint con kind)))
+
+(defun print-conset-difference (set1 set2)
+  (let ((diff1 (conset-difference (copy-conset set1) set2))
+        (diff2 (conset-difference (copy-conset set2) set1)))
+    (format t "Not in set1~%")
+    (print-conset diff1)
+    (format t "Not in set2~%")
+    (print-conset diff2)))
 
 (defun print-constraints (component &optional kind)
   (do-blocks (block component)

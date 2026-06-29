@@ -111,8 +111,15 @@
 (defparameter *strings*
   (let ((h (make-hash-table :test 'equal)))
     (dolist (str (sb-vm:list-allocated-objects :all :test #'simple-string-p))
-      (setf (gethash (string str) h) t))
+      (setf (gethash str h) t
+            (gethash (string-upcase str) h) t
+            (gethash (string-downcase str) h) t)
+      (setq str (reverse str))
+      (setf (gethash str h) t
+            (gethash (string-upcase str) h) t
+            (gethash (string-downcase str) h) t))
     (loop for str being each hash-key of h collect str)))
+(format t "~&Using ~D strings for test~%" (length *strings*))
 
 (defun fill-table-from (table list)
   (dolist (key list table)
@@ -311,7 +318,7 @@
 ;;; and total number of actual insertions performed across threads
 ;;; should equal the total number of keys.
 (defun test-insert-same-keys-concurrently (tbl keys
-                                           &key (nthreads (floor test-util:*n-cpus* 2))
+                                           &key (nthreads (max 2 (floor test-util:*n-cpus* 2)))
                                                 ((:delete keys-to-delete)))
   (flet ((worker (sem &aux inserted)
            (sb-thread:wait-on-semaphore sem)
@@ -476,8 +483,9 @@
            (sb-vm:list-allocated-objects :read-only :type sb-vm:simple-base-string-widetag))
           0 1000))
 
-(test-util:with-test (:name :c-find-in-solist)
-  (let ((set (sb-lockless:make-so-set/addr))  )
+(test-util:with-test (:name :c-find-in-solist
+                            :skipped-on (and :gc-stress :arm64))
+  (let ((set (sb-lockless:make-so-set/addr)))
     (dolist (x *example-objects*)
       (sb-lockless:so-insert set x))
     (assert (not (sb-lockless:c-so-find/addr set 'random)))
@@ -593,3 +601,19 @@ Evaluation took:
   187,631,304 processor cycles
   22,077,904 bytes consed
 |#
+
+#+nil
+(let* ((t0 (get-internal-real-time))
+       (table (test-insert-to-synchronized-table 1 8 10))
+       (t1 (get-internal-real-time))
+       (sb-lockless::*desired-elts-per-bin* 9)
+       (solist (test-insert-to-lockfree-table 1 8 10))
+       (t2 (get-internal-real-time))
+       (et1 (- t1 t0))
+       (et2 (- t2 t1))
+       (deep-size-ht (deep-size table))
+       (deep-size-so (deep-size solist)))
+  (print table)
+  (print solist)
+  (format t "~&Speedup-ratio = ~F~%" (/ et1 et2))
+  (format t "Size ratio ~F~%" (/ deep-size-so deep-size-ht)))

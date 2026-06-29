@@ -12,9 +12,11 @@
 (in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
-  (:args (ptr :scs (any-reg)))
+  (:args (ptr :scs (any-reg descriptor-reg control-stack)))
   (:generator 1
-    (move csp-tn ptr)))
+    (if (sc-is ptr control-stack)
+        (load-stack-tn csp-tn ptr)
+        (move csp-tn ptr))))
 
 (define-vop (%%nip-values)
   (:args (last-nipped-ptr :scs (any-reg) :target dest)
@@ -119,6 +121,7 @@
   (:vop-var vop)
   (:node-var node)
   (:save-p :compute-only)
+  (:check-type t)
   (:generator 0
     (move list arg)
 
@@ -213,5 +216,38 @@
     (inst subs i i n-word-bytes)
     (inst ldr temp (@ context i))
     (inst str temp (@ start i))
+    (inst b :ne LOOP)
+    DONE))
+
+(define-vop (%more-arg-values-skip)
+  (:args (context :scs (descriptor-reg any-reg) :target src)
+         (skip :scs (any-reg immediate))
+         (num :scs (any-reg) :target count :to (:result 1)))
+  (:temporary (:sc any-reg :from (:argument 0)) src)
+  (:arg-types * positive-fixnum positive-fixnum)
+  (:temporary (:sc descriptor-reg) temp)
+  (:temporary (:sc any-reg) i)
+  (:results (start :scs (any-reg))
+            (count :scs (any-reg)))
+  (:generator 20
+    (sc-case skip
+      (immediate
+       (inst add src context (* (tn-value skip) n-word-bytes))
+       (inst subs i num (fixnumize (add-sub-immediate (tn-value skip)))))
+      (any-reg
+       (inst add src context (lsl skip (- word-shift n-fixnum-tag-bits)))
+       (inst subs i num skip)))
+    (unless (eq (tn-kind count) :unused)
+      (inst csel count zr-tn i :le))
+
+    (when (eq (tn-kind start) :unused)
+      (setf start tmp-tn))
+    (move start csp-tn)
+
+    (inst b :le DONE)
+    LOOP
+    (inst ldr temp (@ src 8 :post-index))
+    (inst str temp (@ csp-tn 8 :post-index))
+    (inst subs i i (fixnumize 1))
     (inst b :ne LOOP)
     DONE))

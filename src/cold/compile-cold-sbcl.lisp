@@ -75,7 +75,10 @@
        (sb-c:insert-step-conditions 0)
        ;; save FP and PC for alien calls -- or not
        (sb-c:alien-funcall-saves-fp-and-pc
-        ,(if (find :x86 sb-xc:*features*) 3 0)))))
+        ,(if (find :x86 sb-xc:*features*) 3 0))
+       ;; store coverage data
+       (sb-c:store-coverage-data
+        ,(if (find :sb-cover-for-internals sb-xc:*features*) 3 0)))))
 
 (defun in-target-cross-compilation-mode (fun)
   "Call FUN with everything set up appropriately for cross-compiling
@@ -93,8 +96,6 @@
     (proclaim-target-optimization)
     (funcall fun)))
 
-(setf *target-compile-file* #'sb-xc:compile-file)
-(setf *target-assemble-file* #'sb-c:assemble-file)
 (setf *in-target-compilation-mode-fn* #'in-target-cross-compilation-mode)
 
 ;; Update the xc-readtable
@@ -227,7 +228,8 @@
             (do-stems-and-flags (stem flags 2)
               (unless (position :not-target flags)
                 (format t "~&[~3D/~3D] ~40A" (incf n) total-files (stem-remap-target stem))
-                (let ((start (get-internal-real-time)))
+                (let ((start (get-internal-real-time))
+                      (sb-vm::*eager-tls-assignment* t))
                   (target-compile-stem stem flags)
                   (let ((elapsed (/ (- (get-internal-real-time) start)
                                     internal-time-units-per-second)))
@@ -249,6 +251,12 @@
      (sb-kernel::write-structure-definitions-as-text
       (sb-cold:find-bootstrap-file "output/defstructs.lisp-expr" t)))))
 (sb-kernel::show-ctype-ctor-cache-metrics)
+
+(let ((s (find-symbol "*RAW-CONST-HISTOGRAM*" "SB-VM")))
+  (when (and s (boundp s) (not (null (symbol-value s))))
+    (format t "~2&uword_t constants by popularity:~%")
+    (dolist (x (sort (copy-list (symbol-value s)) #'> :key 'cdr))
+      (format t "~4d ~16,'0x~%" (cdr x) (car x)))))
 
 (defun dump-some-ctype-hashsets ()
   (flet ((cells (hs) (sb-impl::hss-cells (sb-impl::hashset-storage hs))))

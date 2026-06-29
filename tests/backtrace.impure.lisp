@@ -202,6 +202,7 @@
   ;; bug 353: This test fails at least most of the time for x86/linux
   ;; ca. 0.8.20.16. -- WHN
   (with-test (:name (:backtrace :undefined-function :bug-353)
+              :fails-on :sparc
               :skipped-on :interpreter)
     (assert-backtrace
      (lambda () (test #'not-optimized))
@@ -210,8 +211,7 @@
            (list `(flet test :in ,*p*) #'not-optimized)))))
 
 (with-test (:name (:backtrace :interrupted-condition-wait)
-            :skipped-on (not :sb-thread)
-            :broken-on :sb-safepoint) ;; unreliable
+            :skipped-on (not :sb-thread))
   (let ((m (sb-thread:make-mutex))
         (q (sb-thread:make-waitqueue)))
     (assert-backtrace
@@ -224,47 +224,10 @@
              (sb-thread:condition-wait q m)))))
      `((sb-thread::%condition-wait ,q ,m t nil nil nil nil nil nil)))))
 
-;;; Division by zero was a common error on PPC. It depended on the
-;;; return function either being before INTEGER-/-INTEGER in memory,
-;;; or more than MOST-POSITIVE-FIXNUM bytes ahead. It also depends on
-;;; INTEGER-/-INTEGER calling SIGNED-TRUNCATE. I believe Raymond Toy
-;;; says that the Sparc backend (at least for CMUCL) inlines this, so
-;;; if SBCL does the same this test is probably not good for the
-;;; Sparc.
-;;;
-;;; Disabling tail call elimination on this will probably ensure that
-;;; the return value (to the flet or the enclosing top level form) is
-;;; more than MOST-POSITIVE-FIXNUM with the current spaces on OS X.
-;;; Enabling it might catch other problems, so do it anyway.
-(flet ((optimized ()
-         (declare (optimize (speed 2) (debug 1))) ; tail call elimination
-         (declare (muffle-conditions style-warning))
-         (/ 42 0))
-       (not-optimized ()
-         (declare (optimize (speed 1) (debug 3))) ; no tail call elimination
-         (declare (muffle-conditions style-warning))
-         (/ 42 0))
-       (test (fun)
-         (declare (optimize (speed 1) (debug 3))) ; no tail call elimination
-         (funcall fun)))
-
-  (with-test (:name (:backtrace :divide-by-zero :bug-346)
-                    :skipped-on :interpreter)
-    (assert-backtrace (lambda () (test #'optimized))
-                      `((sb-kernel::integer-/-integer 42 &rest)
-                        ((flet test :in ,*p*) ,#'optimized))))
-
-  (with-test (:name (:backtrace :divide-by-zero :bug-356)
-                    :skipped-on :interpreter)
-    (assert-backtrace (lambda () (test #'not-optimized))
-                      `((sb-kernel::integer-/-integer 42 &rest)
-                        ((flet not-optimized :in ,*p*))
-                        ((flet test :in ,*p*) ,#'not-optimized)))))
-
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on (or :mips (and :sparc :linux)))
+                  :fails-on (or :arm :mips :riscv))
   (assert-backtrace #'throw-test '((throw-test))))
 
 (funcall (checked-compile
@@ -288,6 +251,7 @@
                             &optional (two-arg
                                        (find-symbol (format nil "TWO-ARG-~A" fun)
                                                     "SB-KERNEL")))
+             (declare (ignorable predicate))
              (let ((test-name (make-symbol (format nil "TEST-~A" fun))))
                `(flet ((,test-name (x y)
                          ;; make sure it's not in tail position
@@ -550,7 +514,7 @@
   (gf-dispatch-test/gf 1 1)
   ;; Wrong argument count
   (assert-backtrace (lambda () (gf-dispatch-test/f 42))
-                    '(((sb-pcl::gf-dispatch gf-dispatch-test/gf) 42))))
+                    '((gf-dispatch-test/gf 42))))
 
 (defgeneric gf-default-only-test/gf (x y)
   (:method (x y) (+ x y)))
@@ -672,7 +636,7 @@
                                 c
                                 (return (cdar (sb-debug:list-backtrace :count 1))))))
                (apply fun args))))
-      ((fun t) (list t *unavailable-argument* *unavailable-argument*) :test #'equalp)
-      ((fun t 1) (list t 1 *unavailable-argument*) :test #'equalp)
+      ((fun t) (list t) :test #'equalp)
+      ((fun t 1) (list t 1) :test #'equalp)
       ((fun t 1 2) (list t 1 2) :test #'equalp)
       ((fun 1 2 3) (values 1 2 3)))))

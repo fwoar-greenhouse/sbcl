@@ -95,6 +95,8 @@
 (define-type-predicate simple-base-string-p simple-base-string)
 #+sb-unicode (define-type-predicate simple-character-string-p
                   (simple-array character (*)))
+(define-type-predicate simple-rank-1-array-*-p (simple-array * (*)))
+
 (define-type-predicate system-area-pointer-p system-area-pointer)
 
 (when-vop-existsp (:translate signed-byte-8-p)
@@ -116,12 +118,12 @@
 (define-type-predicate simd-pack-256-p simd-pack-256)
 (define-type-predicate weak-pointer-p weak-pointer)
 (define-type-predicate code-component-p code-component)
-#-(or x86 x86-64 arm64) (define-type-predicate lra-p lra)
 (define-type-predicate fdefn-p fdefn)
 ;;; Unlike the un-%'ed versions, these are true type predicates,
 ;;; accepting any type object.
 (define-type-predicate %standard-char-p standard-char)
 (define-type-predicate non-null-symbol-p (and symbol (not null)))
+(define-type-predicate string-designator-p string-designator)
 
 
 (defglobal *backend-type-predicates-grouped*
@@ -171,9 +173,8 @@
               'vector)))
 (declaim (simple-vector *backend-union-type-predicates*))
 
-(defun split-union-type-tests (type)
-  (let ((predicates *backend-union-type-predicates*)
-        (types (union-type-types type)))
+(defun split-union-type-tests (types)
+  (let ((predicates *backend-union-type-predicates*))
     (loop for x below (length predicates) by 2
           for union-types = (union-type-types (aref predicates x))
           when (subsetp union-types types :test #'type=)

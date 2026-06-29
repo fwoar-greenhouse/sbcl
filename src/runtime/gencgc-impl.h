@@ -9,10 +9,6 @@
  * files for more information.
  */
 
-#ifndef GENCGC_IS_PRECISE
-#error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
-#endif
-
 /* One bit of page_words_t is the need_zerofill flag.
  * That leaves 15 bits to store page_words_used. This can represent
  * a page size of up to 64KiB on 32-bit and 128KiB on 64-bit.
@@ -66,9 +62,9 @@ struct page {
      */
 #if CONDENSED_PAGE_TABLE
     // The low bit of the offset indicates the scale factor:
-    // 0 = double-lispwords, 1 = gc cards. Large objects are card-aligned,
+    // 0 = double-lispwords, 1 = gc cards. Large objects are page-aligned,
     // and this representation allows for a 32TB contiguous block using 32K
-    // card size. Larger allocations will have pages that can't directly
+    // page size. Larger allocations will have pages that can't directly
     // store the full offset. That has to be dealt with by the accessor.
     unsigned int scan_start_offset_;
 #else
@@ -114,21 +110,6 @@ struct page {
     generation_index_t gen;
 };
 extern struct page *page_table;
-extern page_index_t page_table_pages;
-
-/* Find the page index within the page_table for the given
- * address. Return -1 on failure. */
-static inline page_index_t find_page_index(void *addr)
-{
-    if (addr >= (void*)DYNAMIC_SPACE_START) {
-        page_index_t index = ((uintptr_t)addr -
-                              (uintptr_t)DYNAMIC_SPACE_START) / GENCGC_PAGE_BYTES;
-        if (index < page_table_pages)
-            return (index);
-    }
-    return (-1);
-}
-extern char *page_address(page_index_t);
 
 /* New objects are allocated to PAGE_TYPE_MIXED or PAGE_TYPE_CONS */
 /* If you change these constants, then possibly also change the following
@@ -275,7 +256,7 @@ struct __attribute__((packed)) corefile_pte {
  *
  */
 extern unsigned char *gc_card_mark;
-extern long gc_card_table_mask;
+extern sword_t gc_card_table_mask;
 #define addr_to_card_index(addr) ((((uword_t)addr)>>GENCGC_CARD_SHIFT) & gc_card_table_mask)
 #define page_to_card_index(n) addr_to_card_index(page_address(n))
 
@@ -325,6 +306,51 @@ gc_general_alloc(struct alloc_region* region, sword_t nbytes, int page_type)
 }
 lispobj copy_potential_large_object(lispobj object, sword_t nwords,
                                    struct alloc_region*, int page_type);
+
+#define compacting_p() (from_space>=0)
+
+#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
+
+extern unsigned char* gc_page_pins;
+static inline bool pinned_p(lispobj obj, page_index_t page)
+{
+    extern struct hopscotch_table pinned_objects;
+    // Single-object pages can be pinned, but the object doesn't go
+    // in the hashtable. pinned_p can be queried on those pages,
+    // but the answer is always 'No', because if pinned, the page would
+    // already have had its generation changed to newspace.
+    if (page_single_obj_p(page)) return 0;
+
+    unsigned char pins = gc_page_pins[page];
+    if (!pins) return 0;
+    unsigned addr_lowpart = obj & (GENCGC_PAGE_BYTES-1);
+    // Divide the page into 8 parts, see whether that part is pinned.
+    unsigned subpage = addr_lowpart / (GENCGC_PAGE_BYTES/8);
+    return (pins & (1<<subpage)) && hopscotch_containsp(&pinned_objects, obj);
+}
+
+extern generation_index_t from_space, new_space;
+// Return true only if 'obj' must be *physically* transported to survive gc.
+// Return false if obj is in the immobile space regardless of its generation.
+// Pretend pinned objects are not in oldspace so that they don't get moved.
+static bool __attribute__((unused))
+from_space_p(lispobj obj)
+{
+    gc_dcheck(compacting_p());
+    page_index_t page_index = find_page_index((void*)obj);
+    // NOTE: It is legal to access page_table at index -1,
+    // and the 'gen' of page -1 is an otherwise unused value.
+    return page_table[page_index].gen == from_space && !pinned_p(obj, page_index);
+}
+
+static bool __attribute__((unused)) new_space_p(lispobj obj)
+{
+    gc_dcheck(compacting_p());
+    page_index_t page_index = find_page_index((void*)obj);
+    // NOTE: It is legal to access page_table at index -1,
+    // and the 'gen' of page -1 is an otherwise unused value.
+    return page_table[page_index].gen == new_space;
+}
 
 #define CHECK_COPY_PRECONDITIONS(object, nwords) \
     gc_dcheck(is_lisp_pointer(object)); \
@@ -564,7 +590,6 @@ extern char * gc_logfile;
 extern void log_generation_stats(char *logfile, char *header);
 extern void print_generation_stats(void);
 extern double generation_average_age(generation_index_t);
-#define PAGE_INDEX_FMT PRIdPTR
 static inline os_vm_size_t npage_bytes(page_index_t npages)
 {
     gc_assert(npages>=0);
@@ -607,7 +632,7 @@ set_page_scan_start_offset(page_index_t index, os_vm_size_t offset)
 {
     // If the offset is nonzero and page-aligned
     unsigned int lsb = offset !=0 && IS_ALIGNED(offset, GENCGC_PAGE_BYTES);
-    os_vm_size_t scaled = (offset >> (lsb ? GENCGC_CARD_SHIFT-1 : WORD_SHIFT)) | lsb;
+    os_vm_size_t scaled = (offset >> (lsb ? GENCGC_PAGE_SHIFT-1 : WORD_SHIFT)) | lsb;
     if (scaled > SCAN_START_OFS_MAX) {
         // Assert that if offset exceed the max representable value,
         // then it is a page-aligned offset, not a cons-aligned offset.
@@ -630,7 +655,7 @@ static os_vm_size_t scan_start_offset_iterated(page_index_t index)
         offset = page_table[lookback_page].scan_start_offset_;
         tot_offset_in_pages += offset >> 1;
     } while (offset == SCAN_START_OFS_MAX);
-    return (os_vm_size_t)tot_offset_in_pages << GENCGC_CARD_SHIFT;
+    return (os_vm_size_t)tot_offset_in_pages << GENCGC_PAGE_SHIFT;
 }
 
 static os_vm_size_t  __attribute__((unused)) page_scan_start_offset(page_index_t index)
@@ -638,7 +663,7 @@ static os_vm_size_t  __attribute__((unused)) page_scan_start_offset(page_index_t
     return page_table[index].scan_start_offset_ != SCAN_START_OFS_MAX
         ? (os_vm_size_t)(page_table[index].scan_start_offset_ & ~1)
           << ((page_table[index].scan_start_offset_ & 1) ?
-              (GENCGC_CARD_SHIFT-1) : WORD_SHIFT)
+              (GENCGC_PAGE_SHIFT-1) : WORD_SHIFT)
         : scan_start_offset_iterated(index);
 }
 
@@ -745,72 +770,16 @@ static inline void ensure_region_closed(struct alloc_region *alloc_region,
         gc_close_region(alloc_region, page_type);
 }
 
-#define compacting_p() (from_space>=0)
-
-#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
-
-extern unsigned char* gc_page_pins;
-#ifdef RETURN_PC_WIDETAG
-#include "code.h" // for fun_code_header
-#endif
-static inline bool pinned_p(lispobj obj, page_index_t page)
-{
-    extern struct hopscotch_table pinned_objects;
-    // Single-object pages can be pinned, but the object doesn't go
-    // in the hashtable. pinned_p can be queried on those pages,
-    // but the answer is always 'No', because if pinned, the page would
-    // already have had its generation changed to newspace.
-    if (page_single_obj_p(page)) return 0;
-
-#ifdef RETURN_PC_WIDETAG
-    // Yet another complication from the despised LRA objects- with the
-    // refinement of 8 pin bits per page, we either must set all possible bits
-    // for a simple-fun, or map LRAs to the code base address.
-    if (widetag_of(native_pointer(obj)) == RETURN_PC_WIDETAG) {
-        // The hash-table stores tagged pointers.
-        obj = make_lispobj(fun_code_header((struct simple_fun*)native_pointer(obj)),
-                           OTHER_POINTER_LOWTAG);
-        page = find_page_index((void*)obj);
-    }
-#endif
-
-    unsigned char pins = gc_page_pins[page];
-    if (!pins) return 0;
-    unsigned addr_lowpart = obj & (GENCGC_PAGE_BYTES-1);
-    // Divide the page into 8 parts, see whether that part is pinned.
-    unsigned subpage = addr_lowpart / (GENCGC_PAGE_BYTES/8);
-    return (pins & (1<<subpage)) && hopscotch_containsp(&pinned_objects, obj);
-}
-
-extern generation_index_t from_space, new_space;
-// Return true only if 'obj' must be *physically* transported to survive gc.
-// Return false if obj is in the immobile space regardless of its generation.
-// Pretend pinned objects are not in oldspace so that they don't get moved.
-static bool __attribute__((unused))
-from_space_p(lispobj obj)
-{
-    gc_dcheck(compacting_p());
-    page_index_t page_index = find_page_index((void*)obj);
-    // NOTE: It is legal to access page_table at index -1,
-    // and the 'gen' of page -1 is an otherwise unused value.
-    return page_table[page_index].gen == from_space && !pinned_p(obj, page_index);
-}
-
-static bool __attribute__((unused)) new_space_p(lispobj obj)
-{
-    gc_dcheck(compacting_p());
-    page_index_t page_index = find_page_index((void*)obj);
-    // NOTE: It is legal to access page_table at index -1,
-    // and the 'gen' of page -1 is an otherwise unused value.
-    return page_table[page_index].gen == new_space;
-}
-
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 struct fixedobj_page { // 8 bytes per page
     unsigned int free_index; // index is in bytes. 4 bytes
     union immobile_page_attr {
       int packed;
       struct {
+        // The only "flags" indicate the write-protect status. They used to
+        // also indicate the nature of objects stored on a page, distinguishing
+        // interned symbols from uninterned symbols for example.
+        // Revision 6a080ae2 did away with such usage.
         unsigned char flags;
         unsigned char obj_align; // object spacing expressed in lisp words
         unsigned char unused1;
@@ -823,11 +792,9 @@ extern struct fixedobj_page *fixedobj_pages;
 #define fixedobj_page_obj_align(i) (fixedobj_pages[i].attr.parts.obj_align<<WORD_SHIFT)
 #endif
 
-extern page_index_t next_free_page;
-
 extern uword_t
-walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),
-                generation_index_t generation, uword_t extra);
+walk_generation(uword_t (*proc)(lispobj*,lispobj*,void*),
+                generation_index_t generation, void* extra);
 
 generation_index_t gc_gen_of(lispobj obj, int defaultval);
 

@@ -20,15 +20,12 @@
 #include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
-#include "dynbind.h"
 #include "thread.h"
 #include "interr.h"
 #include "genesis/symbol.h"
-#include "genesis/binding.h"
 
 /* Specially bind SYMBOL to VALUE. In a multithreaded build, SYMBOL must already
-   have been assigned a thread-local storage index. See *KNOWN-TLS-SYMBOLS* in
-   compiler/generic/genesis for the symbols whose indices are pre-assigned. */
+   have been assigned a thread-local storage index. */
 #ifdef LISP_FEATURE_SB_THREAD
 #define value_address(thing, thread) (lispobj*)(thing + (char*)thread)
 void bind_tls_cell(unsigned symbol, lispobj value, void *th)

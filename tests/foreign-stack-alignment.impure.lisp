@@ -13,10 +13,6 @@
 
 (use-package :sb-alien)
 
-;;; Callbacks are not part of the exported interface yet -- when they are this can
-;;; go away.
-(import 'sb-alien::alien-lambda)
-
 (defun run (program &rest arguments)
   (let* ((stringstream (make-string-output-stream))
          (proc (run-program program arguments
@@ -29,14 +25,14 @@
              output))
     output))
 (defun cc (&rest arguments)
-  (apply #'run #+unix "./run-compiler.sh" #+win32 "gcc" arguments))
+  (apply #'run #+unix "./run-compiler.sh" #+win32 (or #+arm64 "clang" "gcc") arguments))
 
 (defvar *required-alignment*
   (or #+arm 8
       #+mips 8
       #+(and ppc darwin) 16
       #+(and ppc (not darwin)) 8
-      #+(or arm64 x86 x86-64 riscv ppc64) 16
+      #+(or arm64 x86 x86-64 riscv ppc64 loongarch64) 16
       #+sparc 8
       (error "Unknown platform")))
 
@@ -74,8 +70,9 @@
 #+alien-callbacks
 (with-test (:name :callback)
   (assert (= *good-offset*
-             (trampoline (alien-lambda int ()
-                           (stack-alignment-offset *required-alignment*))))))
+             (with-alien-callable ((callback int ()
+                                     (stack-alignment-offset *required-alignment*)))
+               (trampoline callback)))))
 
 (ignore-errors (delete-file *exename*))
 (ignore-errors (delete-file *soname*))

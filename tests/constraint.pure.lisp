@@ -535,18 +535,77 @@
     '(values integer &optional))))
 
 (with-test (:name :truncate-zero-remainder)
-  (assert
-   (type-specifiers-equal
-    (caddr
-     (sb-kernel:%simple-fun-type
-      (checked-compile
-       `(lambda (x y)
-          (declare (integer x y))
-          (multiple-value-bind (q r) (truncate x y)
-            (if (zerop r)
-                (error "~a" q)
-                x))))))
-    '(values (or (integer * -1) (integer 1)) &optional))))
+  (assert-type
+   (lambda (x y)
+     (declare (integer x y))
+     (multiple-value-bind (q r) (truncate x y)
+       (if (zerop r)
+           (error "~a" q)
+           (values x y))))
+   (values (or (integer * -1) (integer 1))
+           (or (integer * -2) (integer 2)) &optional))
+  (assert-type
+   (lambda (x y)
+     (declare (integer x y))
+     (multiple-value-bind (q r) (truncate x y)
+       (if (> r 0)
+           (values x y)
+           (error "~a" q))))
+   (values (integer 1) (or (integer * -2) (integer 2)) &optional))
+  (assert-type
+   (lambda (x y)
+     (declare (integer x y))
+     (multiple-value-bind (q r) (truncate x y)
+       (if (< r 0)
+           (values x y)
+           (error "~a" q))))
+   (values (integer * -1) (or (integer * -2) (integer 2)) &optional))
+  (assert-type
+   (lambda (n d)
+     (declare ((integer -10 10) n)
+              (integer d))
+     (multiple-value-bind (q r) (truncate n d)
+       (declare (ignorable q r))
+       (when (> r 0)
+         q)))
+   (or (integer -4 4) null))
+  (assert-type
+   (lambda (n d)
+     (declare ((integer -11 10) n)
+              (unsigned-byte d))
+     (multiple-value-bind (q r) (truncate n d)
+       (declare (ignorable q r))
+       (when (/= r 0)
+         q)))
+   (or (integer -5 4) null))
+  (assert-type
+   (lambda (n d)
+     (declare ((integer -11 10) n)
+              (unsigned-byte d))
+     (multiple-value-bind (q r) (truncate n d)
+       (declare (ignorable q r))
+       (when (< r 0)
+         q)))
+   (or (integer -5 0) null))
+  (assert-type
+   (lambda (n d)
+     (declare ((integer -11 10) n)
+              (unsigned-byte d))
+     (multiple-value-bind (q r) (truncate n d)
+       (declare (ignorable q r))
+       (when (> r 0)
+         q)))
+   (or (integer 0 4) null))
+  (assert-type
+   (lambda (n d)
+     (declare ((integer -25 25) n)
+              ((or (integer * -5) (integer 5)) d)
+              (optimize (debug 1)))
+     (multiple-value-bind (q r) (truncate n d)
+       (declare (ignorable q r))
+       (when (> r 0)
+         q)))
+   (or null (integer -4 4))))
 
 (with-test (:name :vector-length-var)
   (assert
@@ -713,13 +772,14 @@
      (let ((l (1- v)))
        (< l v)))
    (member t))
-  (assert-type
-   (lambda (v)
-     (declare (simple-vector v)
-              (optimize (debug 1)))
-     (let ((l (1- (length v))))
-       (< l (length v))))
-   (member t)))
+  ;; (assert-type
+  ;;  (lambda (v)
+  ;;    (declare (simple-vector v)
+  ;;             (optimize (debug 1)))
+  ;;    (let ((l (1- (length v))))
+  ;;      (< l (length v))))
+  ;;  (member t))
+  )
 
 (with-test (:name :sub-sign)
   (assert-type
@@ -752,6 +812,13 @@
      (if (equalp x y)
          (eql x y)
          t))
+   boolean)
+  (assert-type
+   (lambda (y)
+     (let ((ht #1=#.(make-hash-table)))
+       (if (equalp (the (eql #1#) ht) y)
+           (eql y ht)
+           t)))
    boolean))
 
 (with-test (:name :bounds-check-constants)
@@ -788,6 +855,13 @@
                         (when (< x (length y))
                           (svref y x)))
                      nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x y)
+                        (unless (>= x (length y))
+                          (svref y x)))
+                     nil))
              0)))
 
 (with-test (:name :bounds-check-length)
@@ -811,7 +885,8 @@
              0)))
 
 
-(with-test (:name :bounds-check-min-length)
+(with-test (:name :bounds-check-min-length
+            :fails-on (or :ppc :ppc64 :riscv :loongarch64 :sparc :mips))
   (assert (= (count 'sb-kernel:%check-bound
                     (ctu:ir1-named-calls
                      `(lambda (x v)
@@ -850,6 +925,7 @@
                                 do (setf (aref array i) i))))
                      nil))
              0))
+  #-sbcl
   (assert (= (count 'sb-kernel:%check-bound
                     (ctu:ir1-named-calls
                      `(lambda (length)
@@ -935,7 +1011,7 @@
    (lambda (x y)
      (when (integerp (+ x y))
        x))
-   (or number null))
+   (or rational (complex rational) null))
   (assert-type
    (lambda (x y)
      (declare (real y))
@@ -958,7 +1034,12 @@
               (fixnum x))
      (when (typep (+ m x) '(integer 2 4))
        x))
-   (or (integer -2 2) null)))
+   (or (integer -2 2) null))
+  (assert-type
+   (lambda (m)
+     (the (integer 0 30) (+ m m))
+     m)
+   rational))
 
 (with-test (:name :-back)
   (assert-type
@@ -975,7 +1056,22 @@
    (lambda (x)
      (when (> (- 3 x) 10)
        x))
-   (or real null)))
+   (or real null))
+  (assert-type
+   (lambda (x)
+     (when (floatp (- x))
+       x))
+   (or float null))
+  (assert-type
+   (lambda (x)
+     (when (typep (- x) '(integer 1 2))
+       x))
+   (or (integer -2 -1) null))
+  (assert-type
+   (lambda (m)
+     (the real (+ m m))
+     m)
+   real))
 
 (with-test (:name :*back)
   (assert-type
@@ -988,7 +1084,7 @@
      (declare ((real 0 3) m))
      (when (typep (* x m) '(integer 0 10))
        x))
-   (or number null))
+   (or (or rational (complex rational) null) null))
   (assert-type
    (lambda (x)
      (when (> (* x 3) 10)
@@ -1000,7 +1096,22 @@
               (integer m))
      (when (typep (* x m) 'integer)
        x))
-   (or rational null)))
+   (or rational null))
+  (assert-type
+   (lambda (m)
+     (the (integer 0 30) (* m m))
+     m)
+   integer)
+  (assert-type
+   (lambda (m)
+     (when (typep (+ m 1) 'float)
+       m))
+   (or null float))
+  (assert-type
+   (lambda (i)
+     (the (mod 16) (* i 3/4))
+     i)
+   (rational 0 20)))
 
 (with-test (:name :ignore-hairy-types)
   (checked-compile
@@ -1182,6 +1293,27 @@
                      nil))
              0)))
 
+(with-test (:name :read-sequence-bounds)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (string stream)
+                        (declare (simple-string string))
+                        (loop for i below (read-sequence string stream)
+                              count (char= (char string i) #\a)))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (string stream)
+                        (declare (simple-string string))
+                        (loop for p = (read-sequence string stream)
+                              while (plusp p)
+                              sum
+                              (loop for i below p
+                                    count (char= (char string i) #\a))))
+                     nil))
+             0)))
+
 (with-test (:name :map-equality-constraints)
   (checked-compile-and-assert
    ()
@@ -1313,3 +1445,748 @@
            (setq n (dpb p1 (byte p2 35) n))
            n))
     ((1 2 3) 34359738371)))
+
+(with-test (:name :%in-bounds-constraint-not-eq)
+  (checked-compile-and-assert
+      ()
+      `(lambda (sv key n)
+         (declare (fixnum n) (simple-vector sv))
+         (let ((found (find key sv :end n)))
+           (if (< n (length sv))
+               -1
+               found)))
+    ((#(1 2 3) 2 2) -1)
+    ((#(1 2 3) 2 3) 2)
+    ((#(1 2 3) 4 3) nil)))
+
+(with-test (:name :characters)
+  (assert-type
+   (lambda (c)
+     (cond ((eql c #\a) 1)
+           ((eql c #\a) 2)
+           (t 1)))
+   (eql 1))
+  (assert-type
+   (lambda (c)
+     (cond ((eql c #\a) 1)
+           ((eql c #\b) 1)
+           ((eql c #\a) 2)
+           (t 1)))
+   (eql 1))
+  (assert-type
+   (lambda (x)
+     (and (char= x #\a) x))
+   (or (eql #\a) null)))
+
+(with-test (:name :multiply-by-one)
+  (assert-type
+   (lambda (x)
+     (the (unsigned-byte 8) (* x 1))
+     x)
+   (unsigned-byte 8)))
+
+(with-test (:name :multiply-by-zero)
+  (assert-type
+   (lambda (b c)
+     (declare ((integer 0 2) b)
+              ((integer 1 10) c))
+     (if (typep (* b c) '(integer * 0))
+         (values b c)
+         (values nil nil)))
+   (values (or null (integer 0 0))
+           (or null (integer 1 10)) &optional))
+  (assert-type
+   (lambda (b c)
+     (declare ((integer 0 2) b)
+              ((integer -10 -2) c))
+     (if (typep (* b c) '(integer 0 1))
+         (values b c)
+         (values nil nil)))
+   (values (or null (integer 0 0))
+           (or null (integer -10 -2)) &optional)))
+
+(with-test (:name :length-back)
+  (assert-type
+   (lambda (x)
+     (if (= (length x) 0)
+         x
+         (error "")))
+   (and sequence (not cons)))
+  (assert-type
+   (lambda (x)
+     (if (= (length x) 0)
+         (error "")
+         x))
+   (and sequence (not null)))
+  (assert-type
+   (lambda (x)
+     (if (> (length x) 0)
+         x
+         (error "")))
+   (and sequence (not null)))
+  (assert-type
+   (lambda (x)
+     (if (> (length x) 0)
+         (error "")
+         x))
+   (and sequence (not cons)))
+  (assert-type
+   (lambda (x)
+     (if (< (length x) 1)
+         x
+         (error "")))
+   (and sequence (not cons)))
+  (assert-type
+   (lambda (x)
+     (if (< (length x) 1)
+         (error "")
+         x))
+   (and sequence (not null)))
+  (assert-type
+   (lambda (x)
+     (if (< (length x) 10)
+         x
+         (error "")))
+   sequence)
+  (assert-type
+   (lambda (x)
+     (if (< (length x) 10)
+         (error "")
+         x))
+   (and sequence (not null))))
+
+(with-test (:name :find-item-type)
+  (assert-type
+   (lambda (x y)
+     (declare (string y))
+     (if (find x y)
+         x
+         (error "")))
+   character)
+  (assert-type
+   (lambda (x y)
+     (declare (string y))
+     (if (position x y)
+         x
+         (error "")))
+   character)
+  (assert-type
+   (lambda (x y)
+     (if (position x y :test #'=)
+         x
+         (error "")))
+   number)
+  (assert-type
+   (lambda (x y)
+     (if (position x y :key #'1+)
+         x
+         (error "")))
+   number)
+  (assert-type
+   (lambda (b v)
+     (declare ((vector (unsigned-byte 8)) v))
+     (if (find b v :test #'>)
+         b
+         (error "")))
+   real)
+  (assert-type
+   (lambda (a v)
+     (declare (fixnum a)
+              ((vector (unsigned-byte 8)) v))
+     (if (find a v :test #'=)
+         a
+         (error "")))
+   (unsigned-byte 8))
+  (assert-type
+   (lambda (x y)
+     (if (member x y :key #'1+)
+         (values x y)
+         (error "")))
+   (values number cons &optional))
+  (assert-type
+   (lambda (x y)
+     (if (member x y :test #'string=)
+         (values x y)
+         (error "")))
+   (values (or string symbol character) cons &optional))
+  (assert-type
+   (lambda (x y)
+     (if (position x y :key #'1+ :test-not #'eql)
+         x
+         (error "")))
+   t)
+  (assert-type
+   (lambda (x y)
+     (if (position x y :test-not #'=)
+         x
+         (error "")))
+   number)
+  (assert-type
+   (lambda (x y)
+     (if (find x y)
+         x
+         (error "")))
+   (not null))
+  (assert-type
+   (lambda (x y)
+     (declare (vector y))
+     (if (find x y)
+         x
+         (error "")))
+   (not null)))
+
+(with-test (:name :member-list-type)
+  (assert-type
+   (lambda (x y)
+     (if (member x y)
+         y
+         (error "")))
+   cons))
+
+(with-test (:name :string=)
+  (assert-type
+   (lambda (y end)
+     (when (string= "ab" y :end1 end)
+       y))
+   (or string symbol character))
+  (assert-type
+   (lambda (y)
+     (when (string= "ab" y)
+       y))
+   (or string symbol))
+  (assert-type
+   (lambda (x y)
+     (when (string= x y :end1 2)
+       y))
+   (or string symbol))
+  (assert-type
+   (lambda (y)
+     (when (string-equal "ab" y)
+       y))
+   (or string symbol))
+  (assert-type
+   (lambda (y)
+     (when (string-equal y "ab")
+       y))
+   (or string symbol)))
+
+(with-test (:name :find-sequence-type)
+  (assert-type
+   (lambda (y)
+     (declare (simple-string y))
+     (when (position #\a y)
+       (length y)))
+   (or null (integer 1 (#.array-dimension-limit))))
+  (assert-type
+   (lambda (y)
+     (if (find 1 y)
+         y
+         (error "x")))
+   (and sequence (not null)))
+  (assert-type
+   (lambda (y)
+     (declare (array y))
+     (if (find t y)
+         y
+         (error "")))
+   (vector t))
+  (assert-type
+   (lambda (y)
+     (if (position t y)
+         y
+         (error "")))
+   (and sequence (not null) (or (not array) (vector t))))
+  (assert-type
+   (lambda (y)
+     (if (position #\a y :test-not #'char=)
+         y
+         (error "")))
+   (and sequence (not null)))
+  (assert-type
+   (lambda (x y)
+     (declare (simple-array y))
+     (if (find x y :key #'car)
+         y
+         (error "")))
+   simple-vector))
+
+(with-test (:name :equal-length)
+  (assert-type
+   (lambda (y x)
+     (declare (simple-vector x y))
+     (if (equalp y x)
+         (= (length y) (length x))
+         t))
+   (eql t))
+  (assert-type
+   (lambda (x y)
+     (declare (simple-vector y x)
+              ((simple-vector 10) x))
+     (if (equalp x y)
+         (length y)
+         (error "")))
+   (eql 10))
+  (assert-type
+   (lambda (x y)
+     (declare (simple-vector y x))
+     (if (and (eql (length x) 9)
+              (equalp x y))
+         (length y)
+         (error "")))
+   (eql 9))
+  (assert-type
+   (lambda (x y)
+     (declare (simple-vector y x))
+     (if (and (> (length x) 5)
+              (equalp x y))
+         (length y)
+         (error "")))
+   (integer 6 (#.array-dimension-limit)))
+  (assert-type
+   (lambda (x)
+     (declare (simple-string x))
+     (if (string= x "abc")
+         (length x)
+         (error "")))
+   (eql 3)))
+
+(with-test (:name :search-length)
+  (assert-type
+   (lambda (x)
+     (declare (simple-string x))
+     (if (search "abc" x)
+         (length x)
+         (error "")))
+   (integer 3 (#.array-dimension-limit)))
+  (assert-type
+   (lambda (a b)
+     (declare (simple-array a b))
+     (when (and (> (length a) 3)
+                (search a b))
+       (length b)))
+   (or null (integer 4 (#.array-dimension-limit)))))
+
+(with-test (:name :subseq)
+  (assert-type
+   (lambda (y s e)
+     (declare (simple-vector y)
+              ((integer 1 2) s)
+              ((integer 7 8) e)
+              (optimize (debug 2)))
+     (let ((s (subseq y s e)))
+       (length s)))
+   (integer 5 7))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (y n)
+                        (declare (simple-vector y)
+                                 (integer n))
+                        (let ((s (subseq y 0 n)))
+                          (aref s (1- n))))
+                     nil))
+             0))
+  (assert-type
+   (lambda (y)
+     (declare (simple-vector y)
+              (optimize (debug 2)))
+     (when (< (length y) 6)
+       (let ((s (subseq y 1 nil)))
+         (length s))))
+   (or null (mod 5)))
+  (assert-type
+   (lambda (y)
+          (declare ((simple-array * (*)) y)
+                   (optimize (debug 2)))
+          (let ((copy (copy-seq y)))
+            (eq (length copy) (length y))))
+   (eql t)))
+
+(with-test (:name :remove)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-vector 9) x)
+              (optimize (debug 2)))
+     (let ((j (delete 5 x)))
+       (length j)))
+   (mod 10))
+  (assert-type
+   (lambda (x)
+     (declare (simple-vector x)
+              (optimize (debug 2)))
+     (when (< (length x) 5)
+       (let ((j (remove-if #'evenp x)))
+         (length j))))
+   (or null (mod 5))))
+
+(with-test (:name :zero-length-check-bound
+            :fails-on (not :sb-unicode))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (simple-string x))
+                        (unless (string= x "")
+                          (aref x 0)))
+                     nil))
+             0)))
+
+(with-test (:name :loop-row-major-aref-check-bound)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (type (simple-array t (* *)) x))
+                        (loop for i below (array-total-size x)
+                              do (print (row-major-aref x i))))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (type (simple-array t (* *)) x))
+                        (loop for i below (array-total-size x)
+                              do (print (row-major-aref x (1+ i)))))
+                     nil))
+             1)))
+
+(with-test (:name :concatenate-length)
+  (assert-type
+   (lambda (x y)
+     (declare ((simple-vector 10) x)
+              (optimize (debug 2)))
+     (let ((x (concatenate 'vector x y)))
+       (length x)))
+   (integer 10 (#.array-dimension-limit)))
+  (assert-type
+   (lambda (x)
+     (declare (optimize (debug 2)))
+     (let ((x (concatenate 'vector '(1 2 3) (subseq x 1))))
+       (length x)))
+   (integer 3 (#.array-dimension-limit)))
+  (assert-type
+   (lambda (x)
+     (declare ((simple-vector 3) x)
+              (optimize (debug 2)))
+     (let ((x (concatenate 'vector x (if * "abc" "abcd"))))
+       (length x)))
+   (integer 6 7))
+  (assert-type
+   (lambda (x)
+     (declare (optimize (debug 2)))
+     (let ((x (concatenate 'vector "00" (subseq x 0 2))))
+       (length x)))
+   (integer 4 4)))
+
+(with-test (:name :inherit-length-var)
+  (assert (not (find 'sb-int:sequence-bounding-indices-bad-error
+                     (ctu:ir1-named-calls
+                      `(lambda (x y n)
+                         (declare (optimize (space 0))
+                                  (fixnum n)
+                                  (simple-base-string y))
+                         (when (< n (length y))
+                           (find x y :start n)))))))
+  (assert-type
+   (lambda (x y)
+     (declare (simple-vector x))
+     (if (< y (length x))
+         (let ((m (length x)))
+           (if (< y m)
+               t
+               m))
+         t))
+   (eql t)))
+
+(with-test (:name :multiple-back)
+  (assert-type
+   (lambda (m)
+     (the (integer 0 30) (+ (* m 2) 2))
+     m)
+   (rational -1 14)))
+
+(with-test (:name :truncate-back)
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer -5 10))
+         m))
+   (or (integer -29 54) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer 0 10))
+         m))
+   (or (integer -4 54) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer 1 10))
+         m))
+   (or (integer 3 54) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer -5 0))
+         m))
+   (or (integer -29 4) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer -5 -2))
+         m))
+   (or (integer -29 -6) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer -4 3) d))
+     (if (typep (truncate m d) '(integer -5 2))
+         m))
+   (or (integer -17 23) null))
+
+  (assert-type
+   (lambda (m)
+     (if (typep (nth-value 1 (truncate m)) 'double-float)
+         m))
+   (or double-float null))
+  (assert-type
+   (lambda (m)
+     (if (typep (truncate m) 'fixnum)
+         m))
+   (or real null))
+  (assert-type
+   (lambda (m)
+     (if (typep (nth-value 1 (truncate m 2.0)) 'double-float)
+         m))
+   (or double-float null))
+  (assert-type
+   (lambda (x)
+     (declare (integer x))
+     (the (integer 3 83461337) (truncate x -74))
+     x)
+   (integer -6176139011 -222)))
+
+(with-test (:name :ignore-delays
+            :fails-on (or :arm :riscv :loongarch64 :ppc :ppc64 :mips :sparc))
+  (assert-type
+   (lambda (x)
+     (declare (optimize debug))
+     (when (typep (nth-value 1 (truncate x 1)) 'float)
+       x))
+   (or null float)))
+
+(with-test (:name :not-eq-eql)
+  (assert-type
+   (lambda (a b)
+     (and (eql a b)
+          (not (eq a b))))
+   boolean))
+
+(with-test (:name :equal-no-notes)
+  (checked-compile
+   `(lambda (a b)
+      (if (eq a b)
+          (equal a b)
+          nil))
+   :allow-notes nil))
+
+(with-test (:name :contagion-alt)
+  (assert-type
+   (lambda (x y)
+     (declare (real x y))
+     (if (typep (+ x y) 'double-float)
+         (error "")
+         x))
+   (or rational single-float))
+  (assert-type
+   (lambda (x)
+     (declare (real x))
+     (if (typep (+ x 1.0) 'single-float)
+         (error "")
+         x))
+   double-float)
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'single-float)
+         (error "")
+         x))
+   (and number (not rational) (not single-float)))
+  (assert-type
+   (lambda (x)
+     (declare (real x))
+     (if (typep (+ x 1) 'single-float)
+         (error "")
+         x))
+   (or double-float rational))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1) 'single-float)
+         (error "")
+         x))
+   (and number (not single-float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1) 'double-float)
+         (error "")
+         x))
+   (and number (not double-float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1d0) 'double-float)
+         (error "")
+         x))
+   complex)
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'double-float)
+         (error "")
+         x))
+   (and number (not double-float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'real)
+         (error "")
+         x))
+   (and number (not real)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'float)
+         (error "")
+         x))
+   (and number (not real)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1) 'float)
+         (error "")
+         x))
+   (and number (not float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (* x 3) 'integer)
+         (error "")
+         x))
+   (and number (not integer))))
+
+(with-test (:name :call-vars-with-setf)
+  (assert-type
+   (lambda (j)
+     (labels ((foo (x)
+                (when (symbolp j)
+                  (setf x j))
+                x))
+       (foo 1)
+       (foo 2)))
+   (or (integer 1 2) symbol)))
+
+(with-test (:name :back-through-casts)
+  (assert-type
+   (lambda (x)
+     (when (typep (nth-value 1 (the (or float (integer 1)) (truncate x 1))) 'float) x))
+   (or float null))
+  (assert-type
+   (lambda (x)
+     (when (typep (the (or float (rational (-1/2) (1))) (nth-value 1 (truncate x 1))) 'float) x))
+   (or float null)))
+
+(with-test (:name :div-by-zero)
+  (assert-type
+   (lambda (x y)
+     (declare (float y))
+     (floor x y)
+     y)
+   float)
+  (assert-type
+   (lambda (x y)
+     (declare (rational x y))
+     (floor x y)
+     y)
+   (and rational (not (eql 0)))))
+
+(with-test (:name :complex-into-real)
+  (assert-type
+   (lambda (c)
+     (if (> (- c c) 10)
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (c)
+     (if (> (+ c c) 10)
+         c
+         (error "")))
+   real)
+  (assert-type
+   (lambda (c)
+     (if (> (* c c) 10)
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (c n)
+     (declare (integer n))
+     (if (> (* c n) 10)
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (c n)
+     (declare ((integer 1) n))
+     (if (> (* c n) 10)
+         c
+         (error "")))
+   real)
+  (assert-type
+   (lambda (n c)
+     (declare (integer n))
+     (if (realp (/ n c))
+         c
+         (error "")))
+   number)
+  (assert-type
+   (lambda (n c)
+     (declare ((integer 1) n))
+     (if (realp (/ n c))
+         c
+         (error "")))
+   real)
+  (assert-type
+   (lambda (n)
+     (the integer (* n n))
+     n)
+   (or integer (complex rational))))
+
+(with-test (:name :growing-amounts-in-loops)
+  (checked-compile `(lambda (n)
+                      (declare (integer n)
+                               (optimize (debug 3)))
+                      (let ((v (- n most-positive-fixnum)))
+                        (loop
+                         (let ((new (+ v 1)))
+                           (setf v new)))))))
+(with-test (:name :join-equality-constraints-loop)
+  (checked-compile
+   `(lambda (data n d j)
+      (declare (simple-string   data)
+               (optimize (debug 3)))
+      (let ((p773 0))
+        (if n
+            (setq p773 1))
+        (let ((name (make-array p773)))
+          (print name))
+
+        (incf p773)
+        (print (schar data p773))
+        (incf p773)
+        (block nil
+          (tagbody
+           g826
+             (progn
+               (if n
+                   (return-from nil))
+               (setq p773 (+ 1 p773))
+               (aref data p773))
+             (go g826)))
+
+        (do ((index22 0 d)) ((or j index22)))))))

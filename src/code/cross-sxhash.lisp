@@ -58,20 +58,17 @@
              most-positive-fixnum)))
 
 (defun sxhash-symbol-xform (s)
-  #-salted-symbol-hash `(symbol-hash ,s)
-  #+(and salted-symbol-hash 64-bit) `(let ((h (symbol-name-hash ,s))) (sb-int:mix h h))
-  #+(and salted-symbol-hash (not 64-bit)) `(symbol-name-hash ,s))
+  #+64-bit `(let ((h (symbol-name-hash ,s))) (sb-int:mix h h)) ; get 60ish bits from 32
+  #-64-bit `(symbol-name-hash ,s))
 ) ; end EVAL-WHEN
 
 (defun calc-symbol-name-hash (string length)
   ;; The reader passes a string buffer and length to avoid consing a new string
   ;; for each symbol read. That does not occur in cross-compilation.
   (assert (= length (length string)))
-  (cond #+(and 64-bit (not relocatable-static-space))
+  (cond #+64-bit
         ((string= string "NIL") ; :NIL must hash the same as NIL
-         ;; Return the high 4 bytes in NIL's car slot.
-         ;; out-of-order with defconstant nil-value
-         (ldb (byte 32 32) (sb-vm::get-nil-taggedptr)))
+         (sb-vm::get-nil-symbol-name-hash))
         (t
          (ldb (byte 32 0) ; discard high bits for 64-bit builds
               (logxor (%sxhash-simple-string string) most-positive-fixnum)))))
@@ -122,6 +119,7 @@
            ;; answer, but this makes it so it does.
            (single-float #.(sxhash-single-float-xform 'obj))
            (double-float #.(sxhash-double-float-xform 'obj)))))
+    #+nil
     (push (cons obj answer) *sxhash-crosscheck*)
     answer))
 
@@ -145,6 +143,27 @@
     (single-float (number-hash (single-float-bits x)))
     (double-float (mix (number-hash (double-float-low-bits x))
                        (number-hash (double-float-high-bits x))))))
+
+(defun descriptor-hash32 (obj)
+  (let* ((input-bits ; always an unsigned word
+          (etypecase obj
+            ((signed-byte #.sb-vm:n-fixnum-bits)
+             (logand (ash obj sb-vm:n-fixnum-tag-bits) sb-ext:most-positive-word))
+            (character
+             (logior (ash (sb-xc:char-code obj) sb-vm:n-widetag-bits) sb-vm:character-widetag))))
+         (output-bits
+          ;; All the 32-bit backends do the same thing: mask off the sign and 2 fixnum lowtag bits.
+          ;; Whatever that yields is interpreted as a fixnum.
+          #-64-bit (logand input-bits #x7FFFFFFC)
+          ;; x86-64 has 32 physical result bits, of which 31 are significant.
+          ;; (this can be done without using a raw constant as the mask)
+          #+x86-64 (ldb (byte 32 0) (logandc2 input-bits sb-vm:fixnum-tag-mask))
+          ;; All other 64-bit vops produce a 32-bit fixnum, which either needs one instruction
+          ;; (e.g. arm64) or more and I just don't care (e.g. ppc64 could do it using one rlwinm
+          ;; at the loss of 3 bits)
+          #+(and 64-bit (not x86-64))
+          (cl:mask-field (cl:byte 32 sb-vm:n-fixnum-tag-bits) input-bits)))
+    (ash output-bits (- sb-vm:n-fixnum-tag-bits))))
 
 (defun fallback-hash (x) ; only for HAIRY type specifier
   (etypecase x

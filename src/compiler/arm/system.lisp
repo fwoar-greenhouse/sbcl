@@ -13,6 +13,16 @@
 
 ;;;; Type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:generator 1
+    (inst bic res arg fixnum-tag-mask)
+    (inst bic res res #x80000000))) ; clear sign bit
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -130,15 +140,6 @@
        ;; maybe it should be promoted to an instruction-macro?
        (inst orr t1 t1 (ash (tn-value data) n-widetag-bits))))
     (storew t1 x 0 other-pointer-lowtag)))
-
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst bic res ptr fixnum-tag-mask)))
 
 ;;;; Allocation
 
@@ -156,7 +157,7 @@
   (:translate control-stack-pointer-sap)
   (:policy :fast-safe)
   (:generator 1
-    (load-csp int)))
+    (move int csp-tn)))
 
 ;;;; Code object frobbing.
 
@@ -217,7 +218,7 @@
   (:generator 1
     (inst debug-trap)
     (inst byte pending-interrupt-trap)
-    (emit-alignment word-shift)))
+    (emit-alignment 2)))
 
 (define-vop (halt)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) error-temp)
@@ -228,7 +229,7 @@
     (inst swi 0)
     (inst byte halt-trap)
     ;; Re-align to the next instruction boundary.
-    (emit-alignment word-shift)))
+    (emit-alignment 2)))
 
 ;;;; Dummy definition for a spin-loop hint VOP
 (define-vop ()
@@ -240,6 +241,4 @@
  (:info x)
  (:temporary (:sc unsigned-reg) tmp)
  (:generator 4
-   ;; Can't compute code-tn-relative index until the boxed header length
-   ;; is known. Some vops emit new boxed words via EMIT-CONSTANT.
    (inst store-coverage-mark x tmp)))

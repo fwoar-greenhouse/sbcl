@@ -38,7 +38,7 @@
   ;; :INITIAL-ELEMENT keyword)
   (initial-element-default (missing-arg) :read-only t)
   ;; how many bits per element
-  (n-bits (missing-arg) :type index :read-only t)
+  (n-bits (missing-arg) :type (mod 129) :read-only t)
   ;; the low-level type code (aka "widetag")
   (typecode (missing-arg) :type index :read-only t)
   ;; if an integer, a typecode corresponding to a complex vector
@@ -51,7 +51,7 @@
   ;; low level hackery (e.g., one element for arrays of BASE-CHAR,
   ;; which is used for a fixed #\NULL so that when we call out to C
   ;; we don't need to cons a new copy)
-  (n-pad-elements (missing-arg) :type index :read-only t))
+  (n-pad-elements (missing-arg) :type bit :read-only t))
 (declaim (freeze-type specialized-array-element-type-properties))
 
 (define-load-time-global *specialized-array-element-type-properties*
@@ -79,8 +79,8 @@
           #+sb-unicode
           (character ,(cl:code-char 0) 32 simple-character-string
                      :complex-typecode #.complex-character-string-widetag)
-          (single-float $0.0f0 32 simple-array-single-float)
-          (double-float $0.0d0 64 simple-array-double-float)
+          (single-float 0.0f0 32 simple-array-single-float)
+          (double-float 0.0d0 64 simple-array-double-float)
           (bit 0 1 simple-bit-vector
                :complex-typecode #.complex-bit-vector-widetag)
           ;; KLUDGE: The fact that these UNSIGNED-BYTE entries come
@@ -125,12 +125,12 @@
           (fixnum 0 64 simple-array-fixnum :fixnum-p t)
           #+64-bit
           ((signed-byte 64) 0 64 simple-array-signed-byte-64)
-          ((complex single-float) ,(complex $0f0 $0f0) 64
+          ((complex single-float) #C(0f0 0f0) 64
            simple-array-complex-single-float)
-          ((complex double-float) ,(complex $0d0 $0d0) 128
+          ((complex double-float) #C(0d0 0d0) 128
            simple-array-complex-double-float)
           #+long-float
-          ((complex long-float) ,(complex $0L0 $0L0) #+x86 192 #+sparc 256
+          ((complex long-float) #C(0L0 0L0) #+x86 192 #+sparc 256
            simple-array-complex-long-float)
           (t 0 #.n-word-bits simple-vector)))))
 
@@ -174,8 +174,9 @@
 ;;; Return the shift amount needed to turn length as number of elements
 ;;; into length as number of bits.
 (defun saetp-n-bits-shift (saetp)
-  (max (1- (integer-length (saetp-n-bits saetp)))
-       0)) ;; because of NIL
+  (if (zerop (saetp-n-bits saetp))
+      (1- sb-vm:n-word-bits) ;; nil-vector, will overflow modular arithmetic to zero.
+      (1- (integer-length (saetp-n-bits saetp)))))
 
 #-sb-xc-host ; not computable as constant in make-host-1
 (defconstant-eqx %%simple-array-n-bits-shifts%%
@@ -191,11 +192,6 @@
   #-sb-xc-host (if (= widetag simple-array-nil-widetag)
                    0
                    (ash 1 (aref %%simple-array-n-bits-shifts%% widetag))))
-
-(defun saetp-index-or-lose (element-type)
-  (or (position element-type sb-vm:*specialized-array-element-type-properties*
-                :key #'sb-vm:saetp-specifier :test #'equal)
-      (error "No saetp for ~S" element-type)))
 
 ;;; I don't understand why we didn't use this more often, instead of
 ;;; having introduced special cases. Oh well, what's done is done.

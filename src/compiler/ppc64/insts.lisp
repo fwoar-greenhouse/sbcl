@@ -326,6 +326,7 @@
       (bf :field ,(ppc-byte 6 8) :type 'crf)
       (bfa :field ,(ppc-byte 11 13) :type 'crf)
       (bi :field ,(ppc-byte 11 15) :type 'bi-field)
+      (bc :field ,(ppc-byte 21 25) :type 'bi-field)
       (bo :field ,(ppc-byte 6 10) :type 'bo-field)
       (bt :field ,(ppc-byte 6 10) :type 'bi-field)
       (d :field ,(ppc-byte 16 31) :sign-extend t)
@@ -415,7 +416,10 @@
 (def-ppc-iformat (d '(:name :tab rt "," d "(" ra ")"))
   rt ra d)
 
-(def-ppc-iformat (ds '(:name :tab rt "," ds "(" ra ")")) ; D scaled
+(def-ppc-iformat (ds '(:name :tab rt "," ; D scaled
+                       #+ppc64 (:using #'ds-annotate ds)
+                       #+ppc ds
+                       "(" ra ")"))
   rt ra ds (subop ds-form-subop))
 
 (def-ppc-iformat (d-si '(:name :tab rt "," ra "," si )) ; D with signed immediate
@@ -484,8 +488,8 @@
 (def-ppc-iformat (x-20 '(:name :tab frt "," ra "," rb))
   frt ra rb (xo xo21-30))
 
-(def-ppc-iformat (x-21 '(:name :tab frt "," rb))
-  frt rb (xo xo21-30) rc)
+(def-ppc-iformat (x-21 '(:name :tab frt "," frb))
+  frt frb (xo xo21-30) rc)
 
 (def-ppc-iformat (x-22 '(:name :tab frt))
   frt (xo xo21-30) rc)
@@ -549,6 +553,9 @@
 
 (def-ppc-iformat (a '(:name :tab frt "," fra "," frb "," frc))
   frt fra frb frc (xo xo26-30) rc)
+
+(def-ppc-iformat (a-i '(:name :tab rt "," ra "," rb "," bc))
+  rt ra rb bc (xo xo26-30) rc)
 
 (def-ppc-iformat (a-tab '(:name :tab frt "," fra "," frb))
   frt fra frb (xo xo26-30) rc)
@@ -646,6 +653,10 @@
                 (label-position si))
              subop))))
         (t
+         (when (fixup-p si) ; assume the fixup will be valid
+           (aver (eq (fixup-flavor si) :linkage-cell))
+           (note-fixup segment :addis+ld si)
+           (setq si 0))
          (if (= (mod si 4) 0)
              (emit-ds-form-inst segment opcode rt ra (ash si -2) subop)
              (error "Displacement should be a multiple of 4")))))
@@ -807,7 +818,12 @@
   (define-x-instruction      lwax  31 341)
   (define-x-instruction      lwaux 31 373 :other-dependencies ((writes ra)))
   ;; Doubleword
-  (define-ds-instruction     ld    58 #b00)
+  ;;(define-ds-instruction     ld    58 #b00)
+  (define-instruction ld (segment rt ra si)
+    (:declare (type (or (signed-byte 16) label fixup) si))
+    (:printer ds ((op 58) (subop 0)))
+    (:emitter
+     (patchable-emit-ds-form segment 58 (reg-tn-encoding rt) (reg-or-0 ra) si 0)))
   (define-ds-instruction     ldu   58 #b01)
   (define-x-instruction      ldx   31 21)
   (define-x-instruction      ldux  31 53)
@@ -998,7 +1014,7 @@
            (define-x-21-instruction (name op xo rc-p &key (cost 4) other-dependencies)
                (multiple-value-bind (other-reads other-writes) (classify-dependencies other-dependencies)
                  `(define-instruction ,name (segment frt frb)
-                   ;; (:printer x-21 ((op ,op) (xo ,xo) (rc ,(if rc-p 1 0))))
+                   (:printer x-21 ((op ,op) (xo ,xo) (rc ,(if rc-p 1 0))))
                    (:cost ,cost)
                    (:delay ,cost)
                    (:dependencies (reads frb) ,@other-reads
@@ -1058,7 +1074,10 @@
                                   (emit-d-form-inst
                                    segment ,op (reg-tn-encoding rt)
                                    ,(if allow-r0 '(reg-tn-encoding ra) '(reg-or-0 ra))
-                                   offset-from-code-tn))))))))
+                                   offset-from-code-tn))))))
+                          (when (and (typep si 'fixup) (eq (fixup-flavor si) :linkage-cell))
+                            (note-fixup segment :addis+ld si)
+                            (setq si 0))))
                     (when (typep si 'fixup)
                       (ecase ,fixup
                         ((:ha :l) (note-fixup segment ,fixup si)))
@@ -1196,6 +1215,7 @@
     (:emitter (emit-d-form-inst segment 3 (valid-tcond-encoding tcond) (reg-tn-encoding ra) si)))
 
   (define-instruction isel (segment rt ra rb bc)
+    (:printer a-i ((op 31) (xo 15) (rc 0)))
     (:emitter
      (emit-a-form-inst segment 31
                        (reg-tn-encoding rt)
@@ -1574,7 +1594,7 @@
   (define-2-x-5-instructions srad 31 794) ; shift right algebraic doubleword
   (define-2-x-10-instructions cntlzw 31 26)
   (define-2-x-10-instructions cntlzd 31 58)
-  (define-x-10-instruction popcntd 31 506 0)
+  (define-x-10-instruction popcntd 31 506 nil)
   (define-2-x-5-instructions and 31 28)
 
   (define-4-xo-instructions subf 31 40)
@@ -1626,19 +1646,19 @@
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 0 5) 339 0)))
 
   (define-instruction mfxer (segment rt)
-    (:printer xfx ((op 31) (xo 339) (spr 1)) '(:name :tab rt))
+    (:printer xfx ((op 31) (xo 339) (spr (ash 1 5))) '(:name :tab rt))
     (:delay 1)
     (:dependencies (reads :xer) (writes rt))
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 1 5) 339 0)))
 
   (define-instruction mflr (segment rt)
-    (:printer xfx ((op 31) (xo 339) (spr 8)) '(:name :tab rt))
+    (:printer xfx ((op 31) (xo 339) (spr (ash 8 5))) '(:name :tab rt))
     (:delay 1)
     (:dependencies (reads :lr) (writes rt))
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 8 5) 339 0)))
 
   (define-instruction mfctr (segment rt)
-    (:printer xfx ((op 31) (xo 339) (spr 9)) '(:name :tab rt))
+    (:printer xfx ((op 31) (xo 339) (spr (ash 9 5))) '(:name :tab rt))
     (:delay 1)
     (:dependencies (reads rt) (reads :ctr))
     (:emitter (emit-xfx-form-inst segment 31 (reg-tn-encoding rt) (ash 9 5) 339 0)))
@@ -1880,6 +1900,8 @@
                               0)))
 
   (define-2-x-21-instructions fneg 63 40)
+  (define-2-x-21-instructions fsqrt 63 22)
+  (define-2-x-21-instructions fsqrts 59 22)
 
   (define-2-x-21-instructions fmr 63 72)
   (define-2-x-21-instructions fnabs 63 136)
@@ -2271,13 +2293,6 @@
   (:delay 0)
   (:emitter
    (emit-header-data segment simple-fun-widetag)))
-
-(define-instruction lra-header-word (segment)
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-header-data segment return-pc-widetag)))
-
 
 ;;;; Instructions for converting between code objects, functions, and lras.
 (defun emit-compute-inst (segment vop dst src label temp calc)
@@ -2315,22 +2330,7 @@
                              (label-position label posn delta-if-after)
                              (component-header-length))))))
 
-;; code = lra - other-pointer-tag - header - label-offset + code-tn-lowtag
-(define-instruction compute-code-from-lra (segment dst src label temp)
-  (:declare (type tn dst src temp) (type label label))
-  (:attributes variable-length)
-  (:dependencies (reads src) (writes dst) (writes temp))
-  (:delay 0)
-  (:vop-var vop)
-  (:emitter
-   (emit-compute-inst segment vop dst src label temp
-                      #'(lambda (label posn delta-if-after)
-                          (- code-tn-lowtag
-                             (label-position label posn delta-if-after)
-                             (component-header-length)
-                             other-pointer-lowtag)))))
-
-;; lra = code - code-tn-lowtag + header + label-offset + other-pointer-tag
+;; lra = code - code-tn-lowtag + header + label-offset
 (define-instruction compute-lra-from-code (segment dst src label temp)
   (:declare (type tn dst src temp) (type label label))
   (:attributes variable-length)
@@ -2342,7 +2342,6 @@
                       #'(lambda (label posn delta-if-after)
                           (+ (label-position label posn delta-if-after)
                              (component-header-length)
-                             other-pointer-lowtag
                              (- code-tn-lowtag))))))
 
 ;;; Unboxed constant support
@@ -2396,7 +2395,7 @@
                    `(.byte ,@bytes)))))))
 
 (defun sb-vm:fixup-code-object (code offset value kind flavor)
-  (declare (type index offset) (ignore flavor))
+  (declare (type index offset))
   (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let ((sap (code-instructions code)))
@@ -2410,6 +2409,16 @@
       (:rldic-m ; This is the M (mask) immediate operand to RLDIC{L,R} which
        ;; appears in (byte 6 5) of the instruction. See EMIT-MD-FORM-INST.
        (setf (ldb (byte 6 5) (sap-ref-32 sap offset)) (encode-mask6 (- 64 value))))
+      (:addis+ld
+       ;; load from linkage table
+       (binding* (((q r) (floor (ash value word-shift) 65536))
+                  (table-bias (- (ash (ash 1 (+ 19 3)) -16))))
+         (when (>= r 32768) ; LD instruction sign-extends, so this is actually negative
+           (incf q))
+         (setf (sap-ref-32 sap (- offset 4)) ; addis instruction
+               (logior (sap-ref-32 sap (- offset 4)) (ldb (byte 16 0) (+ table-bias q)))
+               (sap-ref-32 sap offset) ; ld instruction
+               (logior (sap-ref-32 sap offset) r))))
       (:b
        (error "Can't deal with CALL fixups, yet."))
       (:ba
@@ -2427,6 +2436,8 @@
           (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
                  (if (logbitp 15 l) (ldb (byte 16 0) (1+ h)) h))))
       (:l
+       (when (eq flavor :assembly-routine)
+         (decf value nil-value))
        (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
              (ldb (byte 16 0) value)))))
   nil)
@@ -2452,3 +2463,12 @@
                (inst* segment 'lis temp (ldb (byte 15 16) offset))
                (inst* segment 'ori temp (ldb (byte 16 16) offset))
                temp))))))
+
+(defun emit-long-nop (segment amount)
+  (declare (type sb-assem:segment segment)
+           (type index amount))
+  (if (= amount 4)
+      (assemble (segment)
+        (inst nop))
+      (loop repeat amount
+            do (emit-byte segment 0))))

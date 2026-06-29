@@ -91,13 +91,7 @@ static inline unsigned int code_serialno(struct code* code) {
 #endif
 }
 
-static inline unsigned int code_n_named_calls(struct code* code) {
-#ifdef LISP_FEATURE_64_BIT
-    return code->boxed_size >> 32;
-#else
-    return 0;
-#endif
-}
+extern lispobj debug_function_name_from_pc (struct code* code, void *pc);
 
 // Iterate over the native pointers to each function in 'code_var'
 // offsets are stored as the number of bytes into the instructions
@@ -142,11 +136,6 @@ static inline lispobj fun_code_tagged(void* fun) {
     return make_lispobj(fun_code_header(fun), OTHER_POINTER_LOWTAG);
 }
 
-#ifdef RETURN_PC_WIDETAG
-#define embedded_obj_p(tag) (tag==RETURN_PC_WIDETAG || tag==SIMPLE_FUN_WIDETAG)
-#else
-#define embedded_obj_p(tag) (tag==SIMPLE_FUN_WIDETAG)
-#endif
 /* Convert from a lispobj with lowtag bits to the starting address
  * of the heap object. */
 static inline lispobj *
@@ -156,21 +145,6 @@ base_pointer(lispobj ptr)
     int widetag = widetag_of(obj);
     return embedded_obj_p(widetag) ? (lispobj*)fun_code_header((struct simple_fun*)obj) : obj;
 }
-
-#if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64 || defined LISP_FEATURE_ARM64
-# define FUN_SELF_FIXNUM_TAGGED 1
-# define fun_self_from_baseptr(simple_fun) (lispobj)simple_fun->insts
-# define fun_self_from_taggedptr(funptr) \
-    funptr - FUN_POINTER_LOWTAG + 2*N_WORD_BYTES
-# define fun_taggedptr_from_self(self) \
-    self - 2*N_WORD_BYTES + FUN_POINTER_LOWTAG
-#else
-# define FUN_SELF_FIXNUM_TAGGED 0
-# define fun_self_from_baseptr(simple_fun) \
-    make_lispobj(simple_fun,FUN_POINTER_LOWTAG)
-# define fun_self_from_taggedptr(funptr) funptr
-# define fun_taggedptr_from_self(self) self
-#endif
 
 #define simplefun_is_wrapped(fun) \
   fun->self != fun_self_from_baseptr(fun) && fun->self != 0
@@ -183,7 +157,7 @@ extern int simple_fun_index(struct code*, struct simple_fun*);
 // For those of us who are too memory-impaired to know how to use the value:
 //  - it is the amount to ADD to a tagged simple-fun pointer to get its entry address
 //  - or the amount to SUBTRACT from an entry address to get a tagged fun pointer
-#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV)
+#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV) || defined(LISP_FEATURE_LOONGARCH64)
 #define FUN_RAW_ADDR_OFFSET 0
 #else
 #define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, insts) - FUN_POINTER_LOWTAG)

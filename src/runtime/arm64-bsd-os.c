@@ -39,6 +39,8 @@
 #include "validate.h"
 
 int arch_os_thread_cleanup(struct thread *thread) {
+    if (thread->breakpoint_misc)
+        os_deallocate((os_vm_address_t) thread->breakpoint_misc, getpagesize());
     return 1;                   /* success */
 }
 
@@ -192,6 +194,20 @@ os_context_register_t *
 os_context_float_register_addr(os_context_t *context, int offset)
 {
     return (os_context_register_t*)(&context->uc_mcontext->__ns.__v[offset]);
+}
+
+unsigned int
+os_context_fp_control(os_context_t *context)
+{
+    return (context->uc_mcontext->__ns.__fpsr & 0xf800009f) |
+        (context->uc_mcontext->__ns.__fpcr & 0x3ff8f00);
+}
+
+void
+os_context_set_fp_control(os_context_t *context, unsigned int value)
+{
+    context->uc_mcontext->__ns.__fpsr = value & 0xf800009f;
+    context->uc_mcontext->__ns.__fpcr = value & 0x3ff8f00;
 }
 
 void

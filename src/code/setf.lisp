@@ -24,7 +24,8 @@
 ;;; of a structure slot expands. It is likewise unportable to
 ;;; expect that a NOTINLINE does anything, but we'll check anyway.
 (defun transformable-struct-setf-p (form env)
-  (when (singleton-p (cdr form))
+  (when (and (singleton-p (cdr form))
+             (sb-c:policy env (zerop sb-c::store-xref-data)))
     (let* ((fun (car form))
            (slot-info (structure-instance-accessor-p fun)))
       (when (and slot-info (not (dsd-read-only (cdr slot-info))))
@@ -170,25 +171,28 @@
         (return-from setf `(progn ,@(sb-c::explode-setq form 'error))))
       (when (atom (setq place (macroexpand-for-setf place env)))
         (return-from setf `(setq ,place ,value-form)))
+      (wrap-if
+       (sb-c::compiling-p env)
+       `(sb-c::with-source-form ,place)
+       (block nil
+         (let ((fun (car place)))
+           (when (and (symbolp fun)
+                      ;; Local definition of FUN precludes global knowledge.
+                      (not (sb-c::fun-locally-defined-p fun env)))
+             (let ((inverse (info :setf :expander fun)))
+               ;; NIL is not a valid setf inverse name, for two reasons:
+               ;;  1. you can't define a function named NIL,
+               ;;  2. (DEFSETF THING () ...) is the long form DEFSETF syntax.
+               (when (typep inverse '(cons symbol))
+                 (return `(,(car inverse) ,@(cdr place) ,value-form))))
+             (awhen (transformable-struct-setf-p place env)
+               (return
+                 (slot-access-transform :setf (list (cadr place) value-form) it)))))
 
-      (let ((fun (car place)))
-        (when (and (symbolp fun)
-                   ;; Local definition of FUN precludes global knowledge.
-                   (not (sb-c::fun-locally-defined-p fun env)))
-          (let ((inverse (info :setf :expander fun)))
-            ;; NIL is not a valid setf inverse name, for two reasons:
-            ;;  1. you can't define a function named NIL,
-            ;;  2. (DEFSETF THING () ...) is the long form DEFSETF syntax.
-            (when (typep inverse '(cons symbol))
-              (return-from setf `(,(car inverse) ,@(cdr place) ,value-form))))
-          (awhen (transformable-struct-setf-p place env)
-            (return-from setf
-              (slot-access-transform :setf (list (cadr place) value-form) it)))))
-
-      (multiple-value-bind (temps vals newval setter)
-          (get-setf-expansion place env)
-        (car (gen-let* (mapcar #'list temps vals)
-                       (gen-mv-bind newval value-form (forms-list setter)))))))
+         (multiple-value-bind (temps vals newval setter)
+             (get-setf-expansion place env)
+           (car (gen-let* (mapcar #'list temps vals)
+                          (gen-mv-bind newval value-form (forms-list setter)))))))))
 
   ;; various SETF-related macros
 
@@ -299,7 +303,13 @@
   ;; - One errs, says "Multiple store variables not expected"
   ;; - One pushes multiple values produced by OBJ form into multiple places.
   ;; - At least two produce an incorrect expansion that doesn't even work.
-  (expand-rmw-macro 'cons (list obj) place '() nil env '(item)))
+  ;;
+  ;; (PUSH (CONS key val) an-alist) is an extremely common idiom. If (and only if)
+  ;; ACONS has a translator, it is to be preferred in that usage.
+  (if (and (sb-c::vop-existsp :translate acons)
+           (typep obj '(cons (eql cons) (cons t (cons t null)))))
+      (expand-rmw-macro 'acons (cdr obj) place '() nil env '(k v))
+      (expand-rmw-macro 'cons (list obj) place '() nil env '(item))))
 
 (sb-xc:defmacro pushnew (obj place &rest keys &environment env)
   "Takes an object and a location holding a list. If the object is
@@ -318,19 +328,17 @@
 (sb-xc:defmacro pop (place &environment env)
   "The argument is a location holding a list. Pops one item off the front
   of the list and returns it."
-  (if (symbolp (setq place (macroexpand-for-setf place env)))
-      `(prog1 (car ,place) (setq ,place (cdr ,place)))
-      (multiple-value-bind (temps vals stores setter getter)
-          (get-setf-expansion place env)
-        (let ((list (copy-symbol 'list))
-              (ret (copy-symbol 'car)))
-          `(let* (,@(mapcar #'list temps vals)
-                  (,list ,getter)
-                  (,ret (car ,list))
-                  (,(car stores) (cdr ,list))
-                  ,@(cdr stores))
-             ,setter
-             ,ret)))))
+  (multiple-value-bind (temps vals stores setter getter)
+      (get-setf-expansion place env)
+    (let ((list (copy-symbol 'list))
+          (ret (copy-symbol 'car)))
+      `(let* (,@(mapcar #'list temps vals)
+              (,list ,getter)
+              (,ret (car ,list))
+              (,(car stores) (cdr ,list))
+              ,@(cdr stores))
+         ,setter
+         ,ret))))
 
 (sb-xc:defmacro remf (place indicator &environment env)
   "Place may be any place expression acceptable to SETF, and is expected
@@ -435,8 +443,12 @@
          ;; default can be :assumed, PRESENT-P disambiguates "defaulted" from
          ;; "known" to have made an existence assumption.
          (when present-p
-           (warn "defining setf macro for ~S when ~S was previously ~
-             treated as a function" name setf-fn-name)))
+           ;; This mimics the behavior of %DEFMACRO.
+           (style-warn "~S is being redefined as a setf macro ~
+                       when it was previously assumed to be a function."
+                       name)
+           (undefine-fun-name setf-fn-name)
+           (clear-info :function :where-from setf-fn-name)))
         ;; This is a useless and unavoidable warning during self-build.
         ;; cf. similar disabling of warning in WARN-IF-SETF-MACRO.
         #-sb-xc-host

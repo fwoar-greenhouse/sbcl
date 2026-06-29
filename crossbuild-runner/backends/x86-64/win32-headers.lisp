@@ -204,6 +204,10 @@
           (tv-sec (signed 64))
           (tv-nsec (signed 32))))
 
+(defconstant sizeof-timespec 16) ; #x10
+(defconstant sizeof-timeval 8) ; #x8
+(defconstant sizeof-unw-cursor 0) ; #x0
+
 (in-package "SB-KERNEL")
 
 ;;; GENCGC related

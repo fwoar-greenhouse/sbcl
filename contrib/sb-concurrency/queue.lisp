@@ -177,7 +177,11 @@ must walk the entire queue."
                        (apply compiled-function args))))
            (open-gate (elt item 2)))))))
 
-  (setq sb-impl::*bg-compiler-function* #'run-background-compile)
+  (setq sb-impl::*bg-compiler-function*
+        (lambda ()
+          (let ((result1 (sb-c::default-compiler-worker))
+                (result2 (run-background-compile)))
+            (or result1 result2))))
 
   (defun promise-compile (lexpr)
     ;;   Dynamic      Immobile
@@ -198,5 +202,5 @@ must walk the entire queue."
               (wait-on-gate gate)
               (apply fin args)))
       (enqueue (vector fin lexpr gate) *compilation-queue*)
-      (sb-impl::finalizer-thread-notify)
+      (sb-impl::finalizer-thread-notify 0)
       fin)))

@@ -28,7 +28,7 @@
 (in-package "SB-PCL")
 
 (declaim (list **standard-method-classes**))
-(defglobal **standard-method-classes** nil)
+(define-load-time-global **standard-method-classes** nil)
 
 (defconstant-eqx +standard-method-class-names+
   '(standard-method standard-reader-method
@@ -65,12 +65,10 @@
 
 (defun allocate-standard-funcallable-instance (wrapper name)
   (declare (layout wrapper))
-  (let* ((hash (if name
-                   ;; Named functions have a predictable hash
-                   (mix (sxhash name) (symbol-hash :generic-function)) ; arb. constant
-                   (sb-kernel::quasi-random-address-based-hash
+  (declare (ignore name))
+  (let* ((hash (sb-kernel::quasi-random-address-based-hash
                     (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte)))
-                    most-positive-fixnum)))
+                    most-positive-fixnum))
          (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
          (fin (truly-the funcallable-instance
                          (%make-standard-funcallable-instance
@@ -680,7 +678,7 @@
 ;;; The only bit of cleverness in the implementation is to make the
 ;;; vectors fairly tight, but always longer then 0 elements:
 ;;;
-;;; -- We don't want to waste huge amounts of space no these vectors,
+;;; -- We don't want to waste huge amounts of space on these vectors,
 ;;;    which are mostly required by things like SLOT-VALUE with a
 ;;;    variable slot name, so a constant extension over the minimum
 ;;;    size seems like a good choise.
@@ -754,7 +752,7 @@
                (setf (svref vector index)
                      (acons name
                             (cons (when (or bootstrap
-                                            (and (standard-class-p class)
+                                            (and (std-class-p class)
                                                  (slot-accessor-std-p slot 'all)))
                                     (if bootstrap
                                         (early-slot-definition-location slot)

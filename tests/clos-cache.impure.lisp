@@ -68,7 +68,7 @@
                              (push (find-class ',c) *cache-test-classes*)))))))
   (def))
 
-(defvar *run-cache-test* nil)
+(defvar *run-cache-test* (sb-thread:make-semaphore))
 
 (let* ((instances (map 'vector #'make-instance *cache-test-classes*))
        (limit (length instances)))
@@ -90,7 +90,7 @@
         (write-line string)))))
 
 (defun test-loop ()
-  (loop until *run-cache-test* do (sb-thread:thread-yield))
+  (sb-thread:wait-on-semaphore *run-cache-test*)
   (handler-case
       (loop repeat 1024 do (test-cache))
     (error (e)
@@ -98,17 +98,16 @@
             sb-thread:*current-thread* e)
       (sb-ext:exit :code 1))))
 
-(with-test (:name :clos-cache-test
-            :broken-on :sb-safepoint)
+(with-test (:name :clos-cache-test)
   #+sb-thread
   (let ((threads (loop repeat 32
                        collect (sb-thread:make-thread 'test-loop))))
-    (setf *run-cache-test* t)
+    (sb-thread:signal-semaphore *run-cache-test* 32)
     (mapcar #'sb-thread:join-thread threads))
 
   #-sb-thread
   (progn
-    (setf *run-cache-test* t)
+    (sb-thread:signal-semaphore *run-cache-test* 32)
     (loop repeat 4
           do (test-loop)))
 

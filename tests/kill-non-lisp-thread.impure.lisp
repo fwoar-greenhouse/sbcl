@@ -13,6 +13,7 @@
 
 #+(or :openbsd :win32 (not :sb-thread)) (invoke-restart 'run-tests::skip-file)
 
+#+sb-thread (sb-impl::finalizer-thread-stop)
 (use-package :sb-alien)
 
 (defun run (program &rest arguments)
@@ -37,8 +38,7 @@
 
 (define-alien-routine kill-non-lisp-thread void)
 
-(with-test (:name :kill-non-lisp-thread
-            :broken-on :win32)
+(with-test (:name :kill-non-lisp-thread)
   (let ((sem (sb-thread:make-semaphore)))
     (push (lambda ()
             (sb-thread:signal-semaphore sem))

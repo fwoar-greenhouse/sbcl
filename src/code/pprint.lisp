@@ -846,7 +846,7 @@ line break."
                               (key (car object)))
                           (if (functionp mapping)
                               (funcall mapping key)
-                              (sb-impl::gethash/eql key mapping nil))))))
+                              (sb-impl::gethash/eql-hash key mapping nil))))))
               (cond ((not cons-entry)
                      (dovector (entry (pp-dispatch-entries table) nil)
                        (when (funcall (pprint-dispatch-entry-test-fn
@@ -931,8 +931,7 @@ line break."
             (let ((symbols)
                   (ppd-v)
                   (code (fun-code-header hashtable)))
-              (loop for i from (+ sb-vm:code-constants-offset
-                                  sb-vm:code-slots-per-simple-fun)
+              (loop for i from sb-vm:code-constants-offset
                     below (code-header-words code)
                     do (let ((const (code-header-ref code i)))
                          (when (simple-vector-p const)
@@ -1464,7 +1463,7 @@ line break."
         (output-object object stream)
         (dx-let ((state (cons 0 stream)))
           (if obj-supplied-p
-              (with-circularity-detection (object stream)
+              (with-circularity-detection (object stream state)
                 (descend-into (stream)
                   (start-logical-block stream prefix per-line-p suffix)
                   (funcall proc object state stream)

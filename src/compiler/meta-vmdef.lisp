@@ -201,10 +201,6 @@
        (declare (ignorable ,(car lambda-list)))
        (sb-assem:assemble ()
          ,@body))))
-
-(defglobal *sc-vop-slots*
-    '((:move . sc-move-vops)
-      (:move-arg . sc-move-arg-vops)))
 
 ;;;; primitive type definition
 
@@ -218,9 +214,7 @@
        (/show "doing !DEF-PRIMITIVE-TYPE" ,(string name))
        (assert (not (gethash ',name *backend-primitive-type-names*)))
        (setf (gethash ',name *backend-primitive-type-names*)
-             (make-primitive-type :name ',name
-                                  :scs ',scns
-                                  :specifier ',type))
+             (make-primitive-type ',name ',scns ',type))
        (/show0 "done with !DEF-PRIMITIVE-TYPE")
        ',name)))
 
@@ -343,7 +337,9 @@
   ;; info about how to emit MOVE-ARG VOPs for the &MORE operand in
   ;; call/return VOPs
   (move-args nil :type (member nil :local-call :full-call :known-return :fixed))
-  (before-load :unspecified :type (or (member :unspecified) list)))
+  (before-load :unspecified :type (or (member :unspecified) list))
+  (gc-barrier nil)
+  (check-type nil))
 (declaim (freeze-type vop-parse))
 (defprinter (vop-parse)
   name
@@ -371,9 +367,9 @@
 ;;; The list of slots in the structure, not including the OPERANDS slot.
 ;;; Order here is insignificant; it happens to be alphabetical.
 (defglobal vop-parse-slot-names
-    '(arg-types args before-load body conditional-p cost guard ignores info-args inherits
-      ltn-policy more-args more-results move-args name node-var note optional-results result-types
-      results save-p source-location temps translate variant variant-vars vop-var))
+    '(arg-types args before-load body check-type conditional-p cost gc-barrier guard ignores info-args
+      inherits ltn-policy more-args more-results move-args name node-var note optional-results
+      result-types results save-p source-location temps translate variant variant-vars vop-var))
 ;; A sanity-check. Of course if this fails, the likelihood is that you can't even
 ;; get this far in cross-compilaion. So it's probably not worth much.
 (eval-when (#+sb-xc :compile-toplevel)
@@ -401,8 +397,9 @@
 (defmacro define-move-vop (name kind &rest scs)
   (when (or (oddp (length scs)) (null scs))
     (error "malformed SCs spec: ~S" scs))
-  (let ((accessor (or (cdr (assoc kind *sc-vop-slots*))
-                      (error "unknown kind ~S" kind))))
+  (let ((accessor (ecase kind
+                    (:move 'sc-move-vops)
+                    (:move-arg 'sc-move-arg-vops))))
     `(progn
        ,@(when (eq kind :move)
            `((eval-when (:compile-toplevel :load-toplevel :execute)
@@ -412,7 +409,7 @@
                                        (vop-parse-or-lose name)))))))
 
        (let ((vop (template-or-lose ',name)))
-         (setf (vop-info-move-vop-p vop) t)
+         (setf (vop-info-move-vop-p vop) ,kind)
          (do-sc-pairs (from-sc to-sc ',scs)
            (dolist (dest-sc (cons to-sc (sc-alternate-scs to-sc)))
              (let ((vec (,accessor dest-sc)))
@@ -514,6 +511,7 @@
 ;;;; generation of emit functions
 
 (defun compute-temporaries-description (parse)
+  #+sb-show (declare (optimize (debug 1))) ; workaround for something, I don't know what
   (let ((temps (vop-parse-temps parse))
         (element-type '(unsigned-byte 16)))
     (when temps
@@ -534,6 +532,7 @@
         results))))
 
 (defun compute-ref-ordering (parse)
+  #+sb-show (declare (optimize (debug 1))) ; workaround for something, I don't know what
   (let* ((num-args (+ (length (vop-parse-args parse))
                       (if (vop-parse-more-args parse) 1 0)))
          (num-results (+ (length (vop-parse-results parse))
@@ -722,6 +721,25 @@
                  (t
                   (tn-ref-tn ,temp)))))))
 
+;;; A vop inherits from a vop with :arg-ref, but it puts its argument
+;;; into an :info constant, bind the extra arg-refs to NIL.
+(defun extra-arg-refs (parse)
+  (let ((inherits (vop-parse-inherits parse)))
+    (when inherits
+      (let ((inherited-parse (vop-parse-or-lose inherits)))
+        (when (eq (vop-parse-body parse)
+                  (vop-parse-body inherited-parse))
+          (let ((arg-count (length (vop-parse-args parse)))
+                (inherited-arg-count (length (vop-parse-args inherited-parse))))
+            (when (/= arg-count inherited-arg-count)
+              (loop for extra in (nthcdr arg-count (vop-parse-args inherited-parse))
+                    for temp = (operand-parse-temp extra)
+                    for name = (string temp)
+                    unless (string= name
+                                    #1="OPERAND-PARSE-TEMP"
+                                    :end1 (min (length name) (length #1#)))
+                    collect `(,temp)))))))))
+
 ;;; Make a lambda that parses the VOP TN-REFS, does automatic operand
 ;;; loading, and runs the appropriate code generator.
 (defun make-generator-function (parse)
@@ -750,7 +768,6 @@
            (binds `(,(operand-parse-name op)
                     (tn-ref-tn ,(operand-parse-temp op)))))
           ((:more-argument :more-result))))
-
       `(named-lambda (vop ,(vop-parse-name parse)) (,n-vop)
          (declare (ignorable ,n-vop))
          (let* (,@(access-operands (vop-parse-args parse)
@@ -774,7 +791,8 @@
                 ,@(and (neq (vop-parse-before-load parse) :unspecified)
                        `((,dummy (progn
                                    ,@(vop-parse-before-load parse)))))
-                ,@(binds))
+                ,@(binds)
+                ,@(extra-arg-refs parse))
            (declare (ignore ,@(vop-parse-ignores parse)
                             ,@(and (neq (vop-parse-before-load parse) :unspecified)
                                    `(,dummy))))
@@ -944,11 +962,6 @@
     (dolist (name (cddr spec))
       (unless (symbolp name)
         (error "bad temporary name: ~S" name))
-      ;; It's almost always a mistake to have overlaps in the operand names.
-      ;; But I guess that some users think it's fine?
-      #+sb-xc-host
-      (when (member name (vop-parse-temps parse) :key #'operand-parse-name)
-        (warn "temp ~s already exists in ~s" name (vop-parse-name parse)))
       (incf *parse-vop-operand-count*)
       (let ((res (list :born (parse-time-spec :load)
                        :dies (parse-time-spec :save))))
@@ -1089,11 +1102,6 @@
          (setf (vop-parse-translate parse) (rest spec)))
         (:guard
          (setf (vop-parse-guard parse) (vop-spec-arg spec t)))
-        ;; FIXME: :LTN-POLICY would be a better name for this. It
-        ;; would probably be good to leave it unchanged for a while,
-        ;; though, at least until the first port to some other
-        ;; architecture, since the renaming would be a change to the
-        ;; interface between
         (:policy
             (setf (vop-parse-ltn-policy parse)
                   (vop-spec-arg spec 'ltn-policy)))
@@ -1105,6 +1113,10 @@
          (setf (vop-parse-optional-results parse)
                (append (vop-parse-optional-results parse)
                        (rest spec))))
+        (:gc-barrier
+         (setf (vop-parse-gc-barrier parse) (rest spec)))
+        (:check-type
+         (setf (vop-parse-check-type parse) (rest spec)))
         (t
          (error "unknown option specifier: ~S" (first spec)))))
     (cond (arg-refs-p
@@ -1486,9 +1498,9 @@
 
 ;;;; setting up VOP-INFO
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *slot-inherit-alist*
-    '((:generator-function . vop-info-generator-function))))
+(defconstant-eqx +slot-inherit-alist+
+    '((:generator-function . vop-info-generator-function))
+  #'equal)
 
 ;;; This is something to help with inheriting VOP-INFO slots. We
 ;;; return a keyword/value pair that can be passed to the constructor.
@@ -1500,7 +1512,7 @@
 ;;; the FORM so that the slot is recomputed.
 (defmacro inherit-vop-info (slot parse test form)
   `(if (and ,parse ,test)
-       (list ,slot `(,',(or (cdr (assoc slot *slot-inherit-alist*))
+       (list ,slot `(,',(or (cdr (assoc slot +slot-inherit-alist+))
                             (error "unknown slot ~S" slot))
                      (template-or-lose ',(vop-parse-name ,parse))))
        (list ,slot ,form)))
@@ -1522,13 +1534,17 @@
 
     `(make-vop-info
       :name ',(vop-parse-name parse)
+      :translate ',(vop-parse-translate parse)
       ,@(make-vop-info-types parse)
       :guard ,(awhen (vop-parse-guard parse)
                 (if (typep it '(cons (eql lambda)))
                     it
                     `(lambda (node) (declare (ignore node)) ,it)))
       :note ',(vop-parse-note parse)
-      :info-arg-count ,(length (vop-parse-info-args parse))
+      :info-arg-count ,(- (length (vop-parse-info-args parse))
+                          (if (vop-parse-gc-barrier parse)
+                              1
+                              0))
       :ltn-policy ',(vop-parse-ltn-policy parse)
       :save-p ',(vop-parse-save-p parse)
       :move-args ',(vop-parse-move-args parse)
@@ -1542,7 +1558,27 @@
       :variant (list ,@variant)
       :after-sc-selection
       ;; TODO: inherit it?
-      ,(make-after-sc-function parse))))
+      ,(make-after-sc-function parse)
+      :gc-barrier ',(vop-parse-gc-barrier parse)
+      :check-type ,(let ((mask 0)
+                         (spec (vop-parse-check-type parse)))
+                     (unless (equal spec '(t))
+                       (loop for arg in spec
+                             do (setf (ldb (byte 1 (position arg (vop-parse-operands parse) :key #'operand-parse-name))
+                                           mask)
+                                      1)))
+                     mask)
+      #+(and (not sb-xc-host) sb-devel)
+      :optimizer
+      #+(and (not sb-xc-host) sb-devel)
+      ,(let ((old (gethash (vop-parse-name parse) *backend-template-names*)))
+         (when (and old
+                    (vop-info-optimizer old))
+           (let ((optimizer (vop-info-optimizer old)))
+             (if (consp optimizer)
+                 `(cons (function ,(nth-value 2 (function-lambda-expression (car optimizer))))
+                        ',(cdr optimizer))
+                 `(function ,(nth-value 2 (function-lambda-expression optimizer))))))))))
 
 ;;; Define the symbol NAME to be a Virtual OPeration in the compiler.
 ;;; If specified, INHERITS is the name of a VOP that we default
@@ -1703,6 +1739,9 @@
 ;;; :MOVE-ARGS {NIL | :FULL-CALL | :LOCAL-CALL | :KNOWN-RETURN}
 ;;;     Indicates if and how the more args should be moved into a
 ;;;     different frame.
+;;;
+;;; :CHECK-TYPE Boolean
+;;;     Sets FUN-INFO-EXTERNALLY-CHECKABLE-TYPE for the :TRANSLATE function.
 (defmacro define-vop ((&optional name inherits) &body specs)
   (%define-vop name inherits specs t))
 
@@ -1772,6 +1811,11 @@
                `((let ((,n-res ,(set-up-vop-info inherited-parse parse)))
                    (store-vop-info ,n-res)
                    ,@(set-up-fun-translation parse n-res))))
+           ,@(when (equal (vop-parse-check-type parse) '(t))
+               `((setf ,@(loop for name in (or (vop-parse-translate parse)
+                                               (list name))
+                               collect `(fun-info-externally-checkable-type (fun-info-or-lose ',name))
+                               collect :full))))
            ',name)
         `(let ((info ,(set-up-vop-info inherited-parse parse)))
            (setf (vop-info-type info)
@@ -1971,14 +2015,10 @@
       (try-coalescing vop-info-temps)
       (try-coalescing vop-info-ref-ordering)
       (try-coalescing vop-info-targets)))
-  ;; vop rdefinition should be allowed, but a dup in the cross-compiler
-  ;; is probably a mistake. REGISTER-VOP-PARSE is the wrong place
-  ;; to check this, because parsing has both compile-time and load-time
-  ;; effects, since inheritance is computed at compile-time.
-  ;; And there are false positives with any DEFINE-VOP in an assembler file
-  ;; because those are processed twice. I don't know what to do.
-  #+nil (when (gethash (vop-info-name vop-info) *backend-template-names*)
-                 (warn "Duplicate vop name: ~s" vop-info))
+  ;; redefinition is allowed, but a dup in the cross-compiler is a mistake
+  #+sb-xc-host
+  (when (gethash (vop-info-name vop-info) *backend-template-names*)
+    (error "Duplicate vop name: ~s" vop-info))
   (setf (gethash (vop-info-name vop-info) *backend-template-names*)
         vop-info))
 
@@ -2010,12 +2050,18 @@
     (let ((n-head nil)
           (n-prev nil))
       (dolist (op fixed)
-        (let ((n-ref (gensym)))
-          (binds `(,n-ref (reference-tn ,op ,write-p)))
-          (if n-prev
-              (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
-              (setq n-head n-ref))
-          (setq n-prev n-ref)))
+        (multiple-value-bind (op lvar)
+            (if (typep op '(cons (eql :lvar)))
+                (values (third op) (second op))
+                op)
+          (let ((n-ref (gensym)))
+            (binds `(,n-ref (reference-tn ,op ,write-p)))
+            (when lvar
+              (forms `(setf (tn-ref-type ,n-ref) (lvar-type ,lvar))))
+            (if n-prev
+                (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
+                (setq n-head n-ref))
+            (setq n-prev n-ref))))
 
       (when more
         (let ((n-more (gensym)))
@@ -2052,7 +2098,10 @@
   (let* ((parse (vop-parse-or-lose name))
          (arg-count (length (vop-parse-args parse)))
          (result-count (length (vop-parse-results parse)))
-         (info-count (length (vop-parse-info-args parse)))
+         (info-count (- (length (vop-parse-info-args parse))
+                        (if (vop-parse-gc-barrier parse)
+                            1
+                            0)))
          (noperands (+ arg-count result-count info-count))
          (n-node (gensym))
          (n-block (gensym))

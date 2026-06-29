@@ -93,71 +93,79 @@
       (gensym (symbol-name x))
       (gensym)))
 
-(eval-when (:load-toplevel :execute #+sb-xc-host :compile-toplevel)
-(labels ((symbol-concat (package ignore-lock &rest things)
-           (dx-let ((strings (make-array (length things)))
-                    (length 0)
-                    (only-base-chars t))
-             ;; This loop is nearly like DO-REST-ARG
-             ;; but it works on the host too.
-             (loop for index from 0 below (length things)
-                   do (let* ((thing (nth index things))
-                             (s (if (integerp thing)
-                                    (write-to-string thing :base 10 :radix nil :pretty nil)
-                                    (string thing)))
-                             (l (length s)))
-                        (setf (svref strings index) s)
-                        (incf length l)
-                        #+sb-unicode
-                        (when (and (typep s '(array character (*)))
-                                   ;; BASE-CHAR-p isn't a standard predicate.
-                                   ;; and host ignores ELT-TYPE anyway.
-                                   #-sb-xc-host (notevery #'base-char-p s))
-                          (setq only-base-chars nil))))
-             ;; We copy the string when interning, so DX is ok.
-             (dx-let ((name (make-array (if package length 0)
-                                        :element-type 'character))
-                      (elt-type (if only-base-chars 'base-char 'character))
-                      (start 0))
-               (unless package
-                 ;; MAKE-SYMBOL doesn't copy NAME (unless non-simple).
-                 (setq name (make-array length :element-type elt-type)))
-               (dotimes (index (length things)
-                               (if package
-                                   (values (%intern name length package elt-type
-                                                    ignore-lock))
-                                   (make-symbol name)))
-                 (let ((s (svref strings index)))
-                   (replace name s :start1 start)
-                   (incf start (length s)))))))
-         #+sb-xc-host (%intern (name length package elt-type dummy)
-                        (declare (ignore length elt-type dummy))
-                        ;; Copy, in case the host respects the DX declaration,
-                        ;; but does not copy, which makes our assumption wrong.
-                        (intern (copy-seq name) package)))
-  ;; Concatenate together the names of some strings and symbols,
-  ;; producing a symbol in the current package.
-  (defun symbolicate (&rest things)
-    (apply #'symbol-concat (sane-package) nil things))
-  ;; "bang" means intern even if the specified package is locked.
-  ;; Obviously it takes a package, so it doesn't need PACKAGE- in its name.
-  ;; The main use is to create interned temp vars. It really seems like there
-  ;; ought to be a single package into which all such vars go,
-  ;; avoiding any interning in locked packages.
-  (defun symbolicate! (package &rest things)
-    (apply #'symbol-concat (find-package package) t things))
-  ;; SYMBOLICATE in given package respecting package-lock.
-  (defun package-symbolicate (package &rest things)
-    (apply #'symbol-concat (find-package package) nil things))
-  ;; like SYMBOLICATE, but producing keywords
-  (defun keywordicate (&rest things)
-    (apply #'symbol-concat *keyword-package* nil things))
-  ;; like the above, but producing an uninterned symbol.
-  ;; [we already have GENSYMIFY, and naming this GENSYMICATE for
-  ;; consistency with the above would not be particularly enlightening
-  ;; as to how it isn't just GENSYMIFY]
-  (defun gensymify* (&rest things)
-    (apply #'symbol-concat nil nil things))))
+#+sb-xc-host
+(defun %intern (name length package elt-type dummy)
+  (declare (ignore length elt-type dummy))
+  ;; Copy, in case the host respects the DX declaration,
+  ;; but does not copy, which makes our assumption wrong.
+  (intern (copy-seq name) package))
+
+(defun %symbol-concat (package ignore-lock &rest things)
+  (dx-let ((strings (make-array (length things)))
+           (length 0)
+           (only-base-chars t))
+    ;; This loop is nearly like DO-REST-ARG
+    ;; but it works on the host too.
+    (loop for index from 0 below (length things)
+          do (let* ((thing (nth index things))
+                    (s (if (integerp thing)
+                           (write-to-string thing :base 10 :radix nil :pretty nil)
+                           (string thing)))
+                    (l (length s)))
+               (setf (svref strings index) s)
+               (incf length l)
+               #+sb-unicode
+               (when (and (typep s '(array character (*)))
+                          ;; BASE-CHAR-p isn't a standard predicate.
+                          ;; and host ignores ELT-TYPE anyway.
+                          #-sb-xc-host (notevery #'base-char-p s))
+                 (setq only-base-chars nil))))
+    ;; We copy the string when interning, so DX is ok.
+    (dx-let ((name (make-array (if package length 0)
+                               :element-type 'character))
+             (elt-type (if only-base-chars 'base-char 'character))
+             (start 0))
+      (unless package
+        ;; MAKE-SYMBOL doesn't copy NAME (unless non-simple).
+        (setq name (if only-base-chars
+                       (make-array length :element-type 'base-char)
+                       (make-array length :element-type 'character))))
+      (dotimes (index (length things)
+                      (if package
+                          (values (%intern name length package elt-type
+                                           ignore-lock))
+                          (make-symbol name)))
+        (let ((s (svref strings index)))
+          (replace name s :start1 start)
+          (incf start (length s)))))))
+
+;;; Concatenate together the names of some strings and symbols,
+;;; producing a symbol in the current package.
+(defun symbolicate (&rest things)
+  (apply #'%symbol-concat (sane-package) nil things))
+
+;;; "bang" means intern even if the specified package is locked.
+;;; Obviously it takes a package, so it doesn't need PACKAGE- in its name.
+;;; The main use is to create interned temp vars. It really seems like there
+;;; ought to be a single package into which all such vars go,
+;;; avoiding any interning in locked packages.
+(defun symbolicate! (package &rest things)
+  (apply #'%symbol-concat (find-package package) t things))
+
+;;; SYMBOLICATE in given package respecting package-lock.
+(defun package-symbolicate (package &rest things)
+  (apply #'%symbol-concat (find-package package) nil things))
+
+;;; like SYMBOLICATE, but producing keywords
+(defun keywordicate (&rest things)
+  (apply #'%symbol-concat *keyword-package* nil things))
+
+;;; like the above, but producing an uninterned symbol.
+;;; [we already have GENSYMIFY, and naming this GENSYMICATE for
+;;; consistency with the above would not be particularly enlightening
+;;; as to how it isn't just GENSYMIFY]
+(defun gensymify* (&rest things)
+  (apply #'%symbol-concat nil nil things))
 
 ;;; Access *PACKAGE* in a way which lets us recover when someone has
 ;;; done something silly like (SETF *PACKAGE* :CL-USER) in unsafe code.
@@ -168,7 +176,7 @@
   ;; Perhaps it's possible for *PACKAGE* to be set to a non-package in some
   ;; host Lisp, but in SBCL it isn't, and the PACKAGEP test below would be
   ;; elided unless forced to be NOTINLINE.
-  (declare (notinline packagep))
+  (declare (notinline packagep type-of))
   (let* ((maybe-package *package*)
          (packagep (packagep maybe-package)))
     ;; And if we don't also always check for deleted packages - as was true
@@ -235,20 +243,73 @@
                                        (1- max))))
         (t nil)))
 
+;;; Brent's cycle detection algorithm for sequences of iterated
+;;; function values (the rabbit). It's faster than Floyd's. See
+;;; PROPER-LIST-P for a simple example.
+;;;
+;;; TURTLE is lexically bound to INITIAL-VALUE, which should be one
+;;; step behind the rabbit. BODY computes the next value in the
+;;; sequence. Assuming the next value is in the variable RABBIT, BODY
+;;; can detect a circularity with (EQ TURTLE RABBIT). If no
+;;; circularity is detected, then (and only then) BODY must call
+;;; (UPDATE-TURTLE RABBIT).
+;;;
+;;; Positive N-LAG-BITS values make the turtle slower to start moving,
+;;; which slightly reduces the overhead in the non-circular case but
+;;; catches circularities a bit later.
+(defmacro with-turtle (((turtle &optional initial-value) &key (n-lag-bits 0))
+                       &body body)
+  ;; Instead of the usual implementation with two variables (one to
+  ;; count the steps the turtle rested, another for the current power
+  ;; of two limit), we use a single STEP variable and test it for
+  ;; being a power of 2, which tightens the code and lessens register
+  ;; pressure.
+  ;;
+  ;; This should be WITH-UNIQUE-NAMES, but GENSYM is not yet defined
+  ;; in the cross-compiler.
+  (let ((step (make-symbol "STEP")))
+    (flet ((update-turtle-body ()
+             `(progn
+                ;; Is STEP + 1 a power of 2?
+                ;;
+                ;; Because the standard algorithm (when N-LAG-BITS is
+                ;; 0) finds the STEP with the smallest
+                ;; POWER-OF-TWO-CEILING that's greater than the
+                ;; position of both the cycle's start and its length,
+                ;; we run out of memory before STEP ceases to be a
+                ;; WORD provided that the values in the sequence do
+                ;; exist at the same time in the image (i.e. not
+                ;; lazily generated).
+                (when (zerop (let ((step ,step))
+                               (logand step (locally #-sb-xc-host
+                                              (declare (optimize (safety 0)))
+                                                     (setq ,step (1+ step))))))
+                  (setq ,turtle rabbit)))))
+      `(let ((,turtle ,initial-value)
+             (,step ,(ash 1 n-lag-bits)))
+         #-sb-xc-host (declare (type sb-vm:word ,step))
+         (macrolet ((update-turtle (rabbit)
+                      ;; Avoid nested backquotes ...
+                      (subst rabbit 'rabbit ',(update-turtle-body)))
+                    (reset-turtle ()
+                      '(setq ,turtle ,initial-value
+                        ,step ,(ash 1 n-lag-bits))))
+           ,@body)))))
+
 (defun proper-list-p (x)
   (unless (consp x)
     (return-from proper-list-p (null x)))
-  (let ((rabbit (cdr x))
-        (turtle x))
-    (flet ((pop-rabbit ()
-             (when (eql rabbit turtle) ; circular
-               (return-from proper-list-p nil))
-             (when (atom rabbit)
-               (return-from proper-list-p (null rabbit)))
-             (pop rabbit)))
-      (loop (pop-rabbit)
-            (pop-rabbit)
-            (pop turtle)))))
+  (let ((rabbit (cdr x)))
+    (with-turtle ((turtle x) :n-lag-bits 2)
+      (loop
+        ;; Check for circularity. Use EQ because TURTLE is a CONS.
+        (when (eq rabbit turtle)
+          (return nil))
+        (when (atom rabbit)
+          (return (null rabbit)))
+        ;; RABBIT is a CONS here.
+        (update-turtle rabbit)
+        (pop rabbit)))))
 
 (declaim (inline ensure-list))
 (defun ensure-list (thing)
@@ -279,20 +340,12 @@
                       it)
                  (acond ,@rest)))))))
 
-;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
-;;; Otherwise, evaluate DEFAULT, store the resulting value in
-;;; HASH-TABLE and return two values: 1) the result of evaluating
-;;; DEFAULT 2) NIL.
-(defmacro ensure-gethash (key hash-table default)
-  (with-unique-names (n-key n-hash-table value foundp)
-    `(let ((,n-key ,key)
-           (,n-hash-table ,hash-table))
-       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
-         (if ,foundp
-             (values ,value t)
-             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
-
-(defvar *!removable-symbols* nil)
+(define-load-time-global *!removable-symbols*
+  '(("SB-INT" uncross hash-cons swapped-args-fun char-case-info packed-info-field
+     type-bound-number
+     prepare-for-fast-read-char fast-read-char done-with-fast-read-char
+     fast-read-var-u-integer fast-read-u-integer fast-read-s-integer
+     clear-flag)))
 
 (defun %defconstant-eqx-value (symbol expr eqx)
   (declare (type function eqx))
@@ -328,8 +381,9 @@
 ;;; ease of guarding against differences in host compilers with
 ;;; respect to coalescing structure in (host) fasl files, which might
 ;;; then be used in compiling the target.
+(declaim (ftype (function (list) list) hash-cons))
 (defun hash-cons (list)
-  (declare (type list list))
+  #-sb-xc-host (declare (notinline gethash3 %puthash))
   (let ((table (make-hash-table :test 'equal)))
     (labels ((hc (thing)
                (cond
@@ -350,3 +404,10 @@
 (defun assq (item alist)
   "Return the first pair of alist where item is EQ to the key of pair."
   (assoc item alist :test #'eq))
+
+(defmacro wrap-if (condition with form)
+  `(let ((.condition. ,condition)
+         (.form. ,form))
+     (if .condition.
+         (append ,with (list .form.))
+         .form.)))

@@ -7,10 +7,9 @@
     (return-multiple
      (:return-style :none))
 
-    ;; These four are really arguments.
+    ;; These are really arguments.
     ((:temp nvals any-reg nargs-offset)
      (:temp vals any-reg nl1-offset)
-     (:temp old-fp any-reg nl2-offset)
      (:temp lra non-descriptor-reg lr-offset)
 
      ;; These are just needed to facilitate the transfer
@@ -64,11 +63,10 @@
 
   ;; Deallocate the unused stack space.
   (move ocfp-tn cfp-tn)
-  (move cfp-tn old-fp)
-  (inst add csp-tn ocfp-tn (lsl nvals (- word-shift n-fixnum-tag-bits)))
+  (inst add csp-tn cfp-tn (lsl nvals (- word-shift n-fixnum-tag-bits)))
 
   ;; Return.
-  (lisp-return lra :multiple-values))
+  (lisp-return lra :multiple-values t))
 
 (define-assembly-routine
     (return-values-list
@@ -264,9 +262,7 @@
   (prepare-for-tail-call-variable nargs args count dest temp r0 r1 r2 r3)
   (inst and tmp-tn lexenv lowtag-mask)
   (inst cmp tmp-tn fun-pointer-lowtag)
-  (inst b :eq call)
-  (inst b (make-fixup 'tail-call-symbol :assembly-routine))
-  call
+  (inst b :ne (make-fixup 'tail-call-symbol :assembly-routine))
   (loadw lr lexenv closure-fun-slot fun-pointer-lowtag)
   (lisp-jump lr))
 
@@ -287,16 +283,14 @@
   (inst b :ne not-callable)
 
   (loadw temp fun symbol-fdefn-slot other-pointer-lowtag)
-  (inst cbz temp undefined)
+  (inst cbz temp (make-fixup 'undefined-tramp :assembly-routine 1))
   (move fun temp)
   (loadw lr-tn fun fdefn-raw-addr-slot other-pointer-lowtag)
   (inst add lr-tn lr-tn 4)
   (inst br lr-tn)
-  UNDEFINED
-  (inst b (make-fixup 'undefined-tramp :assembly-routine))
   NOT-CALLABLE
   (inst cmp fun null-tn) ;; NIL doesn't have SYMBOL-WIDETAG
-  (inst b :eq undefined)
+  (inst b :eq (make-fixup 'undefined-tramp :assembly-routine 1))
   (cerror-call nil 'sb-kernel::object-not-callable-error fun)
   (inst and temp fun lowtag-mask)
   (inst cmp temp fun-pointer-lowtag)
@@ -309,7 +303,8 @@
 ;;;; Non-local exit noise.
 
 (define-assembly-routine (throw
-                          (:return-style :full-call-no-return))
+                          (:return-style :full-call-no-return)
+                          (:save-p :compute-only))
     ((:arg target descriptor-reg r0-offset)
      (:arg start any-reg r9-offset)
      (:arg count any-reg nargs-offset)
@@ -321,19 +316,7 @@
 
   LOOP
 
-  (let ((error (gen-label)))
-    (assemble (:elsewhere)
-      (emit-label error)
-
-      ;; Fake up a stack frame so that backtraces come out right.
-      (inst mov ocfp-tn cfp-tn)
-      (inst mov cfp-tn csp-tn)
-      (inst stp ocfp-tn lr-tn (@ csp-tn 16 :post-index))
-
-      (emit-error-break nil error-trap
-                        (error-number-or-lose 'unseen-throw-tag-error)
-                        (list target)))
-    (inst cbz catch error))
+  (inst cbz catch (generate-error-code nil 'unseen-throw-tag-error target))
 
   (loadw-pair tmp-tn catch-block-previous-catch-slot tag catch-block-tag-slot catch)
   (inst cmp tag target)
@@ -347,7 +330,8 @@
 (define-assembly-routine (unwind
                           (:translate %unwind)
                           (:policy :fast-safe)
-                          (:return-style :none))
+                          (:return-style :full-call-no-return)
+                          (:save-p :compute-only))
     ((:arg block (any-reg descriptor-reg) r0-offset)
      (:arg start (any-reg descriptor-reg) r9-offset)
      (:arg count (any-reg descriptor-reg) nargs-offset)
@@ -358,10 +342,11 @@
      ;; for unbind-to-here
      (:temp where any-reg r1-offset)
      (:temp symbol descriptor-reg r2-offset)
-     (:temp value descriptor-reg r3-offset))
+     (:temp value descriptor-reg r3-offset)
+     #+sb-assembling
+     (:temp nfp any-reg nfp-offset))
   AGAIN
-  (let ((error (generate-error-code nil 'invalid-unwind-error)))
-    (inst cbz block error))
+  (inst cbz block (generate-error-code nil 'invalid-unwind-error))
   (load-tl-symbol-value cur-uwp *current-unwind-protect-block*)
   (loadw ocfp block unwind-block-uwp-slot)
   (inst cmp cur-uwp ocfp)
@@ -387,8 +372,7 @@
   (loadw-pair cfp-tn unwind-block-cfp-slot lr unwind-block-entry-pc-slot cur-uwp)
   (loadw next-uwp cur-uwp unwind-block-current-catch-slot)
   (store-tl-symbol-value next-uwp *current-catch-block*)
-  (loadw-pair (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset nfp-offset)
-              unwind-block-nfp-slot next-uwp unwind-block-nsp-slot cur-uwp)
+  (loadw-pair nfp unwind-block-nfp-slot next-uwp unwind-block-nsp-slot cur-uwp)
   (inst mov-sp nsp-tn next-uwp)
 
   ;; Since THROW is called with BLR for better backtraces use BLR here
@@ -405,12 +389,12 @@
   (loadw-pair cfp-tn unwind-block-cfp-slot lr unwind-block-entry-pc-slot block)
   (loadw next-uwp block unwind-block-current-catch-slot)
   (store-tl-symbol-value next-uwp *current-catch-block*)
-  (loadw-pair (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset nfp-offset)
-              unwind-block-nfp-slot next-uwp unwind-block-nsp-slot block)
+  (loadw-pair nfp unwind-block-nfp-slot next-uwp unwind-block-nsp-slot block)
   (inst mov-sp nsp-tn next-uwp)
 
   (inst blr lr))
 
+#-sb-assembling
 (define-vop ()
   (:translate %continue-unwind)
   (:policy :fast-safe)

@@ -5,28 +5,50 @@
 
 (in-package "SB-VM")
 
+;;; This is _not_ conditioned on #+win32 so that there is one less distinction
+;;; in x86-64-arch.c - ok, so it wastes a few words on #+unix.
+(define-assembly-routine (seh-trampoline (:return-style :none)) ()
+  (inst pop r15-tn)      ; \
+  (inst call rbx-tn)     ;  \ __ exactly 8 bytes
+  (inst push r15-tn)     ;  /
+  (inst ret) (inst nop)  ; /
+  ;; Caution: SORT-INLINE-CONSTANTS rearranges constants by size, putting larger ones first.
+  ;; We rely on it here! For this to work, no other asm routine may have unboxed data.
+  ;; If that becomes a problem, this could reserve one :HWORD instead, but that overaligns,
+  ;; causing 3 extra words of padding to be inserted.
+  (inst jmp (register-inline-constant :qword -1))
+  (register-inline-constant :oword -1)) ; for effect
+
 ;;; The SYNCHRONOUS-TRAP routine has nearly the same effect as executing INT3
 ;;; but is more friendly to gdb. There may be some subtle bugs with regard to
 ;;; blocking/unblocking of async signals which arrive nearly around the same
 ;;; time as a synchronous trap.
-#+sw-int-avoidance ; "software interrupt avoidance"
+;;; Partal avoidance will use a call for handle-pending-interrupt after a
+;;; pseudo-atomic sequence, and will emit trapping instructions for TYPE-ERROR
+;;; and other traps.
+;;; For either feature, use at your own risk.
+#+(or sw-int-avoidance partial-sw-int-avoidance) ; "software interrupt avoidance"
 (define-assembly-routine (synchronous-trap) ()
   (inst pushf)
   (inst push rbp-tn)
   (inst mov rbp-tn rsp-tn)
-  (inst and rsp-tn (- 16))
-  (inst sub rsp-tn 8) ; PUSHing an odd number of GPRs
+  (inst and rsp-tn (- 32))
   ;; Arrange in the utterly confusing order that a linux signal context has them
   ;; so that we can memcpy() into a context. Push RBX twice to maintain alignment.
-  (regs-pushlist rcx rax rdx rbx rbx rsi rdi r15 r14 r13 r12 r11 r10 r9 r8)
-  ;;                             ^^^ technically this is the slot for RBP
-  (inst sub rsp-tn (* 16 16))
-  (dotimes (i 16) (inst movdqa (ea (* i 16) rsp-tn) (sb-x86-64-asm::get-fpr :xmm i)))
-  (inst lea rdi-tn (ea 24 rbp-tn)) ; stack-pointer at moment of "interrupt"
-  (inst mov rsi-tn rsp-tn)         ; pointer to saved CPU state
-  (inst call (make-fixup "synchronous_trap" :foreign))
-  (dotimes (i 16) (inst movdqa (sb-x86-64-asm::get-fpr :xmm i) (ea (* i 16) rsp-tn)))
-  (inst add rsp-tn (* 16 16))
+  ;; This enum is usually in "/usr/include/x86_64-linux-gnu/sys/ucontext.h"
+  (regs-pushlist rsp rcx rax rdx rbx rbx rsi rdi r15 r14 r13 r12 r11 r10 r9 r8)
+  ;;                                 ^^^ technically this is the slot for RBP
+
+  (do ((i 15 (1- i))) ((< i 0))
+    (when (member i '(15 11 7 3)) (inst sub rsp-tn (* 4 32))) ; 4 32-byte regs
+    (inst vmovaps (ea (* (mod i 4) 32) rsp-tn) (sb-x86-64-asm::get-fpr :ymm i)))
+
+  (call-c "synchronous_trap" rsp-tn (addressof (ea 24 rbp-tn)))
+
+  (dotimes (i 16)
+    (inst vmovaps (sb-x86-64-asm::get-fpr :ymm i) (ea (* (mod i 4) 32) rsp-tn))
+    (when (member i '(15 11 7 3)) (inst add rsp-tn (* 4 32)))) ; 4 32-byte regs
+
   (regs-poplist rcx rax rdx rbx rbx rsi rdi r15 r14 r13 r12 r11 r10 r9 r8)
   (inst leave)
   (inst popf))
@@ -88,7 +110,23 @@
   (with-registers-preserved (c :except (rsi rdi))
     (pseudo-atomic ()
       #-system-tlabs (inst break halt-trap)
-      #+system-tlabs (call-c (make-fixup "switch_to_arena" :foreign) #+win32 rdi-tn #+win32 rsi-tn))))
+      #+system-tlabs (call-c "switch_to_arena" #+win32 rdi-tn #+win32 rsi-tn))))
+
+#+system-tlabs
+(define-assembly-routine (handle-arena-request) ()
+  ;; we're pseudo-atomic. End it and handle a trap if necessary.
+  (emit-end-pseudo-atomic)
+  ;; Registers that weren't already spilled by (WITH-REGISTERS-PRESERVED (c) ...)
+  ;; (There's no technical reason to push THREAD-TN and NULL-TN. It's purely pragmatic
+  ;; in that they should be changeable without adding a bunch of #+/- here)
+  (let ((save (list rbx-tn r12-tn r13-tn r14-tn r15-tn)))
+    (dolist (reg save) (inst push reg))
+    ;; count of bytes or elements (always at RBP+16) into 2nd arg
+    (inst mov rdi-tn (ea 16 rbp-tn))
+    (call-lisp-fun 'handle-arena-request 2)
+    (inst mov rax-tn rdx-tn) ; Lisp result reg into C result reg
+    (dolist (reg (reverse save)) (inst pop reg)))
+  (emit-begin-pseudo-atomic))
 
 (macrolet ((def-routine-pair (name&options vars &body code)
              `(progn
@@ -100,45 +138,62 @@
                 (symbol-macrolet ((system-tlab-p 2))
                   (define-assembly-routine
                       (,(symbolicate "SYS-" (car name&options)) . ,(cdr name&options))
-                    ,vars ,@code)))))
+
+                    ,vars ,@code))))
+           (test-arena-exhausted (units)
+             (declare (ignorable units))
+             ;; UNITS qualfies what the first arg to the handler measures.
+             #+system-tlabs
+             `(progn (inst test rax-tn rax-tn)
+                     (inst jmp :nz SUCCESS)
+                     ,(ecase units
+                        (:list-elts '(zeroize rdx-tn))
+                        (:bytes-non-list '(inst mov rdx-tn (fixnumize 1)))
+                        (:bytes-list '(inst mov rdx-tn (fixnumize 2))))
+                     (inst call (make-fixup 'handle-arena-request :assembly-routine))
+                     ;; if an oversized object which the predicate determined should be allocated
+                     ;; then it was in fact already allocated, and its address is in rax.
+                     (inst test rax-tn rax-tn)
+                     (inst jmp :z RESTART))))
 
 (def-routine-pair (alloc-tramp) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "alloc" :foreign)
-            (ea 16 rbp-tn)
-            system-tlab-p)
+    RESTART
+    (call-c "alloc" (ea 16 rbp-tn) system-tlab-p)
+    (test-arena-exhausted :bytes-non-list)
+    SUCCESS
     (inst mov (ea 16 rbp-tn) rax-tn))) ; result onto stack
 
 (def-routine-pair (list-alloc-tramp) () ; CONS, ACONS, LIST, LIST*
   (with-registers-preserved (c)
-    (call-c (make-fixup "alloc_list" :foreign)
-            (ea 16 rbp-tn)
-            system-tlab-p)
+    RESTART
+    (call-c "alloc_list" (ea 16 rbp-tn) system-tlab-p)
+    (test-arena-exhausted :bytes-list)
+    SUCCESS
     (inst mov (ea 16 rbp-tn) rax-tn))) ; result onto stack
 
 (def-routine-pair (listify-&rest (:return-style :none)) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "listify_rest_arg" :foreign)
-            (ea 16 rbp-tn)
-            (ea 24 rbp-tn)
-            system-tlab-p)
+    RESTART
+    (call-c "listify_rest_arg" (ea 16 rbp-tn) (ea 24 rbp-tn) system-tlab-p)
+    (test-arena-exhausted :list-elts)
+    SUCCESS
     (inst mov (ea 24 rbp-tn) rax-tn))   ; result
   (inst ret 8)) ; pop one argument; the unpopped word now holds the result
 
 (def-routine-pair (make-list (:return-style :none)) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "make_list" :foreign)
-            (ea 16 rbp-tn)
-            (ea 24 rbp-tn)
-            system-tlab-p)
+    RESTART
+    (call-c "make_list" (ea 16 rbp-tn) (ea 24 rbp-tn) system-tlab-p)
+    (test-arena-exhausted :list-elts)
+    SUCCESS
     (inst mov (ea 24 rbp-tn) rax-tn)) ; result
   (inst ret 8)) ; pop one argument; the unpopped word now holds the result
 )
 
 (define-assembly-routine (alloc-funinstance) ()
   (with-registers-preserved (c)
-    (call-c (make-fixup "alloc_funinstance" :foreign)
-            (ea 16 rbp-tn))
+    (call-c "alloc_funinstance" (ea 16 rbp-tn))
     (inst mov (ea 16 rbp-tn) rax-tn)))
 
 ;;; These routines are for the deterministic consing profiler.
@@ -147,86 +202,41 @@
   (with-registers-preserved (c)
     #+sb-thread
     (pseudo-atomic ()
-      (call-c (make-fixup "allocation_tracker_counted" :foreign)
-              (* (ea 8 rbp-tn))))))
+      (call-c "allocation_tracker_counted" (addressof (ea 8 rbp-tn))))))
 
 (define-assembly-routine (enable-sized-alloc-counter) ()
   (with-registers-preserved (c)
     #+sb-thread
     (pseudo-atomic ()
-      (call-c (make-fixup "allocation_tracker_sized" :foreign)
-              (* (ea 8 rbp-tn))))))
+      (call-c "allocation_tracker_sized" (addressof (ea 8 rbp-tn))))))
 
-(define-assembly-routine (undefined-tramp (:return-style :none))
-    ((:temp rax descriptor-reg rax-offset))
-  (inst pop (ea n-word-bytes rbp-tn))
-  (emit-error-break nil cerror-trap (error-number-or-lose 'undefined-fun-error) (list rax))
-  (inst push (ea n-word-bytes rbp-tn))
-  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) rax)))
-
-#+win32
+#+(or win32 (not immobile-space))
 (define-assembly-routine
     (undefined-alien-tramp (:return-style :none))
     ()
   (error-call nil 'undefined-alien-fun-error rbx-tn))
 
-#-win32
+#+(and immobile-space (not win32))
 (define-assembly-routine
     (undefined-alien-tramp (:return-style :none))
     ()
   ;; This routine computes into RBX the address of the linkage table entry that was called,
   ;; corresponding to the undefined alien function.
-  (inst push rax-tn) ; save registers in case we want to see the old values
-  (inst push rbx-tn)
+  (inst push rax-tn)
   ;; load RAX with the PC after the call site
-  (inst mov rax-tn (ea 16 rsp-tn))
+  (inst mov rax-tn (ea 8 rsp-tn))
+  ;; The CALL takes one of 3 shapes. Only the first has #xE8 at next PC - 5.
+  ;;  * CALL rel32                                  | from immobile code
+  ;;  * MOV EBX, imm32 / ADD EBX, [tbl] / CALL RBX  | from dynamic space
+  ;;  * multibyte-nop / CALL rbx                    | anonymous call
+  (inst cmp :byte (ea -5 rax-tn) #xE8)
+  (inst jmp :ne TRAP) ; RBX is valid
   ;; load RBX with the signed 32-bit immediate from the call instruction
   (inst movsx '(:dword :qword) rbx-tn (ea -4 rax-tn))
-  ;; The decoding seems scary, but it's actually not. Any C call-out instruction has
-  ;; a 4-byte trailing operand, with the preceding byte being unique.
-  ;; if at [PC-5] we see #x25 then it was a call with 32-bit mem addr
-  ;; if ...              #xE8 then ...                32-bit offset
-  ;; if ...              #x92 then it was "call *DISP(%r10)" where r10 is the table base
-  #-immobile-space ; only non-relocatable alien linkage table can use "CALL [ABS]" form
-  (progn (inst cmp :byte (ea -5 rax-tn) #x25)
-         (inst jmp :e ABSOLUTE))
-  #+immobile-space ; only relocatable alien linkage table can use "CALL rel32" form
-  (progn (inst cmp :byte (ea -5 rax-tn) #xE8)
-         (inst jmp :e RELATIVE)
-         (inst cmp :byte (ea -5 rax-tn) #x92)
-         (inst jmp :e ABSOLUTE))
-  ;; failing those, assume RBX was valid. ("can't happen")
-  (inst mov rbx-tn (ea rsp-tn)) ; restore pushed value of RBX
-  (inst jmp trap)
-  ABSOLUTE
-  #-immobile-space (inst sub rbx-tn 8)
-  #+immobile-space (inst lea rbx-tn (ea -8 r10-tn rbx-tn))
-  (inst jmp TRAP)
-  RELATIVE
   (inst add rbx-tn rax-tn)
   TRAP
-  ;; XXX: why aren't we adding something to the stack pointer to balance the two pushes?
-  ;; (I guess we can only THROW at this point, so it doesn't matter)
+  (inst pop rax-tn)
   (error-call nil 'undefined-alien-fun-error rbx-tn))
-
-;;; the closure trampoline - entered when a global function is a closure
-;;; and the function is called "by name" (normally, as when it is the
-;;; head of a form) via an FDEFN. Register %RAX holds the fdefn address,
-;;; but the simple-fun which underlies the closure expects %RAX to be the
-;;; closure itself. So we grab the closure out of the fdefn pointed to,
-;;; then jump to the simple-fun that the closure points to.
-;;;
-;;; Immobile code uses a different strategy to call a closure that has been
-;;; installed as a globally named function. The fdefn contains a jump opcode
-;;; to a tiny code component specific to the particular closure.
-;;; The trampoline is responsible for loading RAX, since named calls don't.
-;;; However, #+immobile-code might still need CLOSURE-TRAMP for any fdefn
-;;; for which the compiler chooses not to use "direct" call convention.
-(define-assembly-routine
-    (closure-tramp (:return-style :none))
-    ()
-  (loadw rax-tn rax-tn fdefn-fun-slot other-pointer-lowtag)
-  (inst jmp (object-slot-ea rax-tn closure-fun-slot fun-pointer-lowtag)))
 
 #+debug-gc-barriers
 (define-assembly-routine (check-barrier (:return-style :none)) ()
@@ -239,10 +249,7 @@
   (inst ret 24)
   check
   (with-registers-preserved (c :except fp) ;; shouldn't have any fp operations
-    (call-c (make-fixup "check_barrier" :foreign)
-            (ea 16 rbp-tn)
-            (ea 24 rbp-tn)
-            (ea 32 rbp-tn)))
+    (call-c "check_barrier" (ea 16 rbp-tn) (ea 24 rbp-tn) (ea 32 rbp-tn)))
   (inst ret 24))
 
 ;;; Perform a store to code, updating the GC card mark bit.
@@ -269,25 +276,17 @@
     (pseudo-atomic ()
       #+immobile-space
       (progn
-        #-sb-thread
-        (let ((fixup (make-fixup "all_threads" :foreign-dataref)))
-          ;; Load THREAD-BASE-TN from the all_threads. Does not need to be spilled
-          ;; to stack, because we do do not give the register allocator access to it.
-          (inst mov thread-tn (rip-relative-ea fixup))
-          (inst mov thread-tn (ea thread-tn)))
         (inst mov rax object)
-        (inst sub rax (thread-slot-ea thread-text-space-addr-slot))
+        (inst sub rax (static-constant-ea text-space-addr))
         (inst shr rax (1- (integer-length immobile-card-bytes)))
-        (inst cmp rax (thread-slot-ea thread-text-card-count-slot))
+        (inst cmp rax (static-constant-ea text-card-count))
         (inst jmp :ae try-dynamic-space)
-        (inst mov rdi (thread-slot-ea thread-text-card-marks-slot))
+        (inst mov rdi (static-constant-ea text-card-marks))
         (inst bts :dword :lock (ea rdi-tn) rax)
         (inst jmp store))
       TRY-DYNAMIC-SPACE
       (inst mov rax object)
-      (inst shr rax gencgc-card-shift)
-      (inst and :dword rax card-index-mask)
-      (inst mov :byte (ea gc-card-table-reg-tn rax) CARD-MARKED)
+      (mark-gc-card rax)
       STORE
       (inst mov rdi object)
       (inst mov rdx word-index)

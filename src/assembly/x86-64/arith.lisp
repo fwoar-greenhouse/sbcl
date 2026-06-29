@@ -21,30 +21,7 @@
 (defun some-fixnum-p (temp x y)
   (inst mov :dword temp x)
   (inst and :dword temp y)
-  (inst test :byte temp fixnum-tag-mask))
-
-(defun static-fun-addr (name)
-  #+immobile-code (make-fixup name :static-call)
-  #-immobile-code (ea (+ nil-value (static-fun-offset name))))
-
-(defun call-static-fun (fun arg-count)
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn (* n-word-bytes 2))
-  (inst mov (ea rsp-tn) rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst mov rcx-tn (fixnumize arg-count))
-  (inst call (static-fun-addr fun))
-  (inst pop rbp-tn))
-
-(defun tail-call-static-fun (fun arg-count)
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn n-word-bytes)
-  (inst push (ea (frame-byte-offset return-pc-save-offset) rbp-tn))
-  (inst mov rcx-tn (fixnumize arg-count))
-  (inst jmp (static-fun-addr fun))))
-
+  (inst test :byte temp fixnum-tag-mask)))
 
 ;;;; addition, subtraction, and multiplication
 
@@ -52,9 +29,9 @@
 (defun return-single-word-bignum (dest alloc-tn source)
   (let ((header (logior (ash 1 n-widetag-bits) bignum-widetag))
         (nbytes #+bignum-assertions 32 #-bignum-assertions 16))
-    (instrument-alloc bignum-widetag nbytes nil alloc-tn)
-    (pseudo-atomic ()
-      (allocation bignum-widetag nbytes 0 alloc-tn nil nil nil)
+    (emit-instrument-alloc nil thread-tn bignum-widetag nbytes alloc-tn)
+    (allocating ()
+      (emit-allocation nil thread-tn bignum-widetag nbytes 0 alloc-tn nil)
       (storew* header alloc-tn 0 0 t)
       (storew source alloc-tn bignum-digits-offset 0)
       (if (eq dest alloc-tn)
@@ -87,7 +64,7 @@
                 (inst ret)
 
                 DO-STATIC-FUN
-                (tail-call-static-fun ',(symbolicate "TWO-ARG-" fun) 2))))
+                (tail-call-lisp-fun ',(symbolicate "TWO-ARG-" fun) 2))))
 
   (define-generic-arith-routine (+ 10)
     (move res x)
@@ -133,7 +110,7 @@
     (inst cmp x rcx)
     (inst jmp :e SINGLE-WORD-BIGNUM)
 
-    (alloc-other bignum-widetag (+ bignum-digits-offset 2) res nil nil nil)
+    (emit-alloc-other nil thread-tn bignum-widetag (+ bignum-digits-offset 2) res)
     (storew rax res bignum-digits-offset other-pointer-lowtag)
     (storew rcx res (1+ bignum-digits-offset) other-pointer-lowtag)
     (inst clc) (inst ret)
@@ -163,9 +140,12 @@
                         rip-tn))
   (inst clc) (inst ret)
   GENERIC
-  (tail-call-static-fun '%negate 1))
+  (tail-call-lisp-fun '%negate 1))
 
 ;;;; comparison
+
+(eval-when (:compile-toplevel)
+  (assert (minusp (static-symbol-offset t))))
 
 (macrolet ((define-cond-assem-rtn (name translate static-fn test)
              `(define-assembly-routine (,name
@@ -186,13 +166,13 @@
                 (inst ret)
 
                 DO-STATIC-FUN
-                (call-static-fun ',static-fn 2)
-                ;; HACK: We depend on NIL having the lowest address of all
-                ;; static symbols (including T)
+                (call-lisp-fun ',static-fn 2)
+                ;; X now holds T or NIL corresponding to the answer but it needs
+                ;; to be returned as :L or :G in EFLAGS. We rely on address of T
+                ;; being less address of NIL (asserted above)
                 ,@(ecase test
-                    (:l `((inst mov y (1+ nil-value))
-                          (inst cmp y x)))
-                    (:g `((inst cmp x (1+ nil-value))))))))
+                    (:l `((inst cmp x null-tn)))
+                    (:g `((inst cmp null-tn x)))))))
   (define-cond-assem-rtn generic-< < two-arg-< :l)
   (define-cond-assem-rtn generic-> > two-arg-> :g))
 
@@ -214,8 +194,9 @@
   (inst ret)
 
   DO-STATIC-FUN
-  (call-static-fun 'two-arg-= 2)
-  (inst cmp x (+ nil-value (static-symbol-offset t))))
+  (call-lisp-fun 'two-arg-= 2)
+  (inst sub x null-tn)
+  (inst cmp x (static-symbol-offset t)))
 
 #+sb-assembling
 (define-assembly-routine (logcount)
@@ -351,12 +332,15 @@
 ;;;   (define-assembly-routine ... ((:temp ...)) (:let ((c (register-inline-constant ...)))))
 ;;; It just doesn't seem worth the effort to do all that.
 (defparameter eql-dispatch nil)
-(define-assembly-routine (generic-eql (:return-style :none))
+(define-assembly-routine (generic-eql (:return-style :none)
+                                      (:export generic-eql* eql-ratio))
     ((:temp rcx unsigned-reg rcx-offset)  ; callee-saved
      (:temp rax unsigned-reg rax-offset)  ; vop temps
      (:temp rsi unsigned-reg rsi-offset)
      (:temp rdi unsigned-reg rdi-offset)
      (:temp r11 unsigned-reg r11-offset))
+  (inst mov :byte rax (ea (- other-pointer-lowtag) rdi))
+  (inst sub :byte rax bignum-widetag)
   ;; SINGLE-FLOAT is included in this table because its widetag within the range
   ;; of accepted widetags in the precondition for calling this routine.
   ;; Technically it would be an error to see an other-pointer object with that tag.
@@ -377,6 +361,7 @@
   ;; widetags are spaced 4 apart, and we've subtracted BIGNUM_WIDETAG,
   ;; so scaling by 2 gets a multiple of 8 with bignum at offset 0 etc.
   ;; But the upper 3 bytes of EAX hold junk presently, so clear them.
+  GENERIC-EQL*
   (inst and :dword rax #x7f)
   (inst lea r11 eql-dispatch)
   (inst jmp (ea r11 rax 2))

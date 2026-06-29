@@ -82,7 +82,6 @@
   (def set-header-data (x val))
   (def widetag-of)
   (def %other-pointer-widetag)
-  (def pointer-hash)
   (def vector-sap)
   (def binding-stack-pointer-sap  ())
   #+cheneygc (def dynamic-space-free-pointer ())
@@ -91,13 +90,14 @@
   (def %fun-pointer-widetag)
   (def %closure-fun)
   (def %closure-index-ref (closure index))
+  (def make-fdefn)
   (def fdefn-name)
   (def fdefn-fun)
-  (def fdefn-makunbound)
+  #-linkage-space (def fdefn-makunbound)
   (def sb-c::vector-length)
   (def make-array-header (type rank))
   (def code-instructions)
-  #-untagged-fdefns (def code-header-ref (code-obj index))
+  (def code-header-ref (code-obj index))
   (def %vector-raw-bits (object offset))
   (def %set-vector-raw-bits (object offset value))
   #-weak-vector-readbarrier (def weak-vector-len)
@@ -139,9 +139,10 @@
   #+compare-and-swap-vops
   (def* (%array-atomic-incf/word (array index diff))
         (%raw-instance-atomic-incf/word (instance index diff)))
+  #+(or arm64 x86 x86-64)
+  (def* (sb-vm::%vector-cas-pair (vector index old1 old2 new1 new2)))
   #+(or x86 x86-64)
-  (def* (sb-vm::%cpu-identification (arg1 arg2))
-        (sb-vm::%vector-cas-pair (vector index old1 old2 new1 new2))
+  (def* (sb-vm::%cpu-identification (eax ecx))
         (sb-vm::%instance-cas-pair (instance index old1 old2 new1 new2))
         (sb-vm::%cons-cas-pair (cons old1 old2 new1 new2)))
 
@@ -157,7 +158,7 @@
         (%make-simd-pack-256-double (a b c d))
         (%make-simd-pack-256-ub64 (a b c d))
         (%simd-pack-256-tag))
-  #+sb-thread (def sb-vm::current-thread-offset-sap)
+  #+(or sb-thread x86-64) (def sb-vm::current-thread-offset-sap)
   (def current-sp ())
   (def current-fp ())
   (def stack-ref (s n))
@@ -165,13 +166,15 @@
   (def symbol-package-id)
   (def symbol-hash)
   (def symbol-%info) ; primitive reader always needs a stub
-  #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
-  (def get-lisp-obj-address)
   #+x86-64
   (def single-float-copysign (float float2))
   #+x86-64
-  (def single-float-sign))
+  (def single-float-sign)
+  #+64-bit
+  (def %make-double-float)
+  (def %numerator)
+  (def %denominator))
 
 #+sb-simd-pack
 (macrolet ((def (name)
@@ -211,3 +214,11 @@
   ;; (OR LIST SYMBOL CLASSOID CLASS), and CLASS isn't known, and you can't
   ;; define it because it's a standard symbol.
   (setq sb-c::*undefined-warnings* nil))
+
+(setf (fdefinition 'unaligned-dx-cons) #'list)
+
+(defun rotate-right-word (n count)
+  (dpb
+   n
+   (byte count (- sb-vm:n-word-bits count))
+   (ash n (- count))))

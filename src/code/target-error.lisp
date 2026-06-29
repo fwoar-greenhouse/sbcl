@@ -75,7 +75,7 @@
 ;; 2) and for which the restart test returns non-NIL for CONDITION.
 ;; When CALL-TEST-P is non-NIL, all restarts are processed.
 (defun map-restarts (function &optional condition (call-test-p t))
-  (declare (function function))
+  (declare (function function) (dynamic-extent function))
   (let ((stack *restart-test-stack*))
     (dolist (restart-cluster *restart-clusters*)
       (dolist (restart restart-cluster)
@@ -110,8 +110,6 @@ restarts associated with CONDITION (or with no condition) will be returned."
          (named-restart-p (restart)
            (when (eq identifier (restart-name restart))
              (return-from %find-restart restart))))
-    ;; KLUDGE: can the compiler infer this dx automatically?
-    (declare (dynamic-extent #'eq-restart-p #'named-restart-p))
     (if (typep identifier 'restart)
         ;; The code under #+previous-... below breaks the abstraction
         ;; introduced by MAP-RESTARTS, but is about twice as
@@ -390,6 +388,7 @@ with that condition (or with no condition) will be returned."
                    (find type-err-layout (layout-inherits layout)))))
            ;; avoid full calls to STACK-ALLOCATED-P here
            (stackp (x)
+             (declare (special sb-vm:*control-stack-start* sb-vm:*control-stack-end*))
              (let ((addr (get-lisp-obj-address x)))
                (and (sb-vm:is-lisp-pointer addr)
                     (<= (get-lisp-obj-address sb-vm:*control-stack-start*) addr)
@@ -513,12 +512,9 @@ with that condition (or with no condition) will be returned."
          `(condition-slot-reader ,name))))
 (defun install-condition-slot-writer (name condition slot-name)
   (declare (ignore condition))
-  (setf (fdefinition name)
-        (set-closure-name
-         (lambda (new-value condition)
-           (set-condition-slot-value condition new-value slot-name))
-         t
-         `(condition-slot-writer ,name))))
+  ;; Builtin condition types don't need writer functions.
+  ;; It'll be allowed post-build - if you must - when this function gets redefined.
+  (error "Won't make a condition-slot-writer for ~S ~S" name slot-name))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun %%compiler-define-condition (name direct-supers layout readers writers)
@@ -831,6 +827,8 @@ with that condition (or with no condition) will be returned."
        (struct-context
         (format nil "when setting slot ~s of structure ~s"
                 (cddr context) (cadr context)))
+       (sb-pcl::slot
+        (format nil "when setting slot ~s" (cadr context)))
        (t context)))
     ((eql sb-c::aref-context)
      (let (*print-circle*)
@@ -838,6 +836,8 @@ with that condition (or with no condition) will be returned."
                type)))
     ((eql sb-c::ftype-context)
      "from the function type declaration.")
+    ((member map)
+     (format nil "for the result type of ~a." context))
     ((and symbol
           (not null))
      (format nil "when binding ~s" context))
@@ -851,23 +851,30 @@ with that condition (or with no condition) will be returned."
   (:report report-general-type-error))
 (defun report-general-type-error (condition stream)
   (let ((type (type-error-expected-type condition))
-        (context (type-error-context condition)))
-    (if (eq context :multiple-values)
-        (format stream  "~@<The values ~
+        (context (type-error-context condition))
+        (datum (type-error-datum condition)))
+    (case context
+      (:multiple-values
+       (format stream  "~@<The values ~
                          ~@:_~2@T~S ~
                          ~@:_are not of type ~
                          ~@:_~2@T~/sb-impl:print-type-specifier/~:@>"
-                   (type-error-datum condition)
-                   type)
-        (format stream  "~@<The value ~
+               datum
+               type))
+      (sb-c::coerce-context
+       (format stream "~S can't be converted to type ~
+                       ~/sb-impl:print-type-specifier/."
+               datum type))
+      (t
+       (format stream  "~@<The value ~
                          ~@:_~2@T~S ~
                          ~@:_is not of type ~
                          ~@:_~2@T~/sb-impl:print-type-specifier/~@[ ~
                          ~@:_~a~]~:@>"
-                (type-error-datum condition)
-                type
-                (decode-type-error-context (type-error-context condition)
-                                           type)))))
+               datum
+               type
+               (decode-type-error-context (type-error-context condition)
+                                          type))))))
 
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
@@ -1154,10 +1161,6 @@ with that condition (or with no condition) will be returned."
 (define-condition simple-reference-warning (reference-condition simple-warning)
   ())
 
-(define-condition arguments-out-of-domain-error
-    (arithmetic-error reference-condition)
-  ())
-
 ;; per CLHS: "The consequences are unspecified if functions are ...
 ;; multiply defined in the same file." so we are within reason to do any
 ;; unspecified behavior at compile-time and/or time, but the compiler was
@@ -1387,14 +1390,15 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
      (let ((array (invalid-array-index-error-array condition))
            (index (type-error-datum condition)))
        (if (integerp index)
-           (format stream "Invalid index ~S for ~@[axis ~W of ~]~S, ~
-                           should be a non-negative integer below ~W."
+           (format stream "Invalid index ~D for ~@[axis ~D of ~]~
+~S~@[, ~:@_should be a non-negative integer below ~D~]."
                    (type-error-datum condition)
                    (when (> (array-rank array) 1)
                      (invalid-array-index-error-axis condition))
                    (type-of array)
                    ;; Extract the bound from (INTEGER 0 (BOUND))
-                   (caaddr (type-error-expected-type condition)))
+                   (let ((max (caaddr (type-error-expected-type condition))))
+                     (if (> max 0) max)))
            (format stream "~s is not of type INTEGER." index))))))
 
 (define-condition invalid-array-error (reference-condition type-error) ()
@@ -1447,15 +1451,15 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
      (let ((sequence (slot-value condition 'sequence))
            (index (type-error-datum condition)))
        (if (vectorp sequence)
-           (format stream "Invalid index ~W for ~S ~@[with fill-pointer ~a~], ~
-                           should be a non-negative integer below ~W."
+           (format stream "Invalid index ~D for ~S~@[ with fill-pointer ~D~]~
+~@[, ~:@_should be a non-negative integer below ~D~]."
                    index
                    (type-of sequence)
                    (and (array-has-fill-pointer-p sequence)
                         (fill-pointer sequence))
-                   (length sequence))
+                   (let ((l (length sequence))) (if (> l 0) l)))
            (format stream
-                   "The index ~S is too large for a ~a of length ~s."
+                   "The index ~D is too large for a ~a of length ~D."
                    index
                    (if (listp sequence)
                        "list"
@@ -1761,7 +1765,7 @@ handled by any other handler, it will be muffled.")
          (debug-source (when debug-info
                          (sb-c::debug-info-source debug-info)))
          (namestring (when debug-source
-                       (debug-source-namestring debug-source))))
+                       (sb-c::debug-source-namestring debug-source))))
     namestring))
 
 (defun interesting-function-redefinition-warning-p (warning old)
@@ -1954,20 +1958,34 @@ the usual naming convention (names like *FOO*) for special variables"
    (description :initarg :description :reader proclamation-mismatch-description :initform nil)
    (name :initarg :name :reader proclamation-mismatch-name)
    (old :initarg :old :reader proclamation-mismatch-old)
-   (new :initarg :new :reader proclamation-mismatch-new))
+   (new :initarg :new :reader proclamation-mismatch-new)
+   (value :initarg :value))
   (:report
    (lambda (condition stream)
-     (format stream
-             "~@<The new ~A proclamation for~@[ ~A~] ~
+     (if (slot-boundp condition 'value)
+         (format stream
+                 "~@<The new ~A proclamation for~@[ ~A~] ~
+               ~/sb-ext:print-symbol-with-prefix/~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:_~
+               does not match the current value ~S of type~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:>"
+                 (proclamation-mismatch-kind condition)
+                 (proclamation-mismatch-description condition)
+                 (proclamation-mismatch-name condition)
+                 (proclamation-mismatch-new condition)
+                 (slot-value condition 'value)
+                 (proclamation-mismatch-old condition))
+         (format stream
+                 "~@<The new ~A proclamation for~@[ ~A~] ~
                ~/sb-ext:print-symbol-with-prefix/~
                ~@:_~2@T~/sb-impl:print-type-specifier/~@:_~
                does not match the old ~4:*~A~3* proclamation~
                ~@:_~2@T~/sb-impl:print-type-specifier/~@:>"
-             (proclamation-mismatch-kind condition)
-             (proclamation-mismatch-description condition)
-             (proclamation-mismatch-name condition)
-             (proclamation-mismatch-new condition)
-             (proclamation-mismatch-old condition)))))
+                 (proclamation-mismatch-kind condition)
+                 (proclamation-mismatch-description condition)
+                 (proclamation-mismatch-name condition)
+                 (proclamation-mismatch-new condition)
+                 (proclamation-mismatch-old condition))))))
 
 (define-condition type-proclamation-mismatch (proclamation-mismatch)
   ()
@@ -2347,13 +2365,13 @@ PROCEED WITH CAUTION."))))
 
 PROCEED WITH CAUTION."))))
 
+(sb-impl:define-thread-local *heap-exhausted-error-available-bytes*)
+(sb-impl:define-thread-local *heap-exhausted-error-requested-bytes*)
 (define-condition heap-exhausted-error (storage-condition)
   ()
   (:report
    (lambda (condition stream)
      (declare (ignore condition))
-     (declare (special *heap-exhausted-error-available-bytes*
-                       *heap-exhausted-error-requested-bytes*))
      ;; See comments in interr.lisp -- there is a method to this madness.
      (if (and (boundp '*heap-exhausted-error-available-bytes*)
               (boundp '*heap-exhausted-error-requested-bytes*))
@@ -2369,6 +2387,15 @@ PROCEED WITH CAUTION."
                  "A ~S condition without bindings for heap statistics.  (If
 you did not expect to see this message, please report it."
                  'heap-exhausted-error)))))
+
+(define-condition arena-exhausted-error (storage-condition)
+  ((arena :initarg :arena)
+   (request :initarg :request))
+  (:report
+   (lambda (condition stream)
+     (format stream "Arena ~A exhausted: ~D bytes requested."
+             (slot-value condition 'arena)
+             (slot-value condition 'request)))))
 
 (define-condition system-condition (condition)
   ((address :initarg :address :reader system-condition-address :initform nil)
@@ -2417,7 +2444,7 @@ you did not expect to see this message, please report it."
      (print-unreadable-object (object stream :type t :identity t)))))
 
 
-(defun assert-error (assertion &rest rest)
+(define-error-wrapper assert-error (assertion &rest rest)
   (let* ((rest rest)
          (n-args-and-values (if (fixnump (car rest))
                                 (* (pop rest) 2)
@@ -2475,7 +2502,7 @@ you did not expect to see this message, please report it."
   (finish-output *query-io*)
   (multiple-value-list (eval (read *query-io*))))
 
-(defun check-type-error (place place-value type &optional type-string)
+(define-error-wrapper check-type-error (place place-value type &optional type-string)
   (let ((condition
          (make-condition
           'simple-type-error
@@ -2490,6 +2517,30 @@ you did not expect to see this message, please report it."
                   (format stream "Supply a new value for ~S." place))
         :interactive read-evaluated-form
         value))))
+
+(define-error-wrapper check-type-error-trap (place value type)
+  (multiple-value-bind (place type type-string)
+      (if (stringp type)
+          (values (car place) (cdr place) type)
+          (values place type))
+    (loop
+     (let ((condition
+             (make-condition
+              'simple-type-error
+              :datum value
+              :expected-type type
+              :format-control
+              "The value of ~S is ~S, which is not ~:[of type ~S~;~:*~A~]."
+              :format-arguments (list place value type-string type))))
+       (restart-case (error condition)
+         (store-value (new-value)
+           :report (lambda (stream)
+                     (format stream "Supply a new value for ~S." place))
+           :interactive read-evaluated-form
+           (setf value new-value)
+           (when (typep new-value type)
+             (return))))))
+    value))
 
 (define-error-wrapper etypecase-failure (value keys)
   (error 'case-failure

@@ -82,7 +82,6 @@
 (defconstant eexist 17) ; #x11
 (defconstant eloop 62) ; #x3e
 (defconstant epipe 32) ; #x20
-(defconstant espipe 29) ; #x1d
 (defconstant ewouldblock 35) ; #x23
 
 (defconstant sc-nprocessors-onln 58) ; #x3a
@@ -128,6 +127,9 @@
 (defconstant sigwinch 28) ; #x1c
 (defconstant sigxcpu 24) ; #x18
 (defconstant sigxfsz 25) ; #x19
+(defconstant itimer-real 0) ; #x0
+(defconstant itimer-virtual 1) ; #x1
+(defconstant itimer-prof 2) ; #x2
 (defconstant fpe-intovf 8) ; #x8
 (defconstant fpe-intdiv 7) ; #x7
 (defconstant fpe-fltdiv 1) ; #x1
@@ -149,6 +151,9 @@
   (struct timespec
           (tv-sec (signed 64))
           (tv-nsec (signed 64))))
+
+(defconstant sizeof-timespec 16) ; #x10
+(defconstant sizeof-timeval 16) ; #x10
 
 ;;; sysctl(3) names
 (in-package "SB-IMPL")

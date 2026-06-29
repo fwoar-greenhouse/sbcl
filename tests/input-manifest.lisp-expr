@@ -1,7 +1,10 @@
 ;;; This comment might make sourceforge stop thinking that the file
 ;;; is binary its diff view.
 ;;; Or not.
-(("aprof.impure.lisp"
+(("alien-struct-access.impure.lisp" "tests/alien-struct-access.so")
+ ("alien-struct-by-value.impure.lisp" "tests/alien-struct-by-value.so")
+ ("alien.impure.lisp" "tests/alien-128.so")
+ ("aprof.impure.lisp"
   "src/code/aprof.lisp"
   "src/code/shaketree.lisp")
  ("avltree.pure.lisp" "tests/bbtree-test-util.lisp")
@@ -9,9 +12,6 @@
  ("brothertree.impure.lisp"
   "src/code/brothertree.lisp")
  ("case.pure.lisp" "tests/case-test.lisp")
- ("chill.test.sh"
-  "src/cold/chill.lisp"
-  "package-data-list.lisp-expr")
  ("clos.impure.lisp"
   "contrib/sb-cltl2.fasl"
   "tests/package-ctor-bug.lisp"
@@ -46,6 +46,7 @@
  ("elfcore.test.sh" "src/runtime/shrinkwrap-sbcl")
  ("exit-hang.impure.lisp" "tests/fcb-threads.so")
  ("fcb-threads.impure.lisp" "tests/fcb-threads.so")
+ ("fifo-slow.impure.lisp" "contrib/sb-posix.fasl")
  ("filecompile.impure.lisp"
   "tests/data/wonky1.lisp"
   "tests/data/wonky2.lisp"
@@ -71,7 +72,6 @@
   "tests/data/compile-file-pos-utf16be.lisp")
  ("packages.impure.lisp"
   "contrib/sb-md5.fasl"
-  "contrib/sb-rotate-byte.fasl"
   "tests/package-test-1.lisp"
   "tests/package-test-2.lisp"
   "tests/package-test-3.lisp"
@@ -86,6 +86,8 @@
   "../xperfecthash61.lisp-expr")
  ("redblack.pure.lisp" "tests/bbtree-test-util.lisp" "src/code/redblack.lisp")
  ("run-program.impure.lisp" "contrib/sb-posix.fasl")
+ ("save11.test.sh"
+  "src/code/repack-xref.lisp" "tools-for-build/corefile.lisp" "tools-for-build/editcore.lisp")
  ("sb-aclrepl.impure.lisp" "contrib/sb-aclrepl.fasl"
   "../contrib/sb-aclrepl/tests.lisp")
  ("sb-bsd-sockets.impure.lisp" "contrib/sb-bsd-sockets.fasl" "contrib/sb-posix.fasl"
@@ -104,7 +106,7 @@
   "../contrib/sb-introspect/xref-test-data.lisp" "../contrib/sb-introspect/xref-test.lisp"
   "../contrib/sb-introspect/test.lisp" "../contrib/sb-introspect/test-driver.lisp"
   "../contrib/sb-introspect/load-test.lisp")
- ("sb-md5.impure.lisp" "contrib/sb-md5.fasl" "contrib/sb-rotate-byte.fasl"
+ ("sb-md5.impure.lisp" "contrib/sb-md5.fasl"
   "../contrib/sb-md5/md5-tests.lisp")
  ("sb-mpfr.impure.lisp" "contrib/sb-gmp.fasl" "contrib/sb-mpfr.fasl"
   "../contrib/sb-mpfr/tests.lisp")
@@ -127,8 +129,9 @@
  ("sb-sprof.impure.lisp" "contrib/sb-sprof.fasl"
   "../contrib/sb-sprof/test.lisp" "../contrib/sb-sprof/graph.lisp")
  ("signals.impure.lisp" "contrib/sb-posix.fasl")
- ("stream.impure.lisp" "contrib/sb-posix.fasl")
- ("threads.impure.lisp"
+ ("stream.impure.lisp" "contrib/sb-posix.fasl" "tests/zero")
+ ("stream.pure.lisp" "tests/zero")
+ ("threads-2.impure.lisp"
   "tests/alloca.so"
   "tests/threads-foreign.so")
  ("threads.test.sh" "tests/condition-wait-sigcont.lisp")
@@ -158,4 +161,5 @@
   "tests/undefined-classoid-bug-1.lisp"
   "tests/undefined-classoid-bug-2.lisp")
  ("x86-64-codegen.impure.lisp"
-  "tests/typep-golden-data.txt"))
+  "tests/typep-golden-data.txt")
+  )

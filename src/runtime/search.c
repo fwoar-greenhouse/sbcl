@@ -61,9 +61,15 @@ lispobj *search_codeblob_offsets(void* pointer) {
     if ((uword_t)pointer < TEXT_SPACE_START ||
         (uword_t)pointer >= (uword_t)text_space_highwatermark) return 0;
     struct vector* v = (void*)TEXT_SPACE_START;
+#ifdef LISP_FEATURE_64_BIT
     uint32_t* data = (void*)v->data;
     int index = bsearch_lesseql_uint32((char*)pointer - (char*)TEXT_SPACE_START,
                                        data, vector_len(v));
+#else
+    uword_t* data = v->data;
+    int index = bsearch_lesseql_uword((char*)pointer - (char*)TEXT_SPACE_START,
+                                      data, vector_len(v));
+#endif
     if (index >= 0) {
         lispobj* base = (lispobj*)(TEXT_SPACE_START + data[index]);
         gc_assert(widetag_of(base) == CODE_HEADER_WIDETAG);
@@ -116,9 +122,9 @@ struct symbol_search {
     char *name;
     bool ignore_case;
 };
-static uword_t search_symbol_aux(lispobj* start, lispobj* end, uword_t arg)
+static uword_t search_symbol_aux(lispobj* start, lispobj* end, void* arg)
 {
-    struct symbol_search* ss = (struct symbol_search*)arg;
+    struct symbol_search* ss = arg;
     return (uword_t)search_for_symbol(ss->name, (lispobj)start, (lispobj)end, ss->ignore_case);
 }
 lispobj* search_for_symbol(char *name, lispobj start, lispobj end, bool ignore_case)
@@ -134,7 +140,7 @@ lispobj* search_for_symbol(char *name, lispobj start, lispobj end, bool ignore_c
     // So if the specified range is all of dynamic space, defer to the space walker.
     if (start == DYNAMIC_SPACE_START && end == dynamic_space_highwatermark()) {
         struct symbol_search ss = {name, ignore_case};
-        return (lispobj*)walk_generation(search_symbol_aux, -1, (uword_t)&ss);
+        return (lispobj*)walk_generation(search_symbol_aux, -1, &ss);
     }
 #endif
     while (where < limit) {
@@ -158,37 +164,9 @@ lispobj* search_for_symbol(char *name, lispobj start, lispobj end, bool ignore_c
     return 0;
 }
 
-/// This unfortunately entails a heap scan,
-/// but it's quite fast if the symbol is found in immobile space.
-#ifdef LISP_FEATURE_SB_THREAD
-struct symbol* lisp_symbol_from_tls_index(lispobj tls_index)
+static uword_t bruteforce_findpkg_by_id(lispobj* where, lispobj* limit, void* arg)
 {
-    lispobj* where = 0;
-    lispobj* end = 0;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    where = (lispobj*)FIXEDOBJ_SPACE_START;
-    end = fixedobj_free_pointer;
-#endif
-    while (1) {
-        while (where < end) {
-            lispobj header = *where;
-            int widetag = header_widetag(header);
-            if (widetag == SYMBOL_WIDETAG &&
-                tls_index_of(((struct symbol*)where)) == tls_index)
-                return (struct symbol*)where;
-            where += object_size2(where, header);
-        }
-        if (where >= (lispobj*)DYNAMIC_SPACE_START)
-            break;
-        where = (lispobj*)DYNAMIC_SPACE_START;
-        end = (lispobj*)dynamic_space_highwatermark();
-    }
-    return 0;
-}
-#endif
-
-static uword_t bruteforce_findpkg_by_id(lispobj* where, lispobj* limit, uword_t id)
-{
+    uword_t id = (uword_t)arg;
     lispobj layout;
     for ( where = next_object(where, 0, limit) ; where ;
           where = next_object(where, object_size(where), limit) ) {
@@ -207,7 +185,7 @@ lispobj get_package_by_id(int id) {
     lispobj vector = barrier_load(&lisp_package_vector);
     if (!vector) {
         // Perform a heap walk. This should never occur except in core loading/saving.
-        lispobj result =  walk_generation(bruteforce_findpkg_by_id, -1, make_fixnum(id));
+        lispobj result =  walk_generation(bruteforce_findpkg_by_id, -1, (void*)make_fixnum(id));
         if (is_lisp_pointer(result)) return result;
         lose("get_package_by_id: no package vector");
     }
@@ -374,14 +352,6 @@ int bsearch_greatereql_uint32(uint32_t item, uint32_t* array, int nelements)
     BSEARCH_ALGORITHM_IMPL
     if (low < nelements) return low;
     return -1;
-}
-#else
-// these passthru stubs could probably just be linker symbol aliases
-int bsearch_lesseql_uint32(uint32_t item, uint32_t* array, int nelements) {
-    return bsearch_lesseql_uword(item, array, nelements);
-}
-int bsearch_greatereql_uint32(uint32_t item, uint32_t* array, int nelements) {
-    return bsearch_greatereql_uword(item, array, nelements);
 }
 #endif
 

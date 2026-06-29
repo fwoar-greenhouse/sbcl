@@ -29,14 +29,12 @@
 (progn
   (declaim (inline assign-vector-flags logior-header-bits reset-header-bits))
   (defun assign-vector-flags (vector flags)
-    (set-header-data vector (dpb flags (byte 8 #.array-flags-data-position) (get-header-data vector)))
-    (values))
+    (set-header-data vector (dpb flags (byte 8 #.array-flags-data-position)
+                                 (get-header-data vector))))
   (defun logior-header-bits (object bits)
-    (set-header-data object (logior (get-header-data object) bits))
-    object)
+    (set-header-data object (logior (get-header-data object) bits)))
   (defun reset-header-bits (object bits)
-    (set-header-data object (logand (get-header-data object) (lognot bits)))
-    (values)))
+    (set-header-data object (logand (get-header-data object) (lognot bits)))))
 
 (defmacro logior-array-flags (array flags)
   `(logior-header-bits ,array (ash ,flags #.array-flags-data-position)))
@@ -364,6 +362,8 @@ with bits from the corresponding position in the new value."
 
 (in-package "SB-VM")
 
+#+sb-unicode ;; KLUDGE: load-time-value isn't evaluted in time in cold-init.
+(declaim (inline blt-copier-for-widetag))
 (defun blt-copier-for-widetag (x)
   (declare ((mod 256) x))
   (aref (load-time-value

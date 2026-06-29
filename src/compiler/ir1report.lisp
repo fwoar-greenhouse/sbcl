@@ -206,22 +206,35 @@
       (let ((form root)
             (current (rest rpath)))
         (loop
-         (when (comma-p form)
-           (setf form (comma-expr form)))
-         (when (atom form)
-            (aver (null current))
+         (loop
+          (unless (comma-p form)
             (return))
-          (let ((head (first form)))
-            (when (symbolp head)
-              (let ((name (symbol-name head)))
-                (when (and (>= (length name) 3) (string= name "DEF" :end1 3))
-                  (context (source-form-context form))))))
-          (when (null current) (return))
-         (let ((cons (nthcdr (pop current) form)))
-           (setq form (if (comma-p cons)
-                          (comma-expr cons)
-                          (car cons)))))
-
+            ;; (... ,<expr> ...) -> (... (unquote <expr>) ...)
+          (aver (= (pop current) 1))
+          (setq form (comma-expr form)))
+         (when (atom form)
+           (return))
+         (let ((head (first form)))
+           (when (and (symbolp head)
+                      (listp (cdr form)))
+             (let ((name (symbol-name head)))
+               (when (and (>= (length name) 3)
+                          (string= name "DEF" :end1 3)
+                          ;; A common name that clearly isn't a definition
+                          (not (and (>= (length name) 7)
+                                    (string= name "DEFAULT" :end1 7))))
+                 (context (source-form-context form))))))
+         (when (null current)
+           (return))
+         (let ((count (pop current))
+               (next form))
+           (dotimes (i count)
+             (cond
+               ((comma-p next)
+                ;; (... . ,<expr>) -> (... . (unquote <expr>)) -> (... unquote <expr>)
+                (setq next (list (comma-expr next))))
+               (t (setq next (cdr next)))))
+           (setq form (car next))))
         (cond ((context)
                (values form (context)))
               ((and path root)
@@ -286,9 +299,9 @@
                       :original-form form
                       :format-args args
                       :context src-context
-                      :file-name (if (symbolp (file-info-truename file-info)) ; :LISP or :STREAM
+                      :file-name (if (member (file-info-%truename file-info) '(:lisp :stream))
                                      ;; (pathname will be NIL in those two cases)
-                                     (file-info-truename file-info)
+                                     (file-info-%truename file-info)
                                      (file-info-pathname file-info))
                       :file-position
                       (nth-value 1 (find-source-root tlf *source-info*))
@@ -435,7 +448,10 @@
         (what (etypecase condition
                 (style-warning 'style-warning)
                 (warning 'warning)
-                ((or error compiler-error) 'error))))
+                ((or error compiler-error) 'error)))
+        (*print-circle* t)
+        #-sb-xc-host
+        (*print-circle-not-shared* t))
     (print-compiler-message
      *error-output*
      (format nil "caught ~S:~%~~@<  ~~@;~~A~~:>" what)
@@ -459,6 +475,7 @@ a STYLE-WARNING (or any more serious condition)."))
    "A condition type signalled when the compiler deletes code that the user
 has written, having proved that it is unreachable."))
 (define-condition unknown-typep-note (simple-compiler-note) ())
+(define-condition perfect-hash-generator-failed (simple-compiler-note) ())
 
 (define-condition compiler-macro-application-missed-warning
     (style-warning)
@@ -517,14 +534,6 @@ has written, having proved that it is unreachable."))
 
 ;;;; condition system interface
 
-;;; Keep track of how many times each kind of condition happens.
-(defvar *compiler-error-count*)
-(defvar *compiler-warning-count*)
-(defvar *compiler-style-warning-count*)
-(defvar *compiler-note-count*)
-
-(defvar *methods-in-compilation-unit*)
-
 ;;; Keep track of whether any surrounding COMPILE or COMPILE-FILE call
 ;;; should return WARNINGS-P or FAILURE-P.
 (defvar *failure-p*)
@@ -535,21 +544,21 @@ has written, having proved that it is unreachable."))
 ;;; counter and print the error message.
 (defun compiler-error-handler (condition)
   (signal condition)
-  (incf *compiler-error-count*)
+  (incf (cu-error-count *compilation-unit*))
   (setf *warnings-p* t
         *failure-p* t)
   (print-compiler-condition condition)
   (continue condition))
 (defun compiler-warning-handler (condition)
   (signal condition)
-  (incf *compiler-warning-count*)
+  (incf (cu-warning-count *compilation-unit*))
   (setf *warnings-p* t
         *failure-p* t)
   (print-compiler-condition condition)
   (muffle-warning condition))
 (defun compiler-style-warning-handler (condition)
   (signal condition)
-  (incf *compiler-style-warning-count*)
+  (incf (cu-style-warning-count *compilation-unit*))
   (setf *warnings-p* t)
   (print-compiler-condition condition)
   (muffle-warning condition))
@@ -576,7 +585,7 @@ has written, having proved that it is unreachable."))
                     (= inhibit-warnings 3))
                 (policy *lexenv* (= inhibit-warnings 3)))
       (with-condition (condition datum args)
-        (incf *compiler-note-count*)
+        (incf (cu-note-count *compilation-unit*))
         (print-compiler-message
          *error-output*
          (format nil "note: ~~A")
@@ -647,8 +656,8 @@ has written, having proved that it is unreachable."))
                (:variable (make-condition 'warning))
                ((:function :type) (make-condition 'style-warning))))))
     (let* ((found (dolist (warning *undefined-warnings* nil)
-                    (when (and (equal (undefined-warning-name warning) name)
-                               (eq (undefined-warning-kind warning) kind))
+                    (when (and (eq (undefined-warning-kind warning) kind)
+                               (equal (undefined-warning-name warning) name))
                       (return warning))))
            (res (or found
                     (make-undefined-warning :name name :kind kind))))
@@ -800,7 +809,7 @@ and defining the function before its first potential use.~@:>"
       ;; Set a bit saying that a warning about the call was generated,
       ;; which suppresses the warning about either a later
       ;; call or a later proclamation.
-      (setf (gethash name *emitted-full-calls*) (logior count 2))
+      (setf (gethash name (cu-emitted-full-calls *compilation-unit*)) (logior count 2))
       ;; While there could be a different style-warning for
       ;;   "You should put the DEFUN after the DECLAIM"
       ;; if they appeared reversed, it's not ideal to warn as soon as that.

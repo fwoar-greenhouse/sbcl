@@ -15,11 +15,33 @@
 
 . ./subr.sh
 
+# The 'embedcore-sbcl' test works for more configurations than the rest of the
+# tests in this file do, so try it first. If this can't be run, neither can
+# anything else.
+run_sbcl <<EOF
+  #+(and linux (or arm64 x86-64)) (exit :code 0) ; good
+  (exit :code 2) ; otherwise
+EOF
+status=$?
+if [ $status != 0 ]; then # test can't be executed
+    # we don't have a way to exit shell tests with "inapplicable" as the result
+    exit $EXIT_TEST_WIN
+fi
+# Ensure that we're not running a stale embedcore-sbcl
+(cd $SBCL_PWD/../src/runtime ; rm -f embedcore-sbcl ; make embedcore-sbcl)
+
+set -e # exit on error
+$SBCL_PWD/../src/runtime/embedcore-sbcl --disable-debugger --no-sysinit --no-userinit --noprint <<EOF
+(format t "~&ELF-embedded core starts OK~%")
+(exit :code 0)
+EOF
+set +e # no exit on error
+
 run_sbcl <<EOF
   #+(and linux elf sb-thread)
   (let ((s (find-symbol "IMMOBILE-SPACE-OBJ-P" "SB-KERNEL")))
     (when (and s (funcall s #'car)) (exit :code 0))) ; good
- (exit :code 2) ; otherwise
+  (exit :code 2) ; otherwise
 EOF
 status=$?
 if [ $status != 0 ]; then # test can't be executed
@@ -30,7 +52,7 @@ fi
 set -e # exit on error
 
 # Ensure that we're not running a stale shrinkwrap-sbcl
-(cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl ; make shrinkwrap-sbcl)
+(cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl* ; make shrinkwrap-sbcl)
 
 # Prevent style-warnings in the editcore script, but don't assume that it
 # can be compiled in the first place unless actually doing the ELFcore tests.
@@ -45,9 +67,7 @@ run_sbcl <<EOF
 EOF
 
 $SBCL_PWD/../src/runtime/shrinkwrap-sbcl --disable-debugger --no-sysinit --no-userinit --noprint <<EOF
-(sb-vm::%alloc-immobile-symbol "junk") ; crashed 'cause I forgot to use rip-relative-EA
-;; I think this tests immobile space exhaustion
-(dotimes (i 100000) (sb-vm::alloc-immobile-fdefn))
+#+x86-64 (sb-vm::%alloc-immobile-symbol "junk") ; crashed 'cause I forgot to use rip-relative-EA
 
 ;; Test that the link step did not use --export-dynamic
 (assert (gethash '("TEXT_SPACE_START") (car sb-sys:*linkage-info*))) ; C symbol exists
@@ -58,18 +78,25 @@ $SBCL_PWD/../src/runtime/shrinkwrap-sbcl --disable-debugger --no-sysinit --no-us
 
 ;; Test that CODE-SERIAL# is never 0 except for simple-fun-less objects
 (sb-vm:map-allocated-objects
- (lambda (obj type size)
-   (declare (ignore size))
-   (when (and (= type sb-vm:code-header-widetag)
-              (> (sb-kernel:code-n-entries obj) 0))
-     (assert (/= (sb-kernel:%code-serialno obj) 0))))
+ ;; Interpreted functions passed to map-allocated-objects can cause the heap walk
+ ;; not to terminate, due to a forever increasing frontier to scan.
+ (compile nil
+  '(lambda (obj type size)
+    (declare (ignore size))
+    (when (and (= type sb-vm:code-header-widetag)
+               (> (sb-kernel:code-n-entries obj) 0))
+      (assert (/= (sb-kernel:%code-serialno obj) 0)))))
  :all)
-;; This just needs any function that when ELFinated has its packed fixups rewritten.
-;; If the packed value is a bignum, it goes into a C data section.
-(let* ((code (sb-kernel:fun-code-header #'compile-file))
-       (fixups (sb-vm::%code-fixups code)))
-  (assert (typep fixups 'bignum))
-  (assert (not (heap-allocated-p fixups))))
+
+;; Test that lisp linkage cells were bypassed.
+;; (This test was copied from elf-sans-immobile)
+(in-package sb-impl)
+(defun asm-string () (with-output-to-string (ss) (disassemble 'y-or-n-p :stream ss)))
+#+x86-64 (assert (search "#'QUERY-READ-CHAR" (asm-string)))
+(defun query-read-char () #\y) ; will undo static linkage
+#+x86-64 (assert (search "; QUERY-READ-CHAR" (asm-string)))
+(assert (eq (let ((*query-io* (make-broadcast-stream))) (y-or-n-p)) t))
+(format t "~&Function redef OK~%")
 EOF
 (cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o shrinkwrap-sbcl.core)
 
@@ -91,6 +118,52 @@ run_sbcl <<EOF
   (setq sb-c:*compile-to-memory-space* :auto)
   (defun g (fun &rest args) (apply fun args)) ; exercise TAIL-CALL-VARIABLE
   (compile 'g)
+#|
+;; The SETF below is sort of illegal. It was an attempt to assert that defrag
+;; of immobile-space followed by ELF conversion did not accidentally affect
+;; the SYMBOL-HASH bits which were erroneously getting descriptor treatment.
+;; The problems in making a test case are as follows: to create a bit pattern
+;; _incorrectly_ altered to point to ELF text space, it would have to be a raw
+;; word that seems to overlap text space after defrag_immobile_space.
+;; Firstly that's technically impossible with 48-bit virtual address space unless
+;; all the highest bits of the quasi-random hash are all zero, which has 1/(2^16)
+;; chance; and near-impossibility of that aside, you'd need a hash word randomly
+;; matching a function address *after* defrag whose address you can not possibly
+;; guess predictably enough to make into a test.
+
+;; What if you set the hash word to the address of the assembler routines?
+;; An interesting trick that almost works. The problem is that the word appears to
+;; have a linkage index of 1 because the low 4 bits are #b1111, the 3 low being
+;; ignored. Now come the next two problems: (1) it breaks the 1:1 mapping from
+;; symbol to linkage-index, and (2) defrag occurs from the space _onto_ itself,
+;; reusing addresses. A temporary copy of the defragged spaces physically resides
+;; somewhere random, but we deposit logical addresses when writing FPs into the
+;; current space. (The temp space is copied en masse back)
+
+;; So during computation of new addresses, rearranging and compacting as much as
+;; possible, we may forwarding a word to an ever-so-slightly higher address
+;; that now holds a completely random and irrelevant bit pattern.
+;; Consider this actual example from trying to make the test pass:
+;; - linkage index 1 holds #xb80072d530 for simple-fun #xb80072d52b
+;; - defrag forwards that function to #xb80072d600 depositing a FP in #xb80072d520
+;; - processing the symbol which names that function calls adjust_linkage_cell
+;;   which sees linkage cell 1 and rewrites it to #xb80072d600
+;; - processing #:GOOFY symbol sees cell 1 and asserts that #xb80072d600 is
+;;   forwarded. But it isn't! It's random data.
+;;
+;; The problem is that we have no record of whether a linkage cell was visited.
+;; They're not really objects, and in real usage this error can't occur.
+;; I suppose one way to do this might just be to skip calling adjust_linkage_cell
+;; when visiting symbols and fdefns, and instead perform one pass over all cells
+;; as a separate space.  Maybe that's the right thing. But not now.
+|#
+  (defvar *the-bits* (sb-kernel:get-lisp-obj-address sb-fasl:*assembler-routines*))
+  (defvar *s* (make-symbol "GOOFY"))
+  ;; bits of symbol-hash slot in #:GOOFY become *the-bits*
+  #+nil (setf sb-vm::(sap-ref-word
+             (int-sap (get-lisp-obj-address cl-user::*s*))
+             (- (ash symbol-hash-slot word-shift) other-pointer-lowtag)) *the-bits*)
+
   (save-lisp-and-die "${tmpcore}")
 EOF
 
@@ -118,7 +191,7 @@ echo Custom core: PASS
 
 (cd $SBCL_PWD/../src/runtime ; rm -f libsbcl.a)
 
-export SBCL_FAKE_MMAP_INSTRUCTION_FILE=heap-reloc/fakemap
+export SBCL_FAKE_MMAP_INSTRUCTION_FILE=heap-reloc/fakemap_64
 i=1
 while [ $i -le 6 ]
 do

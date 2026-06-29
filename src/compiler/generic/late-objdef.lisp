@@ -57,12 +57,9 @@
     ;; The closure scavenge function needs to know if the "self" slot
     ;; has pointer nature though it be fixnum tagged, as on x86.
     ;; The sizer is short_boxed.
-    (closure ,(or #+(or x86 x86-64 arm64) "closure" "short_boxed") "lose" "short_boxed")
+    (closure ,(or #+(or arm64 ppc64 x86 x86-64) "closure" "short_boxed") "lose" "short_boxed")
     ;; Like closure, but these can also have a layout pointer in the high header bytes.
     (funcallable-instance "funinstance" "lose" "short_boxed")
-    ;; These have a scav and trans function, but no size function.
-    #-(or x86 x86-64 arm64 riscv)
-    (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
     (symbol "symbol")
@@ -235,7 +232,6 @@
                    "trans_" transtab)
       (format stream "#define size_pointer (sizerfn)0~%")
       (format stream "#define size_immediate (sizerfn)0~%")
-      (format stream "#define size_unboxed size_boxed~%")
       (write-table "sword_t (*sizetab[256])(lispobj *where)"
                    "size_" sizetab)
       (format stream "#undef size_immediate~%")
@@ -253,6 +249,8 @@
   ;; Arena allocation parameters
   (original-size 0 :type word)
   (growth-amount 0 :type word) ; additive
+  ;; size above which an object gets its own allocation block
+  (huge-object-threshold 0 :type word)
   ;; Maximum we'll allow the arena to grow to, accounting for extension blocks
   ;; and huge object blocks.
   (size-limit 0 :type word)
@@ -261,9 +259,13 @@
   ;; Sum of unusable bytes resulting from discarding the tail of the
   ;; most recently claimed chunk when switching from the arena to the heap.
   (bytes-wasted 0 :type word)
+  ;; if T, allocations overflowed the size limit and the area is
+  ;; operating in its emergency fallback regime.
+  (exhausted nil :type boolean)
   ;; Small integer identifier starting from 0
   (index 0 :type fixnum)
   ;; T if all memory has been protected with PROT_NONE (for debugging)
+  ;; NIL if visible. 0 if hiding is not allowed.
   hidden
   ;; a counter that increments on each rewind, and which can be used by a threads
   ;; in a pool to detect that their cached TLAB pointers are invalid

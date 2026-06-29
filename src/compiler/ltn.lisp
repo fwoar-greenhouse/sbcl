@@ -152,7 +152,6 @@
 ;;; reference, otherwise we annotate for a single value.
 (defun annotate-fun-lvar (lvar &optional (delay t))
   (declare (type lvar lvar))
-  (aver (not (lvar-dynamic-extent lvar)))
   (let* ((tn-ptype (primitive-type (lvar-type lvar)))
          (info (make-ir2-lvar tn-ptype)))
     (setf (lvar-info lvar) info)
@@ -161,7 +160,7 @@
       (if (and delay name)
           (setf (ir2-lvar-kind info) :delayed)
           (setf (ir2-lvar-locs info)
-                (list (make-normal-tn tn-ptype))))))
+                (list (make-normal-tn tn-ptype (lvar-type lvar)))))))
   (ltn-annotate-casts lvar)
   (values))
 
@@ -185,6 +184,24 @@
           (t
            (ltn-default-call node)))))
 
+(defun unboxed-specialized-return-p (name)
+  (and (typep name '(cons (eql sb-impl::specialized-xep)))
+       (let* ((specifier (cadddr name))
+              (type (and (neq specifier '*)
+                         (values-specifier-type (cadddr name)))))
+         (and (values-type-p type)
+              (not (or (values-type-optional type)
+                       (values-type-rest type)))
+              type))))
+
+(defun unboxed-return-p (combination)
+  (let ((fun (basic-combination-fun combination)))
+    (or (let ((info (basic-combination-fun-info combination)))
+          (and info
+               (ir1-attributep (fun-info-attributes info) unboxed-return)
+               (fun-type-returns (lvar-type fun))))
+        (unboxed-specialized-return-p (lvar-fun-name fun)))))
+
 ;;; If TAIL-P is true, then we check to see whether the call can
 ;;; really be a tail call by seeing if this function's return
 ;;; convention is :UNKNOWN. If so, we move the call block successor
@@ -195,9 +212,7 @@
   (declare (type basic-combination call))
   (let ((tails (and (node-tail-p call)
                     (lambda-tail-set (node-home-lambda call))))
-        (unboxed-return (let ((info (basic-combination-fun-info call)))
-                          (and info
-                               (ir1-attributep (fun-info-attributes info) unboxed-return)))))
+        (unboxed-return (unboxed-return-p call)))
     (cond ((not tails))
           ((eq (return-info-kind (tail-set-info tails))
                (if unboxed-return
@@ -228,6 +243,8 @@
   (let ((kind (basic-combination-kind call))
         (info (basic-combination-fun-info call)))
 
+    (rewrite-full-call call)
+
     (dolist (arg (basic-combination-args call))
       (unless (lvar-info arg)
         (setf (lvar-info arg)
@@ -245,8 +262,7 @@
          (when (basic-combination-info call)
            (signal-delayed-combination-condition call))
          (setf (basic-combination-kind call) :full))
-       (setf (basic-combination-info call) :full)
-       (rewrite-full-call call))))
+       (setf (basic-combination-info call) :full))))
   (annotate-fun-lvar (basic-combination-fun call))
   (values))
 
@@ -459,6 +475,10 @@
   (annotate-ordinary-lvar (set-value node))
   (values))
 
+(defoptimizer (%%primitive ltn-annotate) ((template &rest args) node)
+  (ltn-default-call node)
+  (setf (basic-combination-info node) (lvar-value template)))
+
 ;;; If the only use of the TEST lvar is a combination annotated with a
 ;;; conditional template, then don't annotate the lvar so that IR2
 ;;; conversion knows not to emit any code, otherwise annotate as an
@@ -504,7 +524,7 @@
   (declare (type cdynamic-extent node))
   (let ((lvar (dynamic-extent-info node))
         (2comp (component-info (node-component node))))
-    (when lvar
+    (when (and lvar (not (lvar-info lvar)))
       (setf (ir2-component-stack-allocates-p 2comp) t)
       (setf (lvar-dest lvar) node)
       (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
@@ -920,9 +940,13 @@
 ;;; full call.
 (defun ltn-analyze-known-call (call)
   (declare (type combination call))
-  (let ((ltn-policy (node-ltn-policy call))
-        (method (fun-info-ltn-annotate (basic-combination-fun-info call)))
-        (args (basic-combination-args call)))
+  (let* ((ltn-policy (node-ltn-policy call))
+         (info (basic-combination-fun-info call))
+         (method (fun-info-ltn-annotate info))
+         (args (basic-combination-args call))
+         (hook (fun-info-ir2-hook info)))
+    (when hook
+      (funcall hook call))
     (when method
       (funcall method call ltn-policy)
       (return-from ltn-analyze-known-call (values)))
@@ -950,7 +974,7 @@
                     (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
                      (eq name (leaf-source-name funleaf))
-                     (not (sb-vm::static-fdefn-offset name))
+                     (not (static-fdefn-p name))
                      (let ((info (basic-combination-fun-info call)))
                        (not (or (fun-info-ir2-convert info)
                                 (ir1-attributep (fun-info-attributes info)

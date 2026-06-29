@@ -35,10 +35,17 @@
   "Set SYMBOL's value cell to NEW-VALUE."
   (declare (type symbol symbol))
   (about-to-modify-symbol-value symbol 'set new-value)
-  (%set-symbol-value symbol new-value))
+  (%primitive set symbol new-value)
+  new-value)
 
-(defun %set-symbol-value (symbol new-value)
-  (%set-symbol-value symbol new-value))
+;;; The vop named %SET-SYMBOL-GLOBAL-VALUE does not translate the function of that name.
+;;; A bunch of calls in cold-init (and later) need an installed function.
+;;; Also note that the vop doesn't yield a value, but this does, because a 1-valued return
+;;; is shorter than a 0-valued return and seems like the right thing to do anyway.
+(defun %set-symbol-global-value (symbol value)
+  (declare (type (and symbol (not null)) symbol))
+  (%primitive %set-symbol-global-value symbol value)
+  value)
 
 (defun symbol-global-value (symbol)
   "Return the SYMBOL's current global value. Identical to SYMBOL-VALUE,
@@ -49,11 +56,16 @@ distinct from the global value. Can also be SETF."
 
 (defun set-symbol-global-value (symbol new-value)
   (about-to-modify-symbol-value symbol 'set new-value)
-  (%set-symbol-global-value symbol new-value))
+  (%primitive %set-symbol-global-value symbol new-value)
+  new-value)
 
 (declaim (inline %makunbound))
 (defun %makunbound (symbol)
-  (%set-symbol-value symbol (make-unbound-marker)))
+  (let ((marker (make-unbound-marker)))
+    (%primitive set symbol marker)
+    ;; I don't think this can ever be called "for value", but it's cheaper
+    ;; to return a value than not to. It always returned the unbound marker.
+    marker))
 
 (defun makunbound (symbol)
   "Make SYMBOL unbound, removing any value it may currently have."
@@ -100,11 +112,11 @@ distinct from the global value. Can also be SETF."
 ;;; Don't strip encapsulations.
 (declaim (inline %symbol-function))
 (defun %symbol-function (symbol)
+  #+linkage-space (%primitive sb-vm::fdefn-fun symbol)
+  #-linkage-space
   (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
     (if (eql fdefn 0) nil (fdefn-fun (truly-the fdefn fdefn)))))
-(defun (setf %symbol-function) (newval symbol) ; OK to use only if fdefn exists
-  (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
-    (setf (fdefn-fun (truly-the fdefn fdefn)) newval)))
+(defun (setf %symbol-function) (newval symbol) (fset symbol newval))
 
 (defun symbol-function (symbol)
   "Return SYMBOL's current function definition. Settable with SETF."
@@ -134,9 +146,9 @@ distinct from the global value. Can also be SETF."
     ;; I really think the code paths should be reconciled.
     ;; e.g. what's up with *USER-HASH-TABLE-TESTS* being checked
     ;; in %SET-FDEFINITION but not here?
+    (remove-specialized-xep symbol)
     (maybe-clobber-ftype symbol new-value)
-    (let ((fdefn (find-or-create-fdefn symbol)))
-      (setf (fdefn-fun fdefn) new-value))))
+    (fset symbol new-value)))
 
 ;;; Incredibly bogus kludge: the :CAS-TRANS option in objdef makes no indication
 ;;; that you can not use it on certain platforms, so then you do try to use it,
@@ -315,25 +327,21 @@ distinct from the global value. Can also be SETF."
                    (aref *id->package* id)))))
 
 (defun %set-symbol-package (symbol package)
-  (declare (type symbol symbol))
   (let* ((new-id (cond ((not package) +package-id-none+)
                        ((package-id package))
                        (t +package-id-overflow+)))
-         (old-id (symbol-package-id symbol))
-         (name (symbol-name symbol)))
-    (with-pinned-objects (name)
-      (let ((name-bits (logior (ash new-id (- sb-vm:n-word-bits package-id-bits))
-                               (get-lisp-obj-address name))))
-        (declare (ignorable name-bits))
-        (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
-          (setf (info :symbol :package symbol) package))
-        #-compact-symbol (set-symbol-package-id symbol new-id)
-        #+compact-symbol
-        (with-pinned-objects (symbol)
-          (setf (sap-ref-word (int-sap (get-lisp-obj-address symbol))
-                              (- (ash sb-vm:symbol-name-slot sb-vm:word-shift)
-                                 sb-vm:other-pointer-lowtag))
-                name-bits))))
+         (old-id (symbol-package-id symbol)))
+    (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
+      (setf (info :symbol :package symbol) package))
+    #-64-bit (set-symbol-package-id symbol new-id)
+    #+64-bit
+    (let ((disp #+big-endian 4
+                #+x86-64 1
+                #+(and little-endian (not x86-64)) 2))
+      (with-pinned-objects (symbol)
+        (setf (sap-ref-16 (int-sap (get-lisp-obj-address symbol))
+                          (- disp sb-vm:other-pointer-lowtag))
+              new-id)))
     ;; CLEAR-INFO is inefficient, so try not to call it.
     (when (and (= old-id +package-id-overflow+) (/= new-id +package-id-overflow+))
       (clear-info :symbol :package symbol))
@@ -349,8 +357,6 @@ distinct from the global value. Can also be SETF."
 ;;; All symbols go into immobile space if #+immobile-symbols is enabled,
 ;;; but not if disabled. The win with immobile space that is that all symbols
 ;;; can be considered static from an addressing viewpoint, but GC'able.
-;;; (After codegen learns how, provided that defrag becomes smart enough
-;;; to fixup machine code so that defrag remains meaningful)
 ;;;
 ;;; However, with immobile space being limited in size, you might not want
 ;;; symbols in there. In particular, if an application uses symbols as data
@@ -394,42 +400,20 @@ distinct from the global value. Can also be SETF."
                    (not (read-only-space-obj-p name)))
           (logior-array-flags name sb-vm:+vector-shareable+))) ; Set "logically read-only" bit
        (name-hash (calc-symbol-name-hash name (length name)))
-       (symbol
-         (truly-the symbol
-          ;; If no immobile-space, easy: all symbols go in dynamic-space
-          #-immobile-space (sb-vm::%alloc-symbol name)
-          ;; If #+immobile-symbols, then uninterned symbols go in dynamic space, but
-          ;; interned symbols go in immobile space. Good luck IMPORTing an uninterned symbol-
-          ;; it'll work at least superficially, but if used as a code constant, the symbol's
-          ;; address may violate the assumption that it's an imm32 operand.
-          #+immobile-symbols
-          (if (eql kind 0) (sb-vm::%alloc-symbol name) (sb-vm::%alloc-immobile-symbol name))
-          #+(and immobile-space (not immobile-symbols))
-          (if (or (eql kind 1) ; keyword
-                  (and (eql kind 2) ; random interned symbol
-                       (plusp (length name))
-                       (char= (char name 0) #\*)
-                       (char= (char name (1- (length name))) #\*)))
-              (sb-vm::%alloc-immobile-symbol name)
-              (sb-vm::%alloc-symbol name)))))
-    #-salted-symbol-hash (%set-symbol-hash symbol name-hash)
-    #+salted-symbol-hash
+       (symbol #+x86-64 (symbol-allocator-macro kind name)
+               #-x86-64 (sb-vm::%alloc-symbol name)))
     (let ((salt (murmur-hash-word/fixnum
                  (word-mix name-hash (get-lisp-obj-address symbol)))))
-      #+64-bit
-      (let ((hash (logior (ash name-hash 32) (mask-field symbol-hash-prng-byte salt))))
-        ;; %SET-SYMBOL-HASH wants a unsigned fixnum, which HASH is not.
-        (%primitive sb-vm::set-slot symbol (%make-lisp-obj hash)
-                    'make-symbol sb-vm:symbol-hash-slot sb-vm:other-pointer-lowtag))
-      #-64-bit
       (with-pinned-objects (symbol) ; no vop sets the raw slot
-        (setf (sap-ref-32 (int-sap (get-lisp-obj-address symbol))
-                          (- (ash sb-vm:symbol-hash-slot sb-vm:word-shift)
-                             sb-vm:other-pointer-lowtag))
-              (logior (ash name-hash 3) (ldb (byte 3 0) salt)))))
-    ;; Compact-symbol (which is equivalent to #+64-bit) has the package already NIL
-    ;; because the PACKAGE-ID-BITS field defaults to 0.
-    #-compact-symbol (%set-symbol-package symbol nil)
+        (setf (sap-ref-word (int-sap (get-lisp-obj-address symbol))
+                            (- (ash sb-vm:symbol-hash-slot sb-vm:word-shift)
+                               sb-vm:other-pointer-lowtag))
+              #+64-bit (logxor (sb-vm::symhash-xor-constant sb-vm:nil-value)
+                               (logior (ash name-hash 32)
+                                       (mask-field symbol-hash-prng-byte salt)))
+              #-64-bit (logior (ash name-hash 3) (ldb (byte 3 0) salt)))))
+    ;; if #+64-bit then the package ID bits are already 0, implying uninterned
+    #-64-bit (%set-symbol-package symbol nil)
     symbol))
 
 (defun get (symbol indicator &optional (default nil))
@@ -545,9 +529,9 @@ distinct from the global value. Can also be SETF."
   (declare (sb-c::tlab :system)) ; heap-cons the property list if copying it
   (let ((new-symbol (make-symbol (symbol-name symbol))))
     (when copy-props
-      ;; Should this really copy a thread-local value ?
-      ;; I would think it more correct to copy only a global value.
-      (%set-symbol-value new-symbol (%primitive sb-c:fast-symbol-value symbol))
+      ;; Just like for %INTERN, we set the global value. However, should we really _copy_
+      ;; a thread-local value if one existed? I don't know but I don't think so.
+      (%set-symbol-global-value new-symbol (%primitive sb-c:fast-symbol-value symbol))
       (locally (declare (optimize speed)) ; will inline COPY-LIST
         (setf (symbol-plist new-symbol)
               (copy-list (symbol-plist symbol))))
@@ -608,6 +592,43 @@ distinct from the global value. Can also be SETF."
   (loop (multiple-value-bind (sym accessibility)
             (intern (%symbol-nameify prefix (incf *gentemp-counter*)) package)
           (unless accessibility (return sym))))))
+
+(defmacro frob-symbol-progv-optimize (sym bit)
+  (sb-c::if-vop-existsp (:translate reset-header-bits)
+    (ecase bit
+      (1 `(logior-header-bits ,sym sb-vm::+symbol-fast-bindable+))
+      (0 `(reset-header-bits ,sym sb-vm::+symbol-fast-bindable+)))
+
+    ;; This way avoids a race with a thread assigning the TLS index
+    ;; when the required vops don't exist, which matters if and only
+    ;; if #+(and sb-thread 64-bit).
+    ;; Consider two threads binding the same symbol using PROGV:
+    ;;  thread A                    Thread B
+    ;;  --------                    --------
+    ;;  SET BIT:                    SET BIT:
+    ;;    x := load header word        x := load header word
+    ;;    logior x, bit                logior x, bit
+    ;;    store header word            ...
+    ;;                                 ... (descheduled by kernel)
+    ;;  DYNBIND:                       ...
+    ;;    ensure-tls-index             ...
+    ;;                                 store header word ; BUG: clobbers TLS index
+    ;;                              DYNBIND:
+    ;;                                 ensure-tls-index ; BUG: picks a new TLS index
+    ;;
+    `(with-pinned-objects (,sym)
+       (let ((sap (int-sap (get-lisp-obj-address ,sym)))
+             (offset (+ (- sb-vm:other-pointer-lowtag)
+                        #+big-endian (- sb-vm:n-word-bytes 2)
+                        #+little-endian 1)))
+         ;; ASSUMPTION: byte stores are atomic and do not affect adjacent bytes
+         (setf (sap-ref-8 sap offset)
+               (,(ecase bit (1 'logior) (0 'logandc2)) (sap-ref-8 sap offset)
+                 sb-vm::+symbol-fast-bindable+))))))
+
+(defun unset-symbol-progv-optimize (symbol)
+  (frob-symbol-progv-optimize symbol 0)
+  symbol)
 
 (macrolet ((signal-type-error (action-description)
              `(let ((spec (type-specifier type)))
@@ -670,7 +691,7 @@ distinct from the global value. Can also be SETF."
                (when (eq action 'progv)
                  (let ((package (symbol-package symbol)))
                    (if (or (not package) (not (package-locked-p package)))
-                       (logior-header-bits symbol sb-vm::+symbol-fast-bindable+)))))
+                       (frob-symbol-progv-optimize symbol 1)))))
               (continuable
                (cerror "Modify the constant." complaint (describe-action) symbol))
               (t

@@ -8,20 +8,25 @@
 
 ;; sb-xref-for-internals is actively harmful to tree-shaking.
 ;; Remove some symbols to make the hide-packages test pass.
-#+sb-xref-for-internals
+#+(and sb-xref-for-internals (not sb-devel))
 (progn
   (fmakunbound 'sb-kernel::type-class-fun-slot)
   (fmakunbound 'sb-kernel::new-ctype))
 
 (sb-impl::!recompile-globaldb-checkfuns)
 
+;;; Don't inline INSTANCE-SXHASH everywhere, it's too bloaty.
+#-sb-devel
+(progn (sb-int:clear-info :function :inlinep 'sb-impl::instance-sxhash)
+       (unintern 'sb-impl::%instance-sxhash))
+
 ;;; Users don't want to know if there are multiple TLABs per se, but they do want
 ;;; to know if NEW-ARENA returns an arena, so give them a sensible feature name.
 #+system-tlabs (push :arena-allocator *features*)
 
 ;;; Remove symbols from CL:*FEATURES* that should not be exposed to users.
-(export 'sb-impl::+internal-features+ 'sb-impl)
-(let* ((non-target-features
+(let* (#-sb-devel
+       (non-target-features
         ;;
         ;; FIXME: I suspect that this list should be changed to its inverse-
         ;; features that _SHOULD_ go into SB-IMPL:+INTERNAL-FEATURES+ and
@@ -94,34 +99,14 @@
            ;; Developer mode features. A release build will never have them,
            ;; hence it makes no difference whether they're public or not.
            :SB-DEVEL :SB-DEVEL-LOCK-PACKAGES)")))
+       #-sb-devel
        (removable-features
         (append non-target-features public-features)))
-  (defconstant sb-impl:+internal-features+
-    ;;; Well, who would have guessed that our internal features list would nicely
-    ;;; repair damage induced by ASDF, namely: ASDF removes features when loaded.
-    ;;; Take a look at (DEFUN DETECT-OS) in uiop.lisp if you don't believe it,
-    ;;; and watch it in action after (require "ASDF") -
-    ;;;
-    ;;; * *FEATURES* =>
-    ;;; (:X86-64 :64-BIT :ANSI-CL :COMMON-LISP :ELF :GENCGC :HAIKU :IEEE-FLOATING-POINT
-    ;;; :LITTLE-ENDIAN :PACKAGE-LOCAL-NICKNAMES :SB-LDB
-    ;;; :SB-PACKAGE-LOCKS :SB-UNICODE :SBCL :UNIX)
-    ;;;
-    ;;; * (require :asdf)
-    ;;; ("ASDF" "asdf" "UIOP" "uiop")
-    ;;; * *FEATURES*
-    ;;; (:ASDF3.3 :ASDF3.2 :ASDF3.1 :ASDF3 :ASDF2 :ASDF :OS-UNIX
-    ;;; :NON-BASE-CHARS-EXIST-P :ASDF-UNICODE :X86-64 :64-BIT :ANSI-CL :COMMON-LISP
-    ;;; :ELF :GENCGC :IEEE-FLOATING-POINT :LITTLE-ENDIAN :PACKAGE-LOCAL-NICKNAMES
-    ;;; :SB-LDB :SB-PACKAGE-LOCKS :SB-UNICODE :SBCL :UNIX)
-    ;;;
-    ;;; So, what the heck happened to :HAIKU? It's gone.
-    ;;; Well this is pure evil. Just madness.
-    ;;; However, by stashing an extra copy of :HAIKU in the internal feature list,
-    ;;; we can stuff it back in because our contrib builder first loads ASDF
-    ;;; and then rebinds *FEATURES* with the union of the internal ones.
-    (append #+haiku '(:haiku)
-            (remove-if (lambda (x) (member x removable-features)) *features*)))
+  (setq sb-impl:+internal-features+
+            (remove-if (lambda (x) (member x #+sb-devel public-features
+                                             #-sb-devel removable-features))
+                       *features*))
+  (setf (sb-int:info :variable :kind 'sb-impl:+internal-features+) :constant)
   (setq *features* (remove-if-not (lambda (x) (member x public-features))
                                   *features*)))
 
@@ -134,7 +119,7 @@
 ;;; uninterned.
 ;;; Additionally, you can specify an arbitrary way to destroy
 ;;; random bootstrap stuff on per-package basis.
-(defun !unintern-init-only-stuff (&aux result)
+(defun !unintern-init-only-stuff ()
   (dolist (package (list-all-packages))
     (sb-int:awhen (find-symbol "!REMOVE-BOOTSTRAP-SYMBOLS" package)
       (funcall sb-int:it)))
@@ -162,16 +147,13 @@
     ;; So loop over all structure classoids and clobber any
     ;; symbol that should be uninternable.
     (maphash (lambda (classoid layout)
-               (when (structure-classoid-p classoid)
-                 (let ((dd (layout-%info layout)))
-                   (setf (dd-constructors dd)
-                         (delete-if (lambda (x)
-                                      (and (consp x) (uninternable-p (car x))))
-                                    (dd-constructors dd))))))
+               (declare (ignore classoid))
+               (binding* ((dd (layout-info layout) :exit-if-null))
+                 (setf (dd-constructors dd)
+                       (delete-if (lambda (x) (and (consp x) (uninternable-p (car x))))
+                                  (dd-constructors dd)))))
              (classoid-subclasses (find-classoid t)))
-    ;; PATHNAME is not a structure-classoid
-    (setf (sb-kernel:dd-constructors (sb-kernel:find-defstruct-description 'pathname))
-          nil)
+
     ;; Todo: perform one pass, then a full GC, then a final pass to confirm
     ;; it worked. It should be an error if any uninternable symbols remain,
     ;; but at present there are about 7 symbols with referrers.
@@ -188,23 +170,26 @@
                 ;; with non-cold-init lambdas. Though the cold-init function is
                 ;; never called post-build, it is not discarded. Also, I suspect
                 ;; that the following loop should print nothing, but it does:
-#|
-                (sb-vm:map-allocated-objects
-                  (lambda (obj type size)
-                    (declare (ignore size))
-                    (when (= type sb-vm:code-header-widetag)
-                      (let ((name (sb-c::debug-info-name
-                                   (sb-kernel:%code-debug-info obj))))
-                        (when (and (stringp name) (search "COLD-INIT-FORMS" name))
-                          (print obj)))))
-                  :dynamic)
-|#
+                #|
+                (sb-vm:map-allocated-objects ;
+                (lambda (obj type size) ;
+                (declare (ignore size)) ;
+                (when (= type sb-vm:code-header-widetag) ;
+                (let ((name (sb-c::debug-info-name ;
+                (sb-kernel:%code-debug-info obj)))) ;
+                (when (and (stringp name) (search "COLD-INIT-FORMS" name)) ;
+                (print obj)))))         ;
+                :dynamic)               ;
+                |#
                 (fmakunbound symbol)
                 (unintern symbol package))))))
   (sb-int:dohash ((k v) sb-c::*backend-parsed-vops*)
     (declare (ignore k))
     (setf (sb-c::vop-parse-body v) nil))
-  result)
+  ;; Used for inheriting from other VOPs, not needed in the target.
+  (setf sb-c::*backend-parsed-vops* (make-hash-table))
+  nil)
+
 
 ;;; Check for potentially bad format-control strings
 (defun scan-format-control-strings ()
@@ -284,6 +269,17 @@ Please check that all strings which were not recognizable to the compiler
       (format t "~&Removed ~D doc string~:P" count)))
 )
 
+#+sb-core-compression
+(defun compress-debug-info (code)
+  (let ((info (sb-c::%code-debug-info code)))
+    (when (typep info 'sb-c::compiled-debug-info)
+      (let ((map (sb-c::compiled-debug-info-fun-map info)))
+        (when (typep map '(simple-array (unsigned-byte 8) (*)))
+          (sb-alien:with-alien ((compress-vector (function int unsigned size-t) :extern))
+            (sb-sys:with-pinned-objects (map)
+              (sb-alien:alien-funcall compress-vector
+                                      (sb-kernel:get-lisp-obj-address map)
+                                      (length map)))))))))
 (progn
   ;; Remove source forms of compiled-to-memory lambda expressions.
   ;; The disassembler is the major culprit for retention of these,
@@ -299,6 +295,8 @@ Please check that all strings which were not recognizable to the compiler
        (when (typep obj 'sb-c::core-debug-source)
          (setf (sb-c::core-debug-source-form obj) nil)))
       (#.sb-vm:code-header-widetag
+       #+sb-core-compression
+       (compress-debug-info obj)
        (dotimes (i (sb-kernel:code-n-entries obj))
          (let ((fun (sb-kernel:%code-entry-point obj i)))
            (when (sb-kernel:%simple-fun-lexpr fun)
@@ -337,7 +335,6 @@ Please check that all strings which were not recognizable to the compiler
   ;; SAVE-LISP-AND-DIE.
   #-sb-devel (!unintern-init-only-stuff)
 
-
   (do-all-symbols (symbol)
     ;; Don't futz with the header of static symbols.
     ;; Technically LOGIOR-HEADER-BITS can only be used on an OTHER-POINTER-LOWTAG
@@ -366,8 +363,9 @@ Please check that all strings which were not recognizable to the compiler
 (setq sb-c::*policy* (copy-structure sb-c::**baseline-policy**))
 
 ;;; Adjust READTABLE-BASE-CHAR-PREFERENCE back to the advertised default.
-(dolist (rt (list sb-impl::*standard-readtable* *debug-readtable*))
-  (setf (readtable-base-char-preference rt) :symbols))
+(handler-bind ((sb-int:standard-readtable-modified-error #'continue))
+  (dolist (rt (list sb-impl::*standard-readtable* *debug-readtable*))
+    (setf (readtable-base-char-preference rt) :symbols)))
 ;;; Change the internal constructor's default too.
 (let ((dsd sb-kernel::(find 'sb-impl::%readtable-string-preference
                             (dd-slots (find-defstruct-description 'readtable))
@@ -406,64 +404,60 @@ Please check that all strings which were not recognizable to the compiler
         (let ((name (string symbol)))
           (and (> (length name) 2)
                (string= name "M:" :end1 2)))))
+#-sb-devel
 (let ((counts
        (mapcar (lambda (x)
                  (list x
                        (sb-impl::package-external-symbol-count x)
                        (sb-impl::package-internal-symbol-count x)))
-               (sort (list-all-packages) #'string< :key 'package-name))))
-  #-sb-devel
+               (sort (list-all-packages) #'string< :key 'package-name)))
+      (precious-internals
+       ((lambda (list &aux (ht (make-hash-table)))
+          (dolist (sym list ht) (setf (gethash sym ht) t)))
+        '(sb-alien::alien-callback-p sb-alien::alien-lambda ; the API uses internals, really?
+          sb-c::tab sb-c::scramble ; for perfecthash
+          sb-c::make-transform ; cl-protobufs uses this
+          sb-impl::%default-comma-constructor
+          sb-kernel::%%make-random-state
+          sb-lockless::+hash-nbits+ sb-lockless::%make-so-set-node ; for tests
+          sb-loop::*loop-epilogue* sb-loop::add-loop-path ; internals to keep CLSQL working
+          sb-profile::make-counter)))) ; for a test
   ;; Remove inline expansions
   (do-symbols (symbol #.(find-package "SB-C"))
     (when (equal (symbol-package symbol) #.(find-package "SB-C"))
       (sb-int:clear-info :function :inlining-data symbol)
       (sb-int:clear-info :function :inlinep symbol)))
   (sb-impl::shake-packages
-   ;; Development mode: retain all symbols with any system-related properties
-   #+sb-devel
    (lambda (symbol accessibility)
-     (declare (ignore accessibility))
-     (or (sb-kernel:symbol-%info symbol)
-         (sb-kernel:%symbol-function symbol)
-         (and (boundp symbol) (not (keywordp symbol)))))
-   ;; Release mode: retain all symbols satisfying this intricate test
-   #-sb-devel
-   (lambda (symbol accessibility)
+    (or
+     (gethash symbol precious-internals) ; prevails over any condition below
      (case (symbol-package symbol)
       (#.(find-package "SB-VM")
        (or (eq accessibility :external)
            ;; overapproximate what we need for contribs and tests
-           (member symbol '(sb-vm::map-referencing-objects
+           (member symbol `(sb-vm::map-referencing-objects
                             sb-vm::map-stack-references
                             sb-vm::reconstitute-object
                             sb-vm::points-to-arena
                             ;; need this for defining a vop which
                             ;; tests the x86-64 allocation profiler
                             sb-vm::pseudo-atomic
+                            ,@(or #+(or arm64 x86 x86-64)
+                                  '(sb-vm::%vector-cas-pair
+                                    sb-vm::%instance-cas-pair
+                                    sb-vm::%cons-cas-pair))
                             ;; Naughty outside-world code uses these.
                             #+x86-64 sb-vm::reg-in-size))
            (let ((s (string symbol))) (and (search "THREAD-" s) (search "-SLOT" s)))
            (search "-OFFSET" (string symbol))
            (search "-TN" (string symbol))))
-      (#.(find-package "SB-ALIEN")
-       (or (eq accessibility :external) (eq symbol 'sb-alien::alien-callback-p)))
       (#.(mapcar 'find-package
-                 '("SB-ASSEM" "SB-BROTHERTREE" "SB-DISASSEM" "SB-FORMAT"
-                   "SB-IMPL" "SB-KERNEL" "SB-MOP" "SB-PCL" "SB-PRETTY" "SB-PROFILE"
+                 '("SB-ALIEN" "SB-ASSEM" "SB-BROTHERTREE" "SB-C" "SB-DISASSEM" "SB-FORMAT"
+                   "SB-IMPL" "SB-KERNEL" "SB-LOCKLESS" "SB-LOOP" "SB-MOP" "SB-PCL"
+                   "SB-PRETTY" "SB-PROFILE"
                    "SB-REGALLOC" "SB-SYS" "SB-UNICODE" "SB-UNIX" "SB-WALKER"))
        ;; Assume all and only external symbols must be retained
          (eq accessibility :external))
-      (#.(find-package "SB-C")
-       (or (eq accessibility :external)
-           (member symbol '(sb-c::tab sb-c::scramble))))
-      (#.(find-package "SB-LOOP")
-       (or (eq accessibility :external)
-           ;; Retain some internals to keep CLSQL working.
-           (member symbol '(sb-loop::*loop-epilogue*
-                            sb-loop::add-loop-path))))
-      (#.(find-package "SB-LOCKLESS")
-       (or (eq accessibility :external)
-           (member symbol '(sb-lockless::+hash-nbits+)))) ; for a test
       (#.(find-package "SB-THREAD")
        (or (eq accessibility :external)
            ;; for some reason a recent change caused the tree-shaker to drop MAKE-SPINLOCK
@@ -477,9 +471,12 @@ Please check that all strings which were not recognizable to the compiler
        (and (eq accessibility :external)
             (constantp symbol)))
       (#.(find-package "SB-BIGNUM")
-       ;; There are 2 important external symbols for sb-gmp.
+       ;; There are 2 important external symbols for sb-gmp, and 2
+       ;; important external symbols for sb-rotate-byte.
        ;; Other externals can disappear.
        (member symbol '(sb-bignum:%allocate-bignum
+                        sb-bignum:maximum-bignum-length
+                        sb-bignum:bit-index
                         sb-bignum:make-small-bignum)))
       (t
        (if (eq (symbol-package symbol)
@@ -488,7 +485,7 @@ Please check that all strings which were not recognizable to the compiler
            ;; By default, retain any symbol with any attachments
            (or (sb-kernel:symbol-%info symbol)
                (sb-kernel:%symbol-function symbol)
-               (and (boundp symbol) (not (keywordp symbol))))))))
+               (and (boundp symbol) (not (keywordp symbol)))))))))
    :verbose nil :print nil)
   (unintern 'sb-impl::shake-packages 'sb-impl)
   (let ((sum-delta-ext 0)
@@ -512,6 +509,23 @@ Please check that all strings which were not recognizable to the compiler
 
 (scan-format-control-strings)
 
+(macrolet ((def-backward-compatible-sb-c-specials (pairs) ; for UIOP + ASDF
+             `(progn
+                ,@(mapcar (lambda (pair)
+                            `(define-symbol-macro ,(car pair)
+                                 (,(sb-int:package-symbolicate "SB-C" "CU-" (cdr pair) "-COUNT")
+                                   sb-c::*compilation-unit*)))
+                          pairs))))
+  ;; coece to a strict boolean
+  (define-symbol-macro sb-c::*in-compilation-unit* (not (null sb-c::*compilation-unit*)))
+  ;; the "specials" are all SETFable when and only when *IN-COMPILATION-UNIT* is T
+  (def-backward-compatible-sb-c-specials
+      sb-c::((*aborted-compilation-unit-count* . "ABORTED")
+             (*compiler-error-count* . "ERROR")
+             (*compiler-warning-count*  . "WARNING")
+             (*compiler-style-warning-count* . "STYLE-WARNING")
+             (*compiler-note-count* . "NOTE"))))
+
 #+sb-devel
 (rename-package "COMMON-LISP" "COMMON-LISP" '("SB-XC" "CL"))
 
@@ -529,7 +543,8 @@ Please check that all strings which were not recognizable to the compiler
 
 (setq sb-c:*compile-to-memory-space* :auto)
 (when (find-package "SB-INTERPRETER") (setq sb-ext:*evaluator-mode* :interpret))
-#+x86-64 (sb-ext:fold-identical-code :aggressive t :preserve-docstrings t)
+#+(and x86-64 (not sb-devel)) (sb-ext:fold-identical-code :aggressive t :preserve-docstrings t)
 
 ;; See comments in 'readtable.lisp'
-(setf (readtable-base-char-preference *readtable*) :symbols)
+(handler-bind ((sb-int:standard-readtable-modified-error #'continue))
+  (setf (readtable-base-char-preference *readtable*) :symbols))

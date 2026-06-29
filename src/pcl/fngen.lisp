@@ -48,9 +48,15 @@
             (lexenv
              (sb-c::make-almost-null-lexenv
               (ecase safety
-                (:safe base-policy)
+                ;; Stepping invokes the printer on forms, which might
+                ;; invoke print-object, which might require dispatch
+                ;; function recompilation.
+                (:safe (if (sb-c:policy base-policy (= sb-c:insert-step-conditions 0))
+                           base-policy
+                           (sb-c::process-optimize-decl '(optimize (sb-c:insert-step-conditions 0))
+                                                        base-policy)))
                 (:unsafe (sb-c::process-optimize-decl
-                          '((space 1) (compilation-speed 1)
+                          '(optimize (space 1) (compilation-speed 1)
                             (speed 3) (safety 0) (sb-ext:inhibit-warnings 3) (debug 0))
                           base-policy)))
               ;; I suspect that INHIBIT-WARNINGS precludes them from happening
@@ -132,6 +138,11 @@
                (unless (fgen-system old)
                  (setf (fgen-system old) system)))
               (t
+               (unless (eql (sb-vm:thread-current-arena) 0)
+                 (setq gensyms (ensure-heap-list gensyms))
+                 (sb-vm:without-arena
+                     (setq test (copy-tree test)
+                           generator-lambda  (copy-tree generator-lambda))))
                (setf (gethash test table)
                      (make-fgen gensyms generator generator-lambda system))))))))
 
@@ -148,7 +159,8 @@
 (defun get-new-fun-generator (lambda test code-converter)
   (multiple-value-bind (code gensyms) (compute-code lambda code-converter)
     (let ((generator-lambda `(lambda ,gensyms
-                               (declare (optimize (sb-c:store-source-form 0)))
+                               (declare (optimize (sb-c:store-source-form 0)
+                                                  (sb-c::store-xref-data 0)))
                                (function ,code))))
       (let ((generator (pcl-compile generator-lambda :safe)))
         (ensure-fgen test gensyms generator generator-lambda nil)
@@ -182,8 +194,8 @@
             gensyms)))
 
 (defun compute-constants (lambda constant-converter)
-  (let ((*walk-form-expand-macros-p* t) ; doesn't matter here.
-        collect)
+  (let ((*walk-form-expand-macros-p* t)) ; doesn't matter here.
+   (collect ((res))
     (walk-form lambda
                nil
                (lambda (f c e)
@@ -192,11 +204,9 @@
                      f
                      (let ((consts (funcall constant-converter f)))
                        (if consts
-                           (progn
-                             (setq collect (append collect consts))
-                             (values f t))
+                           (dolist (x consts (values f t)) (res x))
                            f)))))
-    collect))
+    (res))))
 
 (defmacro precompile-function-generators (&optional system)
   (let (collect)
@@ -215,3 +225,28 @@
                          collect)))
                *fgens*)
     `(progn ,@collect)))
+
+(defstruct (codegen-parms (:conc-name nil)
+                          (:constructor make-codegen-parms ())
+                          (:predicate nil))
+  ;; If this is NIL, then the whole mechanism for caching dfun constructors is
+  ;; turned off. The only time that makes sense is when debugging LAP code.
+  (enable-dfun-constructor-caching t)
+  (raise-metatypes-to-class-p t)
+  ;; Should PCL call compile at runtime to optimize cache functions?
+  (optimize-cache-functions-p t)
+  ;;
+  (compute-std-cpl-class->entry-table-size 60 :type fixnum)
+  ;;
+  (non-system-typep-cost   100 :type fixnum)
+  (structure-typep-cost     15 :type fixnum)
+  (system-typep-cost         5 :type fixnum)
+  ;;
+  (cache-lookup-cost        30 :type fixnum)
+  (wrapper-of-cost          15 :type fixnum)
+  (secondary-dfun-call-cost 30 :type fixnum)
+  ;;
+  (eq-case-table-limit      15 :type fixnum)
+  (case-table-limit         10 :type fixnum))
+(define-load-time-global *codegen-parms* (make-codegen-parms))
+(declaim (codegen-parms *codegen-parms*))

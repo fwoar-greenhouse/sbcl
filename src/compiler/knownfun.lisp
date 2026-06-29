@@ -19,7 +19,8 @@
 ;;;; interfaces to defining macros
 
 ;;; an IR1 transform
-(defstruct (transform (:copier nil))
+(defstruct (transform (:copier nil)
+                      (:predicate nil))
   ;; the function type which enables this transform.
   ;;
   ;; (Note that declaring this :TYPE FUN-TYPE probably wouldn't
@@ -31,8 +32,7 @@
   ;; the transformation function. Takes the COMBINATION node and
   ;; returns a lambda expression, or THROWs out.
   (function (missing-arg) :type function)
-  ;; T if we should emit a failure note even if SPEED=INHIBIT-WARNINGS.
-  (important nil :type (member nil :slightly t))
+  (important nil :type boolean)
   ;; A function with NODE as an argument that checks wheteher the
   ;; transform applies in its policy.
   ;; It used to be checked in the FUNCTION body but it would produce
@@ -41,11 +41,18 @@
   ;; or if another transform could be applied with the right policy.
   (policy nil :type (or null function)))
 
+;;; A normal transform inserted before VOP-TRANSFORMs
+(defstruct (before-vop-transform (:copier nil)
+                                 (:predicate nil)
+                                 (:include transform)))
+
 ;;; A transform inserted at the front of fun-info-transforms and stops
 ;;; other from firing if it has a VOP that can do the job.
 (defstruct (vop-transform (:copier nil)
                           (:predicate nil)
                           (:include transform)))
+
+(declaim (freeze-type transform))
 
 (defun transform-note (transform)
   (or #+sb-xc-host (documentation (transform-function transform) 'function)
@@ -61,14 +68,20 @@
 ;;; one with the same type and note.
 ;;; Argument order is: policy constraint, ftype constraint, consequent.
 ;;; (think "qualifiers + specializers -> method")
-(defun %deftransform (name policy type fun &optional (important :slightly))
+(defun %deftransform (name policy type fun &optional (important t)
+                                                     priority)
+  (declare (inline make-transform))
   (let* ((ctype (specifier-type type))
          (info (fun-info-or-lose name))
          (transforms (fun-info-transforms info))
          (old (find-if (lambda (transform)
-                         (and (if (eq important :vop)
-                                  (typep transform 'vop-transform)
-                                  (not (typep transform 'vop-transform)))
+                         (and (case important (eq important :vop)
+                                    (:vop
+                                     (typep transform 'vop-transform))
+                                    (:before-vop
+                                     (typep transform 'before-vop-transform))
+                                    (t
+                                     (not (typep transform '(or vop-transform before-vop-transform)))))
                               (type= (transform-type transform)
                                      ctype)))
                        transforms)))
@@ -76,22 +89,36 @@
            (style-warn 'redefinition-with-deftransform :transform old)
            (setf (transform-function old) fun
                  (transform-policy old) policy)
-           (unless (eq important :vop)
+           (unless (or (eq important :vop)
+                       (eq important :before-vop))
              (setf (transform-important old) important)))
           (t
            ;; Put vop-transform at the front.
-           (if (eq important :vop)
-               (push (make-vop-transform :type ctype :function fun
-                                         :policy policy)
-                     (fun-info-transforms info))
-               (let ((normal (member-if (lambda (transform)
-                                          (not (typep transform 'vop-transform)))
-                                        transforms))
-                     (transform (make-transform :type ctype :function fun
-                                                :important important
-                                                :policy policy)))
-                 (setf (fun-info-transforms info)
-                       (append (ldiff transforms normal) (list* transform normal)))))))
+           (case important
+             (:before-vop
+              (push (make-before-vop-transform :type ctype :function fun
+                                               :policy policy)
+                    (fun-info-transforms info)))
+             (:vop
+              (let ((normal (member-if (lambda (transform)
+                                         (not (eq (type-of transform) 'before-vop-transform)))
+                                       transforms))
+                    (transform (make-vop-transform :type ctype :function fun
+                                                   :policy policy)))
+                (setf (fun-info-transforms info)
+                      (append (ldiff transforms normal) (list* transform normal)))))
+             (t
+              (let ((normal (member-if (lambda (transform)
+                                         (not (typep transform '(or vop-transform
+                                                                 before-vop-transform))))
+                                       transforms))
+                    (transform (make-transform :type ctype :function fun
+                                               :important important
+                                               :policy policy)))
+                (setf (fun-info-transforms info)
+                      (if (eq priority :last)
+                          (append transforms (list transform))
+                          (append (ldiff transforms normal) (list* transform normal)))))))))
     name))
 
 ;;; Make a FUN-INFO structure with the specified type, attributes
@@ -101,7 +128,8 @@
                        overwrite-fndb-silently
                        call-type-deriver
                        annotation
-                       folder)
+                       folder
+                       read-only)
   (let* ((ctype (specifier-type type))
          (type-to-store (if (contains-unknown-type-p ctype)
                             ;; unparse it, so SFUNCTION -> FUNCTION
@@ -143,16 +171,18 @@
                        (fun-info-result-arg old-fun-info) result-arg
                        (fun-info-annotation old-fun-info) annotation
                        (fun-info-call-type-deriver old-fun-info) call-type-deriver
-                       (fun-info-folder old-fun-info) folder))
+                       (fun-info-folder old-fun-info) folder
+                       (fun-info-read-only-args old-fun-info) read-only))
                 (t
                  (setf (info :function :info name)
-                       (make-fun-info :attributes attributes
-                                      :derive-type derive-type
-                                      :optimizer optimizer
-                                      :result-arg result-arg
-                                      :call-type-deriver call-type-deriver
-                                      :annotation annotation
-                                      :folder folder))))
+                       (make-fun-info attributes
+                                      derive-type
+                                      optimizer
+                                      result-arg
+                                      call-type-deriver
+                                      annotation
+                                      folder
+                                      read-only))))
           (if location
               (setf (getf (info :source-location :declaration name) 'defknown)
                     location)
@@ -162,13 +192,6 @@
 
 ;;; This macro should be the way that all implementation independent
 ;;; information about functions is made known to the compiler.
-;;;
-;;; FIXME: The comment above suggests that perhaps some of my added
-;;; FTYPE declarations are in poor taste. Should I change my
-;;; declarations, or change the comment, or what?
-;;;
-;;; FIXME: DEFKNOWN is needed only at build-the-system time. Figure
-;;; out some way to keep it from appearing in the target system.
 ;;;
 ;;; Declare the function NAME to be a known function. We construct a
 ;;; type specifier for the function by wrapping (FUNCTION ...) around
@@ -203,8 +226,10 @@
             (memq 'unboxed-return attributes))
     (pushnew 'no-verify-arg-count attributes))
 
-  (multiple-value-bind (type annotation)
-      (split-type-info arg-types result-type)
+  (multiple-value-bind (type annotation read-only)
+      (split-type-info name arg-types result-type (and (member 'call attributes)
+                                                       (or (member 'foldable attributes)
+                                                           (member 'foldable-read-only attributes))))
     `(%defknown ',(if (and (consp name)
                            (not (legal-fun-name-p name)))
                       name
@@ -220,7 +245,9 @@
                                (memq 'fixed-args attributes)
                                (memq 'unboxed-return attributes))
                               (let ((args (make-gensym-list (length arg-types))))
-                                `(lambda ,args (funcall ',name ,@args)))))))
+                                `(lambda ,args (funcall ',name ,@args))))
+                :read-only ',(unless (eql read-only 0)
+                               read-only))))
 
 (defstruct (fun-type-annotation
             (:copier nil))
@@ -229,7 +256,7 @@
   key
   returns)
 
-(defun split-type-info (arg-types result-type)
+(defun split-type-info (name arg-types result-type foldable-call)
   (if (eq arg-types '*)
       `(sfunction ,arg-types ,result-type)
       (multiple-value-bind (llks required optional rest keys)
@@ -243,12 +270,16 @@
               positional-annotation
               rest-annotation
               key-annotation
-              return-annotation)
+              return-annotation
+              (read-only 0))
           (labels ((annotation-p (x)
-                     (typep x '(or (cons (member function function-designator modifying
-                                          inhibit-flushing))
-                                (member type-specifier proper-sequence proper-list
-                                 proper-or-dotted-list proper-or-circular-list))))
+                     (or (typep x '(or (cons (member function function-designator modifying
+                                              inhibit-flushing))
+                                    (member type-specifier proper-sequence proper-list
+                                     proper-or-dotted-list proper-or-circular-list)))
+                         (when (and foldable-call
+                                    (member x '(function-designator function)))
+                           (error "Missing function annotation for a foldable function: ~a" name))))
                    (strip-annotation (x)
                      (if (consp x)
                          (ecase (car x)
@@ -260,6 +291,9 @@
                            (t x))))
                    (process-positional (type)
                      (incf i)
+                     (when (typep type '(cons (eql read-only)))
+                       (setf (ldb (byte 1 i) read-only) 1)
+                       (setf type (second type)))
                      (cond ((annotation-p type)
                             (push (cons i (ensure-list type)) positional-annotation)
                             (strip-annotation type))
@@ -273,6 +307,9 @@
                            (t
                             pair)))
                    (process-rest (type)
+                     (when (typep type '(cons (eql read-only)))
+                       (setf read-only (logior (dpb read-only (byte (1+ i) 0) -1)))
+                       (setf type (second type)))
                      (cond ((annotation-p type)
                             (setf rest-annotation (ensure-list type))
                             (strip-annotation type))
@@ -302,7 +339,8 @@
                  `(make-fun-type-annotation :positional ',positional-annotation
                                             :rest ',rest-annotation
                                             :key ',key-annotation
-                                            :returns ',return-annotation)))))))))
+                                            :returns ',return-annotation))
+               read-only)))))))
 
 ;;; Return the FUN-INFO for NAME or die trying.
 (declaim (ftype (sfunction (t) fun-info) fun-info-or-lose))
@@ -369,87 +407,62 @@
                                        preserve-vector-type
                                        string-designator)
   (lambda (call)
-    (declare (type combination call))
-    (let ((lvar (nth n (combination-args call))))
+    (let ((lvar (nth n (basic-combination-args call))))
       (when lvar
-        (let ((type (lvar-type lvar)))
-          (cond ((and (not string-designator)
-                      (simplify-list-type type
-                                          :preserve-dimensions preserve-dimensions)))
-                ((not (csubtypep type (specifier-type 'vector)))
-                 (cond ((not string-designator) nil)
-                       ((csubtypep type (specifier-type 'character))
-                        (specifier-type `(simple-string 1)))
-                       ((and (constant-lvar-p lvar)
-                             (symbolp (lvar-value lvar)))
-                        (ctype-of (symbol-name (lvar-value lvar))))))
-                (preserve-vector-type
-                 type)
-                (t
-                 (let ((simplified (simplify-vector-type type)))
-                   (if (and preserve-dimensions
-                            (csubtypep simplified (specifier-type 'simple-array)))
-                       (type-intersection (specifier-type
-                                           `(simple-array * ,(ctype-array-dimensions type)))
-                                          simplified)
-                       simplified)))))))))
+        (let* ((type (lvar-type lvar))
+               (result type))
+          (unless string-designator
+            (let ((list-type (type-intersection type (specifier-type 'list))))
+              (unless (eq list-type *empty-type*)
+                (setf result
+                      (type-union
+                       result
+                       (simplify-list-type list-type
+                                           :preserve-dimensions preserve-dimensions))))))
+          (when string-designator
+            (when (types-equal-or-intersect type (specifier-type 'character))
+              (setf result
+                    (type-union
+                     (type-difference result (specifier-type 'character))
+                     (specifier-type '(simple-string 1)))))
+            (let ((symbol-type (type-intersection type (specifier-type 'symbol))))
+              (unless (eq symbol-type *empty-type*)
+                (setf result
+                      (type-union
+                       (type-difference result (specifier-type 'symbol))
+                       (if (member-type-p symbol-type)
+                           (sb-kernel::%type-union (mapcar-member-type-members
+                                                    (lambda (s) (ctype-of (symbol-name s)))
+                                                    symbol-type))
+                           (specifier-type 'simple-string)))))))
+          (unless preserve-vector-type
+            (let ((vector-type (type-intersection type (specifier-type 'vector))))
+              (unless (eq vector-type *empty-type*)
+                (let ((simplified (simplify-vector-type vector-type)))
+                  (setf result
+                        (type-union
+                         result
+                         (if (and preserve-dimensions
+                                  (csubtypep simplified (specifier-type 'simple-array)))
+                             (type-intersection (specifier-type
+                                                 `(simple-array * ,(ctype-array-dimensions vector-type)))
+                                                simplified)
+                             simplified)))))))
+          result)))))
 
 ;;; Derive the type to be the type specifier which is the Nth arg.
 (defun result-type-specifier-nth-arg (n)
   (lambda (call)
-    (declare (type combination call))
-    (let ((lvar (nth n (combination-args call))))
+    (declare (type basic-combination call))
+    (let ((lvar (nth n (basic-combination-args call))))
       (when (and lvar (constant-lvar-p lvar))
         (careful-specifier-type (lvar-value lvar))))))
 
-;;; Derive the type to be the type specifier which is the Nth arg,
-;;; with the additional restriptions noted in the CLHS for STRING and
-;;; SIMPLE-STRING, defined to specialize on CHARACTER, and for VECTOR
-;;; (under the page for MAKE-SEQUENCE).
-;;; At present this is used to derive the output type of CONCATENATE,
-;;; MAKE-SEQUENCE, and MERGE. Two things seem slightly amiss:
-;;; 1. The sequence type actually produced might not be exactly that specified.
-;;;    (TYPE-OF (MAKE-SEQUENCE '(AND (NOT SIMPLE-ARRAY) (VECTOR BIT)) 9))
-;;;    => (SIMPLE-BIT-VECTOR 9)
-;;; 2. Because we *know* that a hairy array won't be produced,
-;;;    why does derivation preserve the non-simpleness, if so specified?
-(defun creation-result-type-specifier-nth-arg (n)
+(defun creation-result-type-specifier-nth-arg (n &optional nil-nil)
   (lambda (call)
-    (declare (type combination call))
-    (let ((lvar (nth n (combination-args call))))
-      (when (and lvar (constant-lvar-p lvar))
-        (let* ((specifier (lvar-value lvar))
-               (lspecifier (if (atom specifier) (list specifier) specifier)))
-          (cond
-            ((eq (car lspecifier) 'string)
-             (destructuring-bind (string &rest size)
-                 lspecifier
-               (declare (ignore string))
-               (careful-specifier-type
-                `(vector character ,@(when size size)))))
-            ((eq (car lspecifier) 'simple-string)
-             (destructuring-bind (simple-string &rest size)
-                 lspecifier
-               (declare (ignore simple-string))
-               (careful-specifier-type
-                `(simple-array character ,@(if size (list size) '((*)))))))
-            (t
-             (let ((ctype (careful-specifier-type specifier)))
-               (cond ((not (array-type-p ctype))
-                      ctype)
-                     ((unknown-type-p (array-type-element-type ctype))
-                      (make-array-type (array-type-dimensions ctype)
-                                       :complexp (array-type-complexp ctype)
-                                       :element-type *wild-type*
-                                       :specialized-element-type *wild-type*))
-                     ((eq (array-type-specialized-element-type ctype)
-                          *wild-type*)
-                      (make-array-type (array-type-dimensions ctype)
-                                       :complexp (array-type-complexp ctype)
-                                       :element-type *universal-type*
-                                       :specialized-element-type *universal-type*))
-                     (t
-                      ctype))))))))))
+    (let ((lvar (nth n (basic-combination-args call))))
+      (when lvar
+        (creation-result-type-specifier lvar nil-nil)))))
 
 (defun read-elt-type-deriver (skip-arg-p element-type-spec no-hang)
   (lambda (call)
@@ -475,38 +488,48 @@
 
 ;;; Return MAX MIN
 (defun sequence-lvar-dimensions (lvar)
-  (if (constant-lvar-p lvar)
-      (let ((value (lvar-value lvar)))
-        (and (proper-sequence-p value)
-             (let ((length (length value)))
-               (values length length))))
-      (let ((max 0) (min array-total-size-limit))
-        (block nil
-          (labels ((max-dim (type)
-                     ;; This can deal with just enough hair to handle type STRING,
-                     ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
-                     ;; if we really want to be more clever.
-                     (typecase type
-                       (union-type
-                        (mapc #'max-dim (union-type-types type)))
-                       (array-type (if (array-type-complexp type)
-                                       (return '*)
-                                       (process-dim (array-type-dimensions type))))
-                       (t (return '*))))
-                   (process-dim (dim)
-                     (if (typep dim '(cons integer null))
-                         (let ((length (car dim)))
-                           (setf max (max max length)
-                                 min (min min length)))
-                         (return '*))))
-            ;; If type derivation were able to notice that non-simple arrays can
-            ;; be mutated (changing the type), we could safely use LVAR-TYPE on
-            ;; any vector type. But it doesn't notice.
-            ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
-            ;; However that's probably not an important use, so the above
-            ;; logic restricts itself to simple arrays.
-            (max-dim (lvar-type lvar))
-            (values max min))))))
+  (cond ((constant-lvar-p lvar)
+         (let ((value (lvar-value lvar)))
+           (and (proper-sequence-p value)
+                (let ((length (length value)))
+                  (values length length)))))
+        ((csubtypep (lvar-type lvar) (specifier-type 'cons))
+         (values nil 1))
+        (t
+         (let ((max 0) (min array-total-size-limit))
+           (block nil
+             (labels ((max-dim (type)
+                        ;; This can deal with just enough hair to handle type STRING,
+                        ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
+                        ;; if we really want to be more clever.
+                        (typecase type
+                          (union-type
+                           (mapc #'max-dim (union-type-types type)))
+                          (array-type (if (array-type-complexp type)
+                                          (return '*)
+                                          (process-dim (array-type-dimensions type))))
+                          (t
+                           (cond ((csubtypep type (specifier-type 'cons))
+                                  (setf max array-total-size-limit
+                                        min (min min 1)))
+                                 ((csubtypep type (specifier-type 'null))
+                                  (setf min 0))
+                                 (t
+                                  (return '*))))))
+                      (process-dim (dim)
+                        (if (typep dim '(cons integer null))
+                            (let ((length (car dim)))
+                              (setf max (max max length)
+                                    min (min min length)))
+                            (return '*))))
+               ;; If type derivation were able to notice that non-simple arrays can
+               ;; be mutated (changing the type), we could safely use LVAR-TYPE on
+               ;; any vector type. But it doesn't notice.
+               ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
+               ;; However that's probably not an important use, so the above
+               ;; logic restricts itself to simple arrays.
+               (max-dim (lvar-type lvar))
+               (values max min)))))))
 
 ;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
 ;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
@@ -516,44 +539,44 @@
          (type (lvar-fun-type fun))
          (policy (lexenv-policy (node-lexenv call)))
          (args (combination-args call)))
-    (when (fun-type-p type)
-      (flet ((assert-type (arg type &optional set index)
-               (when (cond (index
-                            (assert-array-index-lvar-type arg type policy))
-                           (t
-                            (when set
-                              (add-annotation arg
-                                              (make-lvar-modified-annotation :caller (lvar-fun-name fun))))
-                            (assert-lvar-type arg type policy)))
-                 (unless trusted (reoptimize-lvar arg)))))
-        (let ((required (fun-type-required type)))
-          (when set
-            (assert-type (pop args)
-                         (pop required)))
+    (flet ((assert-type (arg type &optional set index)
+             (when (cond (index
+                          (assert-array-index-lvar-type arg type policy))
+                         (t
+                          (when set
+                            (add-annotation arg
+                                            (make-lvar-modified-annotation :caller (lvar-fun-name fun))))
+                          (assert-lvar-type arg type policy)))
+               (unless trusted (reoptimize-lvar arg)))))
+      (let ((required (fun-type-required type)))
+        (when set
           (assert-type (pop args)
-                       (if row-major-aref
-                           (pop required)
-                           (type-intersection
-                            (pop required)
-                            (let ((rank (length args)))
-                              (when (>= rank array-rank-limit)
-                                (setf (combination-kind call) :error)
-                                (compiler-warn "More subscripts for ~a (~a) than ~a (~a)"
-                                               (combination-fun-debug-name call)
-                                               rank
-                                               'array-rank-limit
-                                               array-rank-limit)
-                                (return-from array-call-type-deriver))
-                              (specifier-type `(array * ,rank)))))
-                       set)
-          (loop for type in required
-                do
-                (assert-type (pop args) type nil (or (not (and set row-major-aref))
-                                                     args)))
-          (loop for type in (fun-type-optional type)
-                do (assert-type (pop args) type nil t))
-          (loop for subscript in args
-                do (assert-type subscript (fun-type-rest type) nil t)))))))
+                       (pop required)))
+        (assert-type (pop args)
+                     (if row-major-aref
+                         (pop required)
+                         (type-intersection
+                          (pop required)
+                          (let ((rank (length args)))
+                            (when (>= rank array-rank-limit)
+                              (setf (combination-kind call) :error)
+                              (compiler-warn "More subscripts for ~a (~a) than ~a (~a)"
+                                             (combination-fun-debug-name call)
+                                             rank
+                                             'array-rank-limit
+                                             array-rank-limit)
+                              (return-from array-call-type-deriver))
+                            (make-array-type (make-list rank :initial-element '*)
+                                             :element-type *wild-type*))))
+                     set)
+        (loop for type in required
+              do
+              (assert-type (pop args) type nil (or (not (and set row-major-aref))
+                                                   args)))
+        (loop for type in (fun-type-optional type)
+              do (assert-type (pop args) type nil t))
+        (loop for subscript in args
+              do (assert-type subscript (fun-type-rest type) nil t))))))
 
 (defun append-call-type-deriver (call trusted)
   (let* ((policy (lexenv-policy (node-lexenv call)))
@@ -570,3 +593,38 @@
           (when (and (assert-lvar-type arg list-type policy)
                      (not trusted))
             (reoptimize-lvar arg)))))
+
+(defun nconc-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call))
+         (list-type (specifier-type 'list)))
+    ;; All but the last argument should be proper lists
+    (loop for (arg next) on args
+          while next
+          do
+          (add-annotation
+           arg
+           (make-lvar-proper-sequence-annotation
+            :kind 'proper-or-dotted-list))
+          (when (policy policy (> check-constant-modification 0))
+            (add-annotation arg
+                            (make-lvar-modified-annotation :caller 'nconc)))
+          (when (and (assert-lvar-type arg list-type policy)
+                     (not trusted))
+            (reoptimize-lvar arg)))))
+
+;;; It's either (number) or (real real)
+(defun atan-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call)))
+    (case (length args)
+      (1
+       (when (and (assert-lvar-type (car args) (specifier-type 'number) policy)
+                  (not trusted))
+         (reoptimize-lvar (car args))))
+      (2
+       (loop for arg in args
+             do
+             (when (and (assert-lvar-type arg (specifier-type 'real) policy)
+                        (not trusted))
+               (reoptimize-lvar arg)))))))

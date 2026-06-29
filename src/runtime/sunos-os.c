@@ -19,10 +19,12 @@
 
 #ifdef LISP_FEATURE_X86
 #include "genesis/static-symbols.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 #endif
 
 #include "gc.h"
+
+int sb_GetTID() { return 0; } // this doesn't affect anything
 
 void os_init() {}
 
@@ -60,6 +62,13 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 
     if (gencgc_handle_wp_violation(context, fault_addr)) return;
 
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, fault_addr)) return;
+#endif
+#ifdef LISP_FEATURE_TLS_LOAD_INDIRECT
+    if (handle_tls_deref_trap(context, fault_addr)) return;
+#endif
+
     if (!handle_guard_page_triggered(context, fault_addr))
             lisp_memory_fault_error(context, fault_addr);
 }
@@ -67,7 +76,8 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 #else
 
 static void
-sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
+sigsegv_handler(__attribute__((unused)) int signal,
+                siginfo_t *info, os_context_t *context)
 {
     os_vm_address_t addr = arch_get_bad_addr(signal, info, context);
 

@@ -408,7 +408,7 @@
              (ecase inline
                (inline
                 (assert failure-p)
-                (assert (= 1 (length warnings))))
+                (assert (= 2 (length warnings))))
                (notinline
                 (assert failure-p)
                 (assert (= 1 (length warnings)))))
@@ -605,7 +605,7 @@
     (('(or (eql -16) unsigned-byte)) #(0) :test #'equalp)))
 
 (with-test (:name :check-bound-signed-bound-notes
-            :fails-on (not (or :x86-64 :x86 :arm64)))
+            :fails-on (not (or :x86-64 :x86 :arm64 :riscv :loongarch64)))
   (checked-compile-and-assert
       (:allow-notes nil)
       `(lambda (x y)
@@ -779,13 +779,18 @@
    `(lambda (fn)
       (let ((s (make-string 536870910)))
         (declare (dynamic-extent s))
+        (funcall fn s))))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910 :element-type 'base-char)))
+        (declare (dynamic-extent s))
         (funcall fn s)))))
 
 (with-test (:name :hairy-aref-check-bounds)
   (assert (= (count 'sb-kernel:%check-bound
                     (ctu:ir1-named-calls
                      `(lambda (x)
-                        (declare ((vector t) x))
+                        (declare (vector x))
                         (aref x 0))
                      nil))
              0)))
@@ -808,3 +813,346 @@
       `(lambda (a)
          (typep a '(vector t 2)))
     (((make-array 2 :displaced-to (make-array '(2 1)))) t)))
+
+(defun aindex (i array) (aref array i))
+(defun 2d-aindex (i array) (aref array i i))
+(defun seqindex (i seq) (elt seq i))
+
+(with-test (:name :array-index-error-wording)
+  ;; message contains a "should be ... below"
+  (macrolet ((try (form)
+               `(handler-case ,form
+                  (:no-error (x) (error "Got ~S instead an error" x))
+                  (condition (c)
+                    (let ((str (princ-to-string c)))
+                      (assert (search "Invalid index" str))
+                      (assert (search "should be" str)))))))
+    (try (aindex 5 #(1)))
+    (try (2d-aindex 5 (make-array '(10 1))))
+    (try (seqindex 5 #(1)))
+    (try (seqindex 5 (make-array 9 :fill-pointer 1))))
+  ;; message does not contains a "should be"
+  (macrolet ((try (form)
+               `(handler-case ,form
+                  (:no-error (x) (error "Got ~S instead of an error" x))
+                  (condition (c)
+                    (let ((str (princ-to-string c)))
+                      (assert (search "Invalid index" str))
+                      (assert (not (search "should be" str)))
+                      (assert (not (search "below 0" str))))))))
+    (try (aindex 5 #()))
+    (try (2d-aindex 5 (make-array '(10 0))))
+    (try (seqindex 5 #()))
+    (try (seqindex 5 (make-array 9 :fill-pointer 0)))))
+
+(with-test (:name :fill-pointer-derive-type)
+  (assert-type
+   (lambda (n)
+     (make-array n :element-type 'character :fill-pointer 0))
+   (and (vector character) (not simple-array)))
+  (assert-type
+   (lambda (n f)
+     (make-array n :element-type 'character :fill-pointer f))
+   (array character)))
+
+(with-test (:name :backquote-transform)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (a)
+                         (make-array `(,a (+ 1 2))))
+                      :allow-warnings t))))
+
+(with-test (:name :data-vector-ref-with-offset-unsigned)
+  (checked-compile
+   `(lambda (b)
+      (declare (type (integer * 2) b))
+      (aref #*11101100 (the (satisfies eval) b))))
+  (checked-compile
+   `(lambda (v n)
+      (declare ((simple-vector 8) v)
+               ((integer -4 -1) n))
+      (aref v (+ n 4)))))
+
+(with-test (:name :make-array-non-simple-type)
+  (assert-type
+   (lambda (x e)
+     (make-array 10
+                 :element-type e
+                 :fill-pointer (1- x)))
+   (and vector (not simple-array)))
+  (assert-type
+   (lambda (a)
+     (make-array (array-total-size a)
+                 :displaced-to a))
+   (and (vector t) (not simple-array))))
+
+(with-test (:name :storage-vector-type)
+  (assert-type
+   (lambda (x)
+     (sb-ext:array-storage-vector (the string x)))
+   simple-string))
+
+(with-test (:name :make-array-element-type)
+  (assert-type
+   (lambda (a)
+     (declare (string a))
+     (make-array 3 :element-type (array-element-type a)))
+   (simple-string 3))
+  (assert-type
+   (lambda (a)
+     (make-array 2 :element-type (the (member character base-char) a)))
+   (simple-string 2))
+  (assert-type
+   (lambda (x)
+     (make-array '(1 1)
+                 :element-type 'single-float
+                 :initial-contents x))
+   (simple-array single-float (1 1)))
+  (assert-type
+   (lambda (n)
+    (make-array (list n n)
+                :element-type 'single-float
+                :initial-contents '((1.0))))
+   (simple-array single-float (* *))))
+
+(with-test (:name :multidimensional-access-no-bounds-checks)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (array i j)
+                       (array-row-major-index array i j))
+                     nil))
+             2))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (array i j)
+                       (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+                       (array-row-major-index array i j))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (v)
+                       (declare ((simple-array t (4 4)) v))
+                       (aref v 3 2))
+                     nil))
+             0)))
+
+(with-test (:name :make-simple-array-not-displaced)
+  (assert (not (array-displacement (funcall (checked-compile `(lambda (d) (make-array d))) '(1 2))))))
+
+(with-test (:name :data-vector-pop-fill-pointer-check)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (array)
+      (declare ((array t) array))
+      (vector-pop array))
+   (((make-array 5)) (condition 'type-error))
+   (((make-array 5 :adjustable t)) (condition 'type-error))
+   (((make-array '(5 5))) (condition 'type-error))
+   (((make-array '(5 5) :adjustable t)) (condition 'type-error))
+   (((make-array 5 :fill-pointer t :initial-element 3)) 3)))
+
+(with-test (:name :make-array+array-dimensions)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-array t (1 2)) x))
+     (make-array (array-dimensions x)))
+   (simple-array t (1 2)))
+  (assert-type
+   (lambda (x)
+     (declare ((or (array single-float (1 2))
+                   (array double-float (1 2))) x))
+     (make-array (array-dimensions x) :element-type 'fixnum))
+   (simple-array fixnum (1 2)))
+  (assert-type
+   (lambda (x e)
+     (declare ((array * (*)) x))
+     (make-array (array-dimensions x) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n e)
+     (make-array (list n) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n e)
+     (make-array (cons n nil) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (e)
+     (make-array (list* 10 nil) :element-type e))
+   (simple-array * (10)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a n)
+         (declare ((array * (* *)) a))
+         (let ((d (array-dimensions a)))
+           (adjust-array a n)
+           (make-array d)))
+    (((make-array '(1 2) :adjustable t) '(2 1)) #2A((0 0)) :test #'equalp)))
+
+(with-test (:name :make-array-list-adjustable)
+  (assert-type
+   (lambda (a b)
+     (make-array (list a b) :adjustable t))
+   (and (array t (* *)) (not simple-array)))
+  (assert-type
+   (lambda (a b)
+     (make-array (list a b) :adjustable nil))
+   (simple-array t (* *)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b s)
+         (make-array (list a b) :initial-contents s :adjustable t))
+    ((2 2 '((1 2) (3 4))) #2a((1 2) (3 4)) :test #'equalp))
+  ;; (assert-type
+  ;;  (lambda (a b n)
+  ;;    (make-array (list a b) :adjustable n))
+  ;;  (array t (* *)))
+  )
+
+(with-test (:name :make-array-list-derive-type)
+  (assert-type
+   (lambda (a b p)
+     (make-array (list a b) :displaced-to p))
+   (array t (* *)))
+  (assert-type
+   (lambda (a b p)
+     (make-array (list* a b nil) :displaced-to p))
+   (array t (* *))))
+
+(with-test (:name :make-array-member-element-type)
+  (assert-type
+   (lambda (d)
+     (make-array 1 :element-type (if d
+                                     'double-float
+                                     'single-float)))
+   (or (simple-array double-float (1)) (simple-array single-float (1))))
+  (assert-type
+   (lambda (a n)
+     (declare ((or (array single-float) (array double-float)) a))
+     (setf (aref a 0) n))
+   float)
+  (assert-type
+   (lambda (d)
+     (make-array 2 :element-type (if d 'a 'b)))
+   (simple-array * (2))
+   :allow-style-warnings t))
+
+(with-test (:name :make-array-dimension-mix)
+  (checked-compile-and-assert
+   ()
+   `(lambda (d)
+      (make-array (if d 2 '(1))))
+   ((t) #(0 0) :test #'equalp)
+   ((nil) #(0) :test #'equalp)))
+
+(with-test (:name :array-dimensions-type-derivation)
+  (assert-type
+   (lambda (a n)
+     (declare ((simple-array * (1 2)) a))
+     (array-dimension a n))
+   (member 1 2))
+  (assert-type
+   (lambda (a n)
+     (declare ((simple-array * (1 *)) a))
+     (array-dimension a n))
+   sb-int:index)
+  (assert-type
+   (lambda (a n)
+     (declare ((simple-array * (1 * 3)) a)
+              ((member 0 2) n))
+     (array-dimension a n))
+   (member 1 3))
+  (assert-type
+   (lambda (a n)
+     (if (= (array-dimension a 1) n)
+         (print n))
+     a)
+   (and array (not vector))))
+
+(with-test (:name :array-rank-type-derivation)
+  (assert-type
+   (lambda (a)
+     (if (eql (array-rank a) 3)
+         a
+         (error "")))
+   (array * (* * *)))
+  (assert-type
+   (lambda (a)
+     (if (eql (array-rank a) 1)
+         (error "")
+         a))
+   (and array (not vector)))
+  (assert-type
+   (lambda (a r)
+     (declare ((integer 2) r))
+     (if (= (array-rank a) r)
+         a
+         (error "")))
+   (and array (not vector)))
+  (assert-type
+   (lambda (a r)
+     (declare ((integer 2) r))
+     (if (> (array-rank a) r)
+         a
+         (error "")))
+   (and array (not vector))))
+
+(with-test (:name :array-dimensions-equal)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b n)
+         (let ((d1 (array-dimensions a)))
+           (adjust-array a n)
+           (equal d1 (array-dimensions b))))
+    (((make-array 6 :adjustable t) #6(0) 5) t)))
+
+(with-test (:name :array-dimensions-equal-type-derivation)
+  (assert-type
+   (lambda (a b)
+     (declare ((simple-array * (* 1)) a)
+              ((simple-array * (2 *)) b))
+     (if (equal (array-dimensions a)
+                (array-dimensions b))
+         b
+         (error "")))
+   (simple-array * (2 1)))
+  (assert-type
+   (lambda (a b)
+     (declare ((simple-array * (1 *)) a))
+     (if (equal (array-dimensions a)
+                (array-dimensions b))
+         b
+         (error "")))
+   (array * (* *)))
+  (assert-type
+   (lambda (a b)
+     (declare ((simple-array * (1 2)) a)
+              (simple-array b))
+     (if (equal (array-dimensions a)
+                (array-dimensions b))
+         b
+         (error "")))
+   (simple-array * (1 2)))
+  (assert-type
+   (lambda (a b)
+     (declare ((simple-array * (1 2)) a))
+     (if (equal (array-dimensions a)
+                (array-dimensions b))
+         b
+         (error "")))
+   (array * (* *)))
+  (assert-type
+   (lambda (a n m)
+     (if (equal (array-dimensions a) (list n m))
+         a
+         (error "")))
+   (array * (* *))))
+
+(with-test (:name :array-displaced-type)
+  (assert-type
+   (lambda (a)
+     (if (array-displacement a)
+         a
+         (error "")))
+    (and array (not simple-array))))

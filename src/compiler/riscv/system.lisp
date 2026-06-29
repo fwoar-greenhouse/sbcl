@@ -13,12 +13,27 @@
 
 ;;;; Type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:generator 1
+    (inst andi res arg (lognot fixnum-tag-mask))
+    ;; now shift left and shift right so that:
+    ;;   on 32-bit, the sign bit is clear, yielding 29 bits of precision
+    ;;   on 64-bit, the upper 31 bits are clear, yielding 32 bits of precision
+    (let ((amount #+64-bit 31 #-64-bit 1))
+      (inst slli res res amount)
+      (inst srli res res amount))))
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
@@ -139,14 +154,6 @@
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
 
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst andi res ptr (lognot fixnum-tag-mask))))
-
 
 ;;;; Allocation
 
@@ -192,7 +199,7 @@
          (offset :scs (signed-reg) :to (:result 0)))
   (:arg-types * fixnum)
   (:results (res :scs (unsigned-reg) :from (:argument 0)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:result-types unsigned-num)
   (:generator 10
     #-64-bit
@@ -242,7 +249,7 @@
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
   (:args (n :scs (signed-reg) :target sap))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:arg-types signed-num)
   (:policy :fast-safe)
   (:generator 3

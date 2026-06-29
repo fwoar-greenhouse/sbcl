@@ -24,6 +24,11 @@
         (remf args :hash-function)))
     (apply 'make-hash-table args)))
 
+(defun %hash-table-alist (hash-table &aux result)
+  (maphash (lambda (key value) (push (cons key value) result))
+           hash-table)
+  result)
+
 ;;; In correct code, TRULY-THE has only a performance impact and can
 ;;; be safely degraded to ordinary THE.
 (defmacro truly-the (type expr)
@@ -39,19 +44,11 @@
 
 (defmacro define-thread-local (&rest rest) `(defvar ,@rest))
 
-(defmacro defglobal (name value &rest doc)
-  `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (defparameter ,name
-       (if (boundp ',name)
-           (symbol-value ',name)
-           ,value)
-       ,@doc)))
-
-(defmacro define-load-time-global (&rest args) `(defvar ,@args))
+(defun %set-symbol-global-value (sym val) (setf (symbol-value sym) val))
 
 ;;; Necessary only to placate the host compiler in %COMPILER-DEFGLOBAL.
 (defun set-symbol-global-value (sym val)
-  (setf (symbol-value sym) val))
+  (error "Unexpected (~S ~S ~S)" 'set-symbol-global-value sym val))
 
 (defun %defun (name lambda &optional inline-expansion)
   (declare (ignore inline-expansion))
@@ -172,12 +169,6 @@
 (defun %negate (number)
   (sb-xc:- number))
 
-(defun %single-float (number)
-  (coerce number 'single-float))
-
-(defun %double-float (number)
-  (coerce number 'double-float))
-
 (defun %ldb (size posn integer)
   (ldb (byte size posn) integer))
 
@@ -187,6 +178,22 @@
 (defun %with-array-data (array start end)
   (assert (typep array '(simple-array * (*))))
   (values array start end 0))
+
+;; We could probably just implement this by creating a displaced array
+;; if need be.
+(defmacro with-array-data (((data-var array &key offset-var)
+                            (start-var &optional (svalue 0))
+                            (end-var &optional (evalue nil))
+                            &key force-inline check-fill-pointer
+                                 array-header-p)
+                           &body forms
+                           &environment env)
+  (declare (ignore data-var array offset-var)
+           (ignore start-var svalue)
+           (ignore end-var evalue)
+           (ignore force-inline check-fill-pointer array-header-p)
+           (ignore forms env))
+  `(error "WITH-ARRAY-DATA not implemented on the host."))
 
 (defun %with-array-data/fp (array start end)
   (assert (typep array '(simple-array * (*))))
@@ -287,11 +294,6 @@
 (defun %instance-layout (instance)
   (declare (notinline classoid-layout))
   (classoid-layout (find-classoid (type-of instance))))
-(defun %instance-length (instance)
-  (declare (notinline layout-length))
-  ;; In the target, it is theoretically possible to have %INSTANCE-LENGTH
-  ;; exceeed layout length, but in the cross-compiler they're the same.
-  (layout-length (%instance-layout instance)))
 
 (defun %find-position (item seq from-end start end key test)
   (let ((position (position item seq :from-end from-end
@@ -353,11 +355,24 @@
 (defun %puthash (key table val) ; stemming from toplevel (SETF GETHASH)
   (setf (gethash key table) val))
 
+(defun upgraded-array-element-type (spec &optional environment)
+  (declare (ignore environment))
+  (type-specifier (sb-kernel::%upgraded-array-element-type (specifier-type spec))))
+
 ;;;; Variables which have meaning only to the cross-compiler, defined here
 ;;;; in lieu of #+sb-xc-host elsewere which messes up toplevel form numbers.
 (in-package "SB-C")
 
 (defun allocate-weak-vector (n) (make-array (the integer n)))
+
+#+weak-vector-readbarrier
+(progn (deftype weak-vector () nil) ; nothing is a weak-vector
+       (defun sb-int:weak-vector-ref (v i)
+         (error "Called WEAK-VECTOR-REF on ~S ~S" v i))
+       (defun (setf sb-int:weak-vector-ref) (new v i)
+         (error "Called (SETF WEAK-VECTOR-REF) on ~S ~S ~S" new v i))
+       (defun sb-int:weak-vector-len (v)
+         (error "Called WEAK-VECTOR-LEN on ~S" v)))
 
 ;;; For macro lambdas that are processed by the host
 (declaim (declaration top-level-form))
@@ -429,7 +444,9 @@
 (defun range<= (l x h) (<= l x h))
 (defun range<<= (l x h) (and (< l x) (<= x h)))
 (defun range<=< (l x h) (and (<= l x) (< x h)))
-
+(defun check-range<= (l x h)
+  (and (typep x 'sb-xc:fixnum)
+       (<= l x h)))
 (defvar *unbound-marker* (make-symbol "UNBOUND-MARKER"))
 
 (defun make-unbound-marker ()
@@ -437,3 +454,15 @@
 
 (defun unbound-marker-p (x)
   (eq x *unbound-marker*))
+
+(defmacro with-source-form (source-form form)
+  (declare (ignore source-form))
+  form)
+
+(defun %numerator (x)
+  (check-type x ratio)
+  (numerator x))
+
+(defun %denominator (x)
+  (check-type x ratio)
+  (denominator x))

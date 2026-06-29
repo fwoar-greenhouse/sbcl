@@ -55,19 +55,20 @@
 #endif
 
 
+#ifndef LISP_FEATURE_PPC64
 os_vm_address_t
 arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
     os_vm_address_t addr;
 
-#if defined(LISP_FEATURE_NETBSD) || defined(LISP_FEATURE_OPENBSD)
+#if defined(LISP_FEATURE_NETBSD) || defined(LISP_FEATURE_OPENBSD) || defined(LISP_FEATURE_FREEBSD)
     addr = (os_vm_address_t) (code->si_addr);
 #else
     addr = (os_vm_address_t) (*os_context_register_addr(context,PT_DAR));
 #endif
     return addr;
 }
-
+#endif
 
 void
 arch_skip_instruction(os_context_t *context)
@@ -284,7 +285,7 @@ handle_allocation_trap(os_context_t * context)
 
     struct thread* thread = get_sb_vm_thread();
     gc_assert(!foreign_function_call_active_p(thread));
-    if (gencgc_alloc_profiler && thread->state_word.sprof_enable)
+    if (gencgc_alloc_profiler && thread->sprof_enable)
         record_backtrace_from_context(context, thread);
 
     fake_foreign_function_call(context);
@@ -379,8 +380,11 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
     }
     if (!handle_it) return 0;
 
-    struct thread *thread = get_sb_vm_thread();
-    set_pseudo_atomic_atomic(thread);
+#ifdef DEBUG
+    sigset_t curmask;
+    pthread_sigmask(SIG_BLOCK, 0, &curmask);
+    gc_assert(sigismember(&curmask, SIG_STOP_FOR_GC));
+#endif
 
     int symbol_reg = (prev_inst >> 16) & 31;
     struct symbol *specvar =
@@ -423,7 +427,6 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
     // This is actually always going to be 0 for 64-bit code
     int tlsindex_reg = (code >> 16) & 31; // the register we trapped on
     *os_context_register_addr(context, tlsindex_reg) = tls_index;
-    clear_pseudo_atomic_atomic(thread);
     return 1; // handled this signal
 }
 #endif
@@ -552,7 +555,13 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
         return;
     }
 
-    interrupt_handle_now(signal, (siginfo_t *)code, context);
+    if (signal == SIGILL) {
+        fake_foreign_function_call(context);
+        lose("Unhandled SIGILL at %p.", (void*)OS_CONTEXT_PC(context));
+    }
+    else {
+        interrupt_handle_now(signal, (siginfo_t *)siginfo, context);
+    }
 }
 
 
@@ -596,7 +605,7 @@ ppc_flush_icache(os_vm_address_t address, os_vm_size_t length)
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-  char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+  char *reloc_addr = (char*)ALIEN_LINKAGE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;
@@ -738,6 +747,25 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 }
 
 #ifdef LISP_FEATURE_64_BIT
+#include "forwarding-ptr.inc"
+/* Return the tagged pointer for which 'entrypoint' is the starting address.
+ * This result must have SIMPLE_FUN_WIDETAG.
+ * If the thing has been forwarded, we do NOT return the newspace copy.
+ */
+lispobj entrypoint_taggedptr(uword_t entrypoint) {
+    if (!entrypoint || points_to_asm_code_p(entrypoint)) return 0;
+    lispobj* phdr = (lispobj*)(entrypoint - 2*N_WORD_BYTES);
+    if (forwarding_pointer_p(phdr)) {
+        gc_assert(lowtag_of(forwarding_pointer_value(phdr)) == FUN_POINTER_LOWTAG);
+        // We can't assert on the widetag if forwarded, because defragmentation
+        // puts the new logical object at some totally different physical address.
+        // This function doesn't know if defrag is occurring.
+    } else {
+        __attribute__((unused)) unsigned char widetag = widetag_of(phdr);
+        gc_assert(widetag == SIMPLE_FUN_WIDETAG);
+    }
+    return make_lispobj(phdr, FUN_POINTER_LOWTAG);
+}
 void gcbarrier_patch_code(void* where, int nbits)
 {
     int m_operand = 64 - nbits;

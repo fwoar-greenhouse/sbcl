@@ -84,7 +84,17 @@ os_restore_fp_control(os_context_t *context)
 {
     /* FIXME: Implement. */
 }
+os_context_register_t *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    uintptr_t regspace = (uintptr_t)context + 232;
 
+    if (*(uint32_t *)regspace == 0x56465001) {
+        return (os_context_register_t *)(regspace + 8 + (offset * 8));
+    }
+
+    return NULL;
+}
 void
 os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
@@ -100,8 +110,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     uint32_t trap_instruction = *(uint32_t *)OS_CONTEXT_PC(context);
 
     if (trap_instruction != 0xe7f001f0) {
-        lose("Unrecognized trap instruction %08lx in sigtrap_handler()",
-             trap_instruction);
+        lose("Unrecognized trap instruction %08x in sigtrap_handler()", trap_instruction);
     }
 
     if (code == trap_PendingInterrupt) {
@@ -111,7 +120,15 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     handle_trap(context, code);
 }
 
+
+void
+sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
+    fake_foreign_function_call(context);
+    lose("Unhandled SIGILL at %p.", (void*)OS_CONTEXT_PC(context));
+}
+
 void arch_install_interrupt_handlers()
 {
     ll_install_handler(SIGTRAP, sigtrap_handler);
+    ll_install_handler(SIGILL, sigill_handler);
 }

@@ -32,10 +32,10 @@
 ;;;; !COLD-INIT
 
 ;;; a list of toplevel things set by GENESIS
-(defvar *!cold-toplevels*)
+(declaim (global *!cold-toplevels*))
 
 ;;; a SIMPLE-VECTOR set by GENESIS
-(defvar *!load-time-values*)
+(declaim (global *!load-time-values*))
 
 ;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
 ;; and use it for most of the cold-init functions. (Just be careful
@@ -53,7 +53,7 @@
   (progn
     (setq *break-on-signals* nil)
     (setq sb-kernel::*current-error-depth* 0))
-  (setq *stack-top-hint* nil))
+  (setq sb-debug:*stack-top-hint* nil))
 
 (defun !printer-control-init ()
   (setq *print-readably* nil
@@ -63,6 +63,7 @@
         *print-radix* nil
         *print-vector-length* nil
         *print-circle* nil
+        *print-circle-not-shared* nil
         *print-case* :upcase
         *print-array* t
         *print-gensym* t
@@ -75,33 +76,28 @@
 
 ;;; Create a stream that works early.
 (defun !make-cold-stderr-stream ()
-  (let ((stderr
-          #-win32 2
-          #+win32 (sb-win32::get-std-handle-or-null sb-win32::+std-error-handle+))
-        (buf (make-string 1 :element-type 'base-char :initial-element #\Space)))
-    (%make-fd-stream
-     :cout (lambda (stream ch)
+  (let* ((stderr
+           #-win32 2
+           #+win32 (sb-win32::get-std-handle-or-null sb-win32::+std-error-handle+))
+         (ucs2 #+win32 (sb-win32::console-handle-p stderr))
+         (char-size (if ucs2 4 1))
+         (buf (make-string 1 :element-type (if ucs2 'character 'base-char) :initial-element #\Space)))
+    (flet ((cout (stream ch)
              (declare (ignore stream))
              (setf (char buf 0) ch)
-             (sb-unix:unix-write stderr buf 0 1)
-             ch)
-     :sout (lambda (stream string start end)
-             (declare (ignore stream))
-             (flet ((out (s start len)
-                      (when (plusp len)
-                        (setf (char buf 0) (char s (+ start len -1))))
-                      (sb-unix:unix-write stderr s start len)))
-               (if (typep string 'simple-base-string)
-                   (out string start (- end start))
-                   (let ((n (- end start)))
-                     ;; will croak if there is any non-BASE-CHAR in the string
-                     (out (replace (make-array n :element-type 'base-char)
-                                   string :start2 start) 0 n)))))
-     :misc (lambda (stream operation arg1)
-             (declare (ignore stream arg1))
-             (stream-misc-case (operation :default nil)
-               (:charpos ; impart just enough smarts to make FRESH-LINE dtrt
-                (if (eql (char buf 0) #\newline) 0 1)))))))
+             (sb-unix:unix-write stderr buf 0 char-size)
+             ch))
+      (%make-fd-stream
+       :cout #'cout
+       :sout (lambda (stream string start end)
+               (declare (simple-string string) (index start end))
+               (loop for i from start below end
+                     do (cout stream (char string i))))
+       :misc (lambda (stream operation arg1)
+               (declare (ignore stream arg1))
+               (stream-misc-case (operation :default nil)
+                                 (:charpos ; impart just enough smarts to make FRESH-LINE dtrt
+                                  (if (eql (char buf 0) #\newline) 0 1))))))))
 
 (defun !xc-sanity-checks ()
   ;; Verify on startup that some constants were dumped reflecting the
@@ -133,14 +129,13 @@
   (setq sb-vm::*immobile-codeblob-tree* nil
         sb-vm::*dynspace-codeblob-tree* nil)
   (setq sb-kernel::*defstruct-hooks* '(sb-kernel::!bootstrap-defstruct-hook)
-        sb-kernel::*struct-accesss-fragments-delayed* nil)
+        sb-kernel::*struct-access-fragments-delayed* nil)
   (let ((stream (!make-cold-stderr-stream)))
     (setq *error-output* stream
           *standard-output* stream
           *trace-output* stream))
   (show-and-call !signal-function-cold-init)
   (show-and-call !printer-control-init) ; needed before first instance of FORMAT or WRITE-STRING
-  (setq sb-unix::*unblock-deferrables-on-enabling-interrupts-p* nil) ; needed by LOAD-LAYOUT called by CLASSES-INIT
   (setq *print-length* 6
         *print-level* 3)
   (/show "testing '/SHOW" *print-length* *print-level*) ; show anything
@@ -155,9 +150,7 @@
   ;; this to be initialized, so we initialize it right away.
   (show-and-call !random-cold-init)
 
-  ;; We can't do such much as a simple PROCLAIM without this global
-  ;; hash-table (because of WARN-IF-INLINE-FAILED/PROCLAIM)
-  (setf sb-c::*emitted-full-calls* (make-hash-table :test 'equal :synchronized t))
+  (setq sb-c::*compilation-unit* nil) ; its DEFVAR is not processed yet
 
   ;; All sorts of things need INFO and/or (SETF INFO).
   (/show0 "about to SHOW-AND-CALL !GLOBALDB-COLD-INIT")
@@ -165,13 +158,23 @@
   (show-and-call !function-names-init)
   (show-and-call !pathname-cold-init)
 
-  ;; And now *CURRENT-THREAD*
+  ;; There is a very subtle (and slightly undiscoverable) chicken-and-egg situation
+  ;; which could occur when calling INIT-MAIN-THREAD during cold-init but presumably
+  ;; not after the core is produced: anything in *THREAD-LOCAL-SPECIALS* must
+  ;; have its initialization form evaluable.  This is surely fine for constants
+  ;; but not as clear for *HANDLER-CLUSTERS* which takes its value from
+  ;; **INITIAL-HANDLER-CLUSTERS**. As it happens, we're ok, but that's just one
+  ;; example, so sometimes you have to be careful with DEFINE-THREAD-LOCAL.
   (sb-thread::init-main-thread)
 
+  (show-and-call !hash-table-cold-init)
+
   ;; not sure why this is needed on some architectures. Dark magic.
+  #-linkage-space
   (setf (fdefn-fun (find-or-create-fdefn '%coerce-callable-for-call))
         #'%coerce-callable-to-fun)
   (show-and-call !loader-cold-init)
+  #+linkage-space (show-and-call sb-vm::!initialize-lisp-linkage-table)
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
   ;; It was fine if T because in that case the legality of the arg is certain.
   ;; And be extra paranoid - ensure that it really gets called.
@@ -226,6 +229,12 @@
 
   (setq sb-pcl::*!docstrings* nil) ; needed before any documentation is set
   (setq sb-c::*queued-proclaims* nil) ; needed before any proclaims are run
+  (setq *code-coverage-info* ; needed to note / record code coverage
+        (cons (make-hash-table :test 'equal :synchronized t)
+              (loop for v across (the simple-vector sb-fasl::*!xc-covg-instrumented*)
+                    collect (list-to-weak-vector
+                             (loop for c across (the simple-vector v)
+                                   when (sb-c::code-coverage-map c) collect c)))))
 
   (/show0 "calling cold toplevel forms and fixups")
   (let ((*package* *package*)) ; rebind to self, as if by LOAD
@@ -254,18 +263,15 @@
            (sb-fasl::named-constant-set object index name)))
         ((cons (eql :begin-file))
          (unless (!c-runtime-noinform-p) (print (cdr toplevel-thing))))
+        ((cons (eql :record-code-coverage))
+         (setf (gethash (second toplevel-thing) (car *code-coverage-info*))
+               (sb-c::make-coverage-instrumented-file (third toplevel-thing) nil nil)))
         (t
          (!cold-lose "bogus operation in *!COLD-TOPLEVELS*")))))
   (/show0 "done with loop over cold toplevel forms and fixups")
   (unless (!c-runtime-noinform-p) (terpri))
 
   (makunbound '*!cold-toplevels*) ; so it gets GC'd
-
-  ;; Need the static-space replica of the assembly routine jump vector
-  ;; filled in, and the static space vector of static fdefns.
-  ;; This matters only for code that gets compiled to dynamic space,
-  ;; so it's OK that it occurs somewhat late in cold-init.
-  #+x86-64 (sb-vm::validate-asm-routine-vector)
 
   #+win32 (show-and-call reinit-internal-real-time)
 
@@ -328,6 +334,7 @@
   (show-and-call sb-disassem::!compile-inst-printers)
 
   ;; Toggle some readonly bits
+  #-sb-devel
   (dovector (sc sb-c:*backend-sc-numbers*)
     (when sc
       (logically-readonlyize (sb-c::sc-move-funs sc))
@@ -352,6 +359,32 @@
   "Calls (SB-EXT:EXIT :CODE UNIX-STATUS :ABORT RECKLESSLY-P),
 see documentation for SB-EXT:EXIT."
   (exit :code unix-status :abort recklessly-p))
+
+(define-load-time-global *address-sanitizer-cleanup* t)
+#+sb-thread
+(defun cleanup-for-asan ()
+  ;; Try to force finalizers to run which helps avoid spurious reports of
+  ;; C++ object leakage where objects are managed by Lisp and have a finalizer
+  ;; which performs a free() and/or other requisite destructor actions.
+  ;; Unfortunately, GC alone can not guarantee that finalizers have run, because the
+  ;; finalizer thread may not act quickly enough. And even polling for the list
+  ;; of pending finalizers to become empty isn't adequate due to an inherent race
+  ;; and the fact that the finalizer thread tries to exit as soon as possible
+  ;; when asked to by %EXIT.  Disabling the thread and manually checking for
+  ;; pending finalizers is usually enough to avoid false positives.
+  (when (eq (cas *address-sanitizer-cleanup* t nil) t) ; at most one time
+    (finalizer-thread-stop)
+    (gc :full t)
+    (run-pending-finalizers)
+    (with-alien ((asan-lisp-thread-cleanup (function void) :extern))
+      ;; The recyclebin of available thread structs was dealt with by POST-GC,
+      ;; leaving two more sets of threads to deal with:
+      ;; - threads still running, let's hope they don't need their ZSTD context!
+      (alien-funcall asan-lisp-thread-cleanup)
+      ;; - threads ready to be pthread_joined, so effectively dead to Lisp
+      ;;   but whose pthread memory resources have not been released
+      (sb-thread:%dispose-thread-structs))
+    t))
 
 (declaim (ftype (sfunction (&key (:code (or null exit-code))
                                  (:timeout (or null real))
@@ -394,6 +427,12 @@ Consequences are unspecified if serious conditions occur during EXIT
 excepting errors from *EXIT-HOOKS*, which cause warnings and stop
 execution of the hook that signaled, but otherwise allow the exit
 process to continue normally."
+  #+sb-thread
+  (when (and (not abort)
+             (eql code 0)
+             (proper-list-p *features*) ; Don't croak if features got trashed
+             (member :address-sanitizer *features*))
+    (cleanup-for-asan))
   (if (or abort *exit-in-progress*)
       (os-exit (or code 1) :abort t)
       (let ((code (or code 0)))
@@ -413,7 +452,6 @@ process to continue normally."
     ;; can be called, as pretty much anything can assume that it is set.
     (when total ; newly started process, and not a failed save attempt
       (sb-thread::init-main-thread)
-      #+x86-64 (sb-vm::validate-asm-routine-vector)
       (rebuild-package-vector))
     ;; Initialize streams next, so that any errors can be printed
     (stream-reinit t)
@@ -433,7 +471,7 @@ process to continue normally."
     (sb-debug::disable-debugger))
   (call-hooks "initialization" *init-hooks*)
   #+sb-thread (finalizer-thread-start)
-  (sb-vm::!setup-cpu-specific-routines))
+  (sb-vm::setup-cpu-specific-routines))
 
 ;;;; some support for any hapless wretches who end up debugging cold
 ;;;; init code

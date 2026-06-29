@@ -12,13 +12,12 @@
 (in-package "SB-VM")
 
 
-(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant arg-count-sc (make-sc+offset any-reg-sc-number nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ra-offset))
+(defun make-return-pc-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ra-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
@@ -26,7 +25,7 @@
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
 (defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ocfp-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset descriptor-reg-sc-number ocfp-offset))
@@ -37,19 +36,21 @@
 (defun make-old-fp-save-location (env)
   (specify-save-tn
    (environment-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
-   (make-wired-tn *fixnum-primitive-type* control-stack-arg-scn ocfp-save-offset)))
+   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number ocfp-save-offset)))
 
 (defun make-return-pc-save-location (env)
   (let ((ptype *fixnum-primitive-type*))
     (specify-save-tn
-     (environment-debug-live-tn (make-normal-tn ptype) env)
-     (make-wired-tn ptype control-stack-arg-scn ra-save-offset))))
+     (environment-debug-live-tn
+      (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ra-offset)
+      env)
+     (make-wired-tn ptype control-stack-sc-number ra-save-offset))))
 
 ;;; Make a TN for the standard argument count passing location.  We
 ;;; only need to make the standard location, since a count is never
 ;;; passed when we are using non-standard conventions.
 (defun make-arg-count-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number nargs-offset))
 
 
 ;;;; Frame hackery:
@@ -82,22 +83,28 @@
   (:args (frame-pointer :scs (descriptor-reg))
          (variable-home-tn :load-if nil))
   (:results (value :scs (descriptor-reg any-reg)))
+  ;; :unused-if does not work because offsets haven't been assigned
+  (:temporary (#|:unused-if (typep (ash (tn-offset variable-home-tn) word-shift) 'short-immediate)|#
+               :sc unsigned-reg) tmp)
   (:policy :fast-safe)
   (:generator 4
     (aver (sc-is variable-home-tn control-stack))
-    (loadw value frame-pointer (tn-offset variable-home-tn))))
+    (load-frame-word value frame-pointer (tn-offset variable-home-tn) 'ancestor-frame-ref tmp)))
 
 (define-vop (ancestor-frame-set)
   (:args (frame-pointer :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
   (:results (variable-home-tn :load-if nil))
+  ;; :unused-if does not work because offsets haven't been assigned
+  (:temporary (#|:unused-if (typep (ash (tn-offset variable-home-tn) word-shift) 'short-immediate)|#
+               :sc unsigned-reg) tmp)
   (:generator 4
     (aver (sc-is variable-home-tn control-stack))
-    (storew value frame-pointer (tn-offset variable-home-tn))))
+    (store-frame-word value frame-pointer (tn-offset variable-home-tn) 'ancestor-frame-set tmp)))
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:temporary (:scs (descriptor-reg) :offset l0-offset) fn)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
@@ -111,8 +118,9 @@
 
 (define-vop (xep-setup-sp)
   (:vop-var vop)
+  (:temporary (:sc unsigned-reg) tmp) ; TODO- can :unused-if be based on frame size?
   (:generator 1
-    (inst addi csp-tn cfp-tn (* n-word-bytes (sb-allocated-size 'control-stack)))
+    (add-imm csp-tn cfp-tn (* n-word-bytes (sb-allocated-size 'control-stack)) 'xep-setup-sp tmp)
     (let ((nfp (current-nfp-tn vop)))
       (when nfp
         (inst subi nsp-tn nsp-tn (bytes-needed-for-non-descriptor-stack-frame))
@@ -121,10 +129,11 @@
 (define-vop (allocate-frame)
   (:results (res :scs (any-reg))
             (nfp :scs (any-reg)))
+  (:temporary (:sc unsigned-reg) tmp)
   (:info callee)
   (:generator 2
     (move res csp-tn)
-    (inst addi csp-tn csp-tn (* n-word-bytes (sb-allocated-size 'control-stack)))
+    (add-imm csp-tn csp-tn (* n-word-bytes (sb-allocated-size 'control-stack)) 'allocate-frame tmp)
     (when (ir2-environment-number-stack-p callee)
       (inst addi nsp-tn nsp-tn (- (bytes-needed-for-non-descriptor-stack-frame)))
       (move nfp nsp-tn))))
@@ -135,10 +144,12 @@
 (define-vop (allocate-full-call-frame)
   (:info nargs)
   (:results (res :scs (any-reg)))
+  (:temporary (:sc unsigned-reg
+               :unused-if (typep (* nargs n-word-bytes) 'short-immediate)) tmp)
   (:generator 2
     (when (> nargs register-arg-count)
       (move res csp-tn)
-      (inst addi csp-tn csp-tn (* nargs n-word-bytes)))))
+      (add-imm csp-tn csp-tn (* nargs n-word-bytes) 'allocate-full-call-frame tmp))))
 
 ;;; Emit code needed at the return-point from an unknown-values call
 ;;; for a fixed number of values.  VALUES is the head of the TN-REF
@@ -338,7 +349,7 @@
   (:temporary (:scs (descriptor-reg) :from (:eval 0)) move-temp)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
   (:temporary (:sc any-reg :offset ocfp-offset :from (:eval 0)) ocfp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:ignore arg-locs args ocfp)
   (:info arg-locs callee target nvals)
   (:generator 5
@@ -374,7 +385,7 @@
   (:ignore args save)
   (:vop-var vop)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset lip-offset) lip)
   (:generator 20
     (let ((label (gen-label))
           (cur-nfp (current-nfp-tn vop)))
@@ -568,7 +579,7 @@
 
        ,@(unless (eq return :tail)
            '((:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-             (:temporary (:scs (interior-reg)) lip)))
+             (:temporary (:sc any-reg :offset lip-offset) lip)))
 
        (:generator ,(+ (if named 5 0)
                        (if variable 19 1)
@@ -763,6 +774,7 @@
          (return-pc :scs (any-reg) :target ra)
          (value))
   (:temporary (:sc any-reg :offset ra-offset :from (:argument 1)) ra)
+  (:temporary (:sc any-reg :offset nargs-offset) nargs)
   (:ignore value)
   (:vop-var vop)
   (:generator 6
@@ -772,7 +784,7 @@
     (move csp-tn cfp-tn)
     (move cfp-tn old-fp)
     ;; Out of here.
-    (inst li nargs-tn -1) ; mark single value return
+    (inst li nargs -1) ; mark single value return
     (move ra return-pc)
     (inst jalr zero-tn ra 0)))
 
@@ -896,6 +908,10 @@
   (:temporary (:sc any-reg :offset nl1-offset) count)
   (:temporary (:sc any-reg :offset nl3-offset) dest)
   (:temporary (:sc descriptor-reg :offset l0-offset) temp)
+  ;; EXTRA-TEMP can possibly be eliminated. But since TEMP is wired to L0, it is an
+  ;; arg-passing reg which gets utilized in (NTH I *REGISTER-ARG-TNS*) and so
+  ;; should not be clobbered with random data there. I think.
+  (:temporary (:sc unsigned-reg) extra-temp)
   (:vop-var vop)
   (:info fixed)
   (:generator 20
@@ -905,8 +921,8 @@
           (delta (- (sb-allocated-size 'control-stack) fixed)))
       ;; Compute the end of the fixed stack frame (start of the MORE arg
       ;; area) into RESULT.
-      (inst addi result cfp-tn
-            (* n-word-bytes (sb-allocated-size 'control-stack)))
+      (add-imm result cfp-tn
+            (* n-word-bytes (sb-allocated-size 'control-stack)) 'copy-more-arg extra-temp)
       ;; Compute the end of the MORE arg area (and our overall frame
       ;; allocation) into the stack pointer.
       (cond ((zerop fixed)
@@ -955,7 +971,7 @@
                ;; the list starting from the end (so that we don't
                ;; overwrite any elements before they're copied).
                (inst bge result dest do-regs)
-               (loadw temp dest (- (1+ delta)))
+               (load-frame-word temp dest (- (1+ delta)) 'copy-more-arg extra-temp)
                (storew temp dest -1)
                (inst subi dest dest n-word-bytes)
                (inst j loop))
@@ -965,6 +981,7 @@
                ;; need to copy the list from the start in order to close
                ;; the gap.
                (inst bge result dest done)
+               ;; Unlike above, this LOADW can't have IMM that is too large
                (loadw temp result (- delta))
                (storew temp result 0)
                (inst addi result result n-word-bytes)
@@ -984,9 +1001,10 @@
           (inst subi count count (fixnumize 1))
           ;; Store it into the space reserved to it, by displacement
           ;; from the frame pointer.
-          (storew (nth i *register-arg-tns*) cfp-tn
+          (store-frame-word (nth i *register-arg-tns*) cfp-tn
                   (+ (sb-allocated-size 'control-stack)
-                     (- i fixed)))))
+                     (- i fixed))
+                  'copy-more-arg extra-temp)))
       (emit-label done)
       ;; Now that we're done with the &MORE args, we can set up the
       ;; number stack frame.

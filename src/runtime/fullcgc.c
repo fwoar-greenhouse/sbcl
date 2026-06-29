@@ -17,12 +17,12 @@
 #include "genesis/hash-table.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
-#include "genesis/fdefn.h"
 #include "code.h"
 #include "immobile-space.h"
 #include "queue.h"
 #include "os.h"
 #include "validate.h"
+#include "var-io.h"
 
 #include <stdio.h>
 #ifndef LISP_FEATURE_WIN32
@@ -101,24 +101,14 @@ static inline sword_t dword_index(uword_t ptr, uword_t base) {
 
 /* The "canonical" pointer to an object is usually just the object itself.
  * This is true even for SIMPLE-FUN- we don't need to regard only the code base
- * as canonical. The exception is that LRAs can't be marked because they can't
- * be discovered and marked when marking their containing code */
+ * as canonical. */
 static inline lispobj canonical_ptr(lispobj pointer)
 {
-#ifdef RETURN_PC_WIDETAG
-  /* NO_TLS_VALUE is all 1s, and so it might look like it has OTHER_POINTER_LOWTAG
-   * depending on the architecture (the word size, etc), but there is no memory
-   * at 0xff...ff so definitely don't call widetag_of - that won't fly! */
-    if (lowtag_of(pointer)==OTHER_POINTER_LOWTAG
-        && pointer != NO_TLS_VALUE_MARKER
-        && widetag_of(native_pointer(pointer)) == RETURN_PC_WIDETAG)
-        return fun_code_tagged(native_pointer(pointer));
-#endif
     return pointer;
 }
 
-sword_t fixedobj_index_bit_bias, text_index_bit_bias;
-uword_t *fullcgcmarks;
+static __attribute__((unused)) sword_t fixedobj_index_bit_bias, text_index_bit_bias;
+static uword_t *fullcgcmarks;
 static size_t markbits_size;
 static inline sword_t ptr_to_bit_index(lispobj pointer) {
     if (pointer == NIL) return -1;
@@ -282,7 +272,10 @@ void execute_full_mark_phase()
     struct rusage before, after;
     getrusage(RUSAGE_SELF, &before);
 #endif
-    trace_object((lispobj*)NIL_SYMBOL_SLOTS_START);
+#ifdef T_SYMBOL_SLOTS_START
+    trace_object(T_SYMBOL_SLOTS_START);
+#endif
+    trace_object(NIL_SYMBOL_SLOTS_START);
     scav_static_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer);
     scav_static_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer);
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
@@ -318,7 +311,7 @@ void execute_full_mark_phase()
 #endif
 }
 
-static void local_smash_weak_pointers()
+__attribute__((unused)) static void local_smash_weak_pointers()
 {
     struct weak_pointer *wp, *next_wp;
     for (wp = weak_pointer_chain; wp != WEAK_POINTER_CHAIN_END; wp = next_wp) {
@@ -358,7 +351,7 @@ static void sweep_fixedobj_pages()
     low_page_index_t page;
     uword_t space_base = FIXEDOBJ_SPACE_START;
     sword_t bitmap_index_bias = fixedobj_index_bit_bias;
-    for (page = FIXEDOBJ_RESERVED_PAGES ; ; ++page) {
+    for (page = 0 ; ; ++page) {
         lispobj *obj = fixedobj_page_address(page);
         if (obj >= fixedobj_free_pointer)
             break;
@@ -385,7 +378,6 @@ static void sweep_fixedobj_pages()
  * unlike deposit_filler() which tries to be efficient */
 static void clobber_headered_object(lispobj* addr, sword_t nwords)
 {
-    // FIXME: clobbering an object on single-object pages should free entire pages
     page_index_t page = find_page_index(addr);
     if (page < 0) { // code space
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -403,7 +395,7 @@ static void clobber_headered_object(lispobj* addr, sword_t nwords)
             }
         }
 #endif
-    } else if ((SINGLE_OBJECT_FLAG|page_table[page].type) == (SINGLE_OBJECT_FLAG|PAGE_TYPE_CODE)) {
+    } else if (is_code(page_table[page].type)) {
         // Code pages don't want (0 . 0) fillers, otherwise heap checking
         // gets an error: "object @ 0x..... is non-code on code page"
         addr[0] = make_filler_header(nwords);
@@ -413,8 +405,9 @@ static void clobber_headered_object(lispobj* addr, sword_t nwords)
     }
 }
 
+__attribute__((unused))
 static uword_t sweep(lispobj* where, lispobj* end,
-                     __attribute__((unused)) uword_t arg)
+                     __attribute__((unused)) void* arg)
 {
     sword_t nwords;
     uword_t space_base = DYNAMIC_SPACE_START;
@@ -443,6 +436,19 @@ static uword_t sweep(lispobj* where, lispobj* end,
     return 0;
 }
 
+#ifndef LISP_FEATURE_MARK_REGION_GC
+static uword_t sweep_possibly_large(lispobj* where, lispobj* end,
+                                    __attribute__((unused)) void* arg)
+{
+    extern void free_large_object(lispobj*, lispobj*);
+    if (page_single_obj_p(find_page_index(where))) {
+        if (!pointer_survived_gc_yet((lispobj)where)) free_large_object(where, end);
+    } else
+        sweep(where, end, arg);
+    return 0;
+}
+#endif
+
 void dispose_markbits() {
     os_deallocate((void*)fullcgcmarks, markbits_size);
     fullcgcmarks = 0; markbits_size = 0;
@@ -458,6 +464,9 @@ void dispose_markbits() {
 
 void execute_full_sweep_phase()
 {
+#ifdef LISP_FEATURE_MARK_REGION_GC
+    lose("Can't do sweep");
+#else
     long words_zeroed[1+PSEUDO_STATIC_GENERATION]; // One count per generation
 
     local_smash_weak_pointers();
@@ -468,8 +477,7 @@ void execute_full_sweep_phase()
     memset(words_zeroed, 0, sizeof words_zeroed);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     sweep_fixedobj_pages();
-    sweep((lispobj*)TEXT_SPACE_START, text_space_highwatermark,
-          (uword_t)words_zeroed);
+    sweep((lispobj*)TEXT_SPACE_START, text_space_highwatermark, words_zeroed);
     // Recompute generation masks for text space
     int npages = (ALIGN_UP((uword_t)text_space_highwatermark, IMMOBILE_CARD_BYTES)
                   - TEXT_SPACE_START) / IMMOBILE_CARD_BYTES;
@@ -480,7 +488,7 @@ void execute_full_sweep_phase()
             text_page_genmask[find_text_page_index(where)]
                 |= (1 << immobile_obj_gen_bits(where));
 #endif
-    walk_generation(sweep, -1, (uword_t)words_zeroed);
+    walk_generation(sweep_possibly_large, -1, words_zeroed);
     if (gencgc_verbose) {
         fprintf(stderr, "[Sweep phase: ");
         int i;
@@ -489,4 +497,5 @@ void execute_full_sweep_phase()
         fprintf(stderr, " words zeroed]\n");
     }
     dispose_markbits();
+#endif
 }

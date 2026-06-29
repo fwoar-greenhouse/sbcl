@@ -100,13 +100,7 @@
                       ;; so SYMBOL-HASH won't croak on it.
                       (funcall mapper slot-name))
                      ((simple-vector-p mapper)
-                      (let ((nsymbols (ash (length mapper) -1)))
-                        (dotimes (i nsymbols)
-                          (declare (index i))
-                          (when (eq (svref mapper i) slot-name)
-                            (return (svref mapper
-                                           (truly-the index (+ i nsymbols)))))))))))
-
+                      (search-struct-slot-name-vector mapper slot-name)))))
     (if bits
         (let ((raw-type (logand (truly-the fixnum bits) sb-vm:dsd-raw-type-mask))
               (index (truly-the index (ash bits (- sb-vm:dsd-index-shift)))))
@@ -508,3 +502,7 @@
            :format-control "~S called on ~S, which is not yet finalized."
            :format-arguments (list 'class-slots class)
            :references '((:amop :generic-function class-slots)))))
+
+;;; The error case of the optimizer for slot-value on a structure-object
+;;; that could be NIL. Just shortens the call site by passing one arg.
+(defun nil-not-slot-object (slot-name) (slot-value nil slot-name))

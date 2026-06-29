@@ -15,6 +15,16 @@
           (inst andi. temp temp fixnum-tag-mask)
           (inst bne DO-STATIC-FUN)))
 
+(defmacro tail-call-fallback-fun (name)
+  `(progn
+     ;; The ADDIS will be fixup-patched along with the instruction after it
+     (inst addis lip card-table-base-tn 0)
+     (inst ld lip lip (make-fixup ',name :linkage-cell))
+     (inst li nargs (fixnumize 2))
+     (inst mr ocfp cfp-tn)
+     (inst mr cfp-tn csp-tn)
+     (inst j lip 0)))
+
 (define-assembly-routine
   (generic-+
    (:cost 10)
@@ -32,7 +42,7 @@
    (:temp flag non-descriptor-reg nl3-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp ocfp any-reg ocfp-offset))
 
   (maybe-call-static-fun)
@@ -45,16 +55,9 @@
   (inst add temp2 temp2 temp)
   (with-fixed-allocation (res flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew temp2 res bignum-digits-offset other-pointer-lowtag))
-  (lisp-return lra lip :offset 2)
+  (lisp-return lra :mtlr nil)
 
-  DO-STATIC-FUN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg-+))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FUN (tail-call-fallback-fun two-arg-+)
 
   DONE
   (move res temp))
@@ -75,7 +78,7 @@
    (:temp temp non-descriptor-reg nl0-offset)
    (:temp temp2 non-descriptor-reg nl1-offset)
    (:temp flag non-descriptor-reg nl3-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -90,16 +93,9 @@
   (inst sub temp2 temp temp2)
   (with-fixed-allocation (res flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew temp2 res bignum-digits-offset other-pointer-lowtag))
-  (lisp-return lra lip :offset 2)
+  (lisp-return lra :mtlr nil)
 
-  DO-STATIC-FUN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg--))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FUN (tail-call-fallback-fun two-arg--)
 
   DONE
   (move res temp))
@@ -125,7 +121,7 @@
    (:temp lo non-descriptor-reg nl1-offset)
    (:temp hi non-descriptor-reg nl2-offset)
    (:temp pa-flag non-descriptor-reg nl3-offset)
-   (:temp lip interior-reg lip-offset)
+   (:temp lip any-reg lip-offset)
    (:temp lra descriptor-reg lra-offset)
    (:temp nargs any-reg nargs-offset)
    (:temp ocfp any-reg ocfp-offset))
@@ -150,21 +146,14 @@
   ;; one word bignum
   (with-fixed-allocation (res pa-flag temp bignum-widetag (1+ bignum-digits-offset))
     (storew lo res bignum-digits-offset other-pointer-lowtag))
-  (lisp-return lra lip :offset 2)
+  (lisp-return lra :mtlr nil)
   TWO-WORD-BIGNUM
   (with-fixed-allocation (res pa-flag temp bignum-widetag (+ bignum-digits-offset 2))
     (storew lo res bignum-digits-offset other-pointer-lowtag)
     (storew hi res (1+ bignum-digits-offset) other-pointer-lowtag))
-  (lisp-return lra lip :offset 2)
+  (lisp-return lra :mtlr nil)
 
-  DO-STATIC-FUN
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'two-arg-*))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  DO-STATIC-FUN (tail-call-fallback-fun two-arg-*)
 
   DONE
   (move res lo))
@@ -188,77 +177,8 @@
   (frob signed-* "signed *" 41 signed-num signed-reg)
   (frob fixnum-* "fixnum *" 30 tagged-num any-reg))
 
-
-
-;;;; Division.
-
-(define-assembly-routine (positive-fixnum-truncate
-                          (:note "unsigned fixnum truncate")
-                          (:cost 45)
-                          (:translate truncate)
-                          (:policy :fast-safe)
-                          (:arg-types positive-fixnum positive-fixnum)
-                          (:result-types positive-fixnum positive-fixnum))
-                         ((:arg dividend any-reg nl0-offset)
-                          (:arg divisor any-reg nl1-offset)
-
-                          (:res quo any-reg nl2-offset)
-                          (:res rem any-reg nl0-offset))
-  (aver (location= rem dividend))
-  (let ((error (generate-error-code nil 'division-by-zero-error dividend)))
-    (inst cmpdi divisor 0)
-    (inst beq error))
-    (inst divdu quo dividend divisor)
-    (inst mulld divisor quo divisor)
-    (inst sub rem dividend divisor)
-    (inst sldi quo quo n-fixnum-tag-bits))
-
-(define-assembly-routine (fixnum-truncate
-                          (:note "fixnum truncate")
-                          (:cost 50)
-                          (:policy :fast-safe)
-                          (:translate truncate)
-                          (:arg-types tagged-num tagged-num)
-                          (:result-types tagged-num tagged-num))
-                         ((:arg dividend any-reg nl0-offset)
-                          (:arg divisor any-reg nl1-offset)
-
-                          (:res quo any-reg nl2-offset)
-                          (:res rem any-reg nl0-offset))
-
-  (aver (location= rem dividend))
-  (let ((error (generate-error-code nil 'division-by-zero-error dividend)))
-    (inst cmpdi divisor 0)
-    (inst beq error))
-    (inst divd quo dividend divisor)
-    (inst mulld divisor quo divisor)
-    (inst subf rem divisor dividend)
-    (inst sldi quo quo n-fixnum-tag-bits))
-
-(define-assembly-routine (signed-truncate
-                          (:note "(signed-byte 64) truncate")
-                          (:cost 60)
-                          (:policy :fast-safe)
-                          (:translate truncate)
-                          (:arg-types signed-num signed-num)
-                          (:result-types signed-num signed-num))
-
-                         ((:arg dividend signed-reg nl0-offset)
-                          (:arg divisor signed-reg nl1-offset)
-
-                          (:res quo signed-reg nl2-offset)
-                          (:res rem signed-reg nl0-offset))
-
-  (let ((error (generate-error-code nil 'division-by-zero-error dividend)))
-    (inst cmpdi divisor 0)
-    (inst beq error))
-    (inst divd quo dividend divisor)
-    (inst mulld divisor quo divisor)
-    (inst subf rem divisor dividend))
-
 
 ;;;; Comparison
-
 (macrolet
     ((define-cond-assem-rtn (name translate static-fn inst)
        `(define-assembly-routine
@@ -273,7 +193,7 @@
 
            (:res res descriptor-reg a0-offset)
 
-           (:temp lip interior-reg lip-offset)
+           (:temp lip any-reg lip-offset)
            (:temp nargs any-reg nargs-offset)
            (:temp ocfp any-reg ocfp-offset))
 
@@ -281,13 +201,7 @@
           (inst andi. nargs nargs fixnum-tag-mask)
           (inst beq FIXNUM)
 
-          (inst addi lexenv-tn null-tn (static-fdefn-offset ',static-fn))
-          (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-          (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-          (inst li nargs (fixnumize 2))
-          (inst mr ocfp cfp-tn)
-          (inst mr cfp-tn csp-tn)
-          (inst j lip 0)
+          (tail-call-fallback-fun ,static-fn)
 
           FIXNUM
           (inst cmpd x y) ; RES and X are the same register, so do this first
@@ -313,20 +227,14 @@
 
                           (:res res descriptor-reg a0-offset)
 
-                          (:temp lip interior-reg lip-offset)
+                          (:temp lip any-reg lip-offset)
                           (:temp nargs any-reg nargs-offset)
                           (:temp ocfp any-reg ocfp-offset))
   (inst and nargs x y) ; (x&y) tag is 0 if at least one is fixnum
   (inst andi. nargs nargs fixnum-tag-mask)
   (inst beq FIXNUM)
 
-  (inst addi lexenv-tn null-tn (static-fdefn-offset 'eql))
-  (loadw code-tn lexenv-tn fdefn-fun-slot other-pointer-lowtag)
-  (loadw lip lexenv-tn fdefn-raw-addr-slot other-pointer-lowtag)
-  (inst li nargs (fixnumize 2))
-  (inst mr ocfp cfp-tn)
-  (inst mr cfp-tn csp-tn)
-  (inst j lip 0)
+  (tail-call-fallback-fun eql)
 
   FIXNUM
   (inst cmpd x y)

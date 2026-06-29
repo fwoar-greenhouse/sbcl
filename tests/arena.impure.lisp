@@ -1,9 +1,14 @@
-#+(or (not system-tlabs) interpreter) (invoke-restart 'run-tests::skip-file)
+#+(or gc-stress ;; c-find-heap->arena is not gc-safe
+      (not system-tlabs) interpreter) (invoke-restart 'run-tests::skip-file)
 
 (in-package sb-vm)
 
 (defvar *many-arenas*
   (coerce (loop for i below 10 collect (new-arena 1048576)) 'vector))
+
+;;; KEEP THIS AS THE FIRST TEST IN THE FILE. (Or make a new file of tests)
+(test-util:with-test (:name :run-finder-with-no-arenas)
+  (assert (null (c-find-heap->arena))))
 
 (defvar *arena* (aref *many-arenas* 0))
 ;;; This REWIND is strictly unnecessary. It simply should not crash
@@ -11,6 +16,32 @@
 
 (defun f (x y z)
   (with-arena (*arena*) (list x y z)))
+
+;;; The main use-case for inhibiting all arena allocations despite that objects
+;;; should go to arenas is for debugging an application under Slime.
+;;; Users don't understand all the things they have to avoid doing in Slime to avoid
+;;; violating the heap->arena pointer restriction, both in their code and as a side-effect
+;;; of using Slime to interact with SBCL. Supposing it were possible to alter parts of
+;;; slime to guard its own memory use (by injecting SB-VM:WITHOUT-ARENA all over the place)
+;;; - which frankly doesn't seem like it would be a welcome change - there's no assurance
+;;; that Slime customizations and contributed modules adhere to the required contract.
+;;; Thus it seems pretty impossible, and even if it were possible, users debugging at
+;;; a REPL have no idea how to avoid causing further harm due to Slime's background
+;;; threads holding on to objects users have made.  So we offer a toggle switch to
+;;; disable arenas; I think it's our the best shot. And obviously don't debug your
+;;; arena-related bugs using Slime: debug only your non-arena-related bugs.
+(test-util:with-test (:name :arena-inhibit)
+  (let ((arena *arena*))
+    (sb-vm:with-arena (arena)
+      (write (make-array 100) :stream (make-broadcast-stream)))
+    (assert (plusp (sb-vm:arena-bytes-used arena)))
+    (rewind-arena arena)
+    (unwind-protect
+         (progn (setf (extern-alien "inhibit_arena_use" int) 1)
+                (sb-vm:with-arena (arena)
+                  (write (make-array 100) :stream (make-broadcast-stream))))
+      (setf (extern-alien "inhibit_arena_use" int) 0))
+    (assert (zerop (sb-vm:arena-bytes-used arena)))))
 
 (test-util:with-test (:name :arena-huge-object)
   ;; This arena can grow to 10 MiB.
@@ -47,7 +78,8 @@
     (assert (not (c-find-heap->arena)))
     (destroy-arena a)))
 
-(test-util:with-test (:name :interrupt-thread-on-arena)
+(test-util:with-test (:name :interrupt-thread-on-arena
+                      :broken-on (and :win32 :arm64))
   (let* ((a (new-arena 1048576))
          (sem (sb-thread:make-semaphore))
          (junk))
@@ -168,18 +200,19 @@
   (dolist (code (sb-vm:list-allocated-objects :all :type sb-vm:code-header-widetag))
     (let ((info (sb-kernel:%code-debug-info code)))
       (when (typep info 'sb-c::compiled-debug-info)
-        (do ((cdf (sb-c::compiled-debug-info-fun-map info)
-                  (sb-c::compiled-debug-fun-next cdf)))
-            ((null cdf))
-          (test-util:opaque-identity
-           (sb-di::debug-fun-lambda-list
-            (sb-di::make-compiled-debug-fun cdf code))))))))
+        (let ((fun-map (sb-di::get-debug-info-fun-map
+                        (sb-kernel:%code-debug-info code))))
+          (loop for i from 0 below (length fun-map) by 2 do
+            (let ((cdf (aref fun-map i)))
+              (test-util:opaque-identity
+               (sb-di::debug-fun-lambda-list
+                (sb-di::make-compiled-debug-fun cdf code))))))))))
 
 (test-util:with-test (:name :debug-data-force-to-heap)
   (let ((a (sb-vm:new-arena (* 1024 1024 1024))))
     (sb-vm:with-arena (a)
       (decode-all-debug-data))
-    (assert (null (sb-vm:c-find-heap->arena a)))
+    (assert (zerop (length (sb-vm:c-find-heap->arena a))))
     (sb-vm:destroy-arena a)))
 
 (defun test-with-open-file ()
@@ -478,16 +511,29 @@
     (assert (pathnamep val))
     (assert (not (points-to-arena *condition*)))))
 
+(test-util:with-test (:name :ensure-generic-function-not-in-arena)
+  (let ((a (new-arena 1048576))
+        (name (gensym "ARENA-GF-")))
+    (with-arena (a) (ensure-generic-function name :lambda-list '(x)))
+    (assert (not (c-find-heap->arena a)))
+    (fmakunbound name)
+    (destroy-arena a)))
+
 (test-util:with-test (:name :gc-epoch-not-in-arena)
   (with-arena (*arena*) (gc))
   (assert (heap-allocated-p sb-kernel::*gc-epoch*)))
 
+(defvar *sem* (sb-thread:make-semaphore))
 (defvar *thing-created-by-hook* nil)
-(push (lambda () (push (cons 1 2) *thing-created-by-hook*))
+(push (lambda ()
+        (push (cons 1 2) *thing-created-by-hook*)
+        (sb-thread:signal-semaphore *sem*))
       *after-gc-hooks*)
 (test-util:with-test (:name :post-gc-hooks-unuse-arena)
   (with-arena (*arena*) (gc))
+  (sb-thread:wait-on-semaphore *sem*)
   (setq *after-gc-hooks* nil)
+  (assert *thing-created-by-hook*)
   (assert (heap-allocated-p *thing-created-by-hook*))
   (assert (heap-allocated-p (car *thing-created-by-hook*))))
 
@@ -540,9 +586,22 @@
         (exit-if-no-arenas))
       (assert (= n-deleted n-arenas)))))
 
-(defvar *another-arena* (new-arena 131072))
+(defvar *another-arena* (new-arena 131072 131072 10 :hidable t))
 (defun g (n) (make-array (the integer n) :initial-element #\z))
 (defun f (a n) (with-arena (a) (g n)))
+
+(defun test-read-line ()
+  (let ((stream
+         (make-string-input-stream (format nil "this is line1 and it should be long enough to ~
+ require doubling at least once in ansi-stream-read-line so ok then ~
+ here are some more characters for you because why not~%line2"))))
+    (let* ((a (sb-vm::new-arena 1048576))
+           (string (sb-vm:with-arena (a) (read-line stream))))
+      string)))
+
+(test-util:with-test (:name :read-line)
+  (test-read-line)
+  (assert (null (c-find-heap->arena))))
 
 (defvar *vect* (f *another-arena* 10))
 (setf (aref *vect* 3) "foo")
@@ -652,3 +711,19 @@
                        symbol))
           (format t "~s -> ~s~%" obj (cdr x))
           (format t "~s -> ~s~%" (type-of obj) (cdr x))))))
+
+(defun start-a-thread (arena arg)
+  (sb-vm:with-arena (arena)
+    (let ((name (format nil "worker~d" arg)))
+      (sb-thread:make-thread
+       (lambda () (print 'hi (make-broadcast-stream)))
+       :name name))))
+
+(test-util:with-test (:name :thread-name-not-in-arena)
+  (let* ((arena (new-arena 131072))
+         (thread (start-a-thread arena 1)))
+    (unwind-protect
+         (progn
+           (sb-thread:join-thread thread)
+           (assert (heap-allocated-p (sb-thread:thread-name thread))))
+      (destroy-arena arena))))

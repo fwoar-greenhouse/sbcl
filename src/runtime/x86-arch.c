@@ -36,14 +36,6 @@
 #define UD2_INST 0x0b0f
 #define BREAKPOINT_WIDTH 1
 
-#ifndef LISP_FEATURE_WIN32
-os_vm_address_t
-arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
-{
-    return (os_vm_address_t)code->si_addr;
-}
-#endif
-
 
 /*
  * hacking signal contexts
@@ -356,7 +348,7 @@ void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
     // 'volatile' works around a spurious GCC warning
-    volatile char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+    volatile char *reloc_addr = (char*)ALIEN_LINKAGE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
     if (datap) {
         *(unsigned long *)reloc_addr = (unsigned long)target_addr;
         return;

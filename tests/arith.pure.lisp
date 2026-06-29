@@ -43,7 +43,7 @@
     (() (condition 'division-by-zero))))
 
 (with-test (:name (/ :division-by-zero bignum))
-  (checked-compile-and-assert (:allow-style-warnings t)
+  (checked-compile-and-assert (:allow-warnings t)
       '(lambda () (/ (1+ most-positive-fixnum) 0))
     (() (condition 'division-by-zero))))
 
@@ -282,7 +282,8 @@
            (let ((fn (checked-compile
                       `(lambda (x)
                          (declare (optimize speed) (fixnum x))
-                         (,name x 0)))))
+                         (,name x 0))
+                      :allow-warnings t)))
              (assert-error (funcall fn 1) division-by-zero))))
     (mapc #'frob '(mod truncate rem / floor ceiling))))
 
@@ -441,17 +442,17 @@
                       2596148429267413814265248164610048))))
 
 (with-test (:name (expt 0 0))
-  ;; Check that (expt 0.0 0.0) and (expt 0 0.0) signal error, but
-  ;; (expt 0.0 0) returns 1.0
-  (flet ((error-case (expr)
-           (checked-compile-and-assert (:allow-style-warnings t)
-               `(lambda () ,expr)
-             (() (condition 'sb-int:arguments-out-of-domain-error)))))
-    (error-case '(expt 0.0 0.0))
-    (error-case '(expt 0 0.0)))
-  (checked-compile-and-assert (:allow-style-warnings t)
-      `(lambda () (expt 0.0 0))
-    (() 1.0)))
+  (checked-compile-and-assert ()
+      `(lambda (x y) (expt x y))
+    ((0 0) 1)
+    ((0f0 0) 1f0)
+    ((0d0 0) 1d0)
+    ((0 0f0) 1f0)
+    ((0 0d0) 1d0)
+    ((0d0 0f0) 1d0)
+    ((0f0 0d0) 1d0)
+    ((0f0 -0f0) 1f0)
+    ((-0f0 0f0) 1f0)))
 
 (with-test (:name :multiple-constant-folding)
   (let ((*random-state* (make-random-state t)))
@@ -470,12 +471,12 @@
                    (let ((fast (checked-compile
                                 `(lambda ,vars
                                    (,op ,@args))
-                                :allow-style-warnings (eq op '/)))
+                                :allow-warnings (eq op '/)))
                          (slow (checked-compile
                                 `(lambda ,vars
                                    (declare (notinline ,op))
                                    (,op ,@args))
-                                :allow-style-warnings (eq op '/))))
+                                :allow-warnings (eq op '/))))
                      (loop repeat 3
                            do (let* ((call-args (loop repeat (length vars)
                                                       collect (- (random 21) 10)))
@@ -841,14 +842,11 @@
                      '(#x9516A7 #x2531b4 0 0))))))
 
 (with-test (:name :truncate-by-zero-derivation)
-  (assert
-   (not (equal (cadr
-                (cdaddr (sb-kernel:%simple-fun-type
-                         (checked-compile
-                          `(lambda ()
-                             (truncate 5 0))
-                          :allow-style-warnings t))))
-               '(integer 0 0)))))
+  (assert-type
+   (lambda ()
+     (declare (muffle-conditions warning))
+     (truncate 5 0))
+   nil))
 
 (with-test (:name :truncate-by-zero-derivation.2)
   (checked-compile
@@ -884,6 +882,14 @@
     (((1- (expt 2 64)) -63) 1)
     (((1- (expt 2 64)) -64) 0)))
 
+(with-test (:name :ash-cut-unsafe)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x b)
+         (truly-the fixnum (ash (the (unsigned-byte 64) x) (the (integer -1000 1000) b))))
+    (((1- (expt 2 64)) -63) 1)
+    (((1- (expt 2 64)) -64) 0)))
+
 (with-test (:name :bogus-modular-fun-widths)
   (checked-compile-and-assert
       ()
@@ -893,20 +899,16 @@
     ((nil) 0)))
 
 (with-test (:name :lognot-type-derive)
-  (assert
-   (equal (caddr (sb-kernel:%simple-fun-type
-                  (checked-compile
-                   `(lambda (b)
-                      (lognot (if b -1 2))))))
-          '(values (or (integer -3 -3) (integer 0 0)) &optional))))
+  (assert-type
+   (lambda (b)
+     (lognot (if b -1 2)))
+   (or (integer -3 -3) (integer 0 0))))
 
 (with-test (:name :logand-minus-1-type-derive)
-  (assert
-   (equal (caddr (sb-kernel:%simple-fun-type
-                   (checked-compile
-                    `(lambda (b)
-                       (logand #xf (if b -1 2))))))
-          '(values (or (integer 2 2) (integer 15 15)) &optional))))
+  (assert-type
+   (lambda (b)
+     (logand #xf (if b -1 2)))
+   (or (integer 2 2) (integer 15 15))))
 
 (with-test (:name :ash-vop-liftimes)
   (checked-compile-and-assert
@@ -1053,7 +1055,8 @@
    ((2 2) t)
    ((3 2) nil)))
 
-(with-test (:name :ash-signed-negation-overflow :fails-on :arm)
+(with-test (:name :ash-signed-negation-overflow
+            :fails-on (or :sparc :arm))
   (checked-compile-and-assert
       ()
       `(lambda (a b)

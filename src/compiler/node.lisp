@@ -153,7 +153,7 @@
 ;;; continuations throughout the compiler.
 
 ;;; "Lead-in" Control TRANsfer [to some node]
-(defstruct (ctran (:constructor make-ctran) (:copier nil))
+(defstruct (ctran (:constructor make-ctran (&optional kind)) (:copier nil))
   ;; an indication of the way that this continuation is currently used
   ;;
   ;; :UNUSED
@@ -221,7 +221,8 @@
 ;;; (type derivation, runtime errors).
 ;;; Right now it's basically used for tracking constants and checking
 ;;; them for things like proper sequence, or valid type specifier.
-(defstruct lvar-annotation
+(defstruct (lvar-annotation
+            (:constructor nil))
   (source-path nil :type list)
   lexenv
   fired)
@@ -409,8 +410,8 @@
 
 ;;; The LOOP structure holds information about a loop.
 (defstruct (cloop (:conc-name loop-)
-                  (:predicate loop-p)
-                  (:constructor make-loop)
+                  (:predicate nil)
+                  (:constructor make-loop (kind head &optional tail))
                   (:copier nil))
   ;; The kind of loop that this is.  These values are legal:
   ;;
@@ -426,7 +427,7 @@
   (kind (missing-arg) :type (member :outer :natural :strange))
   ;; The first and last blocks in the loop.  There may be more than one tail,
   ;; since there may be multiple back branches to the same head.
-  (head nil :type (or cblock null))
+  (head (missing-arg) :type cblock :read-only t)
   (tail nil :type list)
   ;; A list of all the blocks in this loop or its inferiors that have a
   ;; successor outside of the loop.
@@ -459,7 +460,7 @@
 ;;; of the function.)
 (defstruct (cblock (:include sset-element)
                    (:constructor make-block (start))
-                   (:constructor make-block-key)
+                   (:constructor make-block-key (&key component pred succ start last))
                    (:copier nil)
                    (:conc-name block-)
                    (:predicate block-p))
@@ -502,23 +503,23 @@
   (dominator nil :type (or null cblock))
   ;; the component this block is in, or NIL temporarily during IR1
   ;; conversion and in deleted blocks
-  (component (progn
-               (aver-live-component *current-component*)
-               *current-component*)
-             :type (or component null))
+  (component *current-component* :type (or component null))
   ;; a flag used by various graph-walking code to determine whether
   ;; this block has been processed already or what. We make this
   ;; initially NIL so that FIND-INITIAL-DFO doesn't have to scan the
   ;; entire initial component just to clear the flags.
   (flag nil)
   ;; some kind of info used by the back end
-  (info nil)
+  (info nil :type (or ir2-block null))
   ;; what macroexpansions and source transforms happened "in" this block, used
   ;; for xref
   (xrefs nil :type list)
   ;; Cache the environment of a block during lifetime analysis. :NONE
   ;; if no cached value has been stored yet.
-  (environment-cache :none :type (or null environment (member :none))))
+  (environment-cache :none :type (or null environment (member :none)))
+  ;; A table for keeping track of which source-paths have already had
+  ;; a %MARK-COVERAGE function converted for them.
+  (source-path-marks nil :type (or null hash-table)))
 (defmethod print-object ((cblock cblock) stream)
   (if (boundp '*compilation*)
       (print-unreadable-object (cblock stream :type t :identity t)
@@ -550,7 +551,9 @@
 ;;;   component.
 (defstruct (component (:copier nil)
                       (:constructor make-component
-                       (head tail &aux (last-block tail))))
+                       (head tail &aux (last-block tail)
+                                       (outer-loop
+                                        (make-loop :outer head (list tail))))))
   ;; space where this component will be allocated in
   ;; :auto won't make any codegen optimizations pertinent to immobile space,
   ;; but will place the code there given sufficient available space.
@@ -591,8 +594,8 @@
   ;; tail. Until environment analysis links NLX entry stubs to the
   ;; component head, every successor of the head is a function start
   ;; (i.e. begins with a BIND node.)
-  (head (missing-arg) :type cblock)
-  (tail (missing-arg) :type cblock)
+  (head (missing-arg) :type cblock :read-only t)
+  (tail (missing-arg) :type cblock :read-only t)
   ;; New blocks are inserted before this.
   (last-block (missing-arg) :type cblock)
   ;; This becomes a list of the CLAMBDA structures for all functions
@@ -621,13 +624,16 @@
   ;; could benefit from further IR1 optimization. T means that
   ;; reoptimization is necessary.
   (reoptimize t :type (member nil :maybe t))
+  ;; For delay-ir1-transform to know when to delay
+  (reoptimize-counter 0 :type fixnum)
+  (phase-counter 0 :type fixnum)
   ;; If this is true, then the control flow in this component was
   ;; messed up by IR1 optimizations, so the DFO should be recomputed.
   (reanalyze nil :type boolean)
   ;; some sort of name for the code in this component
   (name "<unknown>" :type t)
   ;; some kind of info used by the back end.
-  (info nil)
+  (info nil :type (or null ir2-component))
   ;; a map from combination nodes to things describing how an
   ;; optimization of the node failed. The description is an alist
   ;; (TRANSFORM . ARGS), where TRANSFORM is the structure describing
@@ -642,9 +648,8 @@
   (reanalyze-functionals nil :type list)
   (delete-blocks nil :type list)
   ;; The default LOOP in the component.
-  (outer-loop (make-loop :kind :outer :head head :tail (list tail)) :type cloop)
-  (max-block-number 0 :type fixnum)
-  (dominators-computed nil))
+  (outer-loop (missing-arg) :type cloop)
+  (renumber-p nil))
 
 (defprinter (component :identity t)
   name
@@ -656,16 +661,6 @@
            (type (member :maybe t) kind))
   (unless (eq (component-reoptimize component) t)
     (setf (component-reoptimize component) kind)))
-
-;;; Check that COMPONENT is suitable for roles which involve adding
-;;; new code. (gotta love imperative programming with lotso in-place
-;;; side effects...)
-(defun aver-live-component (component)
-  ;; FIXME: As of sbcl-0.pre7.115, we're asserting that
-  ;; COMPILE-COMPONENT hasn't happened yet. Might it be even better
-  ;; (certainly stricter, possibly also correct...) to assert that
-  ;; IR1-FINALIZE hasn't happened yet?
-  (aver (not (eql (component-info component) :dead))))
 
 ;;; A CLEANUP structure represents some dynamic binding action. Blocks
 ;;; are annotated with the current CLEANUP so that dynamic bindings
@@ -679,26 +674,33 @@
 ;;; boundaries by requiring that the exit ctrans initially head their
 ;;; blocks, and then by not merging blocks when there is a cleanup
 ;;; change.
-(defstruct (cleanup (:copier nil))
+(defstruct (cleanup (:copier nil)
+                    (:constructor make-cleanup
+                        (kind &optional mess-up)))
   ;; the kind of thing that has to be cleaned up
   (kind (missing-arg)
         :type (member :special-bind :catch :unwind-protect
                       :block :tagbody :dynamic-extent
-                      #-c-stack-is-control-stack :restore-nsp))
+                      #-c-stack-is-control-stack :restore-nsp)
+        :read-only t)
   ;; the node that messes things up. This is the last node in the
   ;; non-messed-up environment. Null only temporarily. This could be
   ;; deleted due to unreachability.
   (mess-up nil :type (or node null))
   ;; a list of all the NLX-INFO structures whose NLX-INFO-CLEANUP is
   ;; this cleanup.
-  (nlx-info nil :type list))
+  (nlx-info nil :type list)
+  ;; Lexenv entries for the BLOCK special form, to be fixed up when
+  ;; deleting blocks to allow inlining to find it again.
+  (block nil))
 (defprinter (cleanup :identity t)
   kind
   mess-up
   (nlx-info :test nlx-info))
 
 ;;; The ENVIRONMENT structure represents the result of environment analysis.
-(defstruct (environment (:copier nil))
+(defstruct (environment (:copier nil)
+                        (:constructor make-environment (lambda)))
   ;; the function that allocates this environment
   (lambda (missing-arg) :type clambda :read-only t)
   ;; a list of all the LAMBDA-VARs and NLX-INFOs needed from enclosing
@@ -708,7 +710,7 @@
   ;; into this environment
   (nlx-info nil :type list)
   ;; some kind of info used by the back end
-  (info nil))
+  (info nil :type (or ir2-environment null)))
 (defprinter (environment :identity t)
   lambda
   (closure :test closure)
@@ -727,7 +729,8 @@
 ;;; The tail set is somewhat approximate, because it is too early to
 ;;; be sure which calls will be tail-recursive. Any call that *might*
 ;;; end up tail-recursive causes TAIL-SET merging.
-(defstruct (tail-set)
+(defstruct (tail-set
+            (:constructor make-tail-set (funs)))
   ;; a list of all the LAMBDAs in this tail set
   (funs nil :type list)
   ;; our current best guess of the type returned by these functions.
@@ -816,7 +819,7 @@
                 ;; I guess we state the type this way to avoid calling
                 ;; LEGAL-FUN-NAME-P unless absolutely necessary,
                 ;; but this seems a bit of a premature optimization.
-                :type (or symbol (and cons (satisfies legal-fun-name-p)))
+                :type (or symbol (and cons #-host-quirks-cmu (satisfies legal-fun-name-p)))
                 :read-only t)
   ;; the type which values of this leaf must have
   (type *universal-type* :type ctype)
@@ -880,7 +883,11 @@
 
 ;;; The GLOBAL-VAR structure represents a value hung off of the symbol
 ;;; NAME.
-(defstruct (global-var (:include basic-var) (:copier nil))
+(defstruct (global-var (:include basic-var)
+                       (:copier nil)
+                       (:constructor make-global-var (kind %source-name
+                                                      &optional where-from
+                                                                type defined-type)))
   ;; kind of variable described
   (kind (missing-arg)
         :type (member :special :global-function :global :unknown)))
@@ -917,9 +924,14 @@
 ;;; an inline proclamation) we copy the structure so that former
 ;;; INLINEP values are preserved.
 (defstruct (defined-fun (:include global-var
-                                  (where-from :defined)
-                                  (kind :global-function))
-                        (:copier nil))
+                         (where-from :defined)
+                         (kind :global-function))
+               (:constructor make-defined-fun
+                   (%source-name type &optional where-from
+                    &key kind
+                         inline-expansion inlinep
+                         same-block-p functional))
+               (:copier nil))
   ;; The values of INLINEP and INLINE-EXPANSION initialized from the
   ;; global environment.
   (inlinep nil :type inlinep)
@@ -986,6 +998,8 @@
                         (%source-name '.anonymous.)
                         (where-from :defined)
                         (type (specifier-type 'function)))
+                       (:constructor make-functional (&key kind info
+                                                           %source-name %debug-name lexenv))
                        (:copier nil))
   ;; (For public access to this slot, use LEAF-DEBUG-NAME.)
   ;;
@@ -1131,11 +1145,12 @@
   (inline-expanded nil :type boolean)
   ;; Is it coming from a top-level NAMED-LAMBDA?
   (top-level-defun-p nil)
-  (ignore nil))
+  (ignore nil)
+  (reanalyze nil))
 
 (defun pretty-print-functional (functional stream)
   (let ((name (functional-debug-name functional)))
-    (princ `(function
+    (prin1 `(function
              ,(if (typep name '(cons (member xep tl-xep)))
                   (cadr name)
                   name))
@@ -1193,6 +1208,9 @@
 (defstruct (clambda (:include functional)
                     (:conc-name lambda-)
                     (:predicate lambda-p)
+                    (:constructor make-clambda
+                        (&key vars kind bind home %debug-name %source-name
+                              lexenv allow-instrumenting))
                     (:copier nil))
   ;; list of LAMBDA-VAR descriptors for arguments
   (vars nil :type list)
@@ -1295,7 +1313,10 @@
 ;;; arguments into a direct call to the appropriate entry-point
 ;;; function, so functions that are compiled together can avoid doing
 ;;; the dispatch.
-(defstruct (optional-dispatch (:include functional) (:copier nil))
+(defstruct (optional-dispatch
+            (:include functional) (:copier nil)
+            (:constructor make-optional-dispatch
+                (arglist allowp keyp %source-name %debug-name source-path)))
   ;; the original parsed argument list, for anyone who cares
   (arglist nil :type list)
   ;; true if &ALLOW-OTHER-KEYS was supplied
@@ -1345,7 +1366,8 @@
 ;;; LAMBDA-VARs during IR1 conversion. If we use one of these things,
 ;;; then the var will have to be massaged a bit before it is simple
 ;;; and lexical.
-(defstruct (arg-info (:copier nil))
+(defstruct (arg-info (:copier nil)
+                     (:constructor make-arg-info (kind)))
   ;; true if this arg is to be specially bound
   (specialp nil :type boolean)
   ;; the kind of argument being described. Required args only have arg
@@ -1405,11 +1427,17 @@
   explicit-value-cell
   ;; Do not propagate constraints for this var
   no-constraints
-  ;; Does it hold a constant that should't be destructively modified
+  ;; Does it hold a constant that shouldn't be destructively modified
   constant
-  unused-initial-value)
+  unused-initial-value
+  ;; Instruct constraint propagation to do some work.
+  compute-same-refs
+  no-debug)
 
-(defstruct (lambda-var (:include basic-var) (:copier nil))
+(defstruct (lambda-var
+            (:include basic-var) (:copier nil)
+            (:constructor make-lambda-var
+              (%source-name &key type where-from specvar source-form arg-info)))
   (flags #.(lambda-var-attributes) :type attributes)
   ;; the CLAMBDA that this var belongs to. This may be null when we are
   ;; building a lambda during IR1 conversion.
@@ -1437,6 +1465,7 @@
   (inheritable-constraints nil :type (or null (vector t)))
   (equality-constraints    nil :type (or null (vector t)))
   (equality-constraints-hash nil :type (or null hash-table))
+  (vector-length-constraint nil)
   source-form)
 
 (defprinter (lambda-var :identity t)
@@ -1462,6 +1491,10 @@
   `(lambda-var-attributep (lambda-var-flags ,var) constant))
 (defmacro lambda-var-unused-initial-value (var)
   `(lambda-var-attributep (lambda-var-flags ,var) unused-initial-value))
+(defmacro lambda-var-no-debug (var)
+  `(lambda-var-attributep (lambda-var-flags ,var) no-debug))
+(defmacro lambda-var-compute-same-refs (var)
+  `(lambda-var-attributep (lambda-var-flags ,var) compute-same-refs))
 
 
 ;;;; basic node types
@@ -1486,7 +1519,10 @@
   (same-refs nil :type (or null cons)))
 (defprinter (ref :identity t)
   (%source-name :test (neq %source-name '.anonymous.))
-  leaf)
+  (leaf :prin1 (if (and (constant-p leaf)
+                        (not (symbolp (constant-value leaf))))
+                   (constant-value leaf)
+                   leaf)))
 
 (defstruct (multiple-successors-node
             (:constructor nil)
@@ -1498,7 +1534,7 @@
 (defstruct (cif (:include multiple-successors-node)
                 (:conc-name if-)
                 (:predicate if-p)
-                (:constructor make-if)
+                (:constructor make-if (test consequent alternative))
                 (:copier nil))
   ;; LVAR for the predicate
   (test (missing-arg) :type lvar)
@@ -1524,11 +1560,10 @@
   targets)
 
 (defstruct (cset (:include valued-node
-                           (derived-type (make-single-value-type
-                                          *universal-type*)))
+                           (derived-type (make-single-value-type *universal-type*)))
                  (:conc-name set-)
                  (:predicate set-p)
-                 (:constructor make-set)
+                 (:constructor make-set (var value))
                  (:copier nil))
   ;; descriptor for the variable set
   (var (missing-arg) :type basic-var)
@@ -1580,6 +1615,8 @@
   (step-info nil)
   ;; A plist of inline expansions
   (inline-expansions *inline-expansions* :type list :read-only t)
+  ;; Current COMPONENT-REOPTIMIZE-COUNTER set when calling delay-ir1-transform.
+  (delay-to -1 :type fixnum)
   (constraints-in)
   #+() (constraints-out))
 
@@ -1592,7 +1629,10 @@
   (pass-nargs t :type boolean)
   (or-chain-computed nil :type boolean))
 (defprinter (combination :identity t)
-  (fun :prin1 (lvar-uses fun))
+  (fun :prin1 (let ((uses (lvar-uses fun)))
+                (or (and (ref-p uses)
+                         (ref-fun-name uses t))
+                    uses)))
   (args :prin1 (mapcar (lambda (x)
                          (if x
                              (lvar-uses x)
@@ -1612,7 +1652,8 @@
 ;;; The BIND node marks the beginning of a lambda body and represents
 ;;; the creation and initialization of the variables.
 (defstruct (bind (:include node)
-                 (:copier nil))
+                 (:copier nil)
+                 (:constructor make-bind ()))
   ;; the lambda we are binding variables for. Null when we are
   ;; creating the LAMBDA during IR1 translation.
   (lambda nil :type (or clambda null)))
@@ -1626,7 +1667,7 @@
 (defstruct (creturn (:include node)
                     (:conc-name return-)
                     (:predicate return-p)
-                    (:constructor make-return)
+                    (:constructor make-return (result lambda))
                     (:copier nil))
   ;; the lambda we are returning from. Null temporarily during
   ;; ir1tran.
@@ -1647,7 +1688,8 @@
 ;;; type ASSERTED-TYPE.
 (defstruct (cast (:include valued-node)
                  (:copier nil)
-                 (:constructor %make-cast))
+                 (:constructor %make-cast
+                     (asserted-type type-to-check value derived-type context)))
   (asserted-type (missing-arg) :type ctype)
   (type-to-check (missing-arg) :type ctype)
   ;; an indication of what we have proven about how this type
@@ -1682,10 +1724,14 @@
                    (%type-check nil)
                    (asserted-type *wild-type*)
                    (type-to-check *wild-type*))
+                  (:constructor make-delay (value))
                   (:copier nil)))
 
 ;;; Inserted by ARRAY-CALL-TYPE-DERIVER so that it can be later deleted
-(defstruct (array-index-cast (:include cast) (:copier nil)))
+(defstruct (array-index-cast
+            (:include cast) (:copier nil)
+            (:constructor make-array-index-cast
+                (asserted-type type-to-check value derived-type))))
 
 ;;;; non-local exit support
 ;;;;
@@ -1696,7 +1742,8 @@
 ;;; lexical exit. It is the mess-up node for the corresponding :ENTRY
 ;;; cleanup.
 (defstruct (entry (:include node)
-                  (:copier nil))
+                  (:copier nil)
+                  (:constructor make-entry ()))
   ;; All of the EXIT nodes for potential non-local exits to this point.
   (exits nil :type list)
   ;; The cleanup for this entry. NULL only temporarily.
@@ -1711,7 +1758,8 @@
 ;;; lvar is the exit node's LVAR; environment analysis also makes it
 ;;; the lvar of %NLX-ENTRY call.
 (defstruct (exit (:include valued-node)
-                 (:copier nil))
+                 (:copier nil)
+                 (:constructor make-exit (&optional entry value)))
   ;; the ENTRY node that this is an exit for. If null, this is a
   ;; degenerate exit. A degenerate exit is used to "fill" an empty
   ;; block (which isn't allowed in IR1.) In a degenerate exit, Value
@@ -1728,12 +1776,17 @@
 ;;; The ENCLOSE node marks the place at which closure allocation code
 ;;; would be emitted, if necessary.
 (defstruct (enclose (:include node)
-                    (:copier nil))
+                    (:copier nil)
+                    (:constructor make-enclose (funs)))
   ;; The list of functionals that this ENCLOSE node allocates.
   (funs nil :type list)
   ;; The dynamic extent for this enclose if any of its functionals are
   ;; declared dynamic extent.
-  (dynamic-extent nil :type (or null cdynamic-extent)))
+  (dynamic-extent nil :type (or null cdynamic-extent))
+  ;; The union of all dynamic extents inferred by the compiler for
+  ;; this enclose's functionals. NULL when there is a declared dynamic
+  ;; extent.
+  (derived-dynamic-extents () :type list))
 (defprinter (enclose :identity t)
   funs)
 
@@ -1743,16 +1796,14 @@
 (defstruct (cdynamic-extent (:include node)
                             (:conc-name dynamic-extent-)
                             (:predicate dynamic-extent-p)
-                            (:constructor make-dynamic-extent)
+                            (:constructor make-dynamic-extent (&optional values))
                             (:copier nil))
   ;; the values explicitly declared with this dynamic extent.
   (values nil :type list)
-  ;; the cleanup for this extent. NULL indicates that this dynamic
-  ;; extent is over the environment and hence needs no cleanup code.
+  ;; the cleanup for this extent.
   (cleanup nil :type (or cleanup null))
   ;; some kind of info used by the back end
-  (info nil)
-  (preserve-info nil))
+  (info nil))
 
 (defprinter (cdynamic-extent :conc-name dynamic-extent-
                              :identity t)

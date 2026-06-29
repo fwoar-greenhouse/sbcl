@@ -28,12 +28,12 @@
 #include "os.h"
 #include "core.h"
 #include "globals.h"
-#include "dynbind.h"
 #include "lispregs.h"
 #include "validate.h"
 #include "gc.h"
 #include "thread.h"
 #include "arch.h"
+#include "genesis/hash-table.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 #include "genesis/vector.h"
@@ -49,20 +49,25 @@
 
 /* write_memsize_options uses a simple serialization scheme that
  * consists of one word of magic, one word indicating the size of the
- * core entry, and one word per struct field. */
+ * core entry, and one word per struct field.
+ * options == 2 => accept memsize options at runtime.
+ * options == 1 => don't accept them
+*/
 static void
-write_memsize_options(FILE *file)
+write_memsize_options(FILE *file, int options)
 {
-    core_entry_elt_t optarray[RUNTIME_OPTIONS_WORDS] = {
+    size_t size = 5 + options -1;
+    core_entry_elt_t optarray[] = {
       RUNTIME_OPTIONS_MAGIC,
-      5, // number of words in this core header entry
+      size, // number of words in this core header entry
       dynamic_space_size,
       thread_control_stack_size,
-      dynamic_values_bytes
+      dynamic_values_bytes,
+      0
     };
 
-    if (RUNTIME_OPTIONS_WORDS !=
-        fwrite(optarray, sizeof(core_entry_elt_t), RUNTIME_OPTIONS_WORDS, file)) {
+    if (size !=
+        fwrite(optarray, sizeof(core_entry_elt_t), size, file)) {
         perror("Error writing runtime options to file");
     }
 }
@@ -99,13 +104,13 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
         input.pos = 0;
 
         size_t buf_size = ZSTD_CStreamOutSize();
-        unsigned char* buf = successful_malloc(buf_size);
+        unsigned char* buf = checked_malloc(buf_size);
         ZSTD_outBuffer output;
         output.dst = buf;
         output.size = buf_size;
 
         unsigned char * written, * end;
-        long total_written = 0;
+        size_t total_written = 0;
         ZSTD_CStream *stream = ZSTD_createCStream();
         if (stream == NULL)
             lose("failed to create zstd compression context");
@@ -135,10 +140,11 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
                 }
             }
         } while (ret != 0);
-        printf("compressed %lu bytes into %lu at level %i\n",
+        printf("compressed %zu bytes into %zu at level %i\n",
                bytes, total_written, compression);
 
         ZSTD_freeCStream(stream);
+        free(buf);
 #endif
     } else {
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
@@ -159,12 +165,6 @@ static long write_bytes(FILE *file, char *addr, size_t bytes,
 {
     ftell_type here, data;
 
-#ifdef LISP_FEATURE_WIN32
-    // I can't see how we'd ever attempt writing from uncommitted memory,
-    // but this is better than was was previously here (a "touch" loop over all pages)
-    os_commit_memory(addr, bytes);
-#endif
-
     fflush(file);
     here = FTELL(file);
     FSEEK(file, 0, SEEK_END);
@@ -182,7 +182,7 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
 {
     size_t words, bytes, data, compressed_flag;
     static char *names[] = {NULL, "dynamic", "static", "read-only",
-                            "fixedobj", "text"};
+      "fixedobj", "text", "permgen"};
 
     compressed_flag
             = ((core_compression_level != COMPRESSION_LEVEL_NONE)
@@ -206,13 +206,10 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
         printf("writing %lu bytes from the %s space at %p\n",
                (long unsigned)bytes, names[id], addr);
 
-    /* FIXME: it sure would be nice to discover and document the behavior of this function
-     * with regard to aligning up the byte count as pertains to bytes spanned by a rounded
-     * up count that were not zeroized and would not have been written had we not rounded.
-     * That seems quite bogus to operate on bytes that the caller didn't promise were OK
-     * to be saved out (and didn't contain, say, a password and social security number) */
-    data = write_bytes(file, (char *)addr, ALIGN_UP(bytes, os_vm_page_size),
-                       file_offset, core_compression_level);
+    size_t aligned = ALIGN_UP(bytes, os_vm_page_size);
+    if (aligned > bytes && id != READ_ONLY_CORE_SPACE_ID)
+        memset((char*)addr + bytes, 0, aligned - bytes);
+    data = write_bytes(file, (char *)addr, aligned, file_offset, core_compression_level);
 
     write_lispobj(data, file);
     write_lispobj((uword_t)addr, file);
@@ -243,7 +240,7 @@ static void unwind_binding_stack(struct thread* th)
     unbind_to_here((lispobj *)th->binding_stack_start,th);
     write_TLS(CURRENT_CATCH_BLOCK, 0, th); // If set to 0 on start, why here too?
     write_TLS(CURRENT_UNWIND_PROTECT_BLOCK, 0, th);
-    char symbol_name[] = "*SAVE-LISP-CLOBBERED-GLOBALS*";
+    char symbol_name[] = "+SAVE-LISP-CLOBBERED-GLOBALS+";
     lispobj* sym = find_symbol(symbol_name, get_package_by_id(PACKAGE_ID_KERNEL));
     lispobj value;
     int i;
@@ -254,12 +251,39 @@ static void unwind_binding_stack(struct thread* th)
     // these are akin to weak-pointers
     lisp_package_vector = 0;
     alloc_profile_data = 0;
+    free(tlsindex_to_symbol_map);
+    tlsindex_to_symbol_map = 0;
     if (verbose) printf("done]\n");
 }
 
-bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
+#ifdef LISP_FEATURE_X86_64
+static void write_static_space_constants(FILE *file)
+{
+    lispobj* ptr = (lispobj*)static_space_trailer_start;
+    unsigned int nwords = (lispobj*)STATIC_SPACE_END - ptr;
+    write_lispobj(STATIC_CONSTANTS_CORE_ENTRY_TYPE_CODE, file);
+    // +2 for the core header entry itself
+    write_lispobj(2+nwords, file);
+    /* write_lispobj(STATIC_SPACE_START, file); */
+    if (fwrite(ptr, N_WORD_BYTES, nwords, file) != nwords) perror(GENERAL_WRITE_FAILURE_MSG);
+}
+#endif
+
+static lispobj required_foreign_symbols()
+{
+    lispobj* sym = find_symbol("*LINKAGE-INFO*", get_package_by_id(PACKAGE_ID_SYS));
+    lispobj value = ((struct symbol*)sym)->value;
+    gc_assert(instancep(CONS(value)->car));
+    struct hash_table* ht = (void*)native_pointer(CONS(value)->car);
+    gc_assert(simple_vector_p(ht->pairs));
+    __attribute__((unused)) struct vector* kvv = (void*)native_pointer(ht->pairs);
+    gc_assert(fixnum_value(ht->_count) == fixnum_value(kvv->data[0])); // high-water mark
+    return ht->pairs;
+}
+
+void save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                         bool make_executable,
-                        bool save_runtime_options,
+                        int save_runtime_options,
                         int core_compression_level)
 {
     bool verbose = !lisp_startup_options.noinform;
@@ -267,6 +291,9 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     /* (Now we can actually start copying ourselves into the output file.) */
 
     if (verbose) {
+        /* This shows the temporary file name if writing a .o file. I think that's
+         * a reasonable choice, though we could certainly make an extra copy
+         * of the name as originally specified */
         printf("[saving current Lisp image into %s:\n", filename);
         fflush(stdout);
     }
@@ -279,16 +306,24 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
      * all command-line arguments are available to Lisp in SB-EXT:*POSIX-ARGV*.
      * Otherwise command-line processing is performed as normal */
     if (save_runtime_options)
-        write_memsize_options(file);
+        write_memsize_options(file, save_runtime_options);
 
     int stringlen = strlen((const char *)build_id);
     int string_words = ALIGN_UP(stringlen, sizeof (core_entry_elt_t))
         / sizeof (core_entry_elt_t);
     int pad = string_words * sizeof (core_entry_elt_t) - stringlen;
-    /* Write 3 word entry header: a word for entry-type-code, a word for
-     * the total length in words, and a word for the string length */
+    /* Write 6 word entry header: a word for entry-type-code, the length in words,
+     * the GC enum, card table bit width, address of NIL, and string length */
     write_lispobj(BUILD_ID_CORE_ENTRY_TYPE_CODE, file);
-    write_lispobj(3 + string_words, file);
+    write_lispobj(6 + string_words, file);
+#ifdef LISP_FEATURE_GENCGC
+    write_lispobj(1, file);
+#endif
+#ifdef LISP_FEATURE_MARK_REGION_GC
+    write_lispobj(2, file);
+#endif
+    write_lispobj(gc_card_table_nbits, file);
+    write_lispobj(NIL, file);
     write_lispobj(stringlen, file);
     int nwrote = fwrite(build_id, 1, stringlen, file);
     /* Write padding bytes to align to core_entry_elt_t */
@@ -296,11 +331,49 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     if (nwrote != (int)(sizeof (core_entry_elt_t) * string_words))
         perror(GENERAL_WRITE_FAILURE_MSG);
 
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    // Lisp linkage space precedes the general space directory
+    int i;
+    extern void illegal_linkage_space_call();
+    /* The C runtime is theoretically position-independent so don't write out the address
+     * of the unused entry sentinel. The affected elements needn't be restored on restart.
+     * (Maybe add a renumbering pass in Lisp to ensure the table is 100% dense) */
+    for (i=FIRST_USABLE_LINKAGE_ELT; i<linkage_table_count; ++i)
+        if (linkage_space[i] == (uword_t)illegal_linkage_space_call)
+            linkage_space[i] = 0;
+    int nbytes = ALIGN_UP(linkage_table_count<<WORD_SHIFT, BACKEND_PAGE_BYTES);
+    if (!lisp_startup_options.noinform)
+        printf("writing %lu bytes from the %s space at %p\n",
+               (long unsigned)nbytes, "linkage", linkage_space);
+
+    write_lispobj(LISP_LINKAGE_SPACE_CORE_ENTRY_TYPE_CODE, file);
+    write_lispobj(5, file); // number of words in this core header entry
+    write_lispobj(linkage_table_count, file);
+    sword_t data_page =
+        write_bytes(file, (char*)linkage_space,
+                    nbytes, core_start_pos, COMPRESSION_LEVEL_NONE);
+    write_lispobj(data_page, file);
+    write_lispobj(0, file); // address of ELF-based linkage entries
+#endif
+
     write_lispobj(DIRECTORY_CORE_ENTRY_TYPE_CODE, file);
     ftell_type spacecount_pos = FTELL(file);
     write_lispobj(0, file); // placeholder
 
     int count = 0;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    /* Apparently when using MAP_32BIT on Linux, if the requested address can't be granted,
+     * sometimes the kernel won't attempt to find an alternative address that works, instead
+     * returning ENOMEM even though lack of memory is not the real issue. So now that static
+     * space is above 4GB, the next-most-problematic mapping is fixedobj space. By placing
+     * it frst in the directory, it stands the highest chance of mapping as requested. */
+    output_space(file,
+                 IMMOBILE_FIXEDOBJ_CORE_SPACE_ID,
+                 (lispobj *)FIXEDOBJ_SPACE_START,
+                 fixedobj_free_pointer,
+                 core_start_pos,
+                 core_compression_level), ++count;
+#endif
     output_space(file,
                  STATIC_CORE_SPACE_ID,
                  (lispobj *)STATIC_SPACE_START,
@@ -308,6 +381,13 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  core_start_pos,
                  core_compression_level), ++count;
 #ifdef LISP_FEATURE_PERMGEN
+    {
+#define REMEMBERED_BIT (uword_t)0x80000000
+        lispobj* where = (void*)PERMGEN_SPACE_START;
+        // clear every object's bit
+        for ( ; where < permgen_space_free_pointer ; where += object_size(where) )
+            *where &= ~REMEMBERED_BIT;
+    }
     output_space(file,
                  PERMGEN_CORE_SPACE_ID,
                  (lispobj *)PERMGEN_SPACE_START,
@@ -338,14 +418,6 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  read_only_space_free_pointer,
                  core_start_pos,
                  core_compression_level), ++count;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    output_space(file,
-                 IMMOBILE_FIXEDOBJ_CORE_SPACE_ID,
-                 (lispobj *)FIXEDOBJ_SPACE_START,
-                 fixedobj_free_pointer,
-                 core_start_pos,
-                 core_compression_level), ++count;
-#endif
     // Leave this space for last! Things are easier when splitting a core into
     // code and non-code if we don't have to compensate for removal of pages.
     // i.e. if code resided between dynamic and fixedobj space, then dynamic
@@ -357,8 +429,17 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  core_start_pos,
                  core_compression_level), ++count;
 
+#ifdef LISP_FEATURE_X86_64
+    write_static_space_constants(file);
+#endif
+
+    extern int tls_map_starting_offset;
     write_lispobj(INITIAL_FUN_CORE_ENTRY_TYPE_CODE, file);
-    write_lispobj(3, file);
+    write_lispobj(6, file); // length in lispobjs (including this field)
+    // a 'struct initfunctions' from core.h. (Consider a struct-writing function perhaps)
+    write_lispobj(alien_linkage_table_n_prelinked, file);
+    write_lispobj(required_foreign_symbols(), file);
+    write_lispobj(tls_map_starting_offset, file);
     write_lispobj(init_function, file);
 
 #ifdef LISP_FEATURE_GENERATIONAL
@@ -370,7 +451,7 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 #endif
         size_t ptes_nbytes = next_free_page * sizeof(struct corefile_pte);
         size_t aligned_size = ALIGN_UP((bitmapsize+ptes_nbytes), N_WORD_BYTES);
-        char* data = successful_malloc(aligned_size);
+        char* data = checked_malloc(aligned_size);
         // Zeroize the final few bytes of data that get written out
         // but might be untouched by gc_store_corefile_ptes().
         memset(data + aligned_size - N_WORD_BYTES, 0, N_WORD_BYTES);
@@ -379,8 +460,7 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 #endif
         gc_store_corefile_ptes((struct corefile_pte*)(data + bitmapsize));
         write_lispobj(PAGE_TABLE_CORE_ENTRY_TYPE_CODE, file);
-        write_lispobj(6, file); // number of words in this core header entry
-        write_lispobj(gc_card_table_nbits, file);
+        write_lispobj(5, file); // number of words in this core header entry
         write_lispobj(next_free_page, file);
         write_lispobj(aligned_size, file);
         sword_t offset = write_bytes(file, data, aligned_size, core_start_pos,
@@ -413,7 +493,6 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 #endif
 
     if (verbose) printf("done]\n");
-    exit(0);
 }
 
 /* Check if the build_id for the current runtime is present in a
@@ -460,7 +539,7 @@ load_runtime(char *runtime_path, size_t *size_out)
     if (core_offset != -1 && size > (size_t) core_offset)
         size = core_offset;
 
-    buf = successful_malloc(size);
+    buf = checked_malloc(size);
     if ((count = fread(buf, 1, size, input)) != size) {
         fprintf(stderr, "Premature EOF while reading runtime.\n");
         goto lose;
@@ -520,7 +599,7 @@ bool save_runtime_to_filehandle(FILE *output, void *runtime, size_t runtime_size
 
     padding = (os_vm_page_size - (runtime_size % os_vm_page_size)) & ~os_vm_page_size;
     if (padding > 0) {
-        padbytes = successful_malloc(padding);
+        padbytes = checked_malloc(padding);
         memset(padbytes, 0, padding);
         if (padding != fwrite(padbytes, 1, padding, output)) {
             perror("Error saving runtime");
@@ -543,7 +622,9 @@ prepare_to_save(char *filename, bool prepend_runtime, void **runtime_bytes,
     // SB-IMPL::DEINIT already checked for exactly 1 thread,
     // so this really shouldn't happen.
     if (all_threads->next) {
-        fprintf(stderr, "Can't save image with more than one executing thread");
+        extern void list_lisp_threads(int regions, FILE* f);
+        list_lisp_threads(0, stderr);
+        fprintf(stderr, "Can't save image with more than one executing thread\n");
         return NULL;
     }
 
@@ -583,6 +664,7 @@ static void prepare_dynamic_space_for_final_gc(struct thread* thread)
 {
     page_index_t i;
 
+    (void)thread;
     prepare_immobile_space_for_final_gc();
     for (i = 0; i < next_free_page; i++) {
 #ifndef LISP_FEATURE_MARK_REGION_GC
@@ -604,6 +686,10 @@ static void prepare_dynamic_space_for_final_gc(struct thread* thread)
 #endif
         }
     }
+#ifdef LISP_FEATURE_PERMGEN
+    extern void remember_all_permgen();
+    remember_all_permgen();
+#endif
 #ifdef LISP_FEATURE_MARK_REGION_GC
     for (generation_index_t g = 1; g <= PSEUDO_STATIC_GENERATION; g++) {
       generations[0].bytes_allocated += generations[g].bytes_allocated;
@@ -643,6 +729,8 @@ static void prepare_dynamic_space_for_final_gc(struct thread* thread)
 char gc_coalesce_string_literals = 0;
 
 extern void move_rospace_to_dynamic(int), prepare_readonly_space(int,int);
+extern bool generate_elfcore_obj(const char *filename, FILE* input_core,
+                                 char **syms, int sym_count);
 
 /* Do a non-conservative GC twice, and then save a core with the initial
  * function being set to the value of 'lisp_init_function'.
@@ -679,16 +767,20 @@ extern void move_rospace_to_dynamic(int), prepare_readonly_space(int,int);
  *  as empty pages, because we can't represent discontiguous ranges.
  */
 void
-gc_and_save(char *filename, bool prepend_runtime, bool purify,
-            bool save_runtime_options, bool compressed,
+gc_and_save(char *filename, int core_format, bool purify,
+            int save_runtime_options, bool compressed,
             int compression_level, int application_type)
 {
+    int prepend_runtime = core_format == 1;
+    int elf_object = core_format == 2;
+
     // FIXME: Instead of disabling purify for static space relocation,
     // we should make r/o space read-only after fixing up pointers to
     // static space instead.
+    // BUT: On x86-64 it's ok to use the R/O space. All objects there are leaves.
 #if ((defined LISP_FEATURE_SPARC && defined LISP_FEATURE_LINUX) || \
-     (defined LISP_FEATURE_RELOCATABLE_STATIC_SPACE))
-    /* OS says it'll give you the memory where you want, then it says
+     (defined LISP_FEATURE_RELOCATABLE_STATIC_SPACE && !defined LISP_FEATURE_X86_64))
+    /* SunOS says it'll give you the memory where you want, then it says
      * it won't map over it from the core file.  That's news to me.
      * Fragment of output from 'strace -e mmap2 src/runtime/sbcl --core output/sbcl.core':
      * ...
@@ -703,14 +795,22 @@ gc_and_save(char *filename, bool prepend_runtime, bool purify,
     extern void coalesce_similar_objects();
     bool verbose = !lisp_startup_options.noinform;
 
+    if (!elf_object) {
+        /* The filename might come from Lisp, and be moved by the now
+         * non-conservative GC. */
+      filename = strdup(filename);
+    } else {
+      int tempnamelen = strlen(filename) + 5; // ".tmp"
+      char* copy = checked_malloc(tempnamelen);
+      snprintf(copy, tempnamelen, "%s.tmp", filename);
+      filename = copy;
+    }
     file = prepare_to_save(filename, prepend_runtime, &runtime_bytes,
                            &runtime_size);
-    if (file == NULL)
+    if (file == NULL) {
+       free(filename);
        return;
-
-    /* The filename might come from Lisp, and be moved by the now
-     * non-conservative GC. */
-    filename = strdup(filename);
+    }
 
     /* We're destined for process exit at this point, and interrupts can not
      * possibly be handled in Lisp. The installed signal handler closures should
@@ -742,11 +842,11 @@ gc_and_save(char *filename, bool prepend_runtime, bool purify,
      * work. */
     collect_garbage(0);
 #endif
+    save_lisp_gc_iteration = 1;
     move_rospace_to_dynamic(0);
     prepare_immobile_space_for_final_gc(); // once is enough
     prepare_dynamic_space_for_final_gc(thread);
 
-    save_lisp_gc_iteration = 1;
 #ifndef LISP_FEATURE_MARK_REGION_GC
     gencgc_alloc_start_page = next_free_page;
 #endif
@@ -791,6 +891,9 @@ gc_and_save(char *filename, bool prepend_runtime, bool purify,
     // Defragment and set all objects' generations to pseudo-static
     prepare_immobile_space_for_save(verbose);
 
+#ifdef LISP_FEATURE_PPC64
+    NIL_SYMBOL_SLOTS_START[-1] = 0;
+#endif
 #ifdef LISP_FEATURE_X86_64
     untune_asm_routines_for_microarch();
 #endif
@@ -800,12 +903,44 @@ gc_and_save(char *filename, bool prepend_runtime, bool purify,
         save_runtime_to_filehandle(file, runtime_bytes, runtime_size,
                                    application_type);
 
+    char** elf_c_symbols = 0;
+    int n_symbols = 0;
+    if (elf_object) {
+        // Find SB-SYS:*LINKAGE-INFO*
+        lispobj* sym = find_symbol("*LINKAGE-INFO*", get_package_by_id(PACKAGE_ID_SYS));
+        lispobj value = ((struct symbol*)sym)->value;
+        gc_assert(instancep(CONS(value)->car));
+        struct hash_table* ht = (void*)native_pointer(CONS(value)->car);
+        gc_assert(simple_vector_p(ht->pairs));
+        struct vector* kvv = (void*)native_pointer(ht->pairs);
+        n_symbols = fixnum_value(ht->_count);
+        gc_assert(fixnum_value(kvv->data[0]) == n_symbols); // KVV's high-water mark
+        if (verbose) {
+            printf("[linkage info: %d symbols]\n", n_symbols);
+            fflush(stdout);
+        }
+        elf_c_symbols = calloc(n_symbols, sizeof (char*));
+        int i;
+        for (i=0; i<n_symbols; ++i) {
+            lispobj key = kvv->data[(1+i)<<1];
+            // string is code symbol, singleton cons of string is a data symbol
+            if (listp(key)) key = CONS(key)->car;
+            struct vector* c_symbol = VECTOR(key);
+            elf_c_symbols[i] = (char*)c_symbol->data;
+        }
+    }
     save_to_filehandle(file, filename, lisp_init_function,
                        prepend_runtime, save_runtime_options,
                        compressed ? compression_level : COMPRESSION_LEVEL_NONE);
-    /* Oops. Save still managed to fail. Since we've mangled the stack
-     * beyond hope, there's not much we can do.
-     * (beyond FUNCALLing lisp_init_function, but I suspect that's
-     * going to be rather unsatisfactory too... */
-    lose("Attempt to save core after non-conservative GC failed.");
+#ifdef LISP_FEATURE_ELF
+    if (elf_object) {
+        file = fopen(filename, "r"); // reopen it for reading
+        unlink(filename);
+        filename[strlen(filename)-4] = '\0'; // chop ".tmp" from the end
+        fseek(file, 0, SEEK_END);
+        generate_elfcore_obj(filename, file, elf_c_symbols, n_symbols);
+        if (verbose) printf("[Converted to ELF]\n");
+    }
+#endif
+    exit(0);
 }

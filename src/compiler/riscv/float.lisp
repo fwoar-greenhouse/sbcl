@@ -136,11 +136,9 @@
 (defun format-sc (format)
   (ecase format (:single 'single-reg) (:double 'double-reg)))
 (defun complex-reg-real-tn (format x)
-  (make-random-tn :kind :normal :sc (sc-or-lose (format-sc format))
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose (format-sc format)) (tn-offset x)))
 (defun complex-reg-imag-tn (format x)
-  (make-random-tn :kind :normal :sc (sc-or-lose (format-sc format))
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose (format-sc format)) (1+ (tn-offset x))))
 
 (macrolet ((def (name cost stack-sc sc op format size a b)
              `(define-move-fun (,name ,cost) (vop x y)
@@ -420,7 +418,7 @@
              `(define-vop (,name)
                 (:args (x :scs (,sc)))
                 (:results (y :scs (,sc)))
-                (:translate %sqrt)
+                (:translate ,name)
                 (:policy :fast-safe)
                 (:arg-types ,ptype)
                 (:result-types ,ptype)
@@ -428,8 +426,8 @@
                 (:save-p :compute-only)
                 (:generator 1
                   (inst fsqrt ,fmt y x)))))
-  (frob %sqrt/single-float :single single-reg single-float)
-  (frob %sqrt/double-float :double double-reg double-float))
+  (frob %sqrtf :single single-reg single-float)
+  (frob %sqrt :double double-reg double-float))
 
 
 ;;;; Comparison:
@@ -457,22 +455,26 @@
                   (:translate ,translate)
                   (:generator 3
                     (note-this-location vop :internal-error)
-                    (inst ,op :single temp x y)
-                    (if ,(if complement '(not not-p) 'not-p)
+                    (inst ,op :single temp ,@(if complement
+                                                 '(y x)
+                                                 '(x y)))
+                    (if not-p
                         (inst beq temp zero-tn target)
                         (inst bne temp zero-tn target))))
                 (define-vop (,dname double-float-compare)
                   (:translate ,translate)
                   (:generator 3
                     (note-this-location vop :internal-error)
-                    (inst ,op :double temp x y)
-                    (if ,(if complement '(not not-p) 'not-p)
+                    (inst ,op :double temp ,@(if complement
+                                                 '(y x)
+                                                 '(x y)))
+                    (if not-p
                         (inst beq temp zero-tn target)
                         (inst bne temp zero-tn target)))))))
   (frob < flt nil </single-float </double-float)
   (frob <= fle nil <=/single-float <=/double-float)
-  (frob > fle t >/single-float >/double-float)
-  (frob >= flt t >=/single-float >=/double-float)
+  (frob > flt t >/single-float >/double-float)
+  (frob >= fle t >=/single-float >=/double-float)
   (frob = feq nil =/single-float =/double-float))
 
 
@@ -620,7 +622,7 @@
       (double-reg
        (inst fmvx<- :double bits float))
       (double-stack
-       (loadw bits (current-nfp-tn vop) (tn-byte-offset float)))
+       (loadw bits (current-nfp-tn vop) (tn-offset float)))
       (descriptor-reg
        (loadw bits float double-float-value-slot other-pointer-lowtag)))))
 

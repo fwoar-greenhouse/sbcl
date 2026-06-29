@@ -35,43 +35,39 @@
 
 ;;; A PATTERN is a list of entries and wildcards used for pattern
 ;;; matches of translations.
-(defstruct (pattern (:constructor %make-pattern (hash pieces))
+(defstruct (pattern (:constructor %make-pattern (pieces))
                     (:copier nil))
-  (hash 0 :type fixnum :read-only t)
   (pieces nil :type list :read-only t))
 
 ;;;; PATHNAME structures
-
-;;; the various magic tokens that are allowed to appear in pretty much
-;;; all pathname components
-(deftype pathname-component-tokens ()
-  '(member nil :unspecific :wild :unc))
 
 ;;; This definition relies on compiler magic to turn the metclass
 ;;; into BUILT-IN-CLASSOID. Same for LOGICAL-PATHNAME.
 (defstruct (pathname (:conc-name %pathname-)
                      (:copier nil)
                      (:constructor !allocate-pathname
-                         (host device dir+hash name type version))
+                         (host-or-device dir+hash name type version sxhash))
                      (:predicate pathnamep))
   (namestring nil) ; computed on demand
-  ;; the host (at present either a UNIX or logical host)
-  ;; Host and device could be reduced to small integers and packed in one slot
-  ;; by keeping tables of the observed values.
-  (host nil :type %pathname-host :read-only t)
-  ;; the name of a logical or physical device holding files
-  (device nil :type (or simple-string pathname-component-tokens) :read-only t)
+  ;; Either the host or the device can be stored, no both because:
+  ;; - logical pathnames always have :UNSPECIFIC as the device
+  ;; - physical pathnames always have *PHYSICAL-HOST* as the host
+  (host-or-device nil :type (or %pathname-host %pathname-device) :read-only t)
   ;; an interned list of strings headed by :ABSOLUTE or :RELATIVE
   ;; comprising the path, or NIL.
   ;; if the list is non-NIL, it's a cons of the list and a numeric hash.
   (dir+hash nil :type list :read-only t)
   ;; the filename
-  (name nil :type (or simple-string pattern pathname-component-tokens) :read-only t)
+  (name nil :type %pathname-name :read-only t)
   ;; the type extension of the file
-  (type nil :type (or simple-string pattern pathname-component-tokens) :read-only t)
+  (type nil :type %pathname-name :read-only t)
   ;; the version number of the file, a positive integer (not supported
   ;; on standard Unix filesystems)
-  (version nil :type %pathname-version :read-only t))
+  (version nil :type %pathname-version :read-only t)
+  ;; SXHASH must be last because INSTANCE-SXHASH reads the slot whose index
+  ;; is %INSTANCE-LENGTH. The stored length will get decresed by 1 after
+  ;; allocation to make the access come out right.
+  (sxhash 0))
 
 (let ((to (find-layout 'logical-pathname))
       (from (find-layout 'pathname)))
@@ -79,3 +75,20 @@
         (layout-slot-table to) (layout-slot-table from)))
 (declaim (inline logical-pathname-p))
 (defun logical-pathname-p (x) (typep x 'logical-pathname))
+
+(declaim (inline %pathname-host %pathname-device %pathname-directory))
+
+(define-load-time-global *physical-host* nil) ; initialized in {unix|win32}-pathname.lisp
+(defun %pathname-host (pathname)
+  ;; Using layout-depthoid to test for logical-pathname avoids needing to
+  ;; compare to #<SB-KERNEL:LAYOUT LOGICAL-PATHNAME>
+  (if (> (layout-depthoid (%instance-layout pathname)) sb-kernel::pathname-layout-depthoid)
+      (%pathname-host-or-device pathname)
+      *physical-host*))
+
+(defun %pathname-device (pathname)
+  (if (> (layout-depthoid (%instance-layout pathname)) sb-kernel::pathname-layout-depthoid)
+      :unspecific
+      (%pathname-host-or-device pathname)))
+
+(defun %pathname-directory (pathname) (truly-the list (car (%pathname-dir+hash pathname))))

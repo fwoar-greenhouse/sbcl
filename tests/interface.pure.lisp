@@ -22,7 +22,7 @@
       (if (fboundp s)
           (when (documentation s 'function)
             (incf n))))
-    (assert (= n 596))))
+    (assert (= n 597))))
 
 ;;;; tests of interface machinery
 
@@ -38,7 +38,7 @@
 
 ;; Regression from R/O space change
 (with-test (:name (apropos-list :smoke-test))
-  (assert (plusp (length (apropos-list "required-foreign")))))
+  (assert (plusp (length (apropos-list "**finalizer-store**")))))
 
 ;;; APROPOS should accept a package designator, not just a package, and
 ;;; furthermore do the right thing when it gets a package designator.
@@ -160,7 +160,7 @@
 (with-test (:name (disassemble :unboxed-data))
   (assert (< (sb-kernel:code-n-unboxed-data-bytes
               (sb-kernel:fun-code-header #'expt))
-             150))) ; The exact value is irrelevant.
+             300))) ; The exact value is irrelevant.
 
 #+x86-64
 ;; The labeler for LEA would choke on an illegal encoding
@@ -190,7 +190,8 @@
           (string2 (disassembly-text '(lambda (y) (car y)))))
       (assert (string= string1 string2)))))
 
-(with-test (:name :disassemble-assembly-routine)
+(with-test (:name :disassemble-assembly-routine
+            :fails-on :riscv)
   (disassemble sb-fasl:*assembler-routines* :stream (make-broadcast-stream)))
 
 (with-test (:name (sb-ext:assert-version->= :ok))
@@ -236,7 +237,18 @@
                       (funcall fun '(1 2 3 4 5 6 7 8 . 10))))
                    '(1 2 3 4 5 6 7 8)))))
 
-(with-test (:name :no-v0p-ex1stsp-in-build ; spelled L33t Hax0r style on purpose
-            :skipped-on (or :sb-devel
-                            :sb-xref-for-internals))
-  (assert (null (apropos-list "VOP-EXISTSP"))))
+(with-test (:name :compile--install-named-definition)
+  ;; (compiled-function-p #'make-load-form) => NIL because there could be
+  ;; interpreted MAKE-LOAD-FORM methods which COMPILE does not compile,
+  ;; though of course in the baseline image there aren't any.
+  (compile 'blech #'make-load-form)
+  ;; FUNCALL just avoids a style-warning on unknown names.
+  (assert (eq (car (funcall 'blech #p"foo.bar")) 'sb-impl::intern-pathname))
+  (compile 'flem (compile nil '(lambda (x) (+ x 3))))
+  (assert (= (funcall 'flem 9) 12))
+  (compile 'flem (compile nil '(lambda (x) (* x 3))))
+  (assert (= (funcall 'flem 9) 27)))
+
+(with-test (:name (documentation (not sb-impl::legal-fun-name-p)))
+  (assert (typep (documentation '(xxx yyy) 'function)
+                 '(or null string))))

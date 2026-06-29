@@ -12,15 +12,15 @@
 
 (declaim (ftype (function (integer) (or symbol (eql 0))) symbol-from-tls-index))
 
-(defvar *current-internal-error-context*)
+(sb-impl:define-thread-local *current-internal-error-context*)
 
 (defmacro with-pinned-context-code-object
     ((&optional (context '*current-internal-error-context*))
      &body body)
   (declare (ignorable context))
-  #+(or x86 x86-64 arm64)
+  #+(or x86 x86-64 arm64 riscv loongarch64)
   `(progn ,@body)
-  #-(or x86 x86-64 arm64)
+  #-(or x86 x86-64 arm64 riscv loongarch64)
   `(with-pinned-objects ((with-code-pages-pinned (:dynamic)
                            (sb-di::code-object-from-context ,context)))
      ,@body))
@@ -159,31 +159,32 @@
   (defparameter *cpu-features* nil))
 
 (defmacro def-cpu-feature (name detect)
-  ;; eval-when doesn't work correctly in the XC
-  (setf (getf *cpu-features* name) detect)
   `(progn
-     (defglobal ,(symbolicate '+ name '-routines+) ())
-     (setf (getf *cpu-features* ',name) ',detect)))
+     (define-load-time-global ,(symbolicate '+ name '-routines+) ())
+     (eval-when (:compile-toplevel)
+       (setf (getf *cpu-features* ',name) ',detect))))
 
 (defmacro def-variant (name cpu-feature lambda-list &body body)
   (let ((variant (symbolicate name '- cpu-feature)))
     `(progn
        (eval-when (:compile-toplevel :load-toplevel :execute)
          (setf (info :function :type ',variant) (info :function :type ',name)
-               (info :function :info ',variant) (info :function :info ',name)))
+               (info :function :info ',variant) (info :function :info ',name)
+               (info :function :where-from ',variant) :declared))
        (defun ,variant ,lambda-list
          ,@body)
        ;; Avoid STATICALLY-LINK-CORE from making it harder to redefine.
        (proclaim '(notinline ,name))
        (let ((fun #',variant))
-         (setf (getf ,(symbolicate '+ cpu-feature '-routines+) ',name) fun)
+         (setf (getf ,(package-symbolicate "SB-VM" '+ cpu-feature '-routines+) ',name) fun)
          ;; Redefinition at run-time.
          (when (eq (%fun-name #',name) ',variant)
            (setf (%symbol-function ',name) fun))))))
 
-(defvar *previous-cpu-routines* nil)
+(define-load-time-global *previous-cpu-routines* nil)
 
-(defmacro !setup-cpu-specific-routines ()
+(eval-when (:compile-toplevel)
+(sb-xc:defmacro setup-cpu-specific-routines ()
   `(progn
      ,@(loop for (feature detect) on *cpu-features* by #'cddr
              collect
@@ -193,7 +194,7 @@
                       do
                       (push (cons symbol (%symbol-function symbol))
                             *previous-cpu-routines*)
-                      (setf (%symbol-function symbol) definition))))))
+                      (setf (%symbol-function symbol) definition)))))))
 
 (defun restore-cpu-specific-routines ()
   (loop for (symbol . fun) in *previous-cpu-routines*
@@ -202,7 +203,7 @@
 
 ;;; Unless using an arena there is really no way to get a number
 ;;; allocated off the heap
-#-x86-64 (defun copy-number-to-heap (n) n)
+#-(or x86-64 system-tlabs) (defun copy-number-to-heap (n) n)
 
 (defun hexdump (thing &optional (count 2 countp)
                             ;; pass NIL explicitly if T crashes on you
@@ -238,12 +239,6 @@
                 (cond ((and (typep thing 'code-component)
                             (< 1 i (code-header-words thing)))
                        (values (code-header-ref thing i) t))
-                      #+compact-symbol
-                      ((and (typep thing '(and symbol (not null)))
-                            (= i symbol-name-slot))
-                       (values (list (symbol-package-id thing) (symbol-name thing))
-                               t
-                               "{~{~A,~S~}}"))
                       (decode
                        (cond #+system-tlabs ; fingers crossed, assume arena pointers are valid
                              ((and (is-lisp-pointer word) (find-containing-arena word))
@@ -269,4 +264,4 @@
     ;; was at _least_ as much as this one hash-table lookup.
     (with-pinned-objects (object)
       (setf (sap-ref-word (int-sap (get-lisp-obj-address object)) slot)
-            (get-asm-routine 'funcallable-instance-tramp)))))
+            (sb-fasl:get-asm-routine 'funcallable-instance-tramp)))))

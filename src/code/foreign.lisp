@@ -48,16 +48,18 @@
   (let* ((key (if datap (list name) name))
          (info *linkage-info*)
          (ht (car info)))
+    (declare (dynamic-extent key))
     (or (with-system-mutex ((hash-table-lock ht))
           (or (gethash key ht)
               (let* ((index (hash-table-count ht))
-                     (capacity (floor sb-vm:alien-linkage-table-space-size
-                                      sb-vm:alien-linkage-table-entry-size)))
+                     (capacity (floor sb-vm:alien-linkage-space-size
+                                      sb-vm:alien-linkage-table-entry-size))
+                     (name (logically-readonlyize (possibly-base-stringize name)))
+                     (key (if datap (list name) name)))
                 (when (< index capacity)
                   (multiple-value-bind (defined real-address) (dlsym-wrapper t)
                     (unless defined (push key (cdr info)))
                     (arch-write-linkage-table-entry index real-address (if datap 1 0))
-                    (logically-readonlyize name)
                     (setf (gethash key ht) index))))))
         (error "Linkage-table full (~D entries): cannot link ~S."
                (hash-table-count ht) name))))
@@ -115,14 +117,12 @@ symbol in the linkage table, and never returns an address in the linkage-table."
 ;;; It's not our problem that shared objects aren't loadable, but we get the
 ;;; flexibility of recompiling C without recompiling Lisp.
 ;;;
-;;; This function is somewhat badly named, because when DATAP is true,
-;;; the answer is not really the address of NAME, but rather the address
-;;; of the word in the alien-linkage-table holding the address of NAME.
-;;; (This would be better off named ALIEN-LINKAGE-ADDRESS)
+;;; This would be better off named ALIEN-LINKAGE-ADDRESS because the answer is not
+;;; the address of NAME, but rather the address of the word in the alien-linkage-table
+;;; holding the address of NAME, or a callable address in the linkage table.
 ;;; Unfortunately we can not rename it, because CFFI uses it, which is weird
 ;;; because the use is from a function named %FOREIGN-SYMBOL-POINTER which is
-;;; documented to return "a pointer to a foreign symbol NAME."
-;;; which it certainly does not do in all cases.
+;;; documented to return "a pointer to a foreign symbol NAME." which this isn't.
 (defun foreign-symbol-address (name &optional datap)
   "Returns the address of the foreign symbol NAME. DATAP must be true if the
 symbol designates a variable.
@@ -130,9 +130,8 @@ Returns a secondary value T for historical reasons.
 
 The returned address is always a linkage-table address.
 Symbols are entered into the linkage-table if they aren't there already."
-  (declare (ignorable datap))
   (let ((index (ensure-alien-linkage-index name datap)))
-    (values (sb-vm::alien-linkage-table-entry-address index) t)))
+    (values (sb-vm::alien-linkage-index-to-addr index datap) t)))
 
 (defun foreign-symbol-sap (symbol &optional datap)
   "Returns a SAP corresponding to the foreign symbol. DATAP must be true if the
@@ -171,17 +170,13 @@ symbol designates a variable. May enter the symbol into the linkage-table."
                        (when (= value index) (return-from found key))))))))
     (if (listp key) (car key) key)))
 
-(declaim (maybe-inline sap-foreign-symbol))
 (defun sap-foreign-symbol (sap)
-  (declare (ignorable sap))
   (let ((addr (sap-int sap)))
-    (declare (ignorable addr))
-    (when (<= sb-vm:alien-linkage-table-space-start
+    (when (<= sb-vm:alien-linkage-space-start
               addr
-              (+ sb-vm:alien-linkage-table-space-start sb-vm:alien-linkage-table-space-size))
+              (+ sb-vm:alien-linkage-space-start (1- sb-vm:alien-linkage-space-size)))
       (return-from sap-foreign-symbol
-        (alien-linkage-index-to-name
-         (sb-vm::alien-linkage-table-index-from-address addr))))
+        (alien-linkage-index-to-name (sb-vm::alien-linkage-index-from-addr addr))))
     #+os-provides-dladdr
     (with-alien ((info (struct dl-info
                                (filename c-string)
@@ -199,20 +194,20 @@ symbol designates a variable. May enter the symbol into the linkage-table."
       ;; However: We now try to allow libdl to acquire its internal locks in a GCing
       ;; thread, which means that we need all user threads to agree not to stop
       ;; for GC in the midst of _any_ libdl call.
-      (let ((err (sb-vm:with-pseudo-atomic-foreign-calls
-                     (alien-funcall dladdr addr (addr info)))))
-        (if (zerop err)
-            nil
-            (slot info 'symbol))))
-    ;; FIXME: Even in the absence of dladdr we could search the
-    ;; static foreign symbols (and *linkage-info*, for that matter).
-    ))
+      (unless (zerop (sb-vm:with-pseudo-atomic-foreign-calls
+                         (alien-funcall dladdr addr (addr info))))
+        (slot info 'symbol)))))
 
+;;; There 2 vars are not defglobal, as defglobal implies always-bound.
+(declaim (global *runtime-dlhandle* *shared-objects*))
 (defun !foreign-cold-init ()
-  (declare (special *runtime-dlhandle* *shared-objects*))
-  (loop for table-offset from 0
-        and reference across (symbol-value 'sb-vm::+required-foreign-symbols+)
-        do (setf (gethash reference (car *linkage-info*)) table-offset))
+  (let ((pairvector (the simple-vector (cdr *linkage-info*)))
+        (ht (make-hash-table :test 'equal :synchronized t)))
+    (setf *linkage-info* (list ht))
+    (loop for j from 2 below (length pairvector) by 2
+          for linkage-index fixnum from 0
+          do (aver (eql (svref pairvector (1+ j)) linkage-index))
+             (setf (gethash (svref pairvector j) ht) linkage-index)))
   #+os-provides-dlopen
   (setf *runtime-dlhandle* (dlopen-or-lose))
   #+os-provides-dlopen

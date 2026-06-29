@@ -18,6 +18,7 @@
   (:export #:asm-search
            #:assert-consing
            #:assert-no-consing
+           #:code-header-fdefn-range
            #:compiler-derived-type
            #:count-full-calls
            #:find-code-constants
@@ -27,7 +28,10 @@
            #:inspect-ir
            #:ir1-named-calls
            #:ir1-funargs
-           #:disassembly-lines))
+           #:disassembly-lines
+           #:do-blocks
+           #:do-nodes
+           #:do-ir2-blocks))
 
 (cl:in-package :ctu)
 
@@ -40,7 +44,7 @@
     (declare (ignore x))
     (values t nil)))
 
-;;; New tests should use INSPECT-IR or ASM-SEARCH rather than FIND-NAMED-CALLEES
+;;; New tests should often use INSPECT-IR or ASM-SEARCH rather than FIND-NAMED-CALLEES
 ;;; unless you are 100% certain that there will be an fdefn of the given name.
 ;;; (negative assertions may yield falsely passing tests)
 (defun asm-search (expect lambda)
@@ -61,18 +65,56 @@
   (let ((*compile-component-hook* fun))
     (apply #'test-util:checked-compile form checked-compile-args)))
 
+(defmacro do-blocks ((block-var component &optional ends result) &body body)
+  (unless (member ends '(nil :head :tail :both))
+    (error "losing ENDS value: ~S" ends))
+  (let ((n-component (gensym))
+        (n-tail (gensym)))
+    `(let* ((,n-component ,component)
+            (,n-tail ,(if (member ends '(:both :tail))
+                          nil
+                          `(sb-c::component-tail ,n-component))))
+       (do ((,block-var ,(if (member ends '(:both :head))
+                             `(component-head ,n-component)
+                             `(sb-c::block-next (sb-c::component-head ,n-component)))
+                        (sb-c::block-next ,block-var)))
+           ((eq ,block-var ,n-tail) ,result)
+         ,@body))))
+
+(defmacro do-nodes ((node-var lvar-var block)
+                    &body body)
+  (sb-int:with-unique-names (n-block n-start)
+    `(do* ((,n-block ,block)
+           (,n-start (sb-c::block-start ,n-block))
+
+           (,node-var (sb-c::ctran-next ,n-start)
+                      (sb-int:acond ((sb-c::node-next ,node-var)
+                                     (sb-c::ctran-next sb-int:it))
+                                    (t (return))))
+           ,@(when lvar-var
+               `((,lvar-var (when (sb-c::valued-node-p ,node-var)
+                              (sb-c::node-lvar ,node-var))
+                            (when (sb-c::valued-node-p ,node-var)
+                              (sb-c::node-lvar ,node-var))))))
+          (nil)
+       ,@body)))
+
+(defmacro do-ir2-blocks ((block-var component &optional result)
+                         &body forms)
+  `(do ((,block-var (sb-c::block-info (sb-c::component-head ,component))
+                    (sb-c::ir2-block-next ,block-var)))
+       ((null ,block-var) ,result)
+     ,@forms))
+
 (defun ir1-named-calls (lambda-expression &optional (full t))
   (declare (ignorable lambda-expression full))
-  #-sb-devel
-  (throw 'test-util::skip-test t)
-  #+sb-devel
   (let* ((calls)
          (compiled-fun
            (inspect-ir
             lambda-expression
             (lambda (component)
-              (sb-c::do-blocks (block component)
-                (sb-c::do-nodes (node nil block)
+              (do-blocks (block component)
+                (do-nodes (node nil block)
                   (when (and (sb-c::basic-combination-p node)
                              (if full
                                  (eq (sb-c::basic-combination-info node) :full)
@@ -84,16 +126,13 @@
 ;;; return the name of the caller and the names of all such funargs.
 (defun ir1-funargs (lambda-expression)
   (declare (ignorable lambda-expression))
-  #-sb-devel
-  (throw 'test-util::skip-test t)
-  #+sb-devel
   (let* ((calls)
          (compiled-fun
            (inspect-ir
             lambda-expression
             (lambda (component)
-              (sb-c::do-blocks (block component)
-                (sb-c::do-nodes (node nil block)
+              (do-blocks (block component)
+                (do-nodes (node nil block)
                   (when (and (sb-c::basic-combination-p node)
                              (eq (sb-c::basic-combination-info node) :full))
                     (let ((filtered
@@ -110,13 +149,41 @@
                               calls))))))))))
     (values calls compiled-fun)))
 
+(when (member :linkage-space sb-impl:+internal-features+) ; for below
+  (pushnew :linkage-space *features*))
+
+;;; Start and count of fdefns used in #'F synax or normal named call
+;;; (i.e. at the head of an expression).
+;;; SORT-BOXED-CONSTANTS ensures that FDEFNs precede other constants.
+;;; This does not have to be particularly efficient. It's only for tests.
+(defun code-header-fdefn-range (code-obj)
+  (let ((start sb-vm:code-constants-offset)
+        (count 0))
+    (do ((i start (1+ i))
+         (limit (code-header-words code-obj)))
+        ((= i limit))
+      (if (fdefn-p (code-header-ref code-obj i)) (incf count) (return)))
+    (values start count)))
+
+;;; Despite the precautionary comment at (DEFUN ASM-SEARCH), a reasonable use
+;;; of FIND-NAMED-CALLEES is to assert that there are _zero_ named callees,
+;;; as would occur in a function that is entirely transformed to inline expressions.
+;;; For that assertion to be valid on #+linkage-space platforms (ppc64 and x86-64)
+;;; it is furthermore required to override PERMANENT-FNAME-P so that the set
+;;; of linkage table entries referenced is not eliminated from the code header.
 (defun find-named-callees (fun &key (name nil namep))
-  (sb-int:binding* ((code (fun-code-header (%fun-fun fun)))
-                    ((start count) (sb-kernel:code-header-fdefn-range code)))
-    (loop for i from start repeat count
-          for c = (code-header-ref code i)
-          when (or (not namep) (equal name (sb-kernel:fdefn-name c)))
-          collect (sb-kernel:fdefn-fun c))))
+  (let ((code (fun-code-header (%fun-fun fun))))
+    #+linkage-space
+    (loop for index in (sb-c:unpack-code-fixup-locs (sb-vm::%code-fixups code))
+          for this = (sb-vm::linkage-addr->name index :index)
+          when (or (not namep) (equal this name))
+          collect this)
+    #-linkage-space
+    (sb-int:binding* (((start count) (code-header-fdefn-range code)))
+      (loop for i from start repeat count
+            for c = (code-header-ref code i)
+            when (or (not namep) (equal name (sb-kernel:fdefn-name c)))
+            collect (sb-kernel:fdefn-name c)))))
 
 (defun find-anonymous-callees (fun &key (type 'function))
   (let ((code (fun-code-header (%fun-fun fun))))
@@ -129,8 +196,7 @@
 ;;; constants that are present on behalf of %SIMPLE-FUN-foo accessors.
 (defun find-code-constants (fun &key (type t))
   (let ((code (fun-code-header (%fun-fun fun))))
-    (loop for i from (+ sb-vm:code-constants-offset
-                        (* (code-n-entries code) sb-vm:code-slots-per-simple-fun))
+    (loop for i from sb-vm:code-constants-offset
           below (code-header-words code)
           for c = (code-header-ref code i)
           for value = (if (= (widetag-of c) sb-vm:value-cell-widetag)
@@ -143,12 +209,20 @@
 (defun collect-consing-stats (thunk times)
   (declare (type function thunk))
   (declare (type fixnum times))
-  #+(and sb-thread gencgc) (sb-vm::close-thread-alloc-region)
-  (setf sb-int:*n-bytes-freed-or-purified* 0)
-  (let ((before (sb-ext:get-bytes-consed)))
-    (dotimes (i times)
-      (funcall thunk))
-    (values before (sb-ext:get-bytes-consed))))
+  (unwind-protect
+       (progn #+sb-thread
+              (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
+                (sb-impl::finalizer-thread-stop)
+                (sb-thread:%dispose-thread-structs))
+              #+(and sb-thread gencgc) (sb-vm::close-thread-alloc-region)
+              (setf sb-int:*n-bytes-freed-or-purified* 0)
+
+              (let ((before (sb-ext:get-bytes-consed)))
+                (dotimes (i times)
+                  (funcall thunk))
+                (values before (sb-ext:get-bytes-consed))))
+    #+sb-thread
+    (sb-impl::finalizer-thread-start)))
 
 (defun check-consing (yes/no form thunk times)
   (multiple-value-bind (before after)
@@ -194,6 +268,8 @@
                  (write-line toplevel-forms f)
                  (dolist (form toplevel-forms)
                    (prin1 form f))))
+           ;; Preserve all referenced callees. This has no effect on semantics
+           (sb-int:encapsulate 'sb-int:permanent-fname-p 'test-shim #'sb-int:constantly-nil)
            (multiple-value-bind (fasl warn fail)
                (let ((*error-output* error-stream))
                  (compile-file lisp :print nil :verbose nil
@@ -204,6 +280,7 @@
                (let ((*error-output* error-stream))
                  (load fasl :print nil :verbose nil)))
              (values warn fail error-stream)))
+      (sb-int:unencapsulate 'sb-int:permanent-fname-p 'test-shim)
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 
@@ -213,15 +290,12 @@
 ;;; to spelling mistakes or a change in how we name nodes.
 (defun count-full-calls (function-name lambda-expression)
   (declare (ignorable function-name lambda-expression))
-  #-sb-devel
-  (throw 'test-util::skip-test t)
-  #+sb-devel
   (let ((n 0))
     (inspect-ir
      lambda-expression
      (lambda (component)
-       (sb-c::do-blocks (block component)
-         (sb-c::do-nodes (node nil block)
+       (do-blocks (block component)
+         (do-nodes (node nil block)
            (when (and (sb-c::basic-combination-p node)
                       (eq (sb-c::basic-combination-info node) :full)
                       (equal (sb-c::combination-fun-debug-name node)

@@ -959,6 +959,7 @@
                    #P"a/b/srcfile.fasl"))))
 
 (with-test (:name :intern-pathname-non-consy
+            :fails-on (or :mips :sparc)
             :skipped-on :interpreter)
   (ctu:assert-no-consing (make-pathname :name "hi" :type "txt")))
 
@@ -985,3 +986,72 @@
   (assert (/= (sxhash #P"AVERB") (sxhash #P"AVEQS")))
   ;; still more
   (assert (/= (sxhash #P"a[bc]d?x") (sxhash #P"a[bc]d?z"))))
+
+;;; Assert that random bits of the symbols :ABSOLUTE,:RELATIVE,:WILD,etc
+;;; aren't used, as CLHS mandates externalizable SXHASH for pathnames.
+;;; Rev a374a7025c broke this, but it was not broken when committed,
+;;; because symbol hashes had not yet been pseudo-randomized.
+;;; (I think using the random bits is technically allowed, because
+;;; only a rebuild of SBCL could change the random bits, and a rebuild
+;;; would be considered a different "lisp image" would it not?)
+(with-test (:name :pathname-hash-not-random :skipped-on (:not :64-bit))
+  (sb-sys:with-pinned-objects (':absolute)
+    (let* ((sap (sb-sys:int-sap (sb-kernel:get-lisp-obj-address ':absolute)))
+           (offset (- (ash sb-vm:symbol-hash-slot sb-vm:word-shift)
+                      sb-vm:other-pointer-lowtag))
+           (original-word (sb-sys:sap-ref-word sap offset))
+           (original-symbol-hash (sb-kernel:symbol-hash :absolute))
+           (known-pnhash (sb-impl::pattern-hash '(:absolute "mess")))
+           (n-matched 0))
+      (unwind-protect
+           (dotimes (i (ash 1 10)) ; exhaustive test
+             (setf (ldb (byte 10 22) (sb-sys:sap-ref-word sap offset)) i)
+             (when (= (sb-kernel:symbol-hash :absolute) original-symbol-hash)
+               (incf n-matched))
+             (assert (= (sb-impl::pattern-hash '(:absolute "mess"))
+                        known-pnhash)))
+        (setf (sb-sys:sap-ref-word sap offset) original-word))
+      ;; Exactly one of the tested patterns is the unadulterated hash
+      (assert (= n-matched 1)))))
+
+(with-test (:name :enough-namestring-logical-pathname)
+  (let ((namestring "SYS:SRC;FOO.LISP")
+        (pathname #p"SYS:SRC;FOO.LISP")
+        (defaults #p"SYS:SRC;"))
+    (assert (typep pathname 'logical-pathname))
+    (assert (equal (parse-namestring namestring) pathname))
+    ;; identity from CLHS `enough-namestring`
+    (assert (equal (merge-pathnames (enough-namestring pathname defaults) defaults)
+                   (merge-pathnames (parse-namestring pathname nil defaults) defaults)))
+    ;; probably the intended identity
+    (assert (equal (merge-pathnames (enough-namestring pathname defaults) defaults)
+                   (merge-pathnames (parse-namestring namestring nil defaults) defaults)))
+    (assert (equal ";FOO.LISP" (enough-namestring pathname defaults)))))
+
+(with-test (:name :[-escaping)
+  #-win32
+  (progn
+    (assert (pathname-match-p "n" (opaque-identity #p"[n\\]a]")))
+    (assert (pathname-match-p "]" (opaque-identity #p"[n\\]a]")))
+    (assert (pathname-match-p "a" (opaque-identity #p"[n\\]a]")))
+    (assert (not (pathname-match-p "c" (opaque-identity #p"[n\\]a]"))))
+    (assert (pathname-match-p "ab" (opaque-identity #p"[n\\]a]b"))))
+  #+win32
+  (progn
+    (assert (pathname-match-p "n" (opaque-identity #p"[n^]a]")))
+    (assert (pathname-match-p "]" (opaque-identity #p"[n^]a]")))
+    (assert (pathname-match-p "a" (opaque-identity #p"[n^]a]")))
+    (assert (not (pathname-match-p "c" (opaque-identity #p"[n^]a]"))))
+    (assert (pathname-match-p "ab" (opaque-identity #p"[n^]a]b")))))
+
+(with-test (:name :dot-escaping)
+  #-win32
+  (progn
+    (assert (equal (pathname-name (pathname "\\\\\\.abc")) "\\.abc"))
+    (assert (not (pathname-type (pathname "\\\\\\.abc")))))
+  #+win32
+  (progn
+    (assert (equal (pathname-name (pathname "^^^.abc")) "^.abc"))
+    (assert (not (pathname-type (pathname "^^^.abc")))))
+  (let ((p #-win32 #p"a*\\.c" #+win32 #p"a*^.c"))
+    (assert (equal (pathname (namestring p)) p))))

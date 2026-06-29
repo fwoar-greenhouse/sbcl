@@ -68,7 +68,8 @@
 ;;;
 ;;; In each cons, the car is the symbol naming the layout, and the
 ;;; cdr is the layout itself.
-(defvar *!initial-layouts*)
+#+sb-xc-host (defvar *!initial-layouts*)
+#-sb-xc-host (declaim (global *!initial-layouts*))
 
 ;;; a table mapping class names to layouts for classes we have
 ;;; referenced but not yet loaded. This is initialized from an alist
@@ -347,6 +348,17 @@ between the ~A definition and the ~A definition"
                table))
   nil)
 
+;;; Recursively expand classoid-subclasses. Classoid should probably be a sealed
+;;; classoid for the answer to be meaningful, otherwise the true answer is unbounded.
+(defun classoid-all-subclassoids (classoid &aux result)
+  (labels ((add-descendants (classoid &optional layout)
+             (declare (ignore layout))
+             (unless (member classoid result)
+               (push classoid result)
+               (sb-kernel::call-with-subclassoids #'add-descendants classoid))))
+    (add-descendants classoid)
+    result))
+
 ;;; Record LAYOUT as the layout for its class, adding it as a subtype
 ;;; of all superclasses. This is the operation that "installs" a
 ;;; layout for a class in the type system, clobbering any old layout.
@@ -596,12 +608,15 @@ between the ~A definition and the ~A definition"
         ((funcallable-instance-p x) (%fun-layout x))
         ;; Compiler can dump literal layouts, which handily sidesteps
         ;; the question of when cold-init runs L-T-V forms.
+        ;; TODO: if WIDETAG-OF-FOR-LAYOUT and WIDETAG-OF can be made to return
+        ;; INDEX-OF-LAYOUT-FOR-NULL when appropriate, that'll remove this case,
+        ;; entailing 1 fewer constant to dump at each inlining.
         ((null x) #.(find-layout 'null))
         (t
-         ;; Note that WIDETAG-OF is slightly suboptimal here and could be
-         ;; improved - we've already ruled out some of the lowtags.
          (svref (load-time-value **primitive-object-layouts** t)
-                (widetag-of x))))))
+                #.(sb-c::if-vop-existsp (:named sb-vm::widetag-of-for-layout)
+                                        '(%primitive sb-vm::widetag-of-for-layout x)
+                                        '(widetag-of x)))))))
 
 #-sb-xc-host
 (progn
@@ -792,14 +807,16 @@ between the ~A definition and the ~A definition"
   `(logior ,(ctype-class-bits 'classoid)
            (logand (hash-layout-name ,x) +ctype-hash-mask+)))
 ;;; Now that the type-class has an ID, the various constructors can be defined.
-(macrolet ((def-make (name args &aux (allocator (symbolicate "!ALLOC-" name)))
+(macrolet ((def-make (name args &optional (flags 0)
+                      &aux (allocator (symbolicate "!ALLOC-" name)))
              `(defun ,(symbolicate "MAKE-" name) ,args
                 (declare (inline ,allocator))
-                (,allocator (classoid-bits name) ,@(remove '&key args)))))
+                (,allocator (logior (classoid-bits name) ,flags)
+                            ,@(remove '&key args)))))
   (def-make undefined-classoid (name))
   (def-make condition-classoid (&key name))
   (def-make structure-classoid (&key name))
-  (def-make standard-classoid (&key name pcl-class))
+  (def-make standard-classoid (&key name pcl-class) ctype-contains-class)
   (def-make static-classoid (&key name)))
 
 (defun classoid-inherits-from (sub super-or-name)
@@ -934,9 +951,7 @@ between the ~A definition and the ~A definition"
 ;;; hierarchy).  See NAMED :COMPLEX-SUBTYPEP-ARG2
 (declaim (type cons **non-instance-classoid-types**))
 (defglobal **non-instance-classoid-types**
-  '(symbol system-area-pointer weak-pointer code-component
-    #-(or x86 x86-64 arm64 riscv) lra
-    fdefn random-class))
+  '(symbol system-area-pointer weak-pointer code-component fdefn random-class))
 
 (defun classoid-non-instance-p (classoid)
   (declare (type classoid classoid))
@@ -964,6 +979,9 @@ between the ~A definition and the ~A definition"
   (classoid-proper-name type))
 
 ;;;; built-in classes
+
+(defconstant pathname-layout-depthoid 1)
+(defconstant pathname-layout-length (+ 7 sb-vm:instance-data-start))
 
 ;;; The BUILT-IN-CLASSES list is a data structure which configures the
 ;;; creation of all the built-in classes. It contains all the info
@@ -1036,11 +1054,6 @@ between the ~A definition and the ~A definition"
      (code-component :codes (,sb-vm:code-header-widetag)
                      :predicate code-component-p
                      :prototype-form (fun-code-header #'identity))
-     #-(or x86 x86-64 arm64 riscv)
-     (lra :codes (,sb-vm:return-pc-widetag)
-          :predicate lra-p
-          ;; Make the PROTOTYPE slot unbound.
-          :prototype-form sb-pcl:+slot-unbound+)
      (fdefn :codes (,sb-vm:fdefn-widetag)
             :predicate fdefn-p
             :prototype-form (find-or-create-fdefn '(setf car)))
@@ -1063,18 +1076,18 @@ between the ~A definition and the ~A definition"
       :translation (complex single-float)
       :inherits (complex number)
       :codes (,sb-vm:complex-single-float-widetag)
-      :prototype-form ,(complex $0f0 $0f0))
+      :prototype-form ,(complex 0f0 0f0))
      (complex-double-float
       :translation (complex double-float)
       :inherits (complex number)
       :codes (,sb-vm:complex-double-float-widetag)
-      :prototype-form ,(complex $0d0 $0d0))
+      :prototype-form ,(complex 0d0 0d0))
      #+long-float
      (complex-long-float
       :translation (complex long-float)
       :inherits (complex number)
       :codes (,sb-vm:complex-long-float-widetag)
-      :prototype-form ,(complex $0L0 $0L0))
+      :prototype-form ,(complex 0L0 0L0))
      #+sb-simd-pack
      (simd-pack
       :translation simd-pack
@@ -1089,23 +1102,23 @@ between the ~A definition and the ~A definition"
       ;; (%make-simd-pack-256-ub64 42 42 42 42)
       sb-pcl:+slot-unbound+)
      (real :translation real :inherits (number) :prototype-form 0)
-     (float :translation float :inherits (real number) :prototype-form $0f0)
+     (float :translation float :inherits (real number) :prototype-form 0f0)
      (single-float
       :translation single-float
       :inherits (float real number)
       :codes (,sb-vm:single-float-widetag)
-      :prototype-form $0f0)
+      :prototype-form 0f0)
      (double-float
       :translation double-float
       :inherits (float real number)
       :codes (,sb-vm:double-float-widetag)
-      :prototype-form $0d0)
+      :prototype-form 0d0)
      #+long-float
      (long-float
       :translation long-float
       :inherits (float real number)
       :codes (,sb-vm:long-float-widetag)
-      :prototype-form $0L0)
+      :prototype-form 0L0)
      (rational
       :translation rational :inherits (real number) :prototype-form 0)
      (ratio
@@ -1234,13 +1247,13 @@ between the ~A definition and the ~A definition"
       :prototype-form (make-defstruct-description 'arbitrary 0))
 
      ;; KLUDGE: the length must match the subsequent defstruct.
-     (pathname :depth 1
+     (pathname :depth ,pathname-layout-depthoid
                :predicate pathnamep
-               :length ,(+ 7 sb-vm:instance-data-start)
+               :length ,pathname-layout-length
                :prototype-form (make-trivial-default-pathname))
-     (logical-pathname :depth 2
+     (logical-pathname :depth ,(1+ pathname-layout-depthoid)
                        :predicate logical-pathname-p
-                       :length ,(+ 7 sb-vm:instance-data-start)
+                       :length ,pathname-layout-length
                        :prototype-form (make-trivial-default-logical-pathname)
                        :inherits (pathname))
 
@@ -1307,14 +1320,11 @@ between the ~A definition and the ~A definition"
                 (list* name :predicate predicate :translation translation (cdr x))))
             *builtin-classoids*)))
 
-;;; The read interceptor has to be disabled to avoid infinite recursion on CTYPEs
-(eval-when (:compile-toplevel) (setq sb-cold::*choke-on-host-irrationals* nil))
 #-sb-xc-host
 (define-load-time-global *builtin-classoids* nil)
 #-sb-xc-host
 (!cold-init-forms
  (setq *builtin-classoids* '#.(compute-builtin-classoids)))
-(eval-when (:compile-toplevel) (setq sb-cold::*choke-on-host-irrationals* t))
 
 ;;; See also src/code/type-init.lisp where we finish setting up the
 ;;; translations for built-in types.

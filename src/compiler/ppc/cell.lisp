@@ -120,6 +120,23 @@
   (:policy :fast)
   (:translate symbol-global-value))
 
+(define-vop (symbol-hash)
+  (:policy :fast-safe)
+  (:translate symbol-hash)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    ;; Clear the 3 highest bits, ensuring the result is positive fixnum
+    (inst clrlwi res res 3)))
+
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst srwi res res 3))) ; shift out the 3 pseudorandom bits
+
 #+sb-thread
 (progn
   (define-vop (set)
@@ -226,8 +243,7 @@
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
-  (:temporary (:scs (interior-reg)) lip)
-  (:temporary (:scs (non-descriptor-reg)) type)
+  (:temporary (:scs (non-descriptor-reg)) lip type)
   (:generator 38
       (load-type type function (- fun-pointer-lowtag))
       (inst cmpwi type simple-fun-widetag)

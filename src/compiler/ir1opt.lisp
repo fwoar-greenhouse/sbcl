@@ -34,32 +34,48 @@
              ;; later turn out to be of the wrong type.
              ;; And ir1-transforms suffer from this because
              ;; they expect LVAR-VALUE to be of a restricted type.
-             (or (not (lvar-reoptimize principal-lvar))
-                 (ctypep (constant-value leaf) type)))
+             (or (ctypep (constant-value leaf) type)
+                 ;; Don't return T for type-singleton-p, it may still mismatch.
+                 (return-from constant-lvar-p)))
         ;; check for EQL types and singleton numeric types
         (values (type-singleton-p type)))))
 
-(defun lvar-constant (lvar)
+(defun lvar-constant (lvar &optional ignore-types)
   (declare (type lvar lvar))
-  (let* ((type (lvar-type lvar))
-         (principal-lvar (principal-lvar lvar))
-         (principal-use (lvar-uses principal-lvar))
+  (let ((type (lvar-type lvar)))
+    (labels ((process-lvar (lvar)
+               (when lvar
+                 (let* ((principal-lvar (principal-lvar lvar))
+                        (principal-use (lvar-uses principal-lvar))
+                        leaf)
+                   (when (ref-p principal-use)
+                     (if (constant-p (setf leaf (ref-leaf principal-use)))
+                         (when (or ignore-types
+                                   (ctypep (constant-value leaf) type))
+                           (values leaf principal-use))
+                         (process-lvar (lambda-var-ref-lvar principal-use))))))))
+      (process-lvar lvar))))
+
+(defun constant-node-p (node)
+  (let* ((type (node-derived-type node))
          leaf)
-    (and (ref-p principal-use)
-         (constant-p (setf leaf (ref-leaf principal-use)))
-         (or (not (lvar-reoptimize principal-lvar))
-             (ctypep (constant-value leaf) type))
-         leaf)))
+    (if (and (ref-p node)
+             (constant-p (setf leaf (ref-leaf node)))
+             ;; Complex arrays get turned into simple arrays when compiling to a fasl.
+             (not (typep (constant-value leaf) '(and array (not simple-array)))))
+        (values t (constant-value leaf))
+        ;; check for EQL types and singleton numeric types
+        (type-singleton-p type))))
 
 (defun constant-lvar-ignore-types-p (lvar &optional (singleton-types t))
   (declare (type lvar lvar))
-  (let ((use (principal-lvar-use lvar)))
-    (or (and (ref-p use)
-             (constant-p (ref-leaf use))
-             (not (typep (constant-value (ref-leaf use)) '(and array (not simple-array)))))
-        ;; check for EQL types and singleton numeric types
-        (and singleton-types
-             (values (type-singleton-p (lvar-type lvar)))))))
+  (or (let ((constant (lvar-constant lvar t)))
+        (and constant
+             ;; non-simple arrays will become simple when saving to a fasl.
+             (not (typep (constant-value constant) '(and array (not simple-array))))))
+      ;; check for EQL types and singleton numeric types
+      (and singleton-types
+           (values (type-singleton-p (lvar-type lvar))))))
 
 ;;; Are all the uses constant?
 (defun constant-lvar-uses-p (lvar)
@@ -82,15 +98,12 @@
 
 ;;; Return the constant value for an LVAR whose only use is a constant
 ;;; node.
-(defun lvar-value (lvar)
+(defun lvar-value (lvar &optional ignore-types)
   (declare (type lvar lvar))
-  (let ((use  (principal-lvar-use lvar))
-        (type (lvar-type lvar))
-        leaf)
-    (if (and (ref-p use)
-             (constant-p (setf leaf (ref-leaf use))))
-        (values (constant-value leaf) leaf)
-        (multiple-value-bind (constantp value) (type-singleton-p type)
+  (let ((constant (lvar-constant lvar ignore-types)))
+    (if constant
+        (values (constant-value constant) constant)
+        (multiple-value-bind (constantp value) (type-singleton-p (lvar-type lvar))
           (unless constantp
             (error "~S used on non-constant LVAR ~S" 'lvar-value lvar))
           (values value (find-constant value))))))
@@ -98,6 +111,10 @@
 (declaim (inline lvar-value-is))
 (defun lvar-value-is (lvar value)
   (and (constant-lvar-p lvar) (eql (lvar-value lvar) value)))
+
+(defun lvar-value-equal (lvar value)
+  (and (constant-lvar-p lvar)
+       (equal (lvar-value lvar) value)))
 
 ;;; Return true if ARG is NIL, or is a constant-lvar whose
 ;;; value is NIL, false otherwise.
@@ -111,6 +128,11 @@
     (loop for use in uses
           for leaf = (ref-leaf use)
           collect (constant-value leaf))))
+
+(declaim (inline constant-ref-p))
+(defun constant-ref-p (ref)
+  (and (ref-p ref)
+       (constant-p (ref-leaf ref))))
 
 ;;;; interface for obtaining results of type inference
 
@@ -192,6 +214,8 @@
            derived-type))))
 
 (defun node-conservative-type (node)
+  (when (cast-p node)
+    (setf node (principal-lvar-use (cast-value node))))
   (let* ((derived-values-type (node-derived-type node))
          (derived-type (single-value-type derived-values-type)))
     (if (ref-p node)
@@ -265,29 +289,6 @@
          t)
         ((types-equal-or-intersect type (specifier-type '(or cons (and array (not simple-array)))))
          t)))
-
-;;; If LVAR is an argument of a function, return a type which the
-;;; function checks LVAR for.
-(defun lvar-externally-checkable-type (lvar)
-  (declare (type lvar lvar))
-  (let ((dest (lvar-dest lvar)))
-    (when (basic-combination-p dest)
-      (when (call-full-like-p dest)
-        (let ((info (and (eq (basic-combination-kind dest) :known)
-                         (basic-combination-fun-info dest))))
-          (if (and info
-                   (fun-info-externally-checkable-type info))
-              (return-from lvar-externally-checkable-type
-                (coerce-to-values (funcall (fun-info-externally-checkable-type info) dest lvar)))
-              (map-combination-args-and-types
-               (lambda (arg type &rest args)
-                 (declare (ignore args))
-                 (when (eq arg lvar)
-                   (return-from lvar-externally-checkable-type
-                     (coerce-to-values type))))
-               dest
-               :defined-here t :asserted-type t)))))
-    *wild-type*))
 
 ;;;; interface routines used by optimizers
 
@@ -311,15 +312,20 @@
                    (prev (node-prev dest) :exit-if-null)
                    (block (ctran-block prev))
                    (component (block-component block)))
+          (when (valued-node-p dest)
+            (let ((dest (node-dest dest)))
+              (when (and (if-p dest)
+                         (node-prev dest))
+                (reoptimize-node dest))))
           (setf (block-reoptimize block) t)
           (reoptimize-component component :maybe))
-        (loop for cast in (lvar-dependent-nodes lvar)
-              unless (or (not (node-p cast))
-                         (node-deleted cast))
+        (loop for node in (lvar-dependent-nodes lvar)
+              unless (or (not (node-p node))
+                         (node-deleted node))
               do
-              (setf (node-reoptimize cast) t)
-              (setf (block-reoptimize (node-block cast)) t)
-              (reoptimize-component (node-component cast) :maybe)))))
+              (setf (node-reoptimize node) t)
+              (setf (block-reoptimize (node-block node)) t)
+              (reoptimize-component (node-component node) :maybe)))))
   (values))
 
 (defun reoptimize-node (node)
@@ -353,6 +359,9 @@
         ;; Don't use type/=, it will return NIL on unknown types.
         ;; Instead of checking the second value just negate TYPE=
         (unless (type= initial-type int)
+          ;; (when (and (eq int *empty-type*)
+          ;;            (neq rtype *empty-type*))
+          ;;   (break))
           ;; This assertion is easily legitimately violated by
           ;; transforms.
           #+(or)
@@ -399,28 +408,31 @@
 ;;; splitting off DEST a new CAST node; old LVAR will deliver values
 ;;; to CAST. If we improve the assertion, we set TYPE-CHECK to
 ;;; guarantee that the new assertion will be checked.
-(defun assert-lvar-type (lvar type policy &optional context)
+(defun assert-lvar-type (lvar type policy &optional context not-asserted)
   (declare (type lvar lvar) (type ctype type))
-  (unless (type-asserted-p lvar type)
+  (when (or not-asserted
+            (not (type-asserted-p lvar type)))
     (let ((internal-lvar (make-lvar))
           (dest (lvar-dest lvar)))
       (substitute-lvar internal-lvar lvar)
       (let ((cast (insert-cast-before dest lvar type policy
                                       context)))
         (use-lvar cast internal-lvar)
-        t))))
+        (maybe-terminate-block cast nil)
+        cast))))
 
-(defun assert-node-type (node type policy &optional context)
+(defun assert-node-type (node type policy &optional context not-asserted)
   (declare (type node node) (type ctype type))
   (let ((lvar (node-lvar node)))
-    (unless (type-asserted-p lvar type)
+    (when (or not-asserted
+              (not (type-asserted-p lvar type)))
       (let ((new-lvar (make-lvar)))
         (%delete-lvar-use node)
         (use-lvar node new-lvar)
         (let ((cast (insert-cast-after node new-lvar type policy
                                        context)))
           (use-lvar cast lvar)
-          t)))))
+          cast)))))
 
 
 ;;;; IR1-OPTIMIZE
@@ -527,7 +539,14 @@
         (cif
          ;; Don't want comparisons of constants against constants
          ;; from reaching the VOPs.
-         (ir1-optimize-if node t))))))
+         (ir1-optimize-if node t))
+        (cast
+         ;; Simply clearing node-reoptimize will stop cast-type-check
+         ;; from working.
+         (when (and (cast-%type-check node)
+                    (values-subtypep (lvar-derived-type (cast-value node))
+                                     (cast-type-to-check node)))
+           (setf (cast-%type-check node) nil)))))))
 
 ;;; Only handle constant folding, some VOPs do not work
 ;;; on constants.
@@ -537,8 +556,7 @@
         (kind (basic-combination-kind node)))
     (case kind
       (:known
-       (cond ((constant-fold-call-p node)
-              (constant-fold-call node))
+       (cond ((constant-fold-call node))
              ((and (ir1-attributep (fun-info-attributes info) commutative)
                    (= (length args) 2)
                    (constant-lvar-p (first args))
@@ -736,8 +754,8 @@
              (combination (lvar-uses lvar)))
         (labels ((erase-types (type)
                    (dolist (ref (leaf-refs lambda))
-                     (let* ((lvar (node-lvar ref))
-                            (combination (lvar-dest lvar)))
+                     (let* ((combination (node-dest ref)))
+                       (replace-node-type ref (specifier-type 'function))
                        (setf (node-derived-type combination) type)
                        (principal-lvar-single-valuify (node-lvar combination))
                        (reoptimize-lvar (node-lvar combination))))
@@ -788,8 +806,7 @@
                    (when (find-result-type return)
                      (go :restart)))
                  (res (return-result-type return)))))
-
-           (when (type/= (res) (tail-set-type tails))
+           (unless (type= (res) (tail-set-type tails))
              (setf (tail-set-type tails) (res))
              (dolist (fun (tail-set-funs tails))
                (dolist (ref (leaf-refs fun))
@@ -798,6 +815,41 @@
 ;;;; IF optimization
 
 (declaim (start-block ir1-optimize-if kill-if-branch-1))
+
+;;; Make the 0 branch go directly to 2
+;;; (if (> (if x (length x) 0) 10)
+;;;     1
+;;;     2)
+(defun bypass-if (if test block)
+  (let ((combination (lvar-uses test)))
+    (when (and (combination-p combination)
+               (eq (combination-kind combination) :known))
+      (let ((info (combination-fun-info combination)))
+        (when (and info
+                   (flushable-combination-p combination)
+                   (skip-nodes-before-node-p block combination))
+          (loop for arg in (combination-args combination)
+                for uses = (lvar-uses arg)
+                for type = (lvar-type arg)
+                when (consp uses)
+                do
+                (loop for use in uses
+                      when (eq (next-block use) block)
+                      do (let ((node-type (single-value-type (node-derived-type use))))
+                           (when (type/= type node-type)
+                             (let ((types (loop for arg2 in (combination-args combination)
+                                                collect (if (eq arg arg2)
+                                                            node-type
+                                                            (lvar-type arg2)))))
+                               (let ((derived (combination-derive-type-for-arg-types combination types)))
+                                 (cond ((not derived))
+                                       ((eq (setf derived (single-value-type derived))
+                                            (specifier-type 'null))
+                                        (change-block-successor (node-block use) block (if-alternative if))
+                                        (delete-lvar-use use))
+                                       ((not (types-equal-or-intersect derived (specifier-type 'null)))
+                                        (change-block-successor (node-block use) block (if-consequent if))
+                                        (delete-lvar-use use))))))))))))))
 
 ;;; Check whether the predicate is known to be true or false,
 ;;; deleting the IF node in favor of the appropriate branch when this
@@ -809,7 +861,8 @@
 (defun ir1-optimize-if (node &optional fast)
   (declare (type cif node))
   (let* ((test (if-test node))
-         (block (node-block node))(type (lvar-type test))
+         (block (node-block node))
+         (type (lvar-type test))
          (consequent  (if-consequent  node))
          (alternative (if-alternative node))
          (victim
@@ -834,10 +887,13 @@
                                        (node-derived-type consequent-ref)
                                        (node-derived-type (block-start-node alternative)))
                                       :from-scratch t))
+                  ;; Avoid code deletion notes
+                  (setf (ctran-source-path (block-start alternative)) nil)
                   alternative))))
     (cond (victim
            (kill-if-branch-1 node test block victim))
           ((not fast)
+           (bypass-if node test block)
            (tension-if-if-1 node test block)
            (duplicate-if-if-1 node test block)))))
 
@@ -889,7 +945,7 @@
            (when (and (lambda-var-p var)
                       (not (lambda-var-specvar var))
                       (functional-kind-eq (lambda-var-home var) let)
-                      (let-var-immediately-used-p ref var test)
+                      (let-var-immediately-used-p ref var test :flushable t :no-effect t)
                       ;; Rely on constraint propagation to determine
                       ;; that the var with the value of NIL is never
                       ;; used outside of the test itself.
@@ -947,7 +1003,7 @@
                                     penultimate))
                    (next-block (or (node-ends-block penultimate)
                                    (car (block-succ (node-block penultimate)))))
-                   (ctran (make-ctran :kind :block-start))
+                   (ctran (make-ctran :block-start))
                    (new-block (make-block-key :start ctran
                                               :pred (block-pred next-block)
                                               :succ (list next-block)))
@@ -965,7 +1021,7 @@
               (push ref (lambda-refs lambda))
               (setf (combination-args call) (last all-args))
               (setf (lambda-vars original-lambda) (last all-vars)
-                    (lambda-tail-set lambda) (make-tail-set :funs (list lambda)))
+                    (lambda-tail-set lambda) (make-tail-set (list lambda)))
               (setf (bind-lambda bind) lambda)
               (loop for var in vars
                     do (setf (lambda-var-home var) lambda))
@@ -1027,9 +1083,7 @@
            (use-block (node-block use))
            (new-ctran (make-ctran))
            (new-lvar (make-lvar))
-           (new-node (make-if :test new-lvar
-                              :consequent cblock
-                              :alternative ablock))
+           (new-node (make-if new-lvar cblock ablock))
            (new-block (ctran-starts-block new-ctran)))
       (link-node-to-previous-ctran new-node new-ctran)
       (setf (lvar-dest new-lvar) new-node)
@@ -1082,8 +1136,10 @@
       (cond (value
              ;; The number of consumed values is now known, reoptimize the users.
              ;; The VALUES transform in particular benefits from this.
-             (do-uses (use value)
-               (reoptimize-node use))
+             (let ((type (node-derived-type node)))
+               (do-uses (use value)
+                 (reoptimize-node use)
+                 (derive-node-type use type)))
              (delete-filter node (node-lvar node) value))
             (t
              (unlink-node node))))))
@@ -1092,11 +1148,15 @@
 ;;;; combination IR1 optimization
 
 (declaim (start-block ir1-optimize-combination maybe-terminate-block
-                      validate-call-type recognize-known-call))
+                      validate-call-type recognize-known-call
+                      derive-combination-type))
 
 (defun check-important-result (node info)
-  (when (and (null (node-lvar node))
-             (ir1-attributep (fun-info-attributes info) important-result)
+  (when (and (ir1-attributep (fun-info-attributes info) important-result)
+             (or (null (node-lvar node))
+                 (null (principal-lvar-end (node-lvar node))))
+             ;; A constant might be propagated directly, disconnecting the lvar
+             (not (type-singleton-p (single-value-type (node-derived-type node))))
              (neq (combination-info node) :important-result-discarded))
     (when (lvar-fun-is (combination-fun node) '(adjust-array))
       (let ((type (lvar-type (car (combination-args node)))))
@@ -1125,6 +1185,16 @@
                (return-from check-proper-sequences))))
      combination :info info)))
 
+(defun derive-combination-type (combination &optional (show *show-transforms-p*))
+  (let* ((info (basic-combination-fun-info combination))
+         (fun (fun-info-derive-type info)))
+    (when fun
+      (let ((res (funcall fun combination)))
+        (when res
+          (when (eq show :derive-type)
+            (show-type-derivation combination res))
+          (coerce-to-values res))))))
+
 ;;; Do IR1 optimizations on a COMBINATION node.
 (defun ir1-optimize-combination (node &aux (show *show-transforms-p*))
   (declare (type combination node))
@@ -1143,14 +1213,13 @@
            (process-info ()
              (check-important-result node info)
              (check-proper-sequences node info)
-             (let ((fun (fun-info-derive-type info)))
-               (when fun
-                 (let ((res (funcall fun node)))
-                   (when res
-                     (when (eq show :derive-type)
-                       (show-type-derivation node res))
-                     (derive-node-type node (coerce-to-values res))
-                     (maybe-terminate-block node nil)))))))
+             (let ((type (derive-combination-type node show)))
+               (when type
+                 (derive-node-type node type)
+                 (when (eq (node-derived-type node) *empty-type*)
+                   (if (node-deleted node)
+                       (return-from ir1-optimize-combination))
+                   (maybe-terminate-block node nil))))))
       (ecase kind
         (:local
          (let ((fun (combination-lambda node)))
@@ -1169,52 +1238,72 @@
                 (let* ((fun (basic-combination-fun node))
                        (uses (lvar-uses fun))
                        (leaf (when (ref-p uses) (ref-leaf uses))))
-                  (multiple-value-bind (type defined-type)
-                      (cond ((global-var-p leaf)
-                             (values (leaf-type leaf) (leaf-defined-type leaf)))
-                            ((eq kind :unknown-keys)
-                             (values (lvar-fun-type fun t t) nil))
-                            (t
-                             (values nil nil)))
-                    (when (or (and (eq kind :unknown-keys)
-                                   (fun-type-p type))
-                              (and (fun-type-p defined-type)
-                                   (not (fun-type-p type))))
-                      (validate-call-type node type leaf)))
-                  (unless (eq (basic-combination-kind node) kind)
-                    (ir1-optimize-combination node))))))
+                  (cond ((consp uses)
+                         (loop with union
+                               for use in uses
+                               do
+                               (if (ref-p use)
+                                   (let ((type (node-fun-type use)))
+                                     (if (fun-type-p type)
+                                         (let ((return (fun-type-returns type)))
+                                           (setf union
+                                                 (if union
+                                                     (values-type-union union return)
+                                                     return)))
+                                         (return)))
+                                   (return))
+                               finally (derive-node-type node union)))
+                        (t
+                         (multiple-value-bind (type defined-type)
+                             (cond ((global-var-p leaf)
+                                    (values (leaf-type leaf) (leaf-defined-type leaf)))
+                                   ((eq kind :unknown-keys)
+                                    (values (lvar-fun-type fun t t) nil))
+                                   (t
+                                    (values nil nil)))
+                           (when (or (and (eq kind :unknown-keys)
+                                          (fun-type-p type))
+                                     (and (fun-type-p defined-type)
+                                          (not (fun-type-p type))))
+                             (validate-call-type node type leaf)))
+                         (unless (eq (basic-combination-kind node) kind)
+                           (ir1-optimize-combination node))))))))
         (:known
          (aver info)
          (clear-reoptimize-args)
          (process-info)
          (unless (eq (combination-kind node) :error) ;; caused by derive-type
-           (let ((attr (fun-info-attributes info)))
-             (when (constant-fold-call-p node)
-               (constant-fold-call node)
-               (return-from ir1-optimize-combination))
-             (when (fold-call-derived-to-constant node)
-               (return-from ir1-optimize-combination))
-             (when (and (ir1-attributep attr commutative)
-                        (= (length args) 2)
-                        (constant-lvar-p (first args))
-                        (not (constant-lvar-p (second args))))
-               (setf (basic-combination-args node) (nreverse args))))
-
+           (cond ((constant-fold-call node)
+                  (return-from ir1-optimize-combination))
+                 ((not (flushable-combination-p node)))
+                 ((and (not (node-tail-p node))
+                       (not (node-lvar node)))
+                  (return-from ir1-optimize-combination (flush-node node)))
+                 ((fold-call-derived-to-constant node)
+                  (return-from ir1-optimize-combination)))
+           (when (and (ir1-attributep (fun-info-attributes info) commutative)
+                      (= (length args) 2)
+                      (constant-lvar-p (first args))
+                      (not (constant-lvar-p (second args))))
+             (setf (basic-combination-args node) (nreverse args)))
            (let ((optimizer (fun-info-optimizer info)))
-             (unless (and optimizer (funcall optimizer node))
-               (dolist (x (fun-info-transforms info))
-                 (when (eq show :all)
-                   (let* ((lvar (basic-combination-fun node))
-                          (fname (lvar-fun-name lvar t)))
-                     (format *trace-output*
-                             "~&trying transform ~s for ~s"
-                             (transform-type x) fname)))
-                 (unless (ir1-transform node x show)
+             (if (and optimizer (funcall optimizer node))
+                 (when (and (node-reoptimize node)
+                            (not (node-deleted node)))
+                   (setf (node-reoptimize node) nil)
+                   (ir1-optimize-combination node))
+                 (dolist (x (fun-info-transforms info))
                    (when (eq show :all)
-                     (format *trace-output*
-                             "~&quitting because IR1-TRANSFORM result was NIL"))
-                   (return))))))))))
-  (values))
+                     (let* ((lvar (basic-combination-fun node))
+                            (fname (lvar-fun-name lvar t)))
+                       (format *trace-output*
+                               "~&trying transform ~s for ~s"
+                               (transform-type x) fname)))
+                   (unless (ir1-transform node x show)
+                     (when (eq show :all)
+                       (format *trace-output*
+                               "~&quitting because IR1-TRANSFORM result was NIL"))
+                     (return)))))))))))
 
 (defun xep-tail-combination-p (node)
   (and (combination-p node)
@@ -1240,27 +1329,25 @@
 ;;;
 ;;; Why do we need to consider LVAR type? -- APD, 2003-07-30
 (defun maybe-terminate-block (node ir1-converting-not-optimizing-p)
-  (declare (type (or basic-combination cast ref) node))
-  (let* ((block (node-block node))
-         (lvar (node-lvar node))
-         (ctran (node-next node))
-         (tail (component-tail (block-component block)))
-         (succ (first (block-succ block))))
-    (declare (ignore lvar))
-    (unless (or (and (eq node (block-last block)) (eq succ tail))
-                (block-delete-p block)
-                (node-tail-p node)
-                ;; Even if the combination will never return, don't
-                ;; terminate if this is the tail call of a XEP: doing
-                ;; that would inhibit TCO.
-                (xep-tail-combination-p node)
-                ;; Do not consider the block for termination if this
-                ;; is a LET-like combination, since the successor of
-                ;; this node is the body of the LET.
-                (and (combination-p node)
-                     (eq (combination-kind node) :local)
-                     (functional-somewhat-letlike-p (combination-lambda node))))
-      (when (eq (node-derived-type node) *empty-type*)
+  (declare (type node node))
+  (when (eq (node-derived-type node) *empty-type*)
+    (let* ((block (node-block node))
+           (ctran (node-next node))
+           (tail (component-tail (block-component block)))
+           (succ (first (block-succ block))))
+      (unless (or (and (eq node (block-last block)) (eq succ tail))
+                  (block-delete-p block)
+                  (node-tail-p node)
+                  ;; Even if the combination will never return, don't
+                  ;; terminate if this is the tail call of a XEP: doing
+                  ;; that would inhibit TCO.
+                  (xep-tail-combination-p node)
+                  ;; Do not consider the block for termination if this
+                  ;; is a LET-like combination, since the successor of
+                  ;; this node is the body of the LET.
+                  (and (combination-p node)
+                       (eq (combination-kind node) :local)
+                       (functional-somewhat-letlike-p (combination-lambda node))))
         (cond (ir1-converting-not-optimizing-p
                (cond
                  ((block-last block)
@@ -1353,7 +1440,12 @@
                   (let* ((*inline-expansions*
                            (register-inline-expansion leaf call))
                          (res (ir1-convert-inline-expansion leaf inlinep)))
-                    (setf (defined-fun-functional leaf) res)
+                    (when (or (eq inlinep 'maybe-inline)
+                              (policy call
+                                  (or (< speed space)
+                                      (< speed compilation-speed))))
+                      ;; Expand once
+                      (setf (defined-fun-functional leaf) res))
                     (change-ref-leaf ref res)
                     (unless ir1-converting-not-optimizing-p
                       (locall-analyze-component *current-component*))))
@@ -1446,8 +1538,27 @@
       (:full
        (multiple-value-bind (leaf info)
            (multiple-value-bind (type name leaf asserted) (lvar-fun-type fun-lvar)
-             (declare (ignore name))
-             (validate-call-type call type leaf nil asserted))
+             (declare (ignorable name asserted))
+             (when (and (functional-p leaf)
+                        (cast-p (lvar-uses fun-lvar))
+                        (atom (lvar-uses (cast-value (lvar-uses fun-lvar)))))
+               ;; Delete the cast for the call to be inlined,
+               ;; validate-call-type will transfer the types onto the arguments.
+               (setf (leaf-where-from leaf) :declared-verify)
+               (delete-cast (lvar-uses fun-lvar)))
+             (validate-call-type call type leaf nil
+                                 (or asserted
+                                     (policy call (zerop type-check))
+                                     #+sb-xc-host t
+                                     ;; Trust types coming from the system structures
+                                     (let ((source (lvar-uses fun-lvar)))
+                                       (and (combination-p source)
+                                            (lvar-fun-is (combination-fun source) '(%instance-ref))
+                                            (let ((type (lvar-type (car (combination-args source)))))
+                                              (and (structure-classoid-p type)
+                                                   (let ((package (sb-xc:symbol-package (classoid-name type))))
+                                                     (or (eq package *cl-package*)
+                                                         (and package (system-package-p package)))))))))))
          (cond ((functional-p leaf)
                 (convert-call-if-possible
                  (lvar-uses (basic-combination-fun call))
@@ -1456,6 +1567,8 @@
                ((and (global-var-p leaf)
                      (eq (global-var-kind leaf) :global-function)
                      (leaf-has-source-name-p leaf)
+                     (or (not (defined-fun-p leaf))
+                         (not (eq (defined-fun-inlinep leaf) 'notinline)))
                      (or (info :function :source-transform (leaf-source-name leaf))
                          (and info
                               (ir1-attributep (fun-info-attributes info)
@@ -1470,7 +1583,7 @@
                                      (,@(if (symbolp name)
                                             `(,name)
                                             `(funcall #',name))
-                                        ,@dummies))
+                                      ,@dummies))
                                   (leaf-source-name leaf)
                                   nil))))))))
   (values))
@@ -1504,9 +1617,8 @@
          (fun (transform-function transform))
          (constrained (fun-type-p type))
          (table (component-failed-optimizations *component-being-compiled*))
-         (flame (case (transform-important transform)
-                  ((t) (policy node (>= speed inhibit-warnings)))
-                  (:slightly (policy node (> speed inhibit-warnings)))))
+         (flame (and (transform-important transform)
+                     (policy node (> speed inhibit-warnings))))
          (*compiler-error-context* node)
          (policy-test (transform-policy transform)))
     (cond ((and policy-test
@@ -1576,40 +1688,40 @@
 (defun abort-ir1-transform (&rest args)
   (throw 'give-up-ir1-transform (values :aborted args)))
 
-(defvar *delayed-ir1-transforms*)
+;;; Wait for the next component-reoptimize-counter
+(defun delay-ir1-optimizer (node reason)
+  (let* ((delayed (basic-combination-delay-to node))
+         (delayed-n (ash delayed -1))
+         (component *component-being-compiled*)
+         (reoptimize-counter (component-reoptimize-counter component))
+         (phase-counter (component-phase-counter component)))
+    (aver (eq component (node-component node)))
+    (ecase reason
+      (:constraint
+       (cond ((> phase-counter 0)
+              ;; There will be no more constraint-propagate
+              nil)
+             ((or (= delayed-n -1)
+                  (logbitp 0 delayed)) ;; delayed to :ir1-phases but :constraint takes priority
+              (push node *ir1-transforms-after-constraints*)
+              (setf (basic-combination-delay-to node)
+                    ;; Disambiguate by having different low bits
+                    (logand most-positive-fixnum (ash reoptimize-counter 1)))
+              t)
+             ((= delayed-n reoptimize-counter))))
+      (:ir1-phases
+       (cond ((and (not (logbitp 0 delayed))
+                   (= delayed-n reoptimize-counter))) ;; already delayed to :constraint
+             ((= delayed -1)
+              (push node *ir1-transforms-after-ir1-phases*)
+              (setf (basic-combination-delay-to node)
+                    (logand most-positive-fixnum (1+ (ash phase-counter 1))))
+              t)
+             ((= delayed-n phase-counter)))))))
 
-(defun delay-ir1-transform (node &rest reasons)
-  (let ((assoc (assoc node *delayed-ir1-transforms*)))
-    (cond ((not assoc)
-           (setf *delayed-ir1-transforms*
-                 (acons node reasons *delayed-ir1-transforms*))
-           (throw 'give-up-ir1-transform :delayed))
-          ((cdr assoc)
-           (dolist (reason reasons)
-             (pushnew reason (cdr assoc)))
-           (throw 'give-up-ir1-transform :delayed)))))
-
-(defun delay-ir1-transform-p (node &rest reasons)
-  (let ((assoc (assoc node *delayed-ir1-transforms*)))
-    (cond ((not assoc)
-            (setf *delayed-ir1-transforms*
-                    (acons node reasons *delayed-ir1-transforms*))
-           t)
-          ((cdr assoc)
-            (dolist (reason reasons)
-              (pushnew reason (cdr assoc)))
-            t))))
-
-(defun delay-ir1-optimizer (node &rest reasons)
-  (let ((assoc (assoc node *delayed-ir1-transforms*)))
-    (cond ((not assoc)
-           (setf *delayed-ir1-transforms*
-                 (acons node reasons *delayed-ir1-transforms*))
-           t)
-          ((cdr assoc)
-           (dolist (reason reasons)
-             (pushnew reason (cdr assoc)))
-           t))))
+(defun delay-ir1-transform (node reason)
+  (when (delay-ir1-optimizer node reason)
+    (throw 'give-up-ir1-transform :delayed)))
 
 ;;; Poor man's catching and resignalling
 ;;; Implicit %GIVE-UP macrolet will resignal the give-up "condition"
@@ -1630,26 +1742,14 @@
                                                                 ,',args))))
               ,@gave-up-body)))))))
 
-;;; Clear any delayed transform with no reasons - these should have
-;;; been tried in the last pass. Then remove the reason from the
-;;; delayed transform reasons, and if any become empty then set
-;;; reoptimize flags for the node. Return true if any transforms are
-;;; to be retried.
-(defun retry-delayed-ir1-transforms (reason)
-  (setf *delayed-ir1-transforms*
-        (remove-if-not #'cdr *delayed-ir1-transforms*))
+(defun retry-delayed-ir1-transforms (nodes)
   (let ((reoptimize nil))
-    (dolist (assoc *delayed-ir1-transforms*)
-      (let ((reasons (remove reason (cdr assoc))))
-        (setf (cdr assoc) reasons)
-        (unless reasons
-          (let ((node (car assoc)))
-            (unless (node-deleted node)
-              (setf reoptimize t)
-              (setf (node-reoptimize node) t)
-              (let ((block (node-block node)))
-                (setf (block-reoptimize block) t)
-                (reoptimize-component (block-component block) :maybe)))))))
+    (dolist (node nodes)
+      (unless (node-deleted node)
+        (setf reoptimize t)
+        (setf (node-reoptimize node) t)
+        (let ((block (node-block node)))
+          (setf (block-reoptimize block) t))))
     reoptimize))
 
 ;;; Take the lambda-expression RES, IR1 convert it in the proper
@@ -1666,12 +1766,6 @@
   (declare (type combination call) (list res))
   (aver (and (legal-fun-name-p source-name)
              (not (eql source-name '.anonymous.))))
-  ;; Try and DXify downward funargs before any transformation happens
-  ;; so that we get the right scoping information.
-  (when source-name
-    (let ((dxable-args (fun-name-dx-args source-name)))
-      (when dxable-args
-        (dxify-downward-funargs call dxable-args source-name))))
   (node-ends-block call)
   (setf (combination-lexenv call)
         (make-lexenv :default (combination-lexenv call)
@@ -1793,35 +1887,77 @@
             (ir1-attributep attributes foldable)
             (not (ir1-attributep attributes call)))))))
 
-;;; Return T if the function is foldable and if it's marked as CALL
-;;; all function arguments are FOLDABLE too.
-(defun constant-fold-call-p (combination)
-  (let* ((info (basic-combination-fun-info combination))
-         (attr (fun-info-attributes info))
-         (args (basic-combination-args combination)))
-    (cond ((not (ir1-attributep attr foldable))
-           nil)
-          ((ir1-attributep attr call)
-           (map-combination-args-and-types
-            (lambda (arg type lvars &optional annotation)
-              (declare (ignore type lvars))
-              (unless (if (eql (car annotation) 'function-designator)
-                          (let ((fun (or (lvar-fun-name arg t)
-                                         (and (constant-lvar-ignore-types-p arg)
-                                              (lvar-value arg)))))
-                            (and fun
-                                 (constant-fold-arg-p fun)))
-                          (constant-lvar-ignore-types-p arg))
-                (return-from constant-fold-call-p)))
-            combination
-            :info info
-            :unknown-keys-fun
-            (lambda (lvars)
-              (declare (ignore lvars))
-              (return-from constant-fold-call-p)))
-           t)
-          (t
-           (every #'constant-lvar-ignore-types-p args)))))
+(defun constant-fold-call (combination)
+  (when (node-lvar combination)
+    (let* ((info (basic-combination-fun-info combination))
+           (attr (fun-info-attributes info))
+           (args (basic-combination-args combination)))
+      (cond ((not (or (ir1-attributep attr foldable)
+                      (and (ir1-attributep attr foldable-read-only)
+                           ;; (car (list 1)) => (car '(1))
+                           (block nil
+                             (map-refs
+                              (lambda (dest lvar)
+                                (unless (and (combination-p dest)
+                                             (eq (combination-kind dest) :known)
+                                             (let* ((info (combination-fun-info dest))
+                                                    (read-only (fun-info-read-only-args info)))
+                                               (when read-only
+                                                 (logbitp (position lvar (combination-args dest))
+                                                          read-only))))
+                                  (return)))
+                              (node-lvar combination)
+                              :leaf-set (lambda () (return))
+                              :cast t)
+                             t))))
+             nil)
+            ((ir1-attributep attr call)
+             (map-combination-args-and-types
+              (lambda (arg type lvars &optional annotation)
+                (declare (ignore type lvars))
+                (unless (if (eql (car annotation) 'function-designator)
+                            (let ((fun (or (lvar-fun-name arg t)
+                                           (and (constant-lvar-ignore-types-p arg)
+                                                (lvar-value arg t)))))
+                              (and fun
+                                   (constant-fold-arg-p fun)))
+                            (constant-lvar-ignore-types-p arg))
+                  (return-from constant-fold-call)))
+              combination
+              :info info
+              :unknown-keys-fun
+              (lambda (lvars)
+                (declare (ignore lvars))
+                (return-from constant-fold-call)))
+             (%constant-fold-call combination))
+            (t
+             (let (mu-constant
+                   mv-bind
+                   mv-bind-nth)
+               (when (loop for arg in args
+                           for uses = (lvar-uses arg)
+                           always (cond ((atom uses)
+                                         (or (constant-lvar-ignore-types-p arg)
+                                             (and (not mu-constant)
+                                                  (ref-p uses)
+                                                  (not (cdr (leaf-refs (ref-leaf uses))))
+                                                  (multiple-value-bind (uses nth-value) (mv-principal-lvar-ref-use arg t t)
+                                                    (when (and nth-value
+                                                               (listp uses)
+                                                               (loop for use in uses
+                                                                     always (and (combination-is use '(values))
+                                                                                 (constant-ref-p
+                                                                                  (lvar-uses (nth nth-value (combination-args use)))))))
+                                                      (setf mu-constant arg
+                                                            mv-bind uses
+                                                            mv-bind-nth nth-value))))))
+                                        ((and (not mu-constant)
+                                              (loop for use in uses
+                                                    always (constant-ref-p use)))
+                                         (setf mu-constant arg))))
+                 (if mu-constant
+                     (%constant-fold-call-multiple-uses combination mu-constant mv-bind mv-bind-nth)
+                     (%constant-fold-call combination)))))))))
 
 ;;; Replace a call to a foldable function of constant arguments with
 ;;; the result of evaluating the form. If there is an error during the
@@ -1830,32 +1966,41 @@
 ;;;
 ;;; If there is more than one value, then we transform the call into a
 ;;; VALUES form.
-(defun constant-fold-call (call)
+(defun %constant-fold-call (call)
   (flet ((value (lvar)
            (if (lvar-p lvar)
                (let ((name (lvar-fun-name lvar t)))
                  (if name
                      (fdefinition name)
-                     (lvar-value lvar)))
+                     (lvar-value lvar t)))
                lvar)))
-   (let* ((fun-name (lvar-fun-name (combination-fun call) t))
-          (type (info :function :type fun-name))
-          (lvar-args (let ((args (combination-args call)))
-                       (if (fun-type-p type)
-                           (resolve-key-args args type)
-                           args)))
-          (args (mapcar #'value lvar-args)))
-     (multiple-value-bind (values win) (careful-call (or (and (combination-fun-info call)
-                                                              (fun-info-folder (combination-fun-info call)))
-                                                         fun-name)
-                                                     args)
-       (cond ((not win)
-              (setf (combination-kind call) :error
-                    (combination-info call)
-                    (list #'compiler-style-warn "Lisp error during constant folding:~%~A" values)))
-             ((and (proper-list-of-length-p values 1))
-              (replace-combination-with-constant (first values) call))
-             (t (let ((dummies (make-gensym-list (length args))))
+    (let* ((fun-name (lvar-fun-name (combination-fun call) t))
+           (type (info :function :type fun-name))
+           (lvar-args (let ((args (combination-args call)))
+                        (if (fun-type-p type)
+                            (resolve-key-args args type)
+                            args)))
+           (args (mapcar #'value lvar-args))
+           (info (combination-fun-info call))
+           (folder (fun-info-folder info))
+           (fold-p (fun-info-fold-p info)))
+      (when (or (not fold-p)
+                (apply fold-p args))
+       (multiple-value-bind (values win ignore) (careful-call (or folder
+                                                           fun-name)
+                                                       args)
+         (cond ((not win)
+                ;; Ignore errors from dedicated folders, in lieu of adding fun-info-fold-p.
+                (unless (or folder
+                            ignore)
+                  (setf (combination-kind call) :error
+                        (combination-info call)
+                        (list #'compiler-style-warn "Lisp error during constant folding:~%~A" values))
+                  t))
+               ((and (proper-list-of-length-p values 1))
+                (replace-combination-with-constant (first values) call))
+               (t
+                (let ((dummies (make-gensym-list (length args))))
                   (transform-call
                    call
                    `(lambda ,dummies
@@ -1869,16 +2014,115 @@
                                                 `(with-annotations ,(lvar-annotations lvar) ',x)
                                                 `',x)))
                                         values)))
-                   fun-name)))))))
-  (values))
+                   fun-name))
+                t)))))))
+;; fold
+;; (1+ (if a 1 2))
+;; to
+;; (if a 2 3)
+(defun %constant-fold-call-multiple-uses (call multi-use-lvar mv-bind nth-value)
+  (flet ((value (lvar)
+           (if (lvar-p lvar)
+               (let ((name (lvar-fun-name lvar t)))
+                 (if name
+                     (fdefinition name)
+                     (lvar-value lvar t)))
+               lvar))
+         (ref-value (ref)
+           (let ((name (ref-fun-name ref t)))
+             (if name
+                 (fdefinition name)
+                 (constant-value (ref-leaf ref))))))
+    (with-ir1-environment-from-node call
+      (let* ((fun-name (lvar-fun-name (combination-fun call) t))
+             (args (combination-args call))
+             (info (combination-fun-info call))
+             (fun-info-folder (fun-info-folder info))
+             (folder (or fun-info-folder fun-name))
+             (fold-p (fun-info-fold-p info))
+             mv
+             single-value-mv
+             (single-value-p (lvar-single-value-p (node-lvar call)))
+             (values (loop for use in (or mv-bind
+                                          (lvar-uses multi-use-lvar))
+                           for constants = (loop for arg in args
+                                                 collect (if (eq arg multi-use-lvar)
+                                                             (if mv-bind
+                                                                 (value (nth nth-value (combination-args use)))
+                                                                 (ref-value use))
+                                                             (value arg)))
+                           do
+                           (when fold-p
+                             (unless (apply fold-p constants)
+                               (return-from %constant-fold-call-multiple-uses)))
+                           collect
+                           (multiple-value-bind (values win) (careful-call folder constants)
+                             (unless win
+                               (return-from %constant-fold-call-multiple-uses))
+                             (cond ((= (length values) 1))
+                                   (single-value-p
+                                    (setf single-value-mv t))
+                                   (mv-bind
+                                    (return-from %constant-fold-call-multiple-uses))
+                                   (t
+                                    (setf mv t)))
+                             (cons
+                              values
+                              (list* fun-name constants))))))
+        (cond (mv
+               (when (loop for ref in (lvar-uses multi-use-lvar)
+                           always (almost-immediately-used-p multi-use-lvar ref :flushable t
+                                                                                :no-multiple-value-lvars t))
+                 (loop for ref in (lvar-uses multi-use-lvar)
+                       for (value) in values
+                       do
+                       (replace-node ref `(values ,@(loop for v in value
+                                                          collect (list 'quote v))))
+                       (delete-ref ref))
+                 (erase-lvar-type multi-use-lvar)
+                 (use-lvar (insert-cast-after call multi-use-lvar *wild-type* **zero-typecheck-policy** nil t)
+                           (node-lvar call))
+                 (flush-dest (combination-fun call))
+                 (dolist (arg args)
+                   (unless (eq arg multi-use-lvar)
+                     (flush-dest arg)))
+                 (unlink-node call)
+                 t))
+              (t
+               (cond (mv-bind
+                      (loop for use in mv-bind
+                            for values-arg = (nth nth-value (combination-args use))
+                            for ref = (lvar-uses values-arg)
+                            for ((value) . source) in values
+                            do
+                            (push source (node-source-path ref))
+                            (change-ref-leaf ref (find-constant value)
+                                             :recklessly t)
+                            (erase-lvar-type values-arg)))
+                     (t
+                      (loop for ref in (lvar-uses multi-use-lvar)
+                            for ((value) . source) in values
+                            do (push source (node-source-path ref))
+                               (change-ref-leaf ref (find-constant value)
+                                                :recklessly t))
+                      (erase-lvar-type multi-use-lvar)))
+               (when single-value-mv
+                 (replace-node-type call (lvar-derived-type multi-use-lvar))
+                 (principal-lvar-single-valuify (node-lvar call)))
+               (let ((ll (make-gensym-list (length args))))
+                 (transform-call call
+                                 `(lambda ,ll
+                                    (declare (ignorable ,@ll))
+                                    ,(nth (position multi-use-lvar args) ll))
+                                 fun-name))
+               t))))))
 
 (defun fold-call-derived-to-constant (call)
-  (when (flushable-combination-p call)
-    (let ((type (node-derived-type call)))
-      (when (type-single-value-p type)
-        (multiple-value-bind (single-p value) (type-singleton-p (single-value-type type))
-          (when single-p
-            (replace-combination-with-constant value call)))))))
+  (let ((type (node-derived-type call)))
+    (when (type-single-value-p type)
+      (multiple-value-bind (single-p value) (type-singleton-p (single-value-type type))
+        (when single-p
+          (replace-combination-with-constant value call))))))
 
 ;;;; local call optimization
 
@@ -1903,7 +2147,7 @@
                 (and (cdr refs)
                      (eq :declared (leaf-where-from leaf))
                      (type-needs-conservation-p var-type)))
-      (let ((int (type-approx-intersection2 var-type type)))
+      (let ((int (type-intersection var-type type)))
         ;; Can't use type/=, which gives up on hairy types.
         (unless (type= int var-type)
           (setf (leaf-type leaf) int)
@@ -1919,36 +2163,39 @@
 
 ;;; Turn (or (integer 1 1) (integer 3 3)) to (integer 1 3)
 (defun weaken-numeric-union-type (type)
-  (if (union-type-p type)
-      (let ((low  nil)
-            (high nil)
-            class
-            (format :no))
-        (dolist (part (union-type-types type)
-                      (make-numeric-type :class class
-                                         :format format
-                                         :low low
-                                         :high high))
-          (unless (and (numeric-type-real-p part)
-                       (if class
-                           (eql (numeric-type-class part) class)
-                           (setf class (numeric-type-class part)))
-                       (cond ((eq format :no)
-                              (setf format (numeric-type-format part))
-                              t)
-                             ((eql (numeric-type-format part) format))))
-            (return type))
-          (let ((this-low (numeric-type-low part))
-                (this-high (numeric-type-high part)))
-            (unless (and this-low this-high)
-              (return type))
-            (when (consp this-low)
-              (setf this-low (car this-low)))
-            (when (consp this-high)
-              (setf this-high (car this-high)))
-            (setf low  (sb-xc:min this-low  (or low  this-low))
-                  high (sb-xc:max this-high (or high this-high))))))
-      type))
+  (cond ((union-type-p type)
+         (let ((low  nil)
+               (high nil)
+               class
+               (format :no))
+           (dolist (part (union-type-types type)
+                         (make-numeric-type :class class
+                                            :format format
+                                            :low low
+                                            :high high))
+             (unless (and (numeric-type-real-p part)
+                          (if class
+                              (eql (numeric-type-class part) class)
+                              (setf class (numeric-type-class part)))
+                          (cond ((eq format :no)
+                                 (setf format (numeric-type-format part))
+                                 t)
+                                ((eql (numeric-type-format part) format))))
+               (return type))
+             (let ((this-low (numeric-type-low part))
+                   (this-high (numeric-type-high part)))
+               (unless (and this-low this-high)
+                 (return type))
+               (when (consp this-low)
+                 (setf this-low (car this-low)))
+               (when (consp this-high)
+                 (setf this-high (car this-high)))
+               (setf low  (sb-xc:min this-low  (or low  this-low))
+                     high (sb-xc:max this-high (or high this-high)))))))
+        ((typep type 'numeric-union-type)
+         (sb-kernel::weaken-numeric-union  type))
+        (t
+         type)))
 
 ;;; Iteration variable: only SETQs of the form:
 ;;;
@@ -2103,20 +2350,86 @@
       (reoptimize-lvar (set-value dest))))
   (give-up-ir1-transform))
 
+;;; Remove bounds
+(defun simplify-numeric-type (x)
+  (macrolet ((m (&rest types)
+               `(cond ,@(loop for type in types
+                              collect
+                              `((csubtypep x (specifier-type ',type))
+                                (specifier-type ',type)))
+                      (t x))))
+    (m single-float double-float integer float real)))
+
+;;; Try to invoke the type deriver of FUNCTION in (setf x (function x))
+(defun set-type-of-combination (var set initial-type)
+  (let ((combination (principal-lvar-ref-use (set-value set) t)))
+    (when (and (combination-p combination)
+               (eq (combination-kind combination) :known))
+      (let* ((info (combination-fun-info combination))
+             (deriver (and info
+                           (fun-info-derive-type info)))
+             (args (combination-args combination))
+             (var-args))
+        (when deriver
+          (map-combination-args-and-types
+           (lambda (arg type lvars &optional annotation)
+             (declare (ignore lvars annotation))
+             (let ((arg-var (or (lvar-lambda-var arg)
+                                (let ((use (lvar-uses arg)))
+                                  (and (cast-p use)
+                                       (lvar-lambda-var (cast-value use)))))))
+               (when (eq arg-var var)
+                 (setf initial-type
+                       ;; Type derivers expect the right types
+                       (type-intersection initial-type type))
+                 (push arg var-args))))
+           combination)
+          (when (and var-args
+                     (neq initial-type *empty-type*))
+            (labels ((derive (type)
+                       (single-value-type
+                        (or
+                         (combination-derive-type-for-arg-types combination
+                                                                (loop for arg in args
+                                                                      collect (if (memq arg var-args)
+                                                                                  type
+                                                                                  arg)))
+                         (return-from set-type-of-combination))))
+                     (converges-p (initial-type)
+                       (let ((derived (derive initial-type)))
+                         (when derived
+                           ;; Does it converge to the same type again?
+                           (let* ((union (type-union derived initial-type))
+                                  (again-derived (derive union)))
+                             (when (type= derived again-derived)
+                               union))))))
+              ;; Some functions preserve bounds, like LOGIOR
+              (or (converges-p initial-type)
+                  ;; remove bounds or the types won't converge
+                  (let ((simple (simplify-numeric-type initial-type)))
+                    (unless (eq simple initial-type)
+                      (converges-p simple)))))))))))
+
 ;;; Figure out the type of a LET variable that has sets. We compute
 ;;; the union of the INITIAL-TYPE and the types of all the set
 ;;; values and do a PROPAGATE-TO-REFS with this type.
 (defun propagate-from-sets (var initial-type)
-  (let ((types nil))
-    (dolist (set (lambda-var-sets var))
-      (let ((type (lvar-type (set-value set))))
-        (push type types)
-        (when (and (node-reoptimize set)
-                   (not (node-to-be-deleted-p set)))
-          (let ((old-type (node-derived-type set)))
-            (unless (values-subtypep old-type type)
-              (derive-node-type set (make-single-value-type type))))
-          (setf (node-reoptimize set) nil))))
+  (let ((types nil)
+        (sets (lambda-var-sets var)))
+    (or (and sets
+             (not (cdr sets))
+             (let ((type (set-type-of-combination var (car sets) initial-type)))
+               (when type
+                 (push type types))))
+        (dolist (set sets)
+          (let ((type (lvar-type (set-value set))))
+            (push type types)
+            (when (and (node-reoptimize set)
+                       (not (node-to-be-deleted-p set)))
+              (let ((old-type (node-derived-type set)))
+                (unless (values-subtypep old-type type)
+                  (derive-node-type set (make-single-value-type type))))
+              (setf (node-reoptimize set) nil)))))
     (let ((res-type (or (maybe-infer-iteration-var-type var initial-type)
                         (apply #'type-union initial-type types))))
       (propagate-to-refs var res-type)))
@@ -2130,10 +2443,15 @@
   (let ((var (set-var node)))
     (when (and (lambda-var-p var) (leaf-refs var))
       (let ((home (lambda-var-home var)))
-        (when (functional-kind-eq home let)
-          (let* ((initial-value (let-var-initial-value var))
-                 (initial-type (lvar-type initial-value)))
-            (setf (lvar-reoptimize initial-value) nil)
+        (let ((initial-type
+                (cond ((functional-kind-eq home let)
+                       (let ((initial-value (let-var-initial-value var)))
+                         (setf (lvar-reoptimize initial-value) nil)
+                         (lvar-type initial-value)))
+                      ((and (eq (leaf-type var) *universal-type*)
+                            (neq (leaf-defined-type var) *universal-type*))
+                       (leaf-defined-type var)))))
+          (when initial-type
             (propagate-from-sets var initial-type))))))
   (derive-node-type node (make-single-value-type
                           (lvar-type (set-value node))))
@@ -2155,9 +2473,12 @@
        (case (global-var-kind leaf)
          (:global-function
           (let ((name (leaf-source-name leaf)))
-            (or (eq (sb-xc:symbol-package (fun-name-block-name name))
-                    *cl-package*)
-                (info :function :info name)))))))))
+            (or (eq (sb-xc:symbol-package (fun-name-block-name name)) *cl-package*)
+                (info :function :info name)
+                (and (not (fun-lexically-notinline-p name (node-lexenv ref)))
+                     (or
+                      (info :function :source-transform name)
+                      (eq (info :function :inlinep name) 'inline)))))))))))
 
 ;;; If we have a non-set LET var with a single use, then (if possible)
 ;;; replace the variable reference's LVAR with the arg lvar.
@@ -2358,72 +2679,79 @@
 ;;; If the function has an XEP, then we don't do anything, since we
 ;;; won't discover anything.
 ;;;
-;;; If the function is an optional-entry-point, we will just make sure
-;;; &REST lists are known to be lists. Doing the regular rigamarole
-;;; can erroneously propagate too strict types into refs: see
-;;; BUG-655203-REGRESSION in tests/compiler.pure.lisp.
-;;;
+
 ;;; We can clear the LVAR-REOPTIMIZE flags for arguments in all calls
 ;;; corresponding to changed arguments in CALL, since the only use in
 ;;; IR1 optimization of the REOPTIMIZE flag for local call args is
 ;;; right here.
 (defun propagate-local-call-args (call fun)
   (declare (type combination call) (type clambda fun))
-  (unless (functional-entry-fun fun)
-    (if (and (lambda-optional-dispatch fun)
-             (not (functional-kind-eq (lambda-optional-dispatch fun) deleted)))
-        ;; We can still make sure &REST is known to be a list.
-        (loop for var in (lambda-vars fun)
-              do (let ((info (lambda-var-arg-info var)))
-                   (when (and info (eq :rest (arg-info-kind info)))
-                     (propagate-from-sets var (specifier-type 'list)))))
-        ;; The normal case.
-        (let* ((vars (lambda-vars fun))
-               (union (mapcar (lambda (arg var)
-                                (when (and arg
-                                           (lvar-reoptimize arg)
-                                           (null (basic-var-sets var)))
-                                  (lvar-type arg)))
-                              (basic-combination-args call)
-                              vars))
-               (this-ref (lvar-use (basic-combination-fun call))))
+  (unless (or (functional-entry-fun fun)
+              (let ((optional (lambda-optional-dispatch fun)))
+                (and optional
+                     (not (functional-kind-eq optional deleted))
+                     (let ((entry (functional-entry-fun optional)))
+                       ;; If no references can turn this into a local
+                       ;; call then optional dispacthes can propagate
+                       ;; their default args.
+                       (unless (or (not entry)
+                                   (and
+                                    (fun-type-p (leaf-defined-type optional))
+                                    (loop for ref in (leaf-refs entry)
+                                          always (combination-is (node-dest ref) '(sb-impl::%defun)))))
+                         ;; We can still make sure &REST is known to be a list.
+                         (loop for var in (lambda-vars fun)
+                               do (let ((info (lambda-var-arg-info var)))
+                                    (when (and info (eq :rest (arg-info-kind info)))
+                                      (propagate-from-sets var (specifier-type 'list)))))
+                         t)))))
+    (let* ((vars (lambda-vars fun))
+           (union (mapcar (lambda (arg)
+                            (when (and arg
+                                       (lvar-reoptimize arg))
+                              (list (lvar-type arg))))
+                          (basic-combination-args call)))
+           (this-ref (lvar-use (basic-combination-fun call))))
 
-          (dolist (arg (basic-combination-args call))
-            (when arg
-              (setf (lvar-reoptimize arg) nil)))
+      (dolist (arg (basic-combination-args call))
+        (when arg
+          (setf (lvar-reoptimize arg) nil)))
+      (dolist (ref (leaf-refs fun))
+        (let ((dest (node-dest ref)))
+          (unless (or (eq ref this-ref) (not dest))
+            (setq union
+                  (mapcar (lambda (this-arg old)
+                            (when old
+                              (setf (lvar-reoptimize this-arg) nil)
+                              (cons (lvar-type this-arg) old)))
+                          (basic-combination-args dest)
+                          union)))))
 
-          (dolist (ref (leaf-refs fun))
-            (let ((dest (node-dest ref)))
-              (unless (or (eq ref this-ref) (not dest))
-                (setq union
-                      (mapcar (lambda (this-arg old)
-                                (when old
-                                  (setf (lvar-reoptimize this-arg) nil)
-                                  (type-union (lvar-type this-arg) old)))
-                              (basic-combination-args dest)
-                              union)))))
+      (loop for var in vars
+            and type in union
+            when type do
+            (let ((type (sb-kernel::%type-union type)))
+              (if (basic-var-sets var)
+                  (setf (leaf-defined-type var) type)
+                  (propagate-to-refs var type))))
 
-          (loop for var in vars
-                and type in union
-                when type do (propagate-to-refs var type))
-
-          ;; It's possible to discover new inline calls which may have
-          ;; incompatible argument types, so don't allow reuse of this
-          ;; functional during future inline expansion to prevent
-          ;; spurious type conflicts.
-          (let ((defined-fun (and (functional-inline-expanded fun)
-                                  (gethash (leaf-%source-name fun)
-                                           (free-funs *ir1-namespace*)))))
-            (when (defined-fun-p defined-fun)
-              (do ((args (basic-combination-args call) (cdr args))
-                   (vars vars (cdr vars)))
-                  ((null args))
-                (let ((arg (car args))
-                      (var (car vars)))
-                  (unless (and arg
-                               (eq (leaf-type var) *universal-type*))
-                    (setf (defined-fun-functional defined-fun) nil)
-                    (return)))))))))
+      ;; It's possible to discover new inline calls which may have
+      ;; incompatible argument types, so don't allow reuse of this
+      ;; functional during future inline expansion to prevent
+      ;; spurious type conflicts.
+      (let ((defined-fun (and (functional-inline-expanded fun)
+                              (gethash (leaf-%source-name fun)
+                                       (free-funs *ir1-namespace*)))))
+        (when (defined-fun-p defined-fun)
+          (do ((args (basic-combination-args call) (cdr args))
+               (vars vars (cdr vars)))
+              ((null args))
+            (let ((arg (car args))
+                  (var (car vars)))
+              (unless (and arg
+                           (eq (leaf-type var) *universal-type*))
+                (setf (defined-fun-functional defined-fun) nil)
+                (return))))))))
 
   (values))
 
@@ -2460,15 +2788,33 @@
                  (t
                   (propagate-let-args node lambda)))))
         (:full
-         (let* ((fun-changed (lvar-reoptimize fun)))
-           (loop for arg in (basic-combination-args node)
+         (let* ((fun-changed (lvar-reoptimize fun))
+                (name (lvar-fun-name fun))
+                (args (basic-combination-args node)))
+           (loop for arg in args
                  do
                  (setf (lvar-reoptimize arg) nil))
            (when fun-changed
              (setf (lvar-reoptimize fun) nil)
-             (let ((type (lvar-fun-type fun t t)))
-               (when (fun-type-p type)
-                 (derive-node-type node (fun-type-returns type))))
+             (let ((info (info :function :info name)))
+               (let ((type (lvar-fun-type fun t t)))
+                 (when (fun-type-p type)
+                   (derive-node-type node (fun-type-returns type))))
+               (when (and info
+                          (ir1-attributep (fun-info-attributes info) mv-deriver))
+                 (let* ((known-types
+                          (loop for arg in args
+                                append
+                                (multiple-value-bind (types count) (values-types (lvar-derived-type arg))
+                                  (cond ((eq count :unknown)
+                                         (loop-finish))
+                                        (t
+                                         types))))))
+                   (when known-types
+                     (setf (basic-combination-fun-info node) info)
+                     (let ((type (combination-derive-type-for-arg-types node known-types)))
+                       (when type
+                         (derive-node-type node type)))))))
              (maybe-terminate-block node nil)
              (let ((use (lvar-uses fun)))
                (when (and (ref-p use) (functional-p (ref-leaf use)))
@@ -2477,7 +2823,7 @@
                    (or (maybe-let-convert (ref-leaf use))
                        (maybe-convert-to-assignment (ref-leaf use)))))))
            (unless (or (eq (basic-combination-kind node) :local)
-                       (eq (lvar-fun-name fun) '%throw))
+                       (eq name '%throw))
              (ir1-optimize-mv-call node))))
         (:error))))
 
@@ -2616,6 +2962,10 @@
                         (not (type-single-value-p (node-derived-type use)))))
                   ;; single-value returning forms
                   ((leaf-refs (car vars))) ;; the first value is used, nothing to do
+                  ((exit-p use)
+                   (let ((lvar (exit-value use)))
+                     (erase-node-type use (values-specifier-type '(values null &optional)))
+                     (substitute-lvar-uses (make-nil lvar) lvar nil)))
                   (t
                    ;; A single NIL will do
                    (let ((lvar (node-lvar use)))
@@ -2720,25 +3070,26 @@
                                        do (flush-dest arg))
                                  ;; Reference NIL for unsupplied arguments
                                  (when lvars
-                                   (let ((node-prev (node-prev use)))
-                                     (setf (node-prev use) nil)
-                                     (setf (ctran-next node-prev) nil)
-                                     (loop for lvar in lvars
-                                           for prev = node-prev then ctran
-                                           for ctran = (make-ctran)
-                                           do
-                                           (reference-constant prev ctran lvar nil)
-                                           finally
-                                           (link-node-to-previous-ctran use ctran)))))))
+                                   (with-ir1-environment-from-node use
+                                     (let ((node-prev (node-prev use)))
+                                       (setf (node-prev use) nil)
+                                       (setf (ctran-next node-prev) nil)
+                                       (loop for lvar in lvars
+                                             for prev = node-prev then ctran
+                                             for ctran = (make-ctran)
+                                             do
+                                             (reference-constant prev ctran lvar nil)
+                                             finally
+                                             (link-node-to-previous-ctran use ctran))))))))
                         (loop for use in uses
                               do
                               (cond ((and (combination-p use)
-                                        (eq (lvar-fun-name (combination-fun use))
-                                            'values))
-                                   (handle use (combination-args use)
-                                           (values-type-types (node-derived-type use)))
-                                   (flush-dest (combination-fun use))
-                                   (unlink-node use))
+                                          (eq (lvar-fun-name (combination-fun use))
+                                              'values))
+                                     (handle use (combination-args use)
+                                             (values-type-types (node-derived-type use)))
+                                     (flush-dest (combination-fun use))
+                                     (unlink-node use))
                                     (t
                                      (handle use args nil)))))))
                (propagate-to-args new-call fun)
@@ -2757,34 +3108,65 @@
 ;;; (allowing the LIST to be flushed.)
 (defoptimizer (values-list optimizer) ((list) node)
   (let ((use (lvar-uses list)))
-    (when (combination-p use)
-      (let ((name (lvar-fun-name (combination-fun use)))
-            (args (combination-args use)))
-        ;; Recognizing LIST* seems completely ad-hoc, however, once upon a time
-        ;; (LIST x) was translated to (CONS x NIL), so in order for this optimizer to
-        ;; pick off (VALUES-LIST (LIST x)), it had to instead look for (CONS x NIL).
-        ;; Realistically nobody should hand-write (VALUES-LIST ({CONS | LIST*} x NIL))
-        ;; so it seems very questionable in utility to preserve both spellings.
-        (when (or (eq name 'list)
-                  (and (eq name 'list*)
-                       (let ((cdr (car (last args))))
-                        (and (lvar-value-is cdr nil)
-                             (progn
-                               (flush-dest cdr)
-                               (setf args (butlast args))
-                               t)))))
+    (cond ((combination-p use)
+           (let ((name (lvar-fun-name (combination-fun use)))
+                 (args (combination-args use)))
+             ;; Recognizing LIST* seems completely ad-hoc, however, once upon a time
+             ;; (LIST x) was translated to (CONS x NIL), so in order for this optimizer to
+             ;; pick off (VALUES-LIST (LIST x)), it had to instead look for (CONS x NIL).
+             ;; Realistically nobody should hand-write (VALUES-LIST ({CONS | LIST*} x NIL))
+             ;; so it seems very questionable in utility to preserve both spellings.
+             (when (or (eq name 'list)
+                       (and (eq name 'list*)
+                            (let ((cdr (car (last args))))
+                              (and (lvar-value-is cdr nil)
+                                   (progn
+                                     (flush-dest cdr)
+                                     (setf args (butlast args))
+                                     t)))))
 
-          ;; FIXME: VALUES might not satisfy an assertion on NODE-LVAR.
-          (change-ref-leaf (lvar-uses (combination-fun node))
-                           (find-free-fun 'values "in a strange place"))
-          (setf (combination-kind node) :full)
-          (dolist (arg args)
-            (setf (lvar-dest arg) node))
-          (setf (combination-args use) nil)
-          (flush-dest list)
-          (flush-combination use)
-          (setf (combination-args node) args)
-          t)))))
+               ;; FIXME: VALUES might not satisfy an assertion on NODE-LVAR.
+               (change-ref-leaf (lvar-uses (combination-fun node))
+                                (find-free-fun 'values "VALUES-LIST"))
+               (setf (combination-kind node) :full)
+               (dolist (arg args)
+                 (setf (lvar-dest arg) node))
+               (setf (combination-args use) nil)
+               (flush-dest list)
+               (flush-combination use)
+               (setf (combination-args node) args)
+               t)))
+          ;; Transform (values-list (if x (list 1 2 3)))
+          ;; to
+          ;; (if x (values 1 2 3) (values))
+          ((flet ((use-good-p (use)
+                    (and
+                     (typecase use
+                       (combination
+                        (lvar-fun-is (combination-fun use) '(list)))
+                       (ref
+                        (and (ref-leaf use)
+                             (constant-p (ref-leaf use))
+                             (proper-list-p (constant-value (ref-leaf use))))))
+                     (almost-immediately-used-p list use
+                                                ;; Nothing should be pushed onto the stack in between
+                                                :no-multiple-value-lvars t))))
+             (and (listp use)
+                  (every #'use-good-p use)))
+           (flet ((transform (use)
+                    (cond ((ref-p use)
+                           (delete-ref use)
+                           (replace-node use `(values ,@(loop for v in (constant-value (ref-leaf use))
+                                                              collect (list 'quote v)))))
+                          (t
+                           (change-ref-leaf (lvar-uses (combination-fun use))
+                                            (find-free-fun 'values "VALUES-LIST"))
+                           (setf (combination-kind use) :full)
+                           (setf (node-derived-type use) *wild-type*)))))
+             (mapc #'transform use)
+             (substitute-lvar-uses (node-lvar node) list nil)
+             (unlink-node node)
+             t)))))
 
 (deftransform values-list ((list) * * :node node)
   (cond ((and (policy node (< safety 3))
@@ -2793,11 +3175,8 @@
         ((and (vop-existsp :named reverse-values-list)
               (lvar-matches (principal-lvar list) :fun-names '(reverse sb-impl::list-reverse))
               (almost-immediately-used-p list (lvar-use list) :flushable t))
-         (let ((cast (lvar-use list)))
-           (when (and (cast-p cast)
-                      (eq (cast-asserted-type cast) (specifier-type 'list)))
-             (delete-cast cast))
-          (splice-fun-args (principal-lvar list) :any 1))
+         (delete-lvar-cast-if (specifier-type 'list) list)
+         (splice-fun-args (principal-lvar list) :any 1)
          `(reverse-values-list list (length (the list list))))
         (t
          (give-up-ir1-transform))))
@@ -2829,11 +3208,12 @@
 
 ;;; TODO:
 ;;; - CAST chains;
-(defun delete-cast (cast)
+(defun delete-cast (cast &optional (derive-use-types t))
   (declare (type cast cast))
   (let ((value (cast-value cast))
         (lvar (cast-lvar cast)))
-    (unless (array-index-cast-p cast)
+    (when (and derive-use-types
+               (not (array-index-cast-p cast)))
       ;; Normally the types are the same, as the cast gets its derived
       ;; type from the lvar, but it may get a different type when an
       ;; inlined function with a derived type is let-converted.
@@ -2851,26 +3231,20 @@
   #+sb-xc-host context
   #-sb-xc-host (source-to-string context))
 
-(defun cast-mismatch-from-inlined-p (cast node)
-  (let* ((path (node-source-path node))
-         (transformed (memq 'transformed path))
-         (inlined))
-    (cond ((and transformed
-                (not (eq (memq 'transformed (node-source-path cast))
-                         transformed))))
-          ((setf inlined
-                 (memq 'inlined path))
-           (not (eq (memq 'inlined (node-source-path cast))
-                    inlined))))))
-
 ;;; Delete or move around casts when possible
 (defun maybe-delete-cast (cast)
   (let ((lvar (cast-lvar cast))
-        (value (cast-value cast)))
-    (cond ((delay-p cast) nil)
-          ((or (values-subtypep (lvar-derived-type value)
-                                (cast-asserted-type cast))
-               (and (fun-type-p (cast-asserted-type cast))
+        (value (cast-value cast))
+        (asserted (cast-asserted-type cast)))
+    (cond ((delay-p cast)
+           (unless (policy cast (>= insert-debug-catch 2)) ;; used to defeat TCO
+             (when (do-uses (use value t)
+                     (unless (immediately-used-p value use)
+                       (return)))
+               (delete-cast cast)
+               t)))
+          ((or (values-subtypep (lvar-derived-type value) asserted)
+               (and (fun-type-p asserted)
                     (let ((uses (lvar-uses value)))
                       (when (ref-p uses)
                         (let ((fun (ref-leaf uses)))
@@ -2878,23 +3252,32 @@
                                      (functional-entry-fun fun))
                             ;; FIXME: is it important to compute this once?
                             (csubtypep (definition-type (functional-entry-fun fun))
-                                       (cast-asserted-type cast))))))))
+                                       asserted)))))))
            (delete-cast cast)
            t)
           ((listp (lvar-uses value))
            ;; Turn (the vector (if x y #())) into
            ;; (if x (the vector y) #())
-           (let ((atype (cast-asserted-type cast))
-                 (ctran (node-next cast))
+           (let ((ctran (node-next cast))
                  (dest (and lvar
                             (lvar-dest lvar)))
-                 next-block)
+                 next-block
+                 good-types-not-immediately-used
+                 bad-use
+                 multiple-bad-uses)
              (collect ((merges))
                (do-uses (use value)
                  (let ((type (node-derived-type use)))
-                   (when (and (neq type *empty-type*)
-                              (values-subtypep (node-derived-type use) atype)
-                              (immediately-used-p value use))
+                   (when (and (or (and (neq type *empty-type*)
+                                       (values-subtypep type asserted))
+                                  (progn (if bad-use
+                                             (setf multiple-bad-uses t)
+                                             (setf bad-use use))
+                                         nil))
+                              (or (immediately-used-p value use)
+                                  (progn (when (almost-immediately-used-p value use :flushable t)
+                                           (setf good-types-not-immediately-used t))
+                                         nil)))
                      (unless next-block
                        (when ctran (ensure-block-start ctran))
                        (setq next-block (first (block-succ (node-block cast))))
@@ -2907,16 +3290,36 @@
                      (link-blocks (node-block use) next-block)
                      ;; At least one use is good, downgrade any possible
                      ;; type conflicts to style warnings.
-                     (setf (cast-silent-conflict cast)
-                           (if (cast-mismatch-from-inlined-p cast use)
-                               t
-                               :style-warning))
+                     (setf (cast-silent-conflict cast) :style-warning)
                      (when (and (return-p dest)
                                 (basic-combination-p use)
                                 (eq (basic-combination-kind use) :local))
                        (merges use)))))
                (dolist (use (merges))
-                 (merge-tail-sets use))))))))
+                 (merge-tail-sets use)))
+             ;; Can't move a use with a fitting type directly after
+             ;; the cast if there are intermediate nodes between the
+             ;; use and the cast. But if only one use has a bad type the
+             ;; cast can be moved to that use.
+             (when (and good-types-not-immediately-used
+                        (not multiple-bad-uses))
+               (let* ((new-type (values-type-intersection (if (exit-p bad-use)
+                                                              (lvar-derived-type (exit-value bad-use))
+                                                              (lvar-derived-type value)) asserted))
+                      (new-cast (cond ((exit-p bad-use)
+                                       (setf (node-derived-type bad-use) new-type)
+                                       (assert-lvar-type (exit-value bad-use) asserted (lexenv-policy (node-lexenv cast))
+                                                         (cast-context cast)
+                                                         t))
+                                      (t
+                                       (assert-node-type bad-use asserted (lexenv-policy (node-lexenv cast))
+                                                         (cast-context cast)
+                                                         t)))))
+                 (setf (cast-silent-conflict new-cast) :style-warning
+                       (node-source-path new-cast) (node-source-path cast)
+                       (node-derived-type new-cast) new-type))
+               (delete-filter cast lvar value)
+               t))))))
 
 (defun ir1-optimize-cast (cast)
   (declare (type cast cast))
@@ -2938,7 +3341,28 @@
                     (context (cast-context cast))
                     (context (if (local-call-context-p context)
                                  (local-call-context-var context)
-                                 context)))
+                                 context))
+                    (lvar (node-lvar cast))
+                    (bad-type value-type)
+                    bad-uses)
+               ;; Is the mismatch coming from some inlined function which has good uses?
+               (when (and lvar
+                          (eq (cast-silent-conflict cast) :style-warning)
+                          (block common
+                            (do-uses (bad-use value)
+                              (unless (cast-ignore-nil-use bad-use atype)
+                                (do-uses (good-use lvar)
+                                  (unless (eq good-use cast)
+                                    (let ((common (common-inline-point bad-use good-use)))
+                                      (unless (and common
+                                                   (cast-mismatch-from-inlined-p cast common))
+                                        (push bad-use bad-uses)))))))
+                            t))
+                 (cond (bad-uses
+                        (setf detail (lvar-uses-all-sources bad-uses)
+                              bad-type (reduce #'values-type-union bad-uses :key #'node-derived-type)))
+                       (t
+                        (setf (cast-silent-conflict cast) t))))
                (when (or (not (cast-silent-conflict cast))
                          (and (eq (cast-silent-conflict cast) :style-warning)
                               (not (cast-single-value-p cast))
@@ -2948,9 +3372,13 @@
                   (if (cast-single-value-p cast)
                       (lambda (dummy) `(list ,dummy))
                       (lambda (dummy) `(multiple-value-call #'list ,dummy)))))
+
+               (when (typep context '(cons (eql :restart)))
+                 ;; FIXME: Can't restart because the error calls do not return.
+                 (pop context))
+
                (filter-lvar
                 (cast-value cast)
-                ;; FIXME: Derived type.
                 (if (cast-silent-conflict cast)
                     (lambda (dummy)
                       (let ((dummy-sym (gensym)))
@@ -2958,7 +3386,7 @@
                            ,@(and (eq (cast-silent-conflict cast) :style-warning)
                                   `((%compile-time-type-style-warn ,dummy-sym
                                                                    ',(type-specifier atype)
-                                                                   ',(type-specifier value-type)
+                                                                   ',(type-specifier bad-type)
                                                                    ',detail
                                                                    ',(compile-time-type-error-context source-form)
                                                                    ',context)))

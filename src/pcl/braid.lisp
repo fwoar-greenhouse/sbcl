@@ -116,8 +116,8 @@
              ;; This is nuts! any DEFAULT might need its lexical environment,
              ;; yet we EVAL in the null environment.
              :initfunction ,(eval-form (dsd-default slotd)))))
-       (accessor-closures (dsd)
-         (multiple-value-bind (reader-fn writer-fn) (sb-kernel::dsd-reader dsd nil)
+       (accessor-closures (dsd dd)
+         (multiple-value-bind (reader-fn writer-fn) (dsd-primitives dsd dd)
            ;; This is for a structure class that exists only in its compile-time representation.
            ;; I don't see how these would get called, since you can't make an instance
            ;; of the structure.
@@ -128,15 +128,15 @@
                 (include (dd-include dd))
                 (all-slots (dd-slots dd)))
            (unless extra-data
-             (acond ((assoc (dd-name dd) sb-kernel::*struct-accesss-fragments-delayed*)
+             (acond ((assoc (dd-name dd) sb-kernel::*struct-access-fragments-delayed*)
                      (let ((fragments (cdr it)))
                        (dolist (dsd (dd-slots dd))
                          (push (list dsd (pop fragments) (pop fragments)) extra-data)))
-                     (setq sb-kernel::*struct-accesss-fragments-delayed*
-                           (delete it sb-kernel::*struct-accesss-fragments-delayed*)))
+                     (setq sb-kernel::*struct-access-fragments-delayed*
+                           (delete it sb-kernel::*struct-access-fragments-delayed*)))
                     (t
                      (dolist (dsd (dd-slots dd))
-                       (push (cons dsd (accessor-closures dsd)) extra-data)))))
+                       (push (cons dsd (accessor-closures dsd dd)) extra-data)))))
            (multiple-value-bind (super slot-overrides)
                (if (consp include)
                    (values (car include) (mapcar #'car (cdr include)))
@@ -185,7 +185,7 @@
   ;; Create an association from the DSD to the reader and writer functions.
   (let* ((name (classoid-name classoid))
          (dd (find-defstruct-description name))
-         (fragments sb-kernel::*struct-accesss-fragments*))
+         (fragments sb-kernel::*struct-access-fragments*))
     (collect ((accessors))
       (dolist (dsd (dd-slots dd))
         (accessors (list dsd (pop fragments) (pop fragments))))

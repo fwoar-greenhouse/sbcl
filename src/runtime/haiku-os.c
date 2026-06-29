@@ -3,8 +3,12 @@
 #include "interrupt.h"
 #include "arch.h" // for arch_get_bad_addr
 #include "interrupt.h" // for sig_stop_for_gc_handler
+#include "gc.h" // for gencgc_handle_wp_violation
 #include <image.h>
+#include <pthread.h>
 #include <stdio.h>
+
+int sb_GetTID() { return get_pthread_thread_id(pthread_self()); }
 
 os_vm_address_t
 os_alloc_gc_space(int __attribute__((unused)) space_id,
@@ -12,9 +16,10 @@ os_alloc_gc_space(int __attribute__((unused)) space_id,
 {
     int protection = attributes & IS_GUARD_PAGE ? OS_VM_PROT_NONE : OS_VM_PROT_ALL;
     attributes &= ~IS_GUARD_PAGE;
-    // There's no MAP_NORESERVE flag? How do we inform the OS not to commit
-    // the whole range to swap?
-    int flags =  MAP_PRIVATE | MAP_ANONYMOUS;
+    int flags =  MAP_PRIVATE | MAP_NORESERVE | MAP_ANONYMOUS;
+    if (addr) {
+        flags |= MAP_FIXED;
+    }
     os_vm_address_t actual;
 
 #ifdef MAP_32BIT
@@ -23,6 +28,8 @@ os_alloc_gc_space(int __attribute__((unused)) space_id,
 #endif
     actual = mmap(addr, len, protection, flags, -1, 0);
     if (actual == MAP_FAILED) {
+        fprintf(stderr, "mmap: FAILED__ wanted %lu bytes at %p, actually mapped at %p\n",
+                (unsigned long) len, addr, actual);
         perror("mmap");
         return 0;               /* caller should check this */
     }
@@ -48,36 +55,31 @@ char *os_get_runtime_executable_path()
 void os_init() {}
 
 static void
-sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
+sigsegv_handler(__attribute__((unused)) int signal,
+                siginfo_t *info, os_context_t *context)
 {
     /*fprintf(stderr, "SIGSEGV: pc=%p addr=%p\n",
            context->uc_mcontext.rip, info->si_addr);*/
     os_vm_address_t addr = arch_get_bad_addr(signal, info, context);
     if (gencgc_handle_wp_violation(context, addr)) return;
 
-    if (!handle_guard_page_triggered(context, addr))
-            interrupt_handle_now(signal, info, context);
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, addr)) return;
+#endif
+#ifdef LISP_FEATURE_TLS_LOAD_INDIRECT
+    if (handle_tls_deref_trap(context, addr)) return;
+#endif
+
+    if (!handle_guard_page_triggered(context, addr)) {
+        //interrupt_handle_now(signal, info, context);
+        lisp_memory_fault_error(context, addr);
+    }
 }
 
 void
 os_install_interrupt_handlers(void)
 {
-    ll_install_handler(SIGSEGV, sigsegv_handler);
-}
-
-int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr)
-{
-    lose("pthread_getattr_np unimplemented");
-}
-
-int pthread_attr_setstack(pthread_attr_t *attr,
-                          void *stackaddr, size_t stacksize)
-{
-  lose("pthread_attr_setstack unimplemented");
-}
-
-int pthread_attr_getstack(const pthread_attr_t *attr,
-                          void **stackaddr, size_t *stacksize)
-{
-  lose("pthread_attr_getstack unimplemented");
+    if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
+        ll_install_handler(SIGSEGV, sigsegv_handler);
+    }
 }

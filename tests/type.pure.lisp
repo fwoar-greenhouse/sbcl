@@ -11,9 +11,11 @@
 
 (enable-test-parallelism)
 
-(assert (not (sb-kernel:member-type-p (sb-kernel:make-eql-type #\z))))
-(assert (not (sb-kernel:member-type-p (sb-kernel:make-eql-type 1.0))))
-(assert (sb-kernel:member-type-p (sb-kernel:make-eql-type -0.0s0)))
+(with-test (:name :make-eql-type)
+  (assert (not (sb-kernel:member-type-p (sb-kernel:make-eql-type #\z))))
+  (assert (not (sb-kernel:member-type-p (sb-kernel:make-eql-type 1.0))))
+  (assert (eql (sb-kernel:numeric-type-low (sb-kernel:make-eql-type -0f0)) -0f0))
+  (assert (eql (sb-kernel:numeric-type-high (sb-kernel:make-eql-type -0d0)) -0d0)))
 
 (with-test (:name (typexpand-1 typexpand typexpand-all :check-lexenv))
   (flet ((try (f) (assert-error (funcall f 'hash-table 3))))
@@ -244,7 +246,9 @@
   (assert-tri-eq t   t (subtypep '(complex ratio) '(complex rational)))
   (assert-tri-eq t   t (subtypep '(complex ratio) 'complex))
   (assert-tri-eq nil t (subtypep '(complex (integer 1 2))
-                                 '(member #c(1 1) #c(1 2) #c(2 1) #c(2 2)))))
+                                 '(member #c(1 1) #c(1 2) #c(2 1) #c(2 2))))
+  (assert-tri-eq t   t (subtypep '(member #c(1 1) #c(1 2) #c(2 1) #c(2 2))
+                                 '(complex (integer 1 2)))))
 
 (with-test (:name (typep real))
   (assert (typep 0 `(real ,(ash -1 10000) ,(ash 1 10000)))))
@@ -305,7 +309,9 @@
                             (loop for d from c below size do
                                   (test a b c d op deriver))))))))))
 
-(with-test (:name (:type-derivation :logical-operations :scaling) :slow t)
+(with-test (:name (:type-derivation :logical-operations :scaling)
+            :broken-on :mark-region-gc
+            :slow t)
   (let ((type-x1 (sb-c::specifier-type `(integer ,(expt 2 10000)
                                                  ,(expt 2 10000))))
         (type-x2 (sb-c::specifier-type `(integer ,(expt 2 100000)
@@ -524,15 +530,6 @@
                        sb-vm:*specialized-array-element-type-properties*))))
     (assert-tri-eq t t (subtypep 'array u))))
 
-(with-test (:name :bug-1258716)
-  (let ((intersection (sb-kernel:type-intersection
-                       (sb-kernel:specifier-type 'simple-vector)
-                       (sb-kernel:specifier-type `(vector #:unknown)))))
-    (assert (sb-kernel:array-type-p intersection))
-    ;; and not *wild-type*
-    (assert (sb-kernel:type= (sb-kernel:array-type-specialized-element-type intersection)
-                             sb-kernel:*universal-type*))))
-
 (with-test (:name :parse-safely)
   (dolist (x '(array integer cons))
     (assert (handler-case (sb-kernel:specifier-type `(,x . 0))
@@ -579,22 +576,22 @@
                         (sb-kernel:specifier-type '(not bad)))
                  sb-kernel:parse-unknown-type 2)) ; expect 2 signals
 
-(with-test (:name (typep :complex-integer))
-  (assert (not (eval '(typep #c(0 1/2) '(complex integer))))))
-
 (with-test (:name :typep-satisfies-boolean)
   (assert (eq (eval '(typep 1 '(satisfies eval))) t)))
 
 (import '(sb-kernel:specifier-type
+          sb-kernel:values-specifier-type
           sb-kernel:type-specifier
           sb-kernel:type-intersection
+          sb-kernel:values-type-intersection
+          sb-kernel:values-subtypep
           #+sb-unicode sb-kernel::character-string
           sb-kernel:simple-character-string
           sb-kernel:type=
+          sb-kernel:type/=
           sb-kernel:find-classoid
           sb-kernel:make-numeric-type
-          sb-kernel::numeric-types-adjacent
-          sb-kernel::numeric-types-intersect
+          sb-kernel:types-equal-or-intersect
           sb-kernel:*empty-type*))
 
 (with-test (:name :partition-array-into-simple/hairy)
@@ -732,15 +729,13 @@
     (dolist (y '(-0s0 0s0))
       (let ((a (specifier-type `(single-float -10s0 ,x)))
             (b (specifier-type `(single-float ,y 20s0))))
-        (assert (numeric-types-intersect a b)))
+        (assert (types-equal-or-intersect a b)))
       (let ((a (specifier-type `(single-float -10s0 (,x))))
             (b (specifier-type `(single-float ,y 20s0))))
-        (assert (not (numeric-types-intersect a b)))
-        (assert (numeric-types-adjacent a b)))
+        (assert (not (types-equal-or-intersect a b))))
       (let ((a (specifier-type `(single-float -10s0 ,x)))
             (b (specifier-type `(single-float (,y) 20s0))))
-        (assert (not (numeric-types-intersect a b)))
-        (assert (numeric-types-adjacent a b))))))
+        (assert (not (types-equal-or-intersect a b)))))))
 
 (with-test (:name :ctypep-function)
   (assert (not (sb-kernel:ctypep #'+ (eval '(sb-kernel:specifier-type '(function (list))))))))
@@ -900,7 +895,7 @@
    ((36757953510256822605) t)
    ((#C(1d0 1d0)) nil)
    ((#C(1 1)) t)
-   ((#C(1 #.(expt 2 300))) nil)))
+   ((#C(1 #.(expt 2 300))) t)))
 
 #+(or arm64 x86-64)
 (with-test (:name :structure-typep-fold)
@@ -926,3 +921,397 @@
      (declare (integer p))
      (typep p '(vector t 1)))
    null))
+
+(with-test (:name :non-null-symbol-load-widetag)
+  (checked-compile-and-assert
+   ()
+   `(lambda (p)
+     (declare ((or symbol array) p))
+     (typecase  p
+       ((and symbol (not null)) 1)
+       (simple-array 2)))
+   ((nil) nil)
+   ((t) 1)
+   ((:a) 1)
+   (("") 2)
+   (((make-array 10 :adjustable t)) nil)))
+
+(with-test (:name :other-pointer-subtypes)
+  (assert-type
+   (lambda (j)
+     (sb-kernel:%other-pointer-p (the (and sequence (not vector)) j)))
+   null))
+
+(with-test (:name :non-simple-arrays)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (vector t) (not simple-array))))
+   ((#()) nil)
+   (((make-array 10 :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (array t) (not simple-array))))
+   ((#()) nil)
+   ((#2A()) nil)
+   (((make-array '(10 10) :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (vector t 10) (not simple-array))))
+   ((#10(t)) nil)
+   (((make-array 10 :adjustable t)) t)
+   (((make-array '(2 5) :adjustable t)) nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (array t 2) (not simple-array))))
+   ((#2A()) nil)
+   (((make-array '(2 2) :adjustable t)) t)
+   (((make-array 2 :adjustable t)) nil)))
+
+(with-test (:name :member-hairy-type-intersection)
+  (assert
+   (sb-kernel:type=
+    (sb-kernel:type-intersection  (sb-kernel:specifier-type '(member #1=(m) a))
+                                  (sb-kernel:specifier-type '(cons (satisfies eval))))
+    (sb-kernel:specifier-type '(and (cons (satisfies eval) t) (member #1#))))))
+
+(with-test (:name :subtype-array-union)
+  (assert (subtypep (opaque-identity '(array t))
+                    (opaque-identity '(or simple-array (array unsigned-byte)))))
+  (assert (subtypep (opaque-identity '(vector character))
+                    (opaque-identity '(or (and string (not simple-array))
+                                       simple-array))))
+  (assert (subtypep (opaque-identity '(vector unknown))
+                    (opaque-identity 'sequence))))
+
+(deftype subtype-equal-type (&rest args) `(or fixnum (member ,@args)))
+
+(with-test (:name :subtypep-equal-member)
+  (multiple-value-bind (answer certain)
+      ;; Verify that the SUBTYPEP fast path is taken
+      (subtypep (opaque-identity '((invalid)))
+                (opaque-identity '((invalid))))
+    (assert (and answer certain)))
+  (multiple-value-bind (answer certain)
+      (subtypep (opaque-identity '(eql (list 1)))
+                (opaque-identity '(eql (list 1))))
+    (assert (and (not answer) certain)))
+  (multiple-value-bind (answer certain)
+      (subtypep (opaque-identity '(subtype-equal-type 1 (list 2) 3))
+                (opaque-identity '(subtype-equal-type 1 (list 2) 3)))
+    (assert (and (not answer) certain)))
+  (assert (not (subtypep (opaque-identity '(function (&key (member t))))
+                         (opaque-identity '(function (&key (eql t))))))))
+
+(with-test (:name :typep-rational-ratio)
+  (checked-compile-and-assert
+      ()
+      `(lambda (p)
+         (typep p '(and (rational 1) (not integer))))
+    ((4/3) t)
+    ((-4/3) nil)
+    ((1) nil)
+    ((2) nil)))
+
+(with-test (:name :complex-type-of)
+  (assert (equal (type-of (opaque-identity #c(1 2)))
+                 '(complex rational))))
+
+(with-test (:name :complex-sub-real)
+  (assert (equal (sb-ext:typexpand-all '(or (complex rational) (complex single-float)))
+                 (sb-ext:typexpand-all '(complex (or rational single-float))))))
+
+
+(with-test (:name :typep-evaluate)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (block nil
+        (typep (return x) 't)))
+   ((10) 10)))
+
+(with-test (:name :function-simple-union/intersection)
+  (let ((type (sb-kernel:specifier-type
+               '(function (sequence &key (start integer) (end integer)) sequence))))
+    (assert (eq type
+                (sb-kernel::function-simple-union2-type-method type type)))
+    (assert (eq type
+                (sb-kernel::function-simple-intersection2-type-method type type)))))
+
+(with-test (:name :array-canonical-difference)
+  (assert (eql
+           (specifier-type '(and (simple-array * (10)) (not string)))
+           (specifier-type '(and (simple-array * (10)) (not (simple-string 10))))))
+  (assert (type= (specifier-type '(or (simple-array fixnum) (not simple-array)))
+                 (specifier-type '(or (array fixnum) (not simple-array)))))
+  (assert (type= (specifier-type '(or (simple-array (mod 3)) (not simple-array)))
+                 (specifier-type '(or (array (mod 3)) (not simple-array)))))
+  (assert (subtypep '(or (array (mod 3)) (not simple-array))
+                    '(or (simple-array (mod 3)) (not simple-array))))
+  (assert (subtypep '(not (or (not simple-array) simple-string)) '(not string)))
+  (assert (subtypep '(and (array symbol) (not (and (array t) (not simple-array))))
+                    '(simple-array symbol)))
+  (assert (subtypep '(array t)
+                    '(or (and (array t) (not simple-array)) (simple-array integer))))
+  (assert (subtypep '(array (integer 15 27))
+                    '(or (and (array (integer 15 27)) (not simple-array))
+                      (simple-array (integer 17 30)))))
+  (assert (eql (specifier-type '(and (not (simple-array t)) (not (and (array t) (not simple-array)))))
+               (specifier-type '(not (array t)))))
+  (assert (subtypep '(and (not simple-array) (not (and (array t) (not simple-array))))
+                    '(and (not simple-array) (not (array t)))))
+  (assert (eql (specifier-type '(not simple-array))
+               (specifier-type '(or (not array) (and array (not simple-array))))))
+  (assert (eql (specifier-type '(or (and array (not (array t))) (and (array t) (not simple-array))))
+               (specifier-type '(and array (not (simple-array t))))))
+  (assert (eql (specifier-type '(or (not (vector * 10)) (and vector (not simple-array))))
+               (specifier-type '(not (simple-array * (10))))))
+  (assert (not (subtypep '(not (simple-array t))
+                         '(or (not array) (and (array t) (not simple-array))))))
+  (assert (eql (specifier-type '(or (not vector) (not (array t))))
+               (specifier-type '(not (vector t)))))
+  (assert (eql (specifier-type '(or (not simple-array) (not (array t))))
+               (specifier-type '(not (simple-array t)))))
+  (assert (eql (specifier-type '(or (and (not integer) (not vector) (not (array t))) vector (array t)))
+               (specifier-type '(not integer))))
+  (assert (eql (specifier-type '(or (and (not integer) (not vector) (not (array t))) vector))
+               (specifier-type '(or (and (not integer) (not (array t))) vector))))
+  (assert (not (subtypep '(not simple-bit-vector)
+                         '(or (not (array bit)) (and bit-vector (not simple-array))))))
+  (assert (eql (specifier-type '(not (and (array t) (not simple-array))))
+               (specifier-type '(or (not (array t)) simple-array))))
+  (assert (eql (specifier-type '(not (and base-string (not simple-array))))
+               (specifier-type '(or (not base-string) simple-base-string))))
+  (assert (eql (specifier-type '(and (array cons) (array number)))
+               (specifier-type '(array t))))
+  (assert (sb-kernel:intersection-type-p (specifier-type '(and (vector unknown) bit-vector)))))
+
+(with-test (:name :array-canonical-union)
+  (assert (eq
+           (specifier-type '(or simple-vector (not (simple-array t))))
+           (specifier-type '(or vector (not (simple-array t))))))
+  (assert (eq
+           (specifier-type '(or (vector t) (not (simple-array t))))
+           (specifier-type '(or vector (not (simple-array t))))))
+  (assert (eq
+           (specifier-type '(or (vector t) (not (array t))))
+           (specifier-type '(or vector (not (array t))))))
+  (assert (eq
+           (specifier-type '(or simple-vector (not (array t))))
+           (specifier-type '(or (simple-array * (*)) (not (array t))))))
+  (assert (eq
+           (specifier-type '(or simple-vector (not simple-array)))
+           (specifier-type '(or (vector t) (not simple-array)))))
+  (assert (eq
+           (specifier-type '(or (and vector (not (simple-array t))) simple-vector))
+           (specifier-type 'vector)))
+  (assert (eq
+           (specifier-type '(or (not vector) bit-vector))
+           (specifier-type '(or (not vector) (array bit)))))
+  (assert (eq
+           (specifier-type '(or (and (not (array fixnum)) (not (array t)) vector) (vector t)))
+           (specifier-type '(and (not (array fixnum)) vector))))
+  (assert (eq (specifier-type '(or (and simple-array (not (array t)) (not vector)) (simple-array t)))
+              (specifier-type '(or (and simple-array (not vector)) (simple-array t)))))
+  (assert (eq (specifier-type '(or (and vector (not (array t))) (simple-array * (*))))
+              (specifier-type '(and vector (not (and (array t) (not simple-array)))))))
+  (assert (eq (specifier-type '(or (and (not (array t)) (and vector (not simple-array))) (simple-array * (*))))
+              (specifier-type '(and vector (not (and (array t) (not simple-array)))))))
+  (assert (eq (specifier-type '(or (and (not (array t)) (and vector (not simple-array)))
+                                (and (not (array t)) (simple-array * (*)))))
+              (specifier-type '(and vector (not (array t))))))
+  (assert (not (eq (specifier-type '(or (and simple-array (not (array double-float)))
+                                     (simple-array * (*))))
+                   (specifier-type 'simple-array))))
+  (assert (eq (specifier-type '(or (and vector (not (array t)) (not (array fixnum)) (not (array character))) (vector character)))
+              (specifier-type '(and vector (not (array t)) (not (array fixnum))))))
+  (assert (eq (specifier-type '(or (simple-array t) (and (not vector) (and (array t) (not simple-array)))))
+              (specifier-type '(and (array t) (not (and vector (not simple-array)))))))
+  (assert (eq (specifier-type '(or (vector t) (and (not vector) (and (array t) (not simple-array)))))
+              (specifier-type '(or (vector t) (and (array t) (not simple-array))))))
+  (assert (eq (specifier-type '(or (and (array t) (not vector)) (vector t)))
+              (specifier-type '(array t))))
+  (assert (not (eq (specifier-type '(or (and simple-array (not (array t))) (simple-array * (*))))
+                   (specifier-type 'simple-array))))
+  (assert (eq (specifier-type '(or (and (simple-array * (*)) (not (array base-char)) (not (array character))) (and vector (not simple-array))))
+              (specifier-type '(and vector (not (or (simple-array character) (simple-array base-char)))))))
+  (assert (eq
+           (specifier-type '(or (and vector (not (simple-array fixnum)) (not (simple-array t)) (not (simple-array character))) (simple-array character (*))))
+           (specifier-type     '(and vector (not (simple-array fixnum)) (not (simple-array t))))))
+  (assert (not (typep "a" '(or (and array (not (array t)) (not vector)) (simple-array t)))))
+  (assert (eq (specifier-type '(or (simple-array * (*)) (and (not (array t)) vector)))
+              (specifier-type '(and vector (not (and (array t) (not simple-array)))))))
+  (assert (eq (specifier-type '(or (and (array t) (not (and vector (not simple-array)))) (vector t)))
+              (specifier-type '(array t))))
+  (assert (eq (specifier-type '(or (and (not integer) (not (and (array t) (not simple-array))) (not (and vector (not simple-array)))) (array t) vector))
+              (specifier-type '(not integer))))
+  (assert (eq (specifier-type '(or (and (not integer) (not (and (array t) (not simple-array))) (not (and vector (not simple-array)))) vector))
+              (specifier-type '(or (and (not integer) (not (and (array t) (not simple-array)))) vector))))
+  (assert (typep #(1) '(or (vector t 1) (not vector))))
+  (assert (not (typep #(1 2) '(or (vector t 1) (not vector)))))
+  (assert (not (typep "a" '(or (vector t 1) (not vector)))))
+  (assert (eq (specifier-type '(or (and (not (array t)) (not vector) (not simple-array)) (and (array t) (not simple-array)) (and vector (not simple-array))))
+              (specifier-type '(not simple-array))))
+  (assert (eq (specifier-type '(or (and (not (array t)) (not simple-array) (not vector)) (and (array t) (not simple-array))))
+              (specifier-type '(or (and (not simple-array) (not vector)) (and (array t) (not simple-array))))))
+  (assert (eq (specifier-type '(or (simple-array t) (and vector (not (and (array t) (not simple-array))))))
+              (specifier-type '(or (simple-array t) (and (not (array t)) vector)))))
+  (assert (eq (specifier-type '(or (simple-array t) (and (not vector) (not (and (array t) (not simple-array))))))
+              (specifier-type '(or (simple-array t) (and (not (array t)) (not vector))))))
+  (assert (eq (specifier-type '(or (and vector (not (simple-array t))) (not (simple-array base-char))))
+              (specifier-type '(or vector (not (simple-array base-char))))))
+  (assert (not (find (specifier-type '(not (and (array t) (not simple-array))))
+                     (sb-kernel:intersection-type-types
+                      (find-if #'sb-kernel:intersection-type-p
+                               (sb-kernel:union-type-types
+                                (specifier-type '(or (and array (not vector) (not (and (array t) (not simple-array)))) (simple-array t)))))))))
+  (assert (eq (specifier-type `(or (and (vector fixnum) (not simple-array))
+                                   (and vector (not (array t)) (not (array fixnum)))))
+              (specifier-type '(and vector (not (array t)) (not (simple-array fixnum))))))
+  (assert (eq (specifier-type '(or (and vector (not (array fixnum))) (and (not integer) (not (array t)))))
+              (specifier-type '(or vector (and (not integer) (not (array t)))))))
+  (assert (eq (specifier-type '(or (and array (not simple-array) (not (array character))) (simple-array t)))
+              (specifier-type '(or (and array (not simple-array) (not (array character))) (array t)))))
+  (assert (eq (specifier-type '(or (and array (not simple-array)) (simple-array t)))
+              (specifier-type '(or (and array (not simple-array)) (array t)))))
+  (assert (eq (specifier-type '(or (and array (not (array character)) (not vector)) (vector t)))
+              (specifier-type '(or (and array (not (array character)) (not vector)) (array t)))))
+  (assert (not (eq (specifier-type '(or (and simple-base-string (not (vector * 1))) (vector character 1)))
+                   (specifier-type '(or (array character) (and simple-base-string (not (vector * 1))))))))
+  (assert (not (eq (specifier-type '(or (and (not vector) simple-array) (vector character)))
+                   (specifier-type '(or (array character) (and simple-array (not vector))))))))
+
+(with-test (:name :array-intersection)
+  (assert (eq (sb-kernel:array-type-element-type (specifier-type '(and (simple-array nil) (array nil))))
+              (specifier-type 'nil))))
+
+(with-test (:name :intersection-not-numeric)
+  (assert (eql
+           (specifier-type '(and (not (eql 1)) (not (eql 0))))
+           (specifier-type '(not bit))))
+  (assert (eql (specifier-type '(or (not integer) (not (rational 1 10))))
+               (specifier-type '(not (integer 1 10))))))
+
+(with-test (:name :class-canonical-difference)
+  (assert (eql
+           (specifier-type '(or (and stream standard-object) (and (not stream) standard-object)))
+           (specifier-type 'standard-object)))
+  (assert (eql
+           (specifier-type '(or (and stream standard-object) (not standard-object)))
+           (specifier-type '(or stream (not standard-object)))))
+  (assert (eql (specifier-type '(or (and standard-object sb-kernel:extended-sequence)
+                                 (and standard-object (not sb-kernel:extended-sequence))))
+               (specifier-type 'standard-object)))
+  (assert (eql (specifier-type '(or (and atom (not stream)) (and stream standard-object)))
+               (specifier-type '(or (and atom (not stream)) standard-object))))
+  (assert (eq (specifier-type '(or (and (not double-float) (not standard-object)) (and standard-object function)))
+              (specifier-type '(or function (and (not double-float) (not standard-object))))))
+  (assert (eq (specifier-type '(or (and (not double-float) (not standard-object))
+                                (and (not double-float) (not function))
+                                (and standard-object function)))
+              (specifier-type '(not double-float))))
+  (assert (not (eq (specifier-type '(not (or (and function (not stream)) (and stream (not function)))))
+                   (specifier-type '(or stream (not function))))))
+  (assert (eq (specifier-type '(or (and (not double-float) (not stream) (not standard-object)) (and standard-object function stream)))
+              (specifier-type '(or function (and (not double-float) (not stream) (not standard-object))))))
+  (assert (eq (specifier-type '(or (and (not function) (not standard-object) (not symbol)) (and (not function) standard-object)))
+              (specifier-type '(and (not function) (not symbol))))))
+
+(with-test (:name :cons-intersection)
+  (assert (eql (specifier-type '(and (cons (not array) atom) (cons (not integer) (not integer))))
+               (specifier-type '(cons (and (not array) (not integer)) (and atom (not integer))))))
+  (assert (eql (specifier-type '(or (and (not integer) (not stream) (not standard-object)) (and (not stream) standard-object)))
+               (specifier-type '(and (not integer) (not stream))))))
+
+(with-test (:name :float-zero-typep)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (typep x '(single-float * (0.0))))
+    ((0.0) nil)
+    ((-0.0) nil)
+    ((1.0) nil)
+    ((-1.0) t))
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (typep x '(or (member 0.0) (single-float (0.0) 1.0))))
+    ((0.0) t)
+    ((1.0) t)
+    ((2.0) nil)
+    ((-0.0) nil)
+    ((-1.0) nil)
+    ((-2.0) nil)))
+
+(with-test (:name :number-union-type)
+  (assert-type
+   (lambda (a)
+     (declare ((not (or complex double-float)) a))
+     (+ a 1f0))
+   single-float)
+  (assert-type
+   (lambda (a)
+     (declare ((not double-float) a))
+     (1+ a))
+   (or single-float rational complex))
+  (assert (eq (specifier-type 'complex)
+              (specifier-type '(and number (not real)))))
+  (assert (eq (specifier-type '(or rational complex single-float))
+              (specifier-type '(and number (not double-float)))))
+  (assert (eq (specifier-type '(or real complex))
+              (specifier-type 'number))))
+
+(with-test (:name :float-zero-unparse)
+  (assert (member (type-specifier (specifier-type (opaque-identity '(member 0.0d0 -0.0))))
+                  '((or (member 0.0d0) (member -0.0))
+                    (or (member -0.0) (member 0.0d0)))
+                  :test #'equal)))
+
+(with-test (:name :values-intersection)
+  (assert (eq
+           (values-type-intersection
+            (values-specifier-type '(values &optional rational &rest t))
+            (values-specifier-type '(values &optional complex &rest t)))
+           (values-specifier-type '(values &optional))))
+  (assert
+   (eq (values-subtypep (values-specifier-type '(values t &optional))
+                        (values-specifier-type '(values t (not real))))
+       t))
+  (assert
+   (eq (values-subtypep (values-specifier-type '(values t &optional))
+                        (values-specifier-type '(values t &optional t)))
+       t))
+  (assert
+   (eq (values-subtypep (values-specifier-type '(values t &optional))
+                        (values-specifier-type '(values t (not real) &optional)))
+       t))
+  (assert
+   (eq (values-type-intersection (values-specifier-type '(values t (not rational) &optional))
+                                 (values-specifier-type '(values t &optional)))
+       (values-specifier-type '(values t &optional))))
+  (assert
+   (equal (multiple-value-list
+           (values-subtypep
+            (values-specifier-type '(values real &optional real))
+            (values-specifier-type '(values real real))))
+          '(nil t)))
+  (assert
+   (equal (multiple-value-list
+           (values-subtypep
+            (values-specifier-type '(values (or real null) &optional))
+            (values-specifier-type '(values &optional (not boolean)))))
+          '(nil t))))
+
+(with-test (:name :type=-union-negation)
+  (assert
+   (type/= (specifier-type '(or (and symbol (not null)) vector))
+                     (specifier-type 't)))
+  (assert
+   (not (type/= (specifier-type 'unknown) (specifier-type '(or vector cons)))))
+  (assert
+   (not (type/= (specifier-type '(and unknown unknown2)) (specifier-type '(or vector cons)))))
+  (assert
+   (not (type/= (specifier-type '(or unknown unknown2)) (specifier-type '(or vector cons))))))

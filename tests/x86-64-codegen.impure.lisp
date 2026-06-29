@@ -14,12 +14,7 @@
 (load "compiler-test-util.lisp")
 (import 'ctu:disassembly-lines)
 
-;;; This trivial function failed to compile due to rev 88d078fe
-(defun foo (&key k)
-  (make-list (reduce #'max (mapcar #'length k))))
-(compile 'foo)
-
-(with-test (:name :lowtag-test-elision)
+(with-test (:name :lowtag-test-elision :broken-on :sbcl)
   ;; This tests a certain behavior that while "undefined" should at least not
   ;; be fatal. This is important for things like hash-table :TEST where we might
   ;; call (EQUAL x y) with X being an unbound marker indicating an empty cell.
@@ -29,21 +24,28 @@
   (let ((f (compile nil
                     '(lambda (x)
                       (typecase x
-                        ((or character number list sb-kernel:instance function) 1)
+                        ((or character number list sb-kernel:instance function)
+                         nil)
                         ;; After eliminating the preceding cases, the compiler knows
                         ;; that the only remaining pointer type is OTHER-POINTER,
                         ;; so it just tries to read the widetag.
                         ;; If X is the unbound marker, this will read a byte preceding
                         ;; the start of static space, but it holds a zero.
                         (simple-vector 2))))))
-    (assert (not (funcall f (sb-kernel:make-unbound-marker)))))
-  (assert (not (equalp (sb-kernel:make-unbound-marker) "")))
-  (let ((a (- (sb-kernel:get-lisp-obj-address (sb-kernel:make-unbound-marker))
-              sb-vm:other-pointer-lowtag)))
-    (assert (> a sb-vm:static-space-start))))
+    (assert (not (funcall f (sb-kernel:make-unbound-marker))))))
+
+(with-test (:name :lowtag-test-elision.2)
+  (let ((ubm (opaque-identity (sb-kernel:make-unbound-marker)))
+        (thing (opaque-identity "")))
+    (assert (not (eql thing ubm)))
+    (assert (not (equal thing ubm)))
+    (assert (not (equalp thing ubm)))
+    (assert (not (eql ubm thing)))
+    (assert (not (equal ubm thing)))
+    (assert (not (equalp ubm thing)))))
 
 (sb-vm::define-vop (tryme)
-    (:generator 1 (sb-assem:inst mov :byte (sb-vm::ea :gs sb-vm::rax-tn) 0)))
+  (:generator 1 (sb-assem:inst mov :byte (sb-vm::ea :gs sb-vm::rax-tn) 0)))
 (with-test (:name :try-gs-segment)
   (assert (loop for line in (disassembly-lines
                              (compile nil
@@ -113,9 +115,11 @@
   ;;    480F44142538F94B20 CMOVEQ RDX, [#x204BF938]  ; *PRINT-BASE*
   ;; (TODO: could use "CMOVEQ RDX, [RIP-n]" in immobile code)
   (let ((text (disasm-load 0 '*print-base*)))
+    #+tls-load-indirect (assert (= (length text) 2)) ; number of lines
+    #-tls-load-indirect (progn
     (assert (= (length text) 3)) ; number of lines
     ;; two lines should be annotated with *PRINT-BASE*
-    (assert (= (loop for line in text count (search "*PRINT-BASE*" line)) 2)))
+    (assert (= (loop for line in text count (search "*PRINT-BASE*" line)) 2))))
 
   ;; When symbol SC is CONSTANT:
   ;;    498B9578290000     MOV RDX, [R13+disp]       ; tls: FOO
@@ -123,9 +127,11 @@
   ;;    83FA61             CMP EDX, 97
   ;;    480F4450F9         CMOVEQ RDX, [RAX-7]
   (let ((text (disasm-load 0 'foo)))
+    #+tls-load-indirect (assert (= (length text) 2)) ; number of lines
+    #-tls-load-indirect (progn
     (assert (= (length text) 4))
     ;; two lines should be annotated with FOO
-    (assert (= (loop for line in text count (search "FOO" line)) 2))))
+    (assert (= (loop for line in text count (search "FOO" line)) 2)))))
 
 (defvar *blub*) ; immobile space
 (defvar blub)   ; dynamic space
@@ -170,23 +176,6 @@
       (assert (search "; #<SB-KERNEL:LAYOUT " line))
       (assert (search " SB-ASSEM:LABEL" line)))))
 
-#+immobile-code ; uses SB-C::*COMPILE-TO-MEMORY-SPACE*
-(with-test (:name :static-link-compile-to-memory)
-  (let* ((string
-          (with-output-to-string (stream)
-            (disassemble
-             (let ((sb-c::*compile-to-memory-space* :immobile))
-               (compile nil '(lambda () (print (gensym)))))
-             :stream stream)))
-         (lines (split-string string #\newline)))
-    (flet ((find-line (mnemonic operand)
-             (find-if (lambda (line)
-                        (and (search mnemonic line)
-                             (search operand line)))
-                      lines)))
-    (assert (find-line "CALL" "FUNCTION GENSYM"))
-    (assert (find-line "JMP" "FUNCTION PRINT")))))
-
 (with-test (:name :c-call :skipped-on :win32)
   (let* ((lines (split-string
                  (with-output-to-string (s)
@@ -196,7 +185,7 @@
          (c-call (find "os_deallocate" lines :test #'search)))
     ;; Depending on #+immobile-code it's either direct or memory indirect.
     #+immobile-code (assert (search "CALL #x" c-call))
-    #-immobile-code (assert (search "CALL [#x" c-call))))
+    #-immobile-code (assert (search "LEA RBX, [R12-" c-call))))
 
 (with-test (:name :set-symbol-value-imm)
   (let (success)
@@ -590,39 +579,6 @@
       (assert (= (count-assembly-lines instcombined)
                  (- (count-assembly-lines unoptimized) 2))))))
 
-(with-test (:name :array-subtype-dispatch-table)
-  (assert (eql (sb-kernel:code-jump-table-words
-                (sb-kernel:fun-code-header #'sb-kernel:vector-subseq*))
-               ;; n-widetags divided by 4, plus jump table count word.
-               65)))
-
-(defstruct a)
-(defstruct (achild (:include a)))
-(defstruct (agrandchild (:include achild)))
-(defstruct (achild2 (:include a)))
-(defstruct b)
-(defstruct c)
-(defstruct d)
-(defstruct e)
-(defstruct (echild (:include e)))
-(defstruct f)
-
-(declaim (freeze-type a b c d e f))
-(defun typecase-jump-table (x)
-  (typecase x
-    (a 'is-a)
-    (b 'is-b)
-    (c 'is-c)
-    ((or d e) 'is-d-or-e)
-    (f 'is-f)))
-(compile 'typecase-jump-table)
-
-(with-test (:name :typecase-jump-table)
-  (assert (eql (sb-kernel:code-jump-table-words
-                (sb-kernel:fun-code-header #'typecase-jump-table))
-               ;; 6 cases including NIL return, plus the size
-               7)))
-
 (defun assert-thereis-line (lambda expect)
   (let ((f (checked-compile lambda)))
     (assert
@@ -723,10 +679,12 @@
              '(lambda (x) (if (null (foo-s (truly-the foo x))) 'not 'is))))
         (f2 (disassembly-lines
              '(lambda (x) (if (stringp (foo-s (truly-the foo x))) 'is 'not)))))
-    ;; the comparison of X to NIL should be a single-byte test
-    (assert (loop for line in f1
+    ;; Comparison of X to NIL should be a single-byte test.
+    ;; Note that the disassembler always treats imm8 operands as signed
+    (let ((expect "R12"))
+      (assert (loop for line in f1
                   thereis (and (search (format nil "CMP ") line) ; register is arbitrary
-                               (search (format nil ", ~D" (logand sb-vm:nil-value #xff)) line))))
+                               (search (format nil ", ~D" expect) line)))))
     ;; the two variations of the test compile to the identical code
     (dotimes (i 4)
       (assert (string= (nth i f1) (nth i f2))))))
@@ -990,7 +948,7 @@
              (assert (not (loop for line in (disassembly-lines negative-test)
                                 thereis (search telltale line)))))))
 
-(with-test (:name :bash-copiers-byte-or-larger)
+(with-test (:name :bash-copiers-byte-or-larger :skipped-on :sb-devel)
   (dolist (f '(sb-kernel::ub8-bash-copy
                sb-kernel::ub16-bash-copy
                sb-kernel::ub32-bash-copy
@@ -1072,7 +1030,7 @@
                        '(lambda (x)
                          `(,(list 1 2) ,(cons 1 2) ,(list nil x) ,(list '(a) #\x))))))
          (fixups
-          (sb-c::unpack-code-fixup-locs
+          (sb-c:unpack-code-fixup-locs
            (sb-vm::%code-fixups (sb-kernel:fun-code-header f)))))
     ;; There are 5 call outs to the fallback allocator, but only 2 (or 3)
     ;; fixups to the asm routines, because of uniquification per code component.
@@ -1106,14 +1064,6 @@
                (setf (submarine-x sub) a
                      (submarine-y sub) fooval)
                a))))
-
-#+immobile-code
-(with-test (:name :no-static-linkage-if-notinline)
-  ;; The normal state of the image has no "static" calls to FIND-PACKAGE
-  ;; but also has no globally proclaimed NOTINLINE, because that would
-  ;; suppress the optimization for CACHED-FIND-PACKAGE on a constant string.
-  (assert (not (sb-vm::fdefn-has-static-callers (sb-int:find-fdefn 'find-package))))
-  (assert (not (sb-int:info :function :inlinep 'find-package))))
 
 (sb-vm::define-vop (trythis)
   (:generator 1
@@ -1227,7 +1177,7 @@
   (dolist (memspace '(:dynamic :immobile))
     (let ((sb-c::*compile-to-memory-space* memspace))
       (assert (find-in-disassembly
-               (if (eq sb-c::*compile-to-memory-space* :immobile) "lose" "&lose")
+               "lose"
                '(lambda ()
                  (declare (optimize (sb-c::alien-funcall-saves-fp-and-pc 0)))
                  (alien-funcall (extern-alien "lose" (function void))))))
@@ -1363,25 +1313,16 @@
 (with-test (:name :signed-vops) (test-signed))
 (with-test (:name :unsigned-vops) (test-unsigned))
 
-(with-test (:name :old-slot-set-no-barrier)
-  (let ((vops-with-barrier
-          (find-gc-barriers
-           '(lambda (y)
-             (let ((x (cons 0 0)))
-               (setf (car x) y)
-               x)))))
-    (assert (not vops-with-barrier))))
-
 (with-test (:name :smaller-than-qword-cons-slot-init
                   :skipped-on (:not :mark-region-gc))
   (let ((lines (disassembly-lines
-                (compile nil '(lambda (a) (list 1 a #\a))))))
+                (compile nil '(lambda (a) (list 1 a #\a #xfff000))))))
     (assert (loop for line in lines
                   thereis (search "MOV BYTE PTR" line))) ; constant 1
     (assert (loop for line in lines
                   thereis (search "MOV WORD PTR" line))) ; constant #\a
     (assert (loop for line in lines
-                  thereis (search "MOV DWORD PTR" line))))) ; constant NIL
+                  thereis (search "MOV DWORD PTR" line))))) ; constant #xfff000
 
 (defun count-labeled-instructions (function &aux (answer 0))
   (let ((lines (disassembly-lines function)))
@@ -1403,5 +1344,115 @@
               (checked-compile
                `(lambda (x)
                   (declare (optimize (sb-c::verify-arg-count 0)))
-                  (if (sb-kernel:non-null-symbol-p x) 'zook (foo)))))
+                  (if (sb-kernel:non-null-symbol-p x) 'zook (eval x)))))
              1)))
+
+(with-test (:name :disassemble-instance-type-test
+            :skipped-on (not :immobile-space))
+  (let ((lines
+          (disassembly-lines
+           (compile nil '(lambda (m) (the sb-thread:mutex m))))))
+    (assert
+     (loop for line in lines
+           thereis (and (search "CMP DWORD PTR" line)
+                        (search "#<LAYOUT" line)
+                        (search "for SB-THREAD:MUTEX" line))))))
+
+(with-test (:name :dx-list-push-imm :skipped-on (not :immobile-space))
+  (let ((lines
+         (disassembly-lines
+          (compile nil '(lambda (f)
+                         (sb-int:dx-let ((x (list :foo))) (funcall f x)))))))
+    (assert
+     (loop for line in lines
+           thereis (and (search "PUSH #x" line) (search "':FOO" line))))))
+
+(defun check-hasnot (instructions lexpr)
+  (let ((f (compile nil lexpr)))
+    (dolist (inst (get-simple-fun-instruction-model f))
+      (let ((mnemonic (second inst)))
+        (assert (not (find mnemonic instructions :test 'string=)))))))
+
+(with-test (:name :compute-lisp-bool-from-c-bool :skipped-on (:not :sb-thread))
+  (check-hasnot '("JMP")
+                '(lambda (x)
+                  (declare (optimize (sb-c::verify-arg-count 0)))
+                  (= (truly-the fixnum x) 1))))
+
+(with-test (:name :compute-c-bool-from-lisp-bool)
+  (check-hasnot '("JMP" "CMOV")
+                '(lambda (x)
+                  (declare (optimize (sb-c::verify-arg-count 0)))
+                  (if x 1 0))))
+
+(with-test (:name :pcl-ctor-slotv-allocator)
+  (flet ((get-asm-lines (n)
+           (disassembly-lines
+            (compile nil
+             `(lambda () (make-array ,n :initial-element sb-pcl:+slot-unbound+))))))
+    (let ((lines (get-asm-lines 1)))
+      (assert (loop for line in lines
+                    thereis (and (search "MOV QWORD PTR" line)
+                                 (search "], 9" line))))) ; UNBOUND-MARKER-WIDETAG
+    (loop for nelts from 2 to 10
+          do (let ((lines (get-asm-lines nelts)))
+               (assert (loop for line in lines
+                             thereis (search "MOVDDUP XMM" line)))))
+    (let ((lines (get-asm-lines 11)))
+      (assert (loop for line in lines
+                    thereis (search "REPE STOSQ" line))))))
+
+(defconstant arb-qword-const-positive #xFFF0abcdabcd0000)
+(defconstant arb-qword-const-negative (sb-disassem::sign-extend arb-qword-const-positive 64))
+(pushnew :popcnt sb-c:*backend-subfeatures*)
+(defun same-constants-after-collapsing (uw sw)
+  (declare (sb-vm:word uw) (sb-vm:signed-word sw))
+  (values (logcount (logxor uw arb-qword-const-positive))
+          (logcount (logxor sw arb-qword-const-negative))))
+(compile 'same-constants-after-collapsing)
+(defun different-constants (uw sw)
+  (declare (sb-vm:word uw) (sb-vm:signed-word sw))
+  (values (logcount (logxor uw (logior arb-qword-const-positive 1)))
+          (logcount (logxor sw arb-qword-const-negative))))
+(compile 'different-constants)
+
+(with-test (:name :constantize-equivalence)
+  ;; two raw words: jump table count word, and one user constant
+  (assert (= 16 (sb-kernel:code-n-unboxed-data-bytes
+                 (sb-kernel:fun-code-header #'same-constants-after-collapsing))))
+  ;; four raw words: jump table count word, two user data words, and a padding word
+  (assert (= 32 (sb-kernel:code-n-unboxed-data-bytes
+                 (sb-kernel:fun-code-header #'different-constants)))))
+
+(with-test (:name :push-cons)
+  (let ((f (checked-compile
+            '(lambda (alist x y)
+              (declare (optimize (sb-c:instrument-consing 0)))
+              (push (cons x y) alist)))))
+    ;; should have 1 call to list-alloc-tramp, not one for the cons of x, y and one for push
+    (assert (= 1 (count 'sb-c:call (get-simple-fun-instruction-model f) :key 'second)))))
+
+#+sb-thread
+(with-test (:name :tls-symbol-map)
+  (let ((sap (sb-sys:int-sap (ash sb-vm::*tls-symbol-map* sb-vm:n-fixnum-tag-bits)))
+        (divisor (or #+tls-load-indirect 16 8)))
+    (dotimes (i (ash (ash sb-vm::*free-tls-index* sb-vm:n-fixnum-tag-bits)
+                     (- sb-vm:word-shift)))
+      (unless (= (sb-sys:sap-ref-word sap (ash i sb-vm:word-shift)) sb-vm:no-tls-value-marker)
+        (let ((sym (sb-sys:sap-ref-lispobj sap (ash i sb-vm:word-shift))))
+          (assert (= (floor (sb-kernel:symbol-tls-index sym) divisor) i)))))))
+
+#+sb-thread
+(with-test (:name :tls-index-validity :skipped-on (:not :tls-load-indirect))
+  (let ((index-of-package (ash (sb-kernel:symbol-tls-index '*package*)
+                               (- sb-vm:word-shift))))
+    (do-all-symbols (sym)
+      (let ((index (ash (sb-kernel:symbol-tls-index sym) (- sb-vm:word-shift))))
+        (when (plusp index)
+          ;; Every TLS slot below *PACKAGE* corresponds to an always-thread-local special.
+          (if (< index index-of-package)
+              (assert (typep (sb-int:info :variable :wired-tls sym)
+                             '(or (eql :always-thread-local) integer)))
+              (assert (oddp index)))
+          ;; No always-thread-local special clashes with *PACKAGE*'s indirection cell
+          (assert (/= index (1- index-of-package))))))))

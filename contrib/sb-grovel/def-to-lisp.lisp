@@ -26,7 +26,7 @@
 (defun word-cast (arg)
   (format nil "CAST_SIGNED(~A)" arg))
 
-#+(and win32 x86-64)
+#+(and win32 64-bit)
 (defun printf-transform-long-long (x)
   (with-output-to-string (str)
     (loop for previous = #\a then char
@@ -37,7 +37,7 @@
                      (char= char #\l))
             (write-char #\l str)))))
 
-#-(and win32 x86-64)
+#-(and win32 64-bit)
 (defun printf-transform-long-long (x)
   x)
 
@@ -64,11 +64,11 @@ code:
            args)))
 
 (defun c-for-enum (lispname elements export)
-  (printf "(cl:eval-when (:compile-toplevel :load-toplevel :execute) (sb-alien:define-alien-type ~A (sb-alien:enum nil" lispname)
+  (printf "(sb-alien:define-alien-type ~A (sb-alien:enum nil" lispname)
   (dolist (element elements)
     (destructuring-bind (lisp-element-name c-element-name) element
       (printf " (~S %ld)" lisp-element-name (word-cast c-element-name))))
-  (printf ")))")
+  (printf "))")
   (when export
     (dolist (element elements)
       (destructuring-bind (lisp-element-name c-element-name) element
@@ -78,7 +78,7 @@ code:
 
 (defun c-for-structure (lispname cstruct)
   (destructuring-bind (cname &rest elements) cstruct
-    (printf "(cl:eval-when (:compile-toplevel :load-toplevel :execute) (sb-grovel::define-c-struct ~A %ld" lispname
+    (printf "(sb-grovel::define-c-struct ~A %ld" lispname
             (word-cast (format nil "sizeof(~A)" cname)))
     (dolist (e elements)
       (destructuring-bind (lisp-type lisp-el-name c-type c-el-name &key distrust-length) e
@@ -87,9 +87,9 @@ code:
         (as-c "{" cname "t;")
         (printf "  %lu"
                 (format nil "((unsigned long~A)&(t.~A)) - ((unsigned long~A)&(t))"
-                        #+(and win32 x86-64) " long" #-(and win32 x86-64) ""
+                        #+(and win32 64-bit) " long" #-(and win32 64-bit) ""
                         c-el-name
-                        #+(and win32 x86-64) " long" #-(and win32 x86-64) ""))
+                        #+(and win32 64-bit) " long" #-(and win32 64-bit) ""))
         (as-c "}")
         ;; length
         (if distrust-length
@@ -99,7 +99,7 @@ code:
               (printf "  %ld)"
                       (word-cast (format nil "sizeof(t.~A)" c-el-name)))
               (as-c "}")))))
-    (printf "))")))
+    (printf ")")))
 
 (defun print-c-source (stream headers definitions package-name)
   (declare (ignorable definitions package-name))
@@ -115,7 +115,7 @@ code:
     ;; Cast to signed long when possible.
     ;; Other platforms do not seem to be affected by this,
     ;; but we used to cast everything to INT on x86-64, preserve that behaviour.
-    #+(and win32 x86-64)
+    #+(and win32 64-bit)
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long long) (long) (x): (x))")
     #+(and (not win32) x86-64)
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long) (int) (x): (x))")
@@ -123,19 +123,20 @@ code:
     ;; even though 'long' and 'int' are both 4 bytes.
     #-(or x86 64-bit)
     (as-c "#define CAST_SIGNED(x) ((int) (x))")
-    #+(and (not x86-64) (or x86 64-bit))
+    #+(and (not x86-64) (or x86 (and (not win32) 64-bit)))
     (as-c "#define CAST_SIGNED(x) ((long) (x))")
-    (as-c "int main(int argc, char *argv[]) {")
-    (as-c "    FILE *out;")
-    (as-c "    if (argc != 2) {")
-    (as-c "        printf(\"Invalid argcount!\");")
-    (as-c "        return 1;")
-    (as-c "    } else")
-    (as-c "        out = fopen(argv[1], \"w\");")
-    (as-c "    if (!out) {")
-    (as-c "        printf(\"Error opening output file!\");")
-    (as-c "        return 1;")
-    (as-c "    }")
+    (as-c "
+int main(int argc, char *argv[]) {
+    FILE *out;
+    if (argc != 2) {
+        fprintf(stderr, \"Invalid argcount!\\n\");
+        return 1;
+    } else
+        out = fopen(argv[1], \"w\");
+    if (!out) {
+        fprintf(stderr, \"Error opening output file!\\n\");
+        return 1;
+    }")
     (printf "(cl:in-package #:~A)" package-name)
     (printf "(cl:eval-when (:compile-toplevel :execute)")
     (printf "  (cl:defparameter *integer-sizes* (cl:make-hash-table))")
@@ -160,7 +161,7 @@ code:
           (:enum
            (c-for-enum lispname cname export))
           (:type
-           (printf "(cl:eval-when (:compile-toplevel :load-toplevel :execute) (sb-alien:define-alien-type ~A (sb-alien:%ssigned %ld)))" lispname
+           (printf "(sb-alien:define-alien-type ~A (sb-alien:%ssigned %ld))" lispname
                    (format nil "SIGNED_(~A)" cname)
                    (word-cast (format nil "(8*sizeof(~A))" cname))))
           (:string
@@ -169,7 +170,7 @@ code:
           (:function
            (printf "(cl:declaim (cl:inline ~A))" lispname)
            (destructuring-bind (f-cname &rest definition) cname
-             (printf "(sb-grovel::define-foreign-routine (\"~A\" ~A)" f-cname lispname)
+             (printf "(sb-alien:define-alien-routine (\"~A\" ~A)" f-cname lispname)
              (printf "~{  ~W~^\\n~})" definition)))
           (:structure
            (c-for-structure lispname cname))
@@ -194,9 +195,11 @@ code:
      (sb-ext:run-program
       cc
       (append
-       (split-cflags (sb-ext:posix-getenv "EXTRA_CFLAGS"))
+       (split-cflags (sb-ext:posix-getenv "CFLAGS"))
        #+(and linux largefile)
        '("-D_LARGEFILE_SOURCE" "-D_LARGEFILE64_SOURCE" "-D_FILE_OFFSET_BITS=64")
+       #+64-bit-time
+       '("-D_TIME_BITS=64")
        #+(and (or x86 ppc sparc) (or linux freebsd)) '("-m32")
        #+(and x86-64 darwin inode64)
        `("-arch" "x86_64" ,(format nil "-mmacosx-version-min=~A"

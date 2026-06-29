@@ -66,9 +66,11 @@
 ;;; This variable is accessed by C code when saving. Export it to survive tree-shaker.
 ;;; The symbols in this set are clobbered just in time to avoid saving them to the core
 ;;; but not so early that we kill the running image.
-(export 'sb-kernel::*save-lisp-clobbered-globals* 'sb-kernel)
-(define-load-time-global sb-kernel::*save-lisp-clobbered-globals*
+(export 'sb-kernel::+save-lisp-clobbered-globals+ 'sb-kernel)
+(defconstant-eqx sb-kernel::+save-lisp-clobbered-globals+
     '#(sb-impl::*exit-lock*
+       sb-vm::*allocator-mutex*
+       sb-vm::*tls-symbol-map*
        sb-thread::*make-thread-lock*
        sb-thread::*initial-thread*
        ;; Saving *JOINABLE-THREADS* could cause catastophic failure on restart.
@@ -77,7 +79,8 @@
        sb-thread::*joinable-threads*
        sb-thread::*all-threads*
        sb-thread::*session*
-       sb-kernel::*gc-epoch*))
+       sb-kernel::*gc-epoch*)
+  #'equalp)
 
 (defun start-lisp (toplevel callable-exports)
   (if callable-exports
@@ -101,6 +104,7 @@
                                          (compression nil)
                                          #+win32
                                          (application-type :console))
+  #.(format nil
   "Save a \"core image\", i.e. enough information to restart a Lisp
 process later in the same state, in the file of the specified name.
 Only global state is preserved: the stack is unwound in the process.
@@ -120,7 +124,7 @@ The following &KEY arguments are defined:
      If true, arrange to combine the SBCL runtime and the core image
      to create a standalone executable.  If false (the default), the
      core image will not be executable on its own. Executable images
-     always behave as if they were passed the --noinform runtime option.
+     always behave as if they were passed the --noinform runtime option.~A
 
   :SAVE-RUNTIME-OPTIONS
      If true, values of runtime options --dynamic-space-size and
@@ -128,6 +132,8 @@ The following &KEY arguments are defined:
      the standalone executable, and restored when the executable is
      run. This also inhibits normal runtime option processing, causing
      all command line arguments to be passed to the toplevel.
+     If :ACCEPT-RUNTIME-OPTIONS then --dynamic-space-size and
+     --control-stack-size are still processed by the runtime.
      Meaningless if :EXECUTABLE is NIL.
 
   :CALLABLE-EXPORTS
@@ -200,6 +206,10 @@ This implementation is not as polished and painless as you might like:
 This isn't because we like it this way, but just because there don't
 seem to be good quick fixes for either limitation and no one has been
 sufficiently motivated to do lengthy fixes."
+  #+elf "
+     If :EXECUTABLE is :ELF-OBJECT, then the resulting core will be
+     wrapped in a .o which requires further linking. (EXPERIMENTAL)"
+  #-elf "")
   (declare (ignore environment-name))
   (declare (ignorable root-structures))
   (when (and callable-exports toplevel-supplied)
@@ -252,9 +262,13 @@ sufficiently motivated to do lengthy fixes."
           ;; since the GC will invalidate the stack.
           (sb-kernel::unsafe-clear-roots sb-vm:+highest-normal-generation+)
           (gc-and-save name
-                       (foreign-bool executable)
+                       #+elf (if (eq executable :elf-object) 2 (foreign-bool executable))
+                       #-elf (foreign-bool executable)
                        (foreign-bool purify)
-                       (foreign-bool save-runtime-options)
+                       (case save-runtime-options
+                         (:accept-runtime-options 2)
+                         ((nil) 0)
+                         (t 1))
                        (foreign-bool compression)
                        (or compression 0)
                        #+win32 (ecase application-type (:console 0) (:gui 1))
@@ -311,20 +325,34 @@ sufficiently motivated to do lengthy fixes."
   #+sb-thread
   (let (error)
     (with-system-mutex (sb-thread::*make-thread-lock*)
-      (finalizer-thread-stop)
       (sb-thread::%dispose-thread-structs)
-      (let ((threads (sb-thread:list-all-threads))
-            (starting
-             (setq sb-thread::*starting-threads* ; ordinarily pruned in MAKE-THREAD
-                   (delete 0 sb-thread::*starting-threads*)))
-            (joinable sb-thread::*joinable-threads*))
-        (when (or (cdr threads) starting joinable)
-          (let* ((interactive (sb-thread::interactive-threads))
-                 (other (union (set-difference threads interactive)
-                               (union starting joinable))))
-            (setf error (make-condition 'save-with-multiple-threads-error
-                                        :interactive-threads interactive
-                                        :other-threads other))))))
+      ;; As a consequence of a discovery I made about a nasty but common pattern
+      ;; among users of doing (mapc #'some-harmful-operation (list-all-threads),
+      ;; the finalizer thread is not present in (LIST-ALL-THREADS). Better to pretend
+      ;; it doesn't exist than let users affect it (backtrace/terminate/whatever).
+      ;; The same is not true of the signal-waiter thread on #+(and unix sb-safepoint).
+      ;; Maybe it should be. But that being the case, we need to remove the sigwait
+      ;; thread from list-all-threads.
+      (let* ((userthreads
+              (remove-if #'sb-thread::thread-ephemeral-p
+                         (sb-thread:list-all-threads)))
+             (starting-userthreads
+              ;; Cleanup of *starting-threads* is normally done in START-THREAD guarded
+              ;; by *make-thread-lock*. We need to avoid racing with that.
+              (mapcan (lambda (x)
+                        (if (and (sb-thread::thread-p x)
+                                 (not (sb-thread::thread-ephemeral-p x)))
+                            (list x)))
+                      sb-thread::*starting-threads*))
+             (joinable sb-thread::*joinable-threads*))
+        (if (or (cdr userthreads) starting-userthreads joinable)
+            (let* ((interactive (sb-thread::interactive-threads))
+                   (other (union (set-difference userthreads interactive)
+                                 (union starting-userthreads joinable))))
+              (setf error (make-condition 'save-with-multiple-threads-error
+                                          :interactive-threads interactive
+                                          :other-threads other)))
+            (finalizer-thread-stop))))
     (when error (error error))
     #+allocator-metrics (setq sb-thread::*allocator-metrics* nil)
     (setq sb-thread::*sprof-data* nil))
@@ -337,15 +365,18 @@ sufficiently motivated to do lengthy fixes."
     ;; recreate it so that we don't preserve an empty vector taking up 16KB
     (setq sb-kernel::*forward-referenced-layouts* (make-hash-table :test 'equal)))
   ;; Clean up the simulated weak list of covered code components.
-  (rplacd sb-c:*code-coverage-info*
-          (delete-if-not #'weak-pointer-value (cdr sb-c:*code-coverage-info*)))
+  (rplacd *code-coverage-info*
+          (delete nil (mapl (lambda (cell)
+                              (let ((v (car cell)) (dead 0) live)
+                                (dotimes (i (weak-vector-len v))
+                                  (let ((code (weak-vector-ref v i)))
+                                    (if code (push code live) (incf dead))))
+                                (when (plusp dead) ; some cell was expunged
+                                  (rplaca cell (if live (list-to-weak-vector live))))))
+                            (cdr *code-coverage-info*))))
   (sb-kernel::rebuild-ctype-hashsets)
   (drop-all-hash-caches)
   (os-deinit)
-  (clrhash sb-c::*emitted-full-calls*) ; Don't immortalize compiler's scratchpad
-  ;; Perform static linkage. Functions become un-statically-linked
-  ;; on demand, for TRACE, redefinition, etc.
-  #+(and immobile-code x86-64) (sb-vm::statically-link-core)
   (finalizers-deinit)
   ;; Try to shrink the pathname cache. It might be largely nulls
   (rebuild-pathname-cache)
@@ -361,16 +392,18 @@ sufficiently motivated to do lengthy fixes."
 (in-package "SB-C")
 
 (defun coalesce-debug-info ()
+  ;; Discard the uncompacted fun map cache.
+  (setq sb-di::*uncompacted-fun-maps* nil)
+  ;; Discard the debugger's cached mapping of debug functions.
+  (setq sb-di::*compiled-debug-funs* nil)
   (flet ((debug-source= (a b)
            (and (equalp a b)
                 ;; Case sensitive
                 (equal (debug-source-plist a) (debug-source-plist b)))))
     ;; Coalesce the following:
-    ;;  DEBUG-INFO-SOURCE, DEBUG-FUN-NAME
-    ;;  SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
+    ;;  DEBUG-INFO-SOURCE, SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
     ;; FUN-NAMES-EQUALISH considers any two string= gensyms as EQ.
     (let ((source-ht (make-hash-table :test 'equal))
-          (name-ht (make-hash-table :test 'equal))
           (arglist-hash (make-hash-table :hash-function 'sb-impl::equal-hash
                                          :test 'sb-impl::fun-names-equalish))
           (type-hash (make-hash-table :test 'equal)))
@@ -379,12 +412,13 @@ sufficiently motivated to do lengthy fixes."
          (declare (ignore size))
          (case widetag
            (#.sb-vm:code-header-widetag
-            (let ((di (%code-debug-info obj)))
-              ;; Discard memoized debugger's debug info
-              (when (typep di 'sb-c::compiled-debug-info)
-                (setf (sb-c::compiled-debug-info-memo-cell di) nil)))
-            (dotimes (i (sb-kernel:code-n-entries obj))
-              (let* ((fun (sb-kernel:%code-entry-point obj i))
+            (dotimes (i (if (compiled-debug-info-p (%code-debug-info obj))
+                            (code-n-entries obj)
+                            0))
+              ;; FIXME: now that the metadata are not physically in the code primitive
+              ;; object, wouldn't it be better to process the debug-info for deduplication
+              ;; rather than treating the code as if it contained the displaced slots?
+              (let* ((fun (%code-entry-point obj i))
                      (arglist (%simple-fun-arglist fun))
                      (info (%simple-fun-info fun))
                      (type (typecase info
@@ -394,7 +428,7 @@ sufficiently motivated to do lengthy fixes."
                      (xref (%simple-fun-xrefs fun)))
                 (setf (%simple-fun-arglist fun)
                       (ensure-gethash arglist arglist-hash arglist))
-                (setf (sb-impl::%simple-fun-info fun)
+                (setf (%simple-fun-info fun)
                       (if (and type xref) (cons type xref) (or type xref))))))
            (#.sb-vm:instance-widetag
             (typecase obj
@@ -412,15 +446,6 @@ sufficiently motivated to do lengthy fixes."
                             ((neq source canonical-repr)
                              (setf (compiled-debug-info-source obj)
                                    canonical-repr))))))))
-              (compiled-debug-fun
-               (let ((name (compiled-debug-fun-name obj)))
-                 (multiple-value-bind (new foundp)
-                     (gethash name name-ht)
-                   (cond ((not foundp)
-                          (setf (gethash name name-ht) name))
-                         ((neq name new)
-                          (%instance-set obj (get-dsd-index compiled-debug-fun name)
-                                         new))))))
               (sb-lockless::linked-list
                ;; In the normal course of execution, incompletely deleted nodes
                ;; exist only for a brief moment, as the next operation on the list by
@@ -530,7 +555,7 @@ sufficiently motivated to do lengthy fixes."
                           (and (typep di 'sb-c::compiled-debug-info)
                                (let ((src (sb-c::compiled-debug-info-source di)))
                                  (and (typep src 'sb-c::debug-source)
-                                      (let ((str (debug-source-namestring src)))
+                                      (let ((str (sb-c::debug-source-namestring src)))
                                         (if (= (mismatch str "SYS:") 4) 1))))))
                         0))
                    ;; cap the popularity index to 255 and negate so that higher

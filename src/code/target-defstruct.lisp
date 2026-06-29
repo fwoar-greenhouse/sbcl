@@ -13,22 +13,32 @@
 
 ;;;; structure frobbing primitives
 
-#+permgen
-(defun allocate-permgen-layout (nwords)
-  (flet ((thunk ()
-           (let ((freeptr sb-vm:*permgen-space-free-pointer*))
-             (setf sb-vm:*permgen-space-free-pointer*
-                   ;; round-to-odd, add the header word
-                   (sap+ freeptr (ash (1+ (logior nwords 1)) sb-vm:word-shift)))
-             (aver (<= (sap-int sb-vm:*permgen-space-free-pointer*)
-                       (+ sb-vm:permgen-space-start sb-vm:permgen-space-size)))
-             (setf (sap-ref-word freeptr 0)
-                   (logior (ash nwords sb-vm:instance-length-shift)
-                           sb-vm:instance-widetag))
-             (%make-lisp-obj (sap-int (sap+ freeptr sb-vm:instance-pointer-lowtag))))))
-    (if (sb-thread::mutex-p sb-vm::*allocator-mutex*)
-        (with-system-mutex (sb-vm::*allocator-mutex* :without-gcing t) (thunk))
-        (thunk))))
+(export '(%layout-slot-set %layout-slot-cas))
+(defun %layout-slot-set (layout index value)
+  #+permgen (%primitive sb-vm::gc-remember-layout layout)
+  #-immobile-space (%instance-set layout index value)
+  #+immobile-space
+  (sb-vm::with-pseudo-atomic-foreign-calls
+    ;; This is pseudo-atomic because if you mark first and then GC occurs before storing,
+    ;; then GC could (possibly) clear the mark, then you store, and now there's a violation
+    ;; of the marking invariant. If you mark after the store, then you run the risk of an
+    ;; abusive TERMINATE-THREAD causing a violation by aborting before setting the mark.
+    ;; Btw, 1 foreign call per slot assignment is really not a big deal. If you're altering
+    ;; layouts at runtime, slot setting is the least of your problems. Making the hundreds
+    ;; of CLOS metaobjects that go along with class lattice changes is worse by far.
+    (alien-funcall (extern-alien "layout_slot_set" (function void unsigned unsigned int))
+                   (get-lisp-obj-address layout) (get-lisp-obj-address value)
+                   (truly-the (mod 32) index)))
+  value)
+(defun %layout-slot-cas (layout index oldval newval)
+  #-immobile-space (%instance-cas layout index oldval newval)
+  #+immobile-space
+  (sb-vm::with-pseudo-atomic-foreign-calls
+    (%make-lisp-obj
+     (alien-funcall (extern-alien "layout_slot_cas"
+                                  (function unsigned unsigned unsigned unsigned int))
+                    (get-lisp-obj-address layout) (get-lisp-obj-address oldval)
+                    (get-lisp-obj-address newval) (truly-the (mod 32) index)))))
 
 ;;; For lack of any better to place to write up some detail surrounding
 ;;; layout creation for structure types, I'm putting here.
@@ -51,6 +61,7 @@
                          (info nil)
                          (bitmap (if info (dd-bitmap info) 0))
                          (invalid :uninitialized))
+  #+sb-show (declare (optimize (debug 1))) ; workaround for something, I don't know what
   (let* ((fixed-words (type-dd-length layout))
          (extra-id-words ; count of additional words needed to store ancestors
           (if (logtest flags +structure-layout-flag+)
@@ -287,8 +298,8 @@
 ;;; arguments to the defstruct hook (which renders the structure definition
 ;;; into a CLOS class) without having to figure out some means of stashing
 ;;; functions in the DD or DD for the structure.
-(defvar *struct-accesss-fragments* nil)
-(define-load-time-global *struct-accesss-fragments-delayed* nil)
+(defvar *struct-access-fragments* nil)
+(define-load-time-global *struct-access-fragments-delayed* nil)
 
 (defun !bootstrap-defstruct-hook (classoid)
   ;; I hate this, but do whatever it takes...
@@ -296,8 +307,8 @@
   ;; into the LAYOUT-SLOT-TABLE now.
   ;; (I think that's where the code fragments end up)
   (unless (member (classoid-name classoid) '(pathname condition)) ; KLUDGE
-    (push (cons (classoid-name classoid) *struct-accesss-fragments*)
-          *struct-accesss-fragments-delayed*)))
+    (push (cons (classoid-name classoid) *struct-access-fragments*)
+          *struct-access-fragments-delayed*)))
 
 (defun %target-defstruct (dd equalp &rest accessors)
   (declare (type defstruct-description dd))
@@ -336,7 +347,7 @@
                     (lambda (a b)
                       (sb-impl::instance-equalp* comparators a b)))))))
 
-    (let ((*struct-accesss-fragments* accessors))
+    (let ((*struct-access-fragments* accessors))
       (dolist (fun *defstruct-hooks*)
         (funcall fun classoid))))
 
@@ -344,7 +355,7 @@
 (defun !target-defstruct-altmetaclass (dd &rest accessors)
   (declare (type defstruct-description dd))
   (let ((classoid (find-classoid (dd-name dd)))
-        (*struct-accesss-fragments* accessors))
+        (*struct-access-fragments* accessors))
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
   t)
@@ -555,7 +566,7 @@
         (t
          't)))
 
-;;; Return a compiled function that maps keys to values based on SLOTS (an alist)
+;;; Return a lambda expression that maps keys to values based on SLOTS (an alist)
 ;;; where keys are symbols. Though structure slots are stringlike (dups by STRING=
 ;;; are disallowed), STANDARD-OBJECT has no such prohibition, so this employs SYMBOL-HASH
 ;;; rather than SYMBOL-NAME-HASH to better distinguish slots whose symbol-names match.
@@ -567,23 +578,10 @@
 ;;; for collision resolution is so infrequent that rather than resolving it by
 ;;; chosing different input bits, the lambda expression wrapped around the
 ;;; perfect hash should resolve collisions via another alist.
-(defun make-hash-based-slot-mapper (slots lambda-name)
+(defun hash-based-slot-mapper-lexpr (slots unique-hashes lambda-name)
   (flet ((hash (s) (ldb (byte 32 0) (symbol-hash s))))
-    (binding* ((symbols (map 'vector #'car slots))
-               (hashes (map '(simple-array (unsigned-byte 32) (*))
-                            #'hash symbols))
-               (unique-hashes (remove-duplicates hashes))
-               (nil
-                (when (< (length unique-hashes) 3)
-                  ;; Return a simple-vector, all symbols first, followed by all data
-                  (let* ((n (length symbols))
-                         (a (make-array (* n 2))))
-                    (loop for j from 0 for slot in slots
-                          do (setf (svref a j) (car slot)
-                                   (svref a (+ n j)) (cdr slot)))
-                    (return-from make-hash-based-slot-mapper a))))
-               ;; power-of-2 sizing generally results in fewer instructions
-               (lexpr (sb-c:make-perfect-hash-lambda unique-hashes nil))
+    ;; power-of-2 sizing generally results in fewer instructions
+    (binding* ((lexpr (sb-c:make-perfect-hash-lambda unique-hashes nil))
                (nbuckets (power-of-two-ceiling (length unique-hashes)))
                ((body decls) (parse-body (cddr lexpr) nil))
                (optimize-decl (pop decls)))
@@ -592,7 +590,7 @@
       (let* ((buckets (make-array nbuckets :initial-element nil))
              (phash-fun (sb-c::compile-perfect-hash lexpr unique-hashes))
              (resultform
-              (cond ((= (length unique-hashes) (length hashes))
+              (cond ((= (length unique-hashes) (length slots))
                      (let* ((et (choose-smallest-element-type slots :key #'cdr))
                             (data (make-array nbuckets :element-type et)))
                        (fill buckets 0)
@@ -609,25 +607,99 @@
                      `(dolist (choice (svref ,buckets h))
                         (when (eq (car choice) symbol)
                           (return (cdr choice))))))))
-        ;; Bypass COMPILE-PERFECT-HASH here, as it can elect not to actually
-        ;; call COMPILE, but instead make an interpreted function.
-        ;; We don't need the extra check for perfectness that it performs
-        ;; since the above bucketing already asserted that hashing worked.
-        (values (compile
-                 nil
-                 ;; this resembles the ASSOC transform
-                 `(named-lambda ,lambda-name (symbol)
-                    ,optimize-decl
-                    (let* ((sb-c::val (ldb (byte 32 0) (symbol-hash symbol)))
-                           (h (progn ,@body)))
-                      (if (< h ,nbuckets) ,resultform)))))))))
-;;; Return a compiled function which takes a symbol
-;;; and returns the DSD-BITS for the slot in DD of that name.
-(defun make-struct-slot-map (dd)
-  (make-hash-based-slot-mapper
-   (mapcar (lambda (dsd) (cons (dsd-name dsd) (dsd-bits dsd)))
-           (dd-slots dd))
-   ;; Prevent random junk like (lambda (symbol) in "very-long-name-why-why-why")
-   `(slot-mapper ,(dd-name dd))))
+        ;; this resembles the ASSOC transform
+        `(named-lambda ,lambda-name (symbol)
+           ,optimize-decl
+           (let* ((sb-c::val (ldb (byte 32 0) (symbol-hash symbol)))
+                  (h (progn ,@body)))
+             (if (< h ,nbuckets) ,resultform)))))))
+
+(declaim (inline sb-pcl::search-struct-slot-name-vector))
+(defun sb-pcl::search-struct-slot-name-vector (mapper slot-name)
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  ;; MAPPER is a vector of all slot name followed by all values of DSD-BITS
+  (let ((nsymbols (ash (length (truly-the simple-vector mapper)) -1)))
+    (dotimes (i nsymbols)
+      (declare (index i))
+      (when (eq (svref mapper i) slot-name)
+        (return (svref mapper (truly-the index (+ i nsymbols))))))))
+
+(defun make-second-stage-slot-mapper (vector)
+  (declare (sb-c::tlab :system))
+  (lambda (symbol)
+    (sb-pcl::search-struct-slot-name-vector vector symbol)))
+
+(defun install-hash-based-slot-mapper (layout pairs unique-hashes fun-name)
+  (declare (sb-c::tlab :system))
+  (flet ((compile-it ()
+           (let* ((lexpr
+                   (hash-based-slot-mapper-lexpr pairs unique-hashes fun-name))
+                  (compiled-function
+                   ;; Bypass COMPILE-PERFECT-HASH here, as it can elect not to actually
+                   ;; call COMPILE, but instead make an interpreted function.
+                   ;; We don't need the extra check for perfectness that it performs
+                   ;; since the above bucketing already asserted that hashing worked.
+                   (compile nil lexpr)))
+             (setf (layout-slot-mapper layout) compiled-function))))
+    #+sb-thread (progn (atomic-push #'compile-it sb-c::*background-tasks*)
+                       (sb-impl::finalizer-thread-notify 0))
+    #-sb-thread (compile-it)))
+
+(!defstruct-with-alternate-metaclass slot-mapper
+  :slot-names ()
+  :constructor %make-slot-mapper-fn
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)
+
+;;; Install a compiled function taking a symbol naming a slot in the DD
+;;; coresponding to LAYOUT and returning the DSD-BITS of the named slot.
+;;; There are 3 different "stages" the function operates in:
+;;; stage 1: when called, install stage 2 function, background compile
+;;;          the stage 3 function, then call the stage 2 function
+;;; stage 2: use linear search on the name -> dsd-bits mapping vector
+;;; stage 3: use a compiled perfect-hash-based function
+;;; This lazy compilation provided by staging is better than PROMISE-COMPILE in
+;;; the sb-concurrency contrib, because firstly it takes very little memory
+;;; until the function is called (which may never occur), and secondly the caller
+;;; is never delayed by waiting for the compiler.
+(defun install-struct-slot-mapper (layout)
+  (let* ((dd (layout-dd layout))
+         (slots (dd-slots dd))
+         (keys (map 'vector #'dsd-name slots))
+         (values (map 'vector #'dsd-bits slots))
+         (hashes
+          (flet ((hash (s) (ldb (byte 32 0) (symbol-hash s))))
+            (map '(simple-array (unsigned-byte 32) (*)) #'hash keys)))
+         (unique-hashes (remove-duplicates hashes))
+         (vector (let* ((n (length keys))
+                        (a (make-array (* n 2))))
+                   (dotimes (i n a)
+                     (setf (svref a i) (aref keys i)
+                           (svref a (+ i n)) (aref values i)))))
+         (n-unique-hashes (length unique-hashes)))
+    (when (or (< n-unique-hashes 4) (/= n-unique-hashes (length slots)))
+      (return-from install-struct-slot-mapper
+        (setf (layout-slot-mapper layout) vector)))
+    (let ((me (%make-slot-mapper-fn))
+          (pairs (map 'list #'cons keys values)))
+      (setf (sb-kernel:%funcallable-instance-fun me)
+            (lambda (symbol)
+              ;; Try to swap the slot-mapper to the second stage function.
+              ;; This state change acts only to indicate that compilation was started.
+              ;; (Several threads could invoke ME at the exact same time)
+              (let ((old (layout-slot-mapper layout)))
+                (if (neq old me) ; if it's not ME, then it's either the second stage mapper
+                    ;; or else a compiled perfect-hash-based mapper. Either way, punt.
+                    (funcall old symbol)
+                    (let* ((new (make-second-stage-slot-mapper vector))
+                           (actual-old
+                            (%layout-slot-cas layout (get-dsd-index layout slot-mapper) me new)))
+                      (when (eq actual-old me)
+                        (install-hash-based-slot-mapper
+                         layout pairs unique-hashes `(slot-mapper ,(dd-name dd))))
+                      (funcall new symbol))))))
+      (setf (layout-slot-mapper layout) me))))
 
 (/show0 "target-defstruct.lisp end of file")

@@ -209,9 +209,6 @@
   (setf (tn-kind save) :specified-save)
   (setf (tn-save-tn tn) save)
   (setf (tn-save-tn save) tn)
-  (push save
-        (ir2-component-specified-save-tns
-         (component-info *component-being-compiled*)))
   tn)
 
 ;;; Create a constant TN. The backend dependent
@@ -253,13 +250,12 @@
               ;; because liveness depends on pointer tracing without looking at code-fixups.
               (when (and sc
                          (or (not immed)
-                             #+permgen (typep (constant-value constant) 'layout)
-                             #+immobile-space
+                             #+(or immobile-space permgen)
                              (let ((val (constant-value constant)))
                                (or (and (symbolp val) (not (sb-vm:static-symbol-p val)))
                                    (typep val 'layout))))
                          #+(or arm64 x86-64)
-                         (not (eql (constant-value constant) $0f0)))
+                         (not (eql (constant-value constant) 0f0)))
                 (let ((constants (ir2-component-constants component)))
                   (setf (tn-offset res)
                         (vector-push-extend constant constants))))
@@ -295,7 +291,9 @@
          (constants (ir2-component-constants component)))
     (setf (tn-offset res) (fill-pointer constants)
           (tn-type res) type)
-    (vector-push-extend (list :load-time-value handle res) constants)
+    ;; The third list element served no purpose as far as I can discern.
+    ;; Perhaps it was for debugging?
+    (vector-push-extend (list :load-time-value handle #|res|#) constants)
     (push-in tn-next res (ir2-component-constant-tns component))
     res))
 
@@ -307,6 +305,7 @@
                        :alias (tn-primitive-type tn) nil)))
     (setf (tn-save-tn res) tn
           (tn-type res) (tn-type tn))
+    (setf (tn-vertex tn) :alias)
     (push-in tn-next res
              (ir2-component-alias-tns component))
     res))
@@ -331,7 +330,9 @@
     (do ((i 1 (1+ i)))
         ((= i (length constants))
          (setf (tn-offset res) i)
-         (vector-push-extend (list kind info res) constants))
+         ;; The third list element served no purpose as far as I can discern.
+         ;; Perhaps it was for debugging?
+         (vector-push-extend (list kind info #|res|#) constants))
       (let ((entry (aref constants i)))
         (when (and (consp entry)
                    (eq (car entry) kind)
@@ -351,14 +352,14 @@
           (let ((w (tn-writes ,tn)))
             (when w
               (setf (tn-ref-prev w) ,ref))
-            (setf (tn-ref-next ref) w
-                  (tn-writes tn) ,ref)))
+            (setf (tn-ref-next ,ref) w
+                  (tn-writes ,tn) ,ref)))
          (t
           (let ((r (tn-reads ,tn)))
             (when r
               (setf (tn-ref-prev r) ,ref))
             (setf (tn-ref-next ,ref) r
-                  (tn-reads tn) ,ref)))))
+                  (tn-reads ,tn) ,ref)))))
 
 ;;; Make a TN-REF that references TN and return it. WRITE-P should be
 ;;; true if this is a write reference, otherwise false. All we do
@@ -599,7 +600,15 @@
                           (sc-name sc)))
         (when (and (not (sc-save-p alt))
                    (eq (sb-kind (sc-sb alt)) :unbounded))
-          (setf (tn-sc tn) alt)
+          (cond #-fp-and-pc-standard-save
+                ((let ((save-tn (tn-save-tn tn)))
+                   (when (and save-tn (eq (tn-kind save-tn) :specified-save))
+                     (setf (tn-offset tn) (tn-offset save-tn)
+                           (tn-sc tn) (tn-sc save-tn))
+                     t)))
+                (t
+                 (setf (tn-sc tn) alt)))
+
           (return)))))
   (values))
 

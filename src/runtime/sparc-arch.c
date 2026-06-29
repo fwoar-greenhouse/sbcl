@@ -23,11 +23,6 @@
 #include "breakpoint.h"
 #include "pseudo-atomic.h"
 
-os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
-{
-    return (os_vm_address_t)code->si_addr;
-}
-
 void arch_skip_instruction(os_context_t *context)
 {
     OS_CONTEXT_PC(context) = *os_context_npc_addr(context);
@@ -185,7 +180,7 @@ static void handle_allocation_trap(os_context_t *context, unsigned int *pc)
       lose("Allocation trap inside foreign code.");
 
     struct thread* thread = get_sb_vm_thread();
-    if (gencgc_alloc_profiler && thread->state_word.sprof_enable)
+    if (gencgc_alloc_profiler && thread->sprof_enable)
         record_backtrace_from_context(context, thread);
 
     or_inst = pc[-1];
@@ -230,6 +225,8 @@ static void handle_allocation_trap(os_context_t *context, unsigned int *pc)
     undo_fake_foreign_function_call(context);
 }
 
+void save_context_for_ldb(os_context_t *context);
+
 static void sigill_handler(int signal, siginfo_t *siginfo,
                            os_context_t *context)
 {
@@ -238,8 +235,10 @@ static void sigill_handler(int signal, siginfo_t *siginfo,
         unsigned int inst;
         unsigned int* pc = (unsigned int*) siginfo->si_addr;
 
-        if (!gc_managed_heap_space_p((lispobj)pc))
+        if (!gc_managed_heap_space_p((lispobj)pc)) {
+          save_context_for_ldb(context);
           lose("Illegal instruction not in lisp: %p [%x]\n", pc, *pc);
+        }
 
         inst = *pc;
         trap = inst & 0xff;
@@ -299,7 +298,7 @@ void arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-  char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+  char *reloc_addr = (char*)ALIEN_LINKAGE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;

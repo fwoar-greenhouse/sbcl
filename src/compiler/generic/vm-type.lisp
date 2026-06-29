@@ -52,8 +52,6 @@
 (sb-xc:deftype sb-impl::%pathname-directory () 'list)
 (sb-xc:deftype sb-impl::%pathname-name ()
   '(or simple-string sb-impl::pattern (member nil :unspecific :wild)))
-(sb-xc:deftype sb-impl::%pathname-type ()
-  '(or simple-string sb-impl::pattern (member nil :unspecific :wild)))
 (sb-xc:deftype sb-impl::%pathname-version ()
   '(or integer (member nil :newest :wild :unspecific)))
 
@@ -72,7 +70,7 @@
 (sb-xc:deftype half-bignum-length () `(mod ,(1+ (* maximum-bignum-length 2))))
 
 ;;; an index into an integer
-(sb-xc:deftype bit-index ()
+(sb-xc:deftype sb-bignum:bit-index ()
   `(integer 0 ,(- (* (1+ maximum-bignum-length) sb-vm:n-word-bits) 1)))
 
 
@@ -121,32 +119,12 @@
              (when (csubtypep eltype stype)
                (return stype)))))))
 
-(defun upgraded-array-element-type (spec &optional environment)
-  "Return the element type that will actually be used to implement an array
-   with the specifier :ELEMENT-TYPE Spec."
-  (declare (type lexenv-designator environment) (ignore environment))
-  (declare (explicit-check))
-  (let ((type (type-or-nil-if-unknown spec)))
-    (cond ((not type)
-           ;; What about a FUNCTION-TYPE - would (FUNCTION (UNKNOWN) UNKNOWN)
-           ;; upgrade to T? Well, it's still ok to say it's an error.
-           (error "Undefined type: ~S" spec))
-          (t
-           (type-specifier (%upgraded-array-element-type type))))))
-
 (defun upgraded-complex-part-type (spec &optional environment)
   "Return the element type of the most specialized COMPLEX number type that
    can hold parts of type SPEC."
   (declare (type lexenv-designator environment) (ignore environment))
   (declare (explicit-check))
-  (let ((type (type-or-nil-if-unknown spec)))
-    (cond
-      ((eq type *empty-type*) nil)
-      ((not type) (error "Undefined type: ~S" spec))
-      (t
-       (let ((ctype (specifier-type `(complex ,spec)))) ; error checking
-         (declare (ignore ctype))
-         (type-specifier type))))))
+  (type-specifier (upgraded-complex-part-ctype spec)))
 
 ;;; Return the most specific integer type that can be quickly checked that
 ;;; includes the given type.
@@ -371,22 +349,6 @@
           (unless (member null-type remainder :test #'csubtypep)
             (push null-type remainder))))
       (values widetags remainder))))
-
-;; Return T if SYMBOL will have a nonzero TLS index at load time or sooner.
-;; True of all specials exported from CL:, all which expose slots of the thread
-;; structure, and any symbol that the compiler decides will eventually have a
-;; nonzero TLS index due to compiling a dynamic binding of it.
-(defun sb-vm::symbol-always-has-tls-index-p (symbol)
-  (not (null (info :variable :wired-tls symbol))))
-
-;;; Return T if SYMBOL will always have a value in its TLS cell that is
-;;; not EQ to NO-TLS-VALUE-MARKER-WIDETAG. As an optimization, set and ref
-;;; are permitted (but not required) to avoid checking for it.
-;;; This will be true of all C interface symbols, 'struct thread' slots,
-;;; and any variable defined by DEFINE-THREAD-LOCAL.
-(defun sb-vm::symbol-always-has-tls-value-p (symbol)
-  (typep (info :variable :wired-tls symbol)
-         '(or (eql :always-thread-local) fixnum)))
 
 #+(or x86 x86-64)
 (defun sb-vm::displacement-bounds (lowtag element-size data-offset)

@@ -85,24 +85,17 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 ;;;   (<args> <constructor> <system>).
 (define-load-time-global *dfun-constructors* ())
 
-;;; If this is NIL, then the whole mechanism for caching dfun constructors is
-;;; turned off. The only time that makes sense is when debugging LAP code.
-(defvar *enable-dfun-constructor-caching* t)
-
 (defun show-dfun-constructors ()
   (format t "~&DFUN constructor caching is ~A."
-          (if *enable-dfun-constructor-caching*
-              "enabled" "disabled"))
+          (if (enable-dfun-constructor-caching *codegen-parms*) "enabled" "disabled"))
   (dolist (generator-entry *dfun-constructors*)
     (dolist (args-entry (cdr generator-entry))
       (format t "~&~S ~S"
               (cons (car generator-entry) (caar args-entry))
               (caddr args-entry)))))
 
-(defvar *raise-metatypes-to-class-p* t)
-
 (defun get-dfun-constructor (generator &rest args)
-  (when (and *raise-metatypes-to-class-p*
+  (when (and (raise-metatypes-to-class-p *codegen-parms*)
              (member generator '(emit-checking emit-caching
                                  emit-in-checking-cache-p emit-constant-value)))
     (setq args (cons (mapcar (lambda (mt)
@@ -113,7 +106,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                      (cdr args))))
   (let* ((generator-entry (assq generator *dfun-constructors*))
          (args-entry (assoc args (cdr generator-entry) :test #'equal)))
-    (if (null *enable-dfun-constructor-caching*)
+    (if (not (enable-dfun-constructor-caching *codegen-parms*))
         (apply (fdefinition generator) args)
         (or (cadr args-entry)
             (multiple-value-bind (new not-best-p)
@@ -205,7 +198,13 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 (defun standard-slot-value (object slot-name class)
   (declare (notinline standard-instance-access
                       funcallable-standard-instance-access))
-  (let ((location (gethash (cons class slot-name) *standard-slot-locations*)))
+  ;; I'm sure there's a super easy way to feed the mix of the CLASS and SLOT-NAME
+  ;; hashes into a perfect hash fun, but this function seems never to be called except
+  ;; by MOP some tests. Therefore I don't care to improve it beyond the avoidance
+  ;; of 1 cons operation.
+  (let* ((key (cons class slot-name))
+         (location (gethash key *standard-slot-locations*)))
+    (declare (dynamic-extent key))
     (if location
         (let ((value (if (funcallable-instance-p object)
                          (funcallable-standard-instance-access object location)
@@ -620,10 +619,6 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
       (let ((cdc  (caching-dfun-cost gf))) ; fast
         (> cdc (dispatch-dfun-cost gf cdc))))))
 
-(defparameter *non-system-typep-cost* 100)
-(defparameter *structure-typep-cost*  15)
-(defparameter *system-typep-cost* 5)
-
 ;;; According to comments in the original CMU CL version of PCL,
 ;;; the cost LIMIT is important to cut off exponential growth for
 ;;; large numbers of gf methods and argument lists.
@@ -638,12 +633,13 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
      (let* ((type-test-cost
              (if (eq 'class (car type))
                  (let* ((metaclass (class-of (cadr type)))
-                        (mcpl (class-precedence-list metaclass)))
+                        (mcpl (class-precedence-list metaclass))
+                        (costs *codegen-parms*))
                    (cond ((memq *the-class-system-class* mcpl)
-                          *system-typep-cost*)
+                          (system-typep-cost costs))
                          ((memq *the-class-structure-class* mcpl)
-                          *structure-typep-cost*)
-                         (t *non-system-typep-cost*)))
+                          (structure-typep-cost costs))
+                         (t (non-system-typep-cost costs))))
                  0))
             (max-cost-so-far
              (+ (max true-value false-value) type-test-cost)))
@@ -652,17 +648,13 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
        max-cost-so-far))
    #'identity))
 
-(defparameter *cache-lookup-cost*  30)
-(defparameter *wrapper-of-cost* 15)
-(defparameter *secondary-dfun-call-cost* 30)
-
 (defun caching-dfun-cost (gf)
-  (let ((nreq (get-generic-fun-info gf)))
-    (+ *cache-lookup-cost*
-       (* *wrapper-of-cost* nreq)
-       (if (methods-contain-eql-specializer-p
-            (generic-function-methods gf))
-           *secondary-dfun-call-cost*
+  (let ((nreq (get-generic-fun-info gf))
+        (costs *codegen-parms*))
+    (+ (cache-lookup-cost costs)
+       (* (wrapper-of-cost costs) nreq)
+       (if (methods-contain-eql-specializer-p (generic-function-methods gf))
+           (secondary-dfun-call-cost costs)
            0))))
 
 (declaim (inline make-callable))
@@ -701,7 +693,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                                 :size 4))))
     (make-emf-cache generic-function valuep cache classes-list new-class)))
 
-(defvar *dfun-miss-gfs-on-stack* ())
+(defvar *dfun-miss-gfs-on-stack* ()) ; define-thread-local is in target-signal-common
 
 (defmacro dfun-miss ((gf args wrappers invalidp nemf
                       &optional type index caching-p applicable)
@@ -1049,7 +1041,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 ;;;  <index>      If <type> is READER or WRITER, and the slot accessed is
 ;;;            an :instance slot, this is the index number of that slot
 ;;;            in the object argument.
-(defvar *cache-miss-values-stack* ())
+(defvar *cache-miss-values-stack* ()) ; define-thread-local is in target-signal-common
 
 (defun cache-miss-values (gf args state)
   (multiple-value-bind (nreq applyp metatypes nkeys arg-info)
@@ -1113,10 +1105,17 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
               (index (standard-slot-value/eslotd slotd 'location))
               (type (gf-info-simple-accessor-type arg-info)))
           (when (and method
-                     (subtypep (ecase accessor-type
-                                 ((reader) (car classes))
-                                 ((writer) (cadr classes)))
-                               class))
+                     (let ((method-class (ecase accessor-type
+                                           ((reader) (car classes))
+                                           ((writer) (cadr classes)))))
+                       (or (eq method-class class)
+                           ;; SUBTYPEP doesn't work because it calls the CLASS-WRAPPER GF.
+                           (block nil
+                             (sb-kernel::do-subclassoids ((subclassoid layout)
+                                                          (layout-classoid (standard-slot-value/class class 'wrapper)))
+                               (declare (ignore layout))
+                               (when (eq method-class (classoid-pcl-class subclassoid))
+                                 (return t)))))))
             (return-from break-vicious-metacircle
               (values index (list method) type index)))))))
   (error "~@<vicious metacircle:  The computation of an ~
@@ -1643,10 +1642,12 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
           (call-no-applicable-method gf args)))
       (let* ((key (car methods))
              (cache
-              (if (listp key)           ; early method
-                  (sixth key)           ; See !EARLY-MAKE-A-METHOD
-                  (or (method-em-cache key)
-                      (setf (method-em-cache key) (cons nil nil))))))
+               (if (listp key)          ; early method
+                   (sixth key)          ; See !EARLY-MAKE-A-METHOD
+                   (or (method-em-cache key)
+                       (setf (method-em-cache key)
+                             (sb-thread:barrier (:write)
+                               (cons nil nil)))))))
         (if (and (null (cdr methods)) all-applicable-p ; the most common case
                  (null method-alist-p) wrappers-p (not function-p))
             (or (car cache)
@@ -1661,7 +1662,9 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                   (let ((value (get-secondary-dispatch-function2
                                 gf methods types method-alist-p wrappers-p
                                 all-applicable-p all-sorted-p function-p)))
-                    (push (cons akey value) (cdr cache))
+                    (setf (cdr cache)
+                          (sb-thread:barrier (:write)
+                            (cons (cons akey value) (cdr cache))))
                     value)))))))
 
 (defun get-secondary-dispatch-function2 (gf methods types method-alist-p

@@ -72,11 +72,12 @@
   ;; Canonicalize
   (setq element-type (type-specifier (specifier-type element-type)))
   ;; Expressed type must be _exactly_ one of the supported ones.
-  (aver (find (case element-type
-                #-sb-unicode (base-char 'character)
-                (t element-type))
-              sb-vm:*specialized-array-element-type-properties*
-              :key #'sb-vm:saetp-specifier :test 'equal))
+  (unless (find (case element-type
+                  #-sb-unicode (base-char 'character)
+                  (t element-type))
+                sb-vm:*specialized-array-element-type-properties*
+                :key #'sb-vm:saetp-specifier :test 'equal)
+    (error "No specialized array element-type for: ~a" element-type))
 
   (let ((array (cl:make-array dims
                               :element-type element-type
@@ -96,6 +97,14 @@
   (if (gethash array *array-to-specialization*) t nil))
 (deftype sb-xc:simple-vector ()
   '(and cl:simple-vector (not (satisfies target-specialized-array-p))))
+
+(defun %other-pointer-widetag (x)
+  (if (bit-vector-p x)
+      sb-vm:simple-bit-vector-widetag
+      (sb-vm:saetp-typecode
+       (find (array-element-type x)
+             sb-vm:*specialized-array-element-type-properties*
+             :key #'sb-vm:saetp-specifier :test #'equal))))
 
 (defun sb-cold::clear-specialized-array-registry ()
   (let ((registry *array-to-specialization*))

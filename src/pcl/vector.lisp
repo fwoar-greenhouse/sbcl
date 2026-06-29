@@ -50,7 +50,8 @@
 
 ;;; Used for interning parts of SLOT-NAME-LISTS, as part of
 ;;; PV-TABLE interning -- just to save space.
-(define-load-time-global *slot-name-lists* (make-hashset 64 #'list-elts-eq #'sxhash))
+(define-load-time-global *slot-name-lists*
+    (make-hashset 64 #'list-elts-eq #'sb-c::hash-list-of-symbols))
 
 ;;; Used for interning PV-TABLES, keyed by the SLOT-NAME-LISTS
 ;;; used.
@@ -68,8 +69,7 @@
            ;; (this isn't a weak hashset, but still, don't try to store NIL because
            ;; it causes the set to size up on every alleged failure to find)
            (if slot-names
-               (or (hashset-find *slot-name-lists* slot-names)
-                   (hashset-insert *slot-name-lists* slot-names))))
+               (hashset-insert-if-absent *slot-name-lists* slot-names #'identity)))
          (%intern-pv-table (snl)
            (ensure-gethash
             snl *pv-tables*
@@ -80,7 +80,7 @@
 
 (defun use-standard-slot-access-p (class slot-name type)
   (or (not (eq **boot-state** 'complete))
-      (and (standard-class-p class)
+      (and (std-class-p class)
            (let ((slotd (find-slot-definition class slot-name)))
              (and slotd
                   (slot-accessor-std-p slotd type))))))
@@ -135,9 +135,6 @@
             (unless (eq new-cache cache)
               (setf (pv-table-cache pv-table) new-cache))
             pv)))))
-
-(defun make-pv-type-declaration (var)
-  `(type simple-vector ,var))
 
 ;;; Sometimes we want to finalize if we can, but it's OK if
 ;;; we can't.
@@ -160,12 +157,9 @@
 
 (defun can-optimize-access (form required-parameters env)
   (destructuring-bind (op var-form slot-name-form &optional new-value) form
-    (let ((type (ecase op
-                  (slot-value 'reader)
-                  (set-slot-value 'writer)
-                  (slot-boundp 'boundp)
-                  (slot-makunbound 'makunbound)))
-          (var (extract-the var-form))
+    (declare (ignore op))
+    (aver (constantp slot-name-form env))
+    (let ((var (extract-the var-form))
           (slot-name (constant-form-value slot-name-form env)))
       (when (and (symbolp var) (not (var-special-p var env)))
         (let* ((rebound? (caddr (var-declaration '%variable-rebinding var env)))
@@ -189,13 +183,9 @@
                           class form))
                        (setf class nil))))
               (when (and class-name (not (eq class-name t)))
-                (when (not (and class
-                                (memq *the-class-structure-object*
-                                      (class-precedence-list class))))
-                  (aver type)
-                  (values (cons parameter-or-nil (or class class-name))
-                          slot-name
-                          new-value))))))))))
+                (values (cons parameter-or-nil (or class class-name))
+                        slot-name
+                        new-value)))))))))
 
 ;;; Check whether the binding of the named variable is modified in the
 ;;; method body.
@@ -299,23 +289,27 @@
 (defun optimize-instance-access (slots read/write sparameter slot-name
                                  new-value &optional safep)
   (let ((class (if (consp sparameter) (cdr sparameter) *the-class-t*))
-        (parameter (if (consp sparameter) (car sparameter) sparameter)))
+        (parameter (if (consp sparameter) (car sparameter) sparameter))
+        slotd)
     (if (and (eq **boot-state** 'complete)
              (classp class)
-             (memq *the-class-structure-object* (class-precedence-list class)))
-        (let ((slotd (find-slot-definition class slot-name)))
-          (ecase read/write
-            (:read
-             `(,(slot-definition-defstruct-accessor-symbol slotd) ,parameter))
-            (:write
-             `(setf (,(slot-definition-defstruct-accessor-symbol slotd)
-                     ,parameter)
-                    ,new-value))
-            (:boundp
-             t)
-            (:makunbound
-             ;; what should SLOT-MAKUNBOUND on a structure slot do?  Do that here.
-             )))
+             (typep (setq slotd (find-slot-definition class slot-name))
+                    'structure-effective-slot-definition))
+        (ecase read/write
+          (:read
+           `(,(slot-definition-defstruct-accessor-symbol slotd) ,parameter))
+          (:write
+           `(setf (,(slot-definition-defstruct-accessor-symbol slotd)
+                   ,parameter)
+                  ,new-value))
+          (:boundp
+           (if (slot-definition-always-bound-p slotd)
+               t
+               ;; no need for speed for BOUNDP on structure slots
+               `(accessor-slot-boundp ,parameter ,slot-name)))
+          (:makunbound
+           ;; no need for speed for MAKUNBOUND on structure slots
+           `(accessor-slot-makunbound ,parameter ,slot-name)))
         (let* ((parameter-entry (assq parameter slots))
                (slot-entry      (assq slot-name (cdr parameter-entry)))
                (position (posq parameter-entry slots))
@@ -369,10 +363,9 @@
   (if (eq **boot-state** 'complete)
       (let (slotd)
         (cond ((or
-                ;; Conditions, structures, and classes for which FIND-CLASS
+                ;; Conditions, and classes for which FIND-CLASS
                 ;; doesn't return them yet.
-                ;; FIXME: surely we can get faster accesses for structures?
-                (not (standard-class-p class))
+                (not (std-class-p class))
                 ;; Should not happen... (FIXME: assert instead?)
                 (eq class *the-class-t*)
                 (not (class-finalized-p class))
@@ -648,7 +641,7 @@
          ,@forms)
       `(let* ((.pv-table. ,pv-table-form)
               (.pv. (pv-table-lookup-pv-args .pv-table. ,@pv-parameters)))
-        (declare ,(make-pv-type-declaration '.pv.))
+        (declare (simple-vector .pv.))
         ,@forms)))
 
 (defun split-declarations (body args req-args cnm-p parameters-setqd)

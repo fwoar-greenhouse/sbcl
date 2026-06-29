@@ -16,7 +16,7 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 4) ; FIXME: C
 
-(defconstant +backend-fasl-file-implementation+ #-64-bit :rv32g #+64-bit :rv64g)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ #-64-bit :rv32g #+64-bit :rv64g)
 
 (defconstant +backend-page-bytes+ #+linux 4096 #+netbsd 8192)
 
@@ -51,7 +51,7 @@
 (defconstant-eqx float-rounding-mode (byte 3 5) #'equalp)
 (defconstant-eqx float-sticky-bits (byte 5 0) #'equalp)
 ;;;; RISC-V has no explicit floating point traps.
-(defconstant-eqx float-traps-byte (byte 5 0) #'equalp)
+(defconstant-eqx float-traps-byte (byte 0 0) #'equalp)
 (defconstant-eqx float-exceptions-byte (byte 5 0) #'equalp)
 (defconstant float-fast-bit (ash 1 24)) ;; Flush-to-zero mode
 

@@ -157,3 +157,11 @@ for."
     (if kind
         `(make-hash-table-using-defaults ,kind)
         form)))
+
+(declaim (inline gethash3))
+(defun gethash3 (key hash-table default)
+  (funcall (hash-table-gethash-impl hash-table) key hash-table default))
+
+(declaim (inline %puthash))
+(defun %puthash (key hash-table value)
+  (funcall (hash-table-puthash-impl hash-table) key hash-table value))

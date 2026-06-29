@@ -47,7 +47,7 @@
 
 (defoptimizer ir2-convert-setter ((object value) node block name offset lowtag)
   (let ((value-tn (lvar-tn node block value)))
-    (vop set-slot node block (lvar-tn node block object) value-tn
+    (vop set-slot node block (lvar-tn node block object) (:lvar value value-tn)
          name offset lowtag)
     (move-lvar-result node block (list value-tn) (node-lvar node))))
 
@@ -67,8 +67,8 @@
          (res (first locs)))
     (vop compare-and-swap-slot node block
          (lvar-tn node block object)
-         (lvar-tn node block old)
-         (lvar-tn node block new)
+         (:lvar old (lvar-tn node block old))
+         (:lvar new (lvar-tn node block new))
          name offset lowtag
          res)
     (move-lvar-result node block locs lvar)))
@@ -322,22 +322,6 @@
      sb-vm:other-pointer-lowtag
      (loop for i from 1 to n-args collect `(:arg . ,i)))))
 
-;;; :SET-TRANS (in objdef.lisp !DEFINE-PRIMITIVE-OBJECT) doesn't quite
-;;; cut it for symbols, where under certain compilation options
-;;; (e.g. #+SB-THREAD) we have to do something complicated, rather
-;;; than simply set the slot.  So we build the IR2 converting function
-;;; by hand.  -- CSR, 2003-05-08
-(let ((fun-info (fun-info-or-lose '%set-symbol-value)))
-  (setf (fun-info-ir2-convert fun-info)
-        (lambda (node block)
-          (let ((args (basic-combination-args node)))
-            (destructuring-bind (symbol value) args
-              (let ((value-tn (lvar-tn node block value)))
-                (vop set node block
-                     (lvar-tn node block symbol) value-tn)
-                (move-lvar-result
-                 node block (list value-tn) (node-lvar node))))))))
-
 ;;; Stack allocation optimizers per platform support
 (defoptimizer (make-array-header* stack-allocate-result) ((&rest args))
   t)
@@ -358,7 +342,11 @@
                                  (if (sb-c:msan-unpoison sb-c:*compilation*)
                                      'sb-vm::allocate-vector-on-stack+msan-unpoison
                                      'sb-vm::allocate-vector-on-stack)
-                                 'sb-vm::allocate-vector-on-heap))
+                                 (cond #-x86-64
+                                       ((sb-vm::system-tlab-p 0 call)
+                                        'sb-vm::sys-allocate-vector-on-heap)
+                                       (t
+                                        'sb-vm::allocate-vector-on-heap))))
 
 (defun make-vector-check-overflow-p (node)
   (not (or (zerop (policy node safety))
@@ -396,8 +384,13 @@
 
 ;;; ...conses
 (defoptimizer (cons stack-allocate-result) ((&rest args))
-  t)
+  (bug "Shouldn't get here")) ; due to source-transform of cons -> list*
+(when-vop-existsp (:translate acons)
+  (defoptimizer (acons stack-allocate-result) ((&rest args)) t))
 (defoptimizer (%make-complex stack-allocate-result) ((&rest args))
+  t)
+
+(defoptimizer (unaligned-dx-cons stack-allocate-result) ((car))
   t)
 
 ;;; MAKE-LIST optimizations
@@ -431,10 +424,13 @@
   (let* ((writer (producer-vop (vop-args vop)))
          ;; Take the last of the info arguments
          ;; in case WORDS is also an info argument.
+         (last (car (last (vop-codegen-info vop))))
          (value
-          (the (or sb-vm:word
-                   (member :trap :unbound :safe-default :unsafe-default))
-               (car (last (vop-codegen-info vop)))))
+          (if last
+              (the (or sb-vm:word
+                       (member :trap :unbound :safe-default :unsafe-default))
+                   last)
+              (return-from elide-zero-fill))) ; :INITIAL-ELEMENT NIL
          (elidep
           (ecase (vop-name writer)
             (sb-vm::allocate-vector-on-heap
@@ -510,3 +506,16 @@
   (:results (res :scs (any-reg)))
   (:result-types fixnum)
   (:generator 1 (inst #+mips addu #-mips add res x y)))
+
+;;; This vop is safe even if the user calls ALIEN-SAP by hand - the compiler will assert
+;;; the arg to be of type SB-ALIEN-INTERNALS:ALIEN-VALUE (unless checking is dsabled).
+;;; *** produces a bad build on ppc and ppc64 - why? ***
+#+(or arm64 loongarch64 riscv x86 x86-64)
+(define-vop (alien-sap)
+  (:translate alien-sap)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:results (r :scs (descriptor-reg)))
+  (:generator 1
+   (loadw r x (+ (get-dsd-index alien-value sb-kernel::sap) instance-slots-offset)
+          instance-pointer-lowtag)))

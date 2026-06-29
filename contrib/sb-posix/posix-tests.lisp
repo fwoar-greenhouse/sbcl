@@ -17,6 +17,14 @@
             (logior
              sb-posix::s-irgrp sb-posix::s-iwgrp sb-posix::s-ixgrp
              sb-posix::s-iroth sb-posix::s-iwoth sb-posix::s-ixoth))))
+#-win32
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (sb-alien:define-alien-routine openpty sb-alien:int
+    (amaster sb-alien:int :out)
+    (aslave sb-alien:int :out)
+    (name (* sb-alien:char))
+    (termp (* t))
+    (winp (* t))))
 
 (defmacro define-eacces-test (name form &rest values)
   #+win32 (declare (ignore name form values))
@@ -162,6 +170,7 @@
             ;; non-writable parent dir may return EACCES instead of ENOTDIR
             #+unix (member err `(,sb-posix:enotdir ,sb-posix:eacces)))))
 
+#-haiku
 (deftest rmdir.error.3
   (handler-case
       (sb-posix:rmdir #-win32 "/" #+win32 (sb-ext:posix-getenv "windir"))
@@ -171,7 +180,7 @@
        `(member #+(or darwin openbsd freebsd) ,sb-posix:eisdir
                 #+win32 ,sb-posix::eacces #+win32 ,sb-posix::enotempty
                 #+sunos ,sb-posix::einval
-                #-(or darwin openbsd freebsd win32 sunos) ,sb-posix::ebusy))))
+                #-(or darwin openbsd freebsd win32 sunos haiku) ,sb-posix::ebusy))))
   t)
 
 (deftest rmdir.error.4
@@ -223,7 +232,7 @@
     (logand mode (logior sb-posix::s-iread sb-posix::s-iwrite sb-posix::s-iexec)))
   #.(logior sb-posix::s-iread sb-posix::s-iwrite sb-posix::s-iexec))
 
-#-(or (and darwin x86) win32)
+#-(or (and darwin x86) win32 haiku)
 (deftest stat.2
   (eql
    (sb-posix::stat-mode (sb-posix:stat "/"))
@@ -419,7 +428,7 @@
                sb-posix::o-nonblock))
   t)
 
-#-(or gc-stress win32 netbsd) ; fix: cant handle c-vargs
+#-(or gc-stress win32 netbsd haiku) ; fix: cant handle c-vargs
 (deftest fcntl.flock.1
     (locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
       (let ((flock (make-instance 'sb-posix:flock
@@ -497,7 +506,8 @@
         (unwind-protect
              (let ((buf (make-array 10 :element-type '(unsigned-byte 8))))
                (values
-                (sb-posix:read fd (sb-sys:vector-sap buf) 10)
+                (sb-sys:with-pinned-objects (buf)
+                  (sb-posix:read fd (sb-sys:vector-sap buf) 10))
                 (code-char (aref buf 0))
                 (code-char (aref buf 1))
                 (code-char (aref buf 2))))
@@ -511,7 +521,7 @@
         (sb-posix:closedir dir))))
   nil)
 
-#-(and darwin x86)
+#-(or (and darwin x86) haiku)
 (deftest readdir.1
   (let ((dir (sb-posix:opendir "/")))
     (unwind-protect
@@ -524,7 +534,7 @@
       (sb-posix:closedir dir)))
   t)
 
-#-darwin
+#-(or darwin haiku)
 (test-util:with-test (:name :readdir/dirent-name)
   (let* ((dir (sb-posix:opendir *current-directory*))
          (posix-readdir (loop for entry = (sb-posix:readdir dir)
@@ -554,7 +564,9 @@
             (retval nil))
         (unwind-protect
              (let ((buf (coerce "foo" 'simple-base-string)))
-               (setf retval (sb-posix:write fd (sb-sys:vector-sap buf) 3)))
+               (setf retval
+                     (sb-sys:with-pinned-objects (buf)
+                       (sb-posix:write fd (sb-sys:vector-sap buf) 3))))
           (sb-posix:close fd))
 
         (with-open-file (inf tmpname) (values retval (read-line inf)))))
@@ -566,7 +578,7 @@
   (not (sb-posix:getpwuid 0))
   nil)
 
-#-(or android win32)
+#-(or android win32 haiku)
 (deftest pwent.2
   ;; make sure that we found something
   (not (sb-posix:getpwnam "root"))
@@ -635,7 +647,7 @@
     ;; make sure that we get something sensible, not an error
     (handler-case (progn (sb-posix:getgrnam "almost-certainly-does-not-exist")
                          nil)
-      (t (cond) (declare (ignore cond)) t))
+      (t (cond) (princ-to-string cond)))
   nil)
 
 #-(or android win32 (not sb-thread))
@@ -706,13 +718,33 @@
         (= new (sb-posix:cfgetospeed termios))))
   t)
 
+#-win32
+(deftest tcsetattr.smoke.pty
+    (let (master-fd slave-fd)
+      (unwind-protect
+           (progn
+             (multiple-value-bind (rv master slave)
+                 (openpty nil nil nil)
+               (assert (zerop rv))
+               (setf master-fd master
+                     slave-fd slave))
+             (let ((termios (sb-posix:tcgetattr slave-fd)))
+               ;; The pre-fix bug on openBSD was that even round-tripping an
+               ;; unmodified termios value could smash memory or crash.
+               (sb-posix:tcsetattr slave-fd sb-posix:tcsanow termios))
+             t)
+        (when slave-fd
+          (sb-posix:close slave-fd))
+        (when master-fd
+          (sb-posix:close master-fd))))
+  t)
 
 #-win32
 (deftest time.1
     (plusp (sb-posix:time))
   t)
 
-#-(or (and darwin x86) win32)
+#-(or (and darwin x86) win32 haiku)
 (macrolet ((test (name posix-fun)
              `(deftest ,name
                 (let ((file (merge-pathnames #p"utimes.1" *test-directory*))
@@ -760,7 +792,7 @@
     #.(concatenate 'string "/" (make-string 255 :initial-element #\a)))
 
   ;; The error tests are in the order of exposition from SUSv3.
-  #-freebsd
+  #-(or freebsd haiku)
   (deftest readlink.error.1
     (if (zerop (sb-posix:getuid))
         sb-posix:eacces
@@ -782,6 +814,7 @@
              (sb-posix:unlink link-pathname)
              (sb-posix:rmdir subdir-pathname)))))
     #.sb-posix:eacces)
+  #-haiku
   (deftest readlink.error.2
       (let* ((non-link-pathname (make-pathname :name "readlink.error.2"
                                                :defaults *test-directory*))
@@ -812,6 +845,7 @@
     #.sb-posix:eloop)
   ;; Note: PATH_MAX and NAME_MAX need not be defined, and may vary, so
   ;; failure of this test is not too meaningful.
+  #-haiku
   (deftest readlink.error.4
       (let ((pathname
              (make-pathname :name (make-string 257 ;NAME_MAX plus some, maybe

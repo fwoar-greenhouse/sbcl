@@ -8,30 +8,30 @@
 (with-test (:name :cons-madly-without-interrupts)
   (sb-sys:without-interrupts (cons-madly)))
 
-(with-test (:name :without-gcing)
-  (let ((gc-happend nil))
-    (push (lambda () (setq gc-happend t)) sb-ext:*after-gc-hooks*)
+(define-alien-variable n-lisp-gcs int)
+(with-test (:name :without-gcing
+            :skipped-on :gc-stress)
+  (let ((initial-gc-count n-lisp-gcs))
 
     ;; check that WITHOUT-GCING defers explicit gc
     (sb-sys:without-gcing
       (gc)
-      (assert (not gc-happend)))
-    (assert gc-happend)
+      (assert (= n-lisp-gcs initial-gc-count)))
+    (assert (> n-lisp-gcs initial-gc-count))
 
     ;; check that WITHOUT-GCING defers SIG_STOP_FOR_GC
     #+sb-thread
     (let ((in-without-gcing nil))
-      (setq gc-happend nil)
+      (setq initial-gc-count n-lisp-gcs)
       (sb-thread:make-thread (lambda ()
                                (loop while (not in-without-gcing))
                                (sb-ext:gc)))
       (sb-sys:without-gcing
         (setq in-without-gcing t)
         (sleep 3)
-        (assert (not gc-happend)))
-      ;; give the hook time to run
+        (assert (= n-lisp-gcs initial-gc-count)))
       (sleep 1)
-      (assert gc-happend))))
+      (assert (> n-lisp-gcs initial-gc-count)))))
 
 ;;; After each iteration of FOO there are a few pinned conses.
 ;;; On alternate GC cycles, those get promoted to generation 1.
@@ -55,22 +55,23 @@
 #+sb-thread
 (with-test (:name :concurrently-alloc-code)
   ;; this debug setting may or may not find a problem, but it can't hurt to try
-  (setf (extern-alien "pre_verify_gen_0" int) 1)
-  (let ((worker-th
-         (sb-thread:make-thread
-          (let ((stop (+ (get-internal-real-time)
-                         (* 1.5 internal-time-units-per-second))))
-            (lambda (&aux (n 0))
-              (loop while (<= (get-internal-real-time) stop)
-                    do (compile nil `(lambda () (print 20)))
-                       (incf n))
-              n)))))
-    (let ((gcs 0))
-      (loop (gc) (incf gcs)
-            (unless (sb-thread:thread-alive-p worker-th)
-              (return))
-            (sb-unix:nanosleep 0 (+ 1000000 (random 100000))))
-      (let ((compiles (sb-thread:join-thread worker-th)))
-        (format t "~&Compiled ~D times, GC'ed ~D times~%"
-                compiles gcs))))
-  (setf (extern-alien "pre_verify_gen_0" int) 0))
+  (let ((pre_verify_gen_0 (extern-alien "pre_verify_gen_0" int)))
+   (setf (extern-alien "pre_verify_gen_0" int) 1)
+   (let ((worker-th
+           (sb-thread:make-thread
+            (let ((stop (+ (get-internal-real-time)
+                           (* 1.5 internal-time-units-per-second))))
+              (lambda (&aux (n 0))
+                (loop while (<= (get-internal-real-time) stop)
+                      do (compile nil `(lambda () (print 20)))
+                         (incf n))
+                n)))))
+     (let ((gcs 0))
+       (loop (gc) (incf gcs)
+             (unless (sb-thread:thread-alive-p worker-th)
+               (return))
+             (sb-unix:nanosleep 0 (+ 1000000 (random 100000))))
+       (let ((compiles (sb-thread:join-thread worker-th)))
+         (format t "~&Compiled ~D times, GC'ed ~D times~%"
+                 compiles gcs))))
+   (setf (extern-alien "pre_verify_gen_0" int) pre_verify_gen_0)))

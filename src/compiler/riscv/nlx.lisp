@@ -14,7 +14,7 @@
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 (defun make-nlx-entry-arg-start-location ()
-  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+  (make-wired-tn *fixnum-primitive-type* any-reg-sc-number ocfp-offset))
 
 ;;; Save and restore dynamic environment.
 ;;;
@@ -79,9 +79,9 @@
   (:info entry-label)
   (:results (block :scs (any-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 22
-    (inst addi block cfp-tn (tn-byte-offset tn))
+    (add-imm block cfp-tn (tn-byte-offset tn) 'make-unwind-block temp)
     (load-current-unwind-protect-block temp)
     (storew temp block unwind-block-uwp-slot)
     (storew cfp-tn block unwind-block-cfp-slot)
@@ -98,9 +98,17 @@
   (:results (block :scs (any-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 44
-    (inst addi result cfp-tn (tn-byte-offset tn))
+    ;; ADD-IMM needs 3 instructions usually, but this way almost always needs
+    ;; at most 2 instructions in all likelihood.
+    (do ((src-operand cfp-tn)
+         (imm (tn-byte-offset tn)))
+        ((zerop imm))
+      (let ((short-imm (min imm 2040))) ; 2040 = maximum short immediate
+        (inst addi result src-operand short-imm)
+        (setq src-operand result)
+        (zerop (decf imm short-imm))))
     (load-current-unwind-protect-block temp)
     (storew temp result catch-block-uwp-slot)
     (storew cfp-tn result catch-block-cfp-slot)

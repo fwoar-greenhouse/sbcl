@@ -33,13 +33,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
-                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
-                 (defparameter ,name
-                   (list ,@(mapcar #'(lambda (name)
-                                       (symbolicate name "-OFFSET")) regs))))))
+                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg zero 0)
   (defreg nsp 1)
@@ -92,7 +86,7 @@
 
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
- (defparameter register-arg-names '(a0 a1 a2 a3)))
+ (defconstant-eqx register-arg-names '(a0 a1 a2 a3) #'equal))
 
 
 
@@ -190,11 +184,6 @@
   (non-descriptor-reg registers
    :locations #.non-descriptor-regs)
 
-  ;; Pointers to the interior of objects.  Used only as a temporary.
-  (interior-reg registers
-   :locations (#.lip-offset))
-
-
   ;; **** Things that can go in the floating point registers.
 
   ;; Non-Descriptor single-floats.
@@ -238,12 +227,10 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn zero any-reg)
-  (defregtn lip interior-reg)
+  (defregtn lip any-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
   (defregtn lra descriptor-reg)
@@ -282,10 +269,6 @@
 
 ;;;; function call parameters
 
-;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
 ;;; offsets of special stack frame locations
@@ -304,16 +287,13 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 (defparameter thread-base-tn
-  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
-                  :offset thread-offset))
+  (make-random-tn (sc-or-lose 'unsigned-reg) thread-offset))
 
 (export 'single-value-return-byte-offset)
 

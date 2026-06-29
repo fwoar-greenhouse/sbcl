@@ -30,7 +30,7 @@
   (:vop-var vop)
   (:generator 1
     (without-scheduling ()
-      (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) value name)
+      (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) name)
       (storew value object offset lowtag))))
 
 ;;;; Symbol hacking VOPs:
@@ -91,6 +91,26 @@
   (:translate symbol-global-value))
 (define-vop (fast-symbol-global-value fast-symbol-value)
   (:translate symbol-global-value))
+
+(define-vop (symbol-hash)
+  (:policy :fast-safe)
+  (:translate symbol-hash)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:sc unsigned-reg) tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    ;; Clear the 3 highest bits, ensuring the result is positive fixnum.
+    (inst li tmp #x1fffffff)
+    (inst and res res tmp)))
+
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:ignore tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst srl res res 3))) ; shift out the 3 pseudorandom bits
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -113,8 +133,7 @@
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
-  (:temporary (:scs (interior-reg)) lip)
-  (:temporary (:scs (non-descriptor-reg)) type)
+  (:temporary (:scs (non-descriptor-reg)) lip type)
   (:generator 38
       (without-scheduling ()
         (emit-gengc-barrier fdefn nil type)) ; type = temp
@@ -190,14 +209,11 @@
   (:temporary (:scs (descriptor-reg)) symbol value)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 0
-    (let ((loop (gen-label))
-          (skip (gen-label))
-          (done (gen-label)))
       (move where arg)
       (inst beq where bsp-tn done)
       (inst nop)
 
-      (emit-label loop)
+      LOOP
       (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
       (inst beq symbol skip)
       (loadw value bsp-tn (- binding-value-slot binding-size))
@@ -206,13 +222,13 @@
         (storew value symbol symbol-value-slot other-pointer-lowtag))
       (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
 
-      (emit-label skip)
+      SKIP
       (storew zero-tn bsp-tn (- binding-value-slot binding-size))
       (inst addu bsp-tn bsp-tn (* -2 n-word-bytes))
       (inst bne where bsp-tn loop)
       (inst nop)
 
-      (emit-label done))))
+      DONE))
 
 
 
@@ -332,7 +348,7 @@
                          (index :scs (any-reg)))
                   (:arg-types * positive-fixnum)
                   (:results (value :scs (,sc)))
-                  (:temporary (:scs (interior-reg)) lip)
+                  (:temporary (:scs (non-descriptor-reg)) lip)
                   (:result-types ,primtype)
                   (:generator 5
                     (inst addu lip object index)
@@ -345,7 +361,7 @@
                          (index :scs (any-reg))
                          (value :scs (,sc)))
                   (:arg-types * positive-fixnum ,primtype)
-                  (:temporary (:scs (interior-reg)) lip)
+                  (:temporary (:scs (non-descriptor-reg)) lip)
                   (:generator 5
                     (inst addu lip object index)
                     (storew value lip instance-slots-offset instance-pointer-lowtag))))))
@@ -359,7 +375,7 @@
          (index :scs (any-reg)))
   (:arg-types * positive-fixnum)
   (:results (value :scs (single-reg)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:result-types single-float)
   (:generator 5
     (inst addu lip object index)
@@ -373,7 +389,7 @@
          (index :scs (any-reg))
          (value :scs (single-reg)))
   (:arg-types * positive-fixnum single-float)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 5
     (inst addu lip object index)
     (inst swc1 value lip (- (* instance-slots-offset n-word-bytes)
@@ -386,7 +402,7 @@
          (index :scs (any-reg)))
   (:arg-types * positive-fixnum)
   (:results (value :scs (double-reg)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:result-types double-float)
   (:generator 5
     (inst addu lip object index)
@@ -408,7 +424,7 @@
          (index :scs (any-reg))
          (value :scs (double-reg)))
   (:arg-types * positive-fixnum double-float)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 5
     (inst addu lip object index)
     (let ((immediate-offset (- (* instance-slots-offset n-word-bytes)
@@ -429,7 +445,7 @@
          (index :scs (any-reg)))
   (:arg-types * positive-fixnum)
   (:results (value :scs (complex-single-reg)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:result-types complex-single-float)
   (:generator 5
     (inst addu lip object index)
@@ -451,7 +467,7 @@
          (index :scs (any-reg))
          (value :scs (complex-single-reg)))
   (:arg-types * positive-fixnum complex-single-float)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 5
     (inst addu lip object index)
     (inst swc1 (complex-single-reg-real-tn value)
@@ -469,7 +485,7 @@
          (index :scs (any-reg)))
   (:arg-types * positive-fixnum)
   (:results (value :scs (complex-double-reg)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:result-types complex-double-float)
   (:generator 5
     (inst addu lip object index)
@@ -525,7 +541,7 @@
          (index :scs (any-reg))
          (value :scs (complex-double-reg)))
   (:arg-types * positive-fixnum complex-double-float)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 5
     (inst addu lip object index)
     (let ((value-real (complex-double-reg-real-tn value)))

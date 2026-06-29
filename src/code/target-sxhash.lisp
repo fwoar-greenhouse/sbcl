@@ -18,6 +18,8 @@
 ;;; when we descend into a compound object or when we step through elements of
 ;;; a compound object.
 (defconstant +max-hash-depthoid+ 4)
+
+(defconstant +max-hash-table-bits+ #-64-bit 29 #+64-bit 31)
 
 ;;; This is an out-of-line callable entrypoint that the compiler can
 ;;; transform SXHASH into when hashing a non-simple string.
@@ -28,10 +30,29 @@
           (with-array-data ((string x) (start) (end) :check-fill-pointer t)
             (values string start end))
           (values x 0 (length x)))
-    ;; I'm not sure I believe the comment about FLET TRICK being needed.
-    ;; The generated code seems tight enough, and the comment is, after all,
-    ;; >14 years old.
     (%sxhash-simple-substring string start end)))
+
+(defun %sxhash-string/truncating (x max-length)
+  (declare (type string x)
+           (type fixnum max-length)
+           (optimize speed (safety 0)))
+  (multiple-value-bind (string start end)
+      (if (array-header-p x)
+          (with-array-data ((string x) (start) (end) :check-fill-pointer t)
+            (values string start end))
+          (values x 0 (length x)))
+    (%sxhash-simple-substring/truncating string start end max-length)))
+
+(defmacro %%sxhash-string (x max-length on-truncate)
+  (once-only ((x x) (max-length max-length))
+    (with-unique-names (hash n-chars-truncated)
+      `(if ,max-length
+           (multiple-value-bind (,hash ,n-chars-truncated)
+               (%sxhash-string/truncating ,x ,max-length)
+             (unless (zerop ,n-chars-truncated)
+               ,on-truncate)
+             ,hash)
+           (%sxhash-string ,x)))))
 
 ;;;; the SXHASH function
 
@@ -42,7 +63,7 @@
 ;;; indicator as to whether there was a hash slot appended by GC. States:
 ;;;   #b00 = never hashed
 ;;;   #b01 = hashed and not moved a/k/a "need stable hash"
-;;;   #b11 = hashed and moved a/k/a "has stable hash"
+;;;   #b11 = hashed and moved a/k/a "has hash slot"
 ;;;
 ;;; When we need to take the address, there are a few ways to get a consistent
 ;;; view of the object's hash status bits and its address:
@@ -58,38 +79,74 @@
 ;;; Since WITH-PINNED-OBJECT costs nothing on conservative gencgc,
 ;;; that's what I'm going with.
 ;;;
-(defun %instance-sxhash (instance)
-  ;; LAYOUT must not acquire an extra slot for the stable hash,
-  ;; because the bitmap length is derived from the instance length.
-  ;; It would probably be simple to eliminate this as a special case
-  ;; by ensuring that instances of LAYOUT commence life with a trailing
-  ;; hash slot and the SB-VM:HASH-SLOT-PRESENT-FLAG set.
-  (when (typep instance 'layout)
-    ;; This might be wrong if the clos-hash was clobbered to 0
-    (return-from %instance-sxhash (layout-clos-hash instance)))
+;;; There was still a very subtle data race on precise backends.
+;;; Conservative pinning prevents the bug, which would be as follows:
+;;;
+;;; Initial state: object address has never been hashed, so both bits are 0.
+;;;
+;;;          thread A                     thread B
+;;; -------------------------------+--------------------------------------
+;;;  read has-hash-slot bit        |  read has-hash-slot bit
+;;;  answer = no                   |  answer = no
+;;;  with-pinned-objects           |  -- descheduled, context switch --
+;;;    set need-stable-hash        |
+;;;    take address                |   (thread is not running user code here)
+;;;  end W-P-O                     |
+;;;  ... leave this function       |
+;;;  start GC                      |
+;;;      ...                       |  -> respond to stop-for-gc signal
+;;;  (*) copy and extend object    |
+;;;      set has-hash-slot         |
+;;;      ...                       |
+;;;  end GC                        |  -> return from stop-for-gc (user code resumes)
+;;;                                |
+;;;                                |  ; we think there is no hash slot, but there is
+;;;                                |  with-pinned-objects
+;;;                                |    observe need-stable-hash = 1
+;;;                                |    take address of object -> WRONG !
+;;;                                |  end W-P-O
+;;;
+;;; With conservative stack scanning, the asterisked step can not occur
+;;; due to an impicit pin from thread B.
+
+(declaim (inline %instance-sxhash))
+
+;;; Prevent IF-VOP-EXISTSP from being part of the inline expansion of this defun,
+;;; which might be useful after self-build
+(sb-c::if-vop-existsp (:named sb-vm::set-instance-hashed-return-address)
+ (defun %instance-sxhash (instance header-word)
   ;; Non-simple cases: no hash slot, and either unhashed or hashed-not-moved.
-  (let* ((header-word (instance-header-word instance))
-         (addr (with-pinned-objects (instance)
-                 ;; First we have to indicate that a hash was taken from the address
-                 ;; if not already so marked.
-                 (unless (logbitp sb-vm:stable-hash-required-flag header-word)
-                   #-sb-thread (setf (sap-ref-word (int-sap (get-lisp-obj-address instance))
-                                                   (- sb-vm:instance-pointer-lowtag))
-                                     (logior (ash 1 sb-vm:stable-hash-required-flag)
-                                             header-word))
-                   #+sb-thread (%primitive sb-vm::set-instance-hashed instance))
-                 (get-lisp-obj-address instance))))
+  (let ((addr (if (logbitp sb-vm:stable-hash-required-flag header-word)
+                  (get-lisp-obj-address instance)
+                  (%primitive sb-vm::set-instance-hashed-return-address instance))))
     ;; perturb the address
     (murmur-hash-word/+fixnum addr)))
 
+ (defun %instance-sxhash (instance header-word)
+   (with-pinned-objects (instance)
+     ;; On precise GC platforms we have to check again inside W-P-O for a hash slot.
+     ;; However ppc64 pins context registers and surely everything is in registers,
+     ;; so I doubt it is needed there.
+     #+(and sb-thread (not (or x86 x86-64)))
+     (when (logbitp sb-vm:hash-slot-present-flag header-word)
+       (return-from %instance-sxhash
+         (truly-the hash-code (%instance-ref instance (%instance-length instance)))))
+     ;; Indicate that an addressed-based hash was taken unless already done.
+     (unless (logbitp sb-vm:stable-hash-required-flag header-word)
+       #-sb-thread (setf (sap-ref-word (int-sap (get-lisp-obj-address instance))
+                                       (- sb-vm:instance-pointer-lowtag))
+                         (logior (ash 1 sb-vm:stable-hash-required-flag) header-word))
+       #+sb-thread (%primitive sb-vm::set-instance-hashed instance))
+     (murmur-hash-word/+fixnum (get-lisp-obj-address instance)))))
+
 (declaim (inline instance-sxhash))
 (defun instance-sxhash (instance)
-  (if (logbitp sb-vm:hash-slot-present-flag
-               (instance-header-word (truly-the instance instance)))
-      ;; easy case: 1 word beyond the apparent length is a word added
-      ;; by GC (which may have resized the object, but we don't need to know).
-      (truly-the hash-code (%instance-ref instance (%instance-length instance)))
-      (%instance-sxhash instance)))
+  (let ((header-word (instance-header-word (truly-the instance instance))))
+    (if (logbitp sb-vm:hash-slot-present-flag header-word)
+        ;; easy case: 1 word beyond the apparent length is a word added
+        ;; by GC (which may have resized the object, but we don't need to know).
+        (truly-the hash-code (%instance-ref instance (%instance-length instance)))
+        (%instance-sxhash instance header-word))))
 
 ;;; Return a pseudorandom number that was assigned on allocation.
 ;;; FIN is a STANDARD-FUNCALLABLE-INSTANCE but we don't care to type-check it.
@@ -242,86 +299,109 @@
              ;; in hash.pure.lisp should be made more rigorous as well.
              (%sxhash-simple-bit-vector (copy-seq bit-vector))))))))
 
-;;; To avoid "note: Return type not fixed values ..."
-;;; PATHNAME-SXHASH can't easily be placed in pathname.lisp because that file
-;;; depends on LOGICAL-HOST but the definition of LOGICAL-HOST is complicated
-;;; and seems to belong where it is, in target-pathname.lisp, though maybe not.
-(declaim (ftype (sfunction (t) hash-code) pathname-sxhash))
-
 (defun sap-hash (x)
   ;; toss in a LOGNOT so that (the word a) and (int-sap a) hash differently
   (murmur-hash-word/+fixnum (logand (lognot (sap-int x)) most-positive-word)))
 
-(defun sxhash (x)
-  ;; profiling SXHASH is hard, but we might as well try to make it go
-  ;; fast, in case it is the bottleneck somewhere.  -- CSR, 2003-03-14
-  ;; So, yes, profiling is a little tough but not impossible with some added
-  ;; instrumentation in each stanza of the COND, either manually or
-  ;; automagically. Based on a manual approach, the order of the tests below
-  ;; are now better arranged by approximate descending frequency in terms
-  ;; of calls observed in certain test. Regardless of the fact that applications
-  ;; will vary by use-cases, this seems like a good order because:
-  ;;  * despite that INSTANCE is often the 2nd-most common object type in the heap
-  ;;    (right behind CONS), there are probably at least as many heap words
-  ;;    that are FIXNUM as instance pointers. So it stands to reason that
-  ;;    SXHASH-RECURSE is invoked very often on FIXNUM.
-  ;;  * SYMBOLs are extremely common as table keys, more so than INSTANCE,
-  ;;    so we should pick off SYMBOL sooner than INSTANCE as well.
-  ;;  * INSTANCE (except for PATHNAME) doesn't recurse anyway - in fact
-  ;;    it is particularly dumb (by design), so performing that test later
-  ;;    doesn't incur much of a penalty.
-  ;; Anyway, afaiu, the code below was previously ordered by gut feeling
-  ;; rather than than actual measurement, so having any rationale for ordering
-  ;; is better than having no rationale. And as a further comment observes,
-  ;; we could do away with the question of order if only we had jump tables.
-  ;; (Also, could somebody perhaps explain how these magic numbers were chosen?)
-  (declare (optimize speed))
-  (labels ((sxhash-recurse (x depthoid)
-             (declare (type index depthoid))
-             (typecase x
-               ;; we test for LIST here, rather than CONS, because the
-               ;; type test for CONS is in fact the test for
-               ;; LIST-POINTER-LOWTAG followed by a negated test for
-               ;; NIL.  If we're going to have to test for NIL anyway,
-               ;; we might as well do it explicitly and pick off the
-               ;; answer.  -- CSR, 2004-07-14
-               (list
-                (if (null x)
-                    (sxhash x)          ; through DEFTRANSFORM
-                    (if (plusp depthoid)
+;;; Like SXHASH, but the amount of hashing effort can be controlled.
+;;;
+;;; MAX-DEPTHOID overrides +MAX-HASH-DEPTHOID+.
+;;;
+;;; MAX-LENGTH limits the number of characters to hash in a single
+;;; string. Currently, an equal number of characters from the
+;;; beginning and end of the string are hashed. NIL means no limit.
+;;;
+;;; ON-TRUNCATE is a form that's evaluated whenever (even multiple
+;;; times) some data in X is discarded and higher limits (MAX-ATOMS
+;;; and MAX-LENGTH) may change the hash. Thus ON-TRUNCATE is not
+;;; evaluated if we bail out because there are too many cycles.
+(defmacro %sxhash (x max-depthoid max-length &key on-truncate)
+  (once-only ((x x) (max-depthoid max-depthoid) (max-length max-length))
+    `(locally (declare (optimize speed))
+       ;; Profiling SXHASH is hard, but we might as well try to make
+       ;; it go fast, in case it is the bottleneck somewhere. -- CSR,
+       ;; 2003-03-14 So, yes, profiling is a little tough but not
+       ;; impossible with some added instrumentation in each stanza of
+       ;; the COND, either manually or automagically. Based on a
+       ;; manual approach, the order of the tests below are now better
+       ;; arranged by approximate descending frequency in terms of
+       ;; calls observed in certain test. Regardless of the fact that
+       ;; applications will vary by use-cases, this seems like a good
+       ;; order because:
+       ;;
+       ;;  * despite that INSTANCE is often the 2nd-most common object
+       ;;    type in the heap (right behind CONS), there are probably
+       ;;    at least as many heap words that are FIXNUM as instance
+       ;;    pointers. So it stands to reason that FIXNUMs quite
+       ;;    commonly occur in objects.
+       ;;
+       ;;  * SYMBOLs are extremely common as table keys, more so than
+       ;;    INSTANCE, so we should pick off SYMBOL sooner than
+       ;;    INSTANCE as well.
+       ;;
+       ;;  * INSTANCE (except for PATHNAME) doesn't recurse anyway -
+       ;;    in fact it is particularly dumb (by design), so
+       ;;    performing that test later doesn't incur much of a
+       ;;    penalty.
+       ;;
+       ;; Anyway, afaiu, the code below was previously ordered by gut
+       ;; feeling rather than than actual measurement, so having any
+       ;; rationale for ordering is better than having no rationale.
+       ;; And as a further comment observes, we could do away with the
+       ;; question of order if only we had jump tables. (Also, could
+       ;; somebody perhaps explain how these magic numbers were
+       ;; chosen?)
+       (labels
+           ((sxhash-recurse (x depthoid)
+              (declare (type index depthoid))
+              (typecase x
+                ;; We test for LIST here, rather than CONS, because
+                ;; the type test for CONS is in fact the test for
+                ;; LIST-POINTER-LOWTAG followed by a negated test for
+                ;; NIL. If we're going to have to test for NIL anyway,
+                ;; we might as well do it explicitly and pick off the
+                ;; answer. -- CSR, 2004-07-14
+                (list
+                 (cond ((null x)
+                        (sxhash x))     ; through DEFTRANSFORM
+                       ((plusp depthoid)
                         (mix (sxhash-recurse (car x) (1- depthoid))
-                             (sxhash-recurse (cdr x) (1- depthoid)))
+                             (sxhash-recurse (cdr x) (1- depthoid))))
+                       (t
+                        (when (< ,max-depthoid 32)
+                          ,on-truncate)
                         261835505)))
-               (symbol (sxhash x)) ; through DEFTRANSFORM
-               (fixnum (sxhash x)) ; through DEFTRANSFORM
-               (instance
-                (if (pathnamep x)
-                    (pathname-sxhash x)
-                    (instance-sxhash x)))
-               (array
-                (typecase x
-                  (string (%sxhash-string x))
-                  (bit-vector (%sxhash-bit-vector x))
-                  ;; Would it be legal to mix in the widetag?
-                  (t (logxor 191020317 (sxhash (array-rank x))))))
-               ;; general, inefficient case of NUMBER
-               ;; There's a spurious FIXNUMP test here, as we've already picked it off.
-               ;; Maybe the NUMBERP emitter could be informed that X can't be a fixnum,
-               ;; because writing this case as (OR BIGNUM RATIO FLOAT COMPLEX)
-               ;; produces far worse code.
-               (number (number-sxhash x))
-               (character
-                (logxor 72185131
-                        (sxhash (char-code x)))) ; through DEFTRANSFORM
-               (funcallable-instance
-                (if (logtest (layout-flags (%fun-layout x)) +pcl-object-layout-flag+)
-                    ;; We have a hash code, so might as well use it.
-                    (fsc-instance-hash x)
-                    ;; funcallable structure, not funcallable-standard-object
-                    9550684))
-               (system-area-pointer (sap-hash x))
-               (t 42))))
-    (sxhash-recurse x +max-hash-depthoid+)))
+                (symbol (sxhash x))     ; through DEFTRANSFORM
+                (fixnum (sxhash x))     ; through DEFTRANSFORM
+                (instance (instance-sxhash x))
+                (array
+                 (typecase x
+                   (string (%%sxhash-string x ,max-length ,on-truncate))
+                   (bit-vector (%sxhash-bit-vector x))
+                   (t
+                    ;; We could even mix in the widetag.
+                    (logxor 191020317 (sxhash (array-rank x))))))
+                ;; general, inefficient case of NUMBER
+                ;; There's a spurious FIXNUMP test here, as we've already picked it off.
+                ;; Maybe the NUMBERP emitter could be informed that X can't be a fixnum,
+                ;; because writing this case as (OR BIGNUM RATIO FLOAT COMPLEX)
+                ;; produces far worse code.
+                (number (number-sxhash x))
+                (character
+                 (logxor 72185131
+                         (sxhash (char-code x)))) ; through DEFTRANSFORM
+                (funcallable-instance
+                 (if (logtest (layout-flags (%fun-layout x)) +pcl-object-layout-flag+)
+                     ;; We have a hash code, so might as well use it.
+                     (fsc-instance-hash x)
+                     ;; funcallable structure, not funcallable-standard-object
+                     9550684))
+                (system-area-pointer (sap-hash x))
+                (t 42))))
+         (sxhash-recurse ,x (min (truly-the index ,max-depthoid) 32))))))
+
+(defun sxhash (x)
+  (%sxhash x +max-hash-depthoid+ nil))
 
 ;;;; the PSXHASH function
 
@@ -332,7 +412,6 @@
                    (hi (symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type)))
                    (bignum-hash (symbolicate 'sxhash-bignum- type)))
                `(let ((key ,key))
-                  (declare (inline float-infinity-p))
                   (cond (;; This clause allows FIXNUM-sized integer
                          ;; values to be handled without consing.
                          (<= ,lo key ,hi)
@@ -432,17 +511,17 @@
                             (mixf result (logand (%raw-instance-ref/word key i)
                                                  most-positive-fixnum)))
                            (,(1+index-of 'single-float)
-                            ,(mix-float '(%raw-instance-ref/single key i) $0f0))
+                            ,(mix-float '(%raw-instance-ref/single key i) 0f0))
                            (,(1+index-of 'double-float)
-                            ,(mix-float '(%raw-instance-ref/double key i) $0d0))
+                            ,(mix-float '(%raw-instance-ref/double key i) 0d0))
                            (,(1+index-of 'sb-kernel:complex-single-float)
                             (let ((cplx (%raw-instance-ref/complex-single key i)))
-                              ,(mix-float '(realpart cplx) $0f0)
-                              ,(mix-float '(imagpart cplx) $0f0)))
+                              ,(mix-float '(realpart cplx) 0f0)
+                              ,(mix-float '(imagpart cplx) 0f0)))
                            (,(1+index-of 'sb-kernel:complex-double-float)
                             (let ((cplx (%raw-instance-ref/complex-double key i)))
-                              ,(mix-float '(realpart cplx) $0d0)
-                              ,(mix-float '(imagpart cplx) $0d0)))))))
+                              ,(mix-float '(realpart cplx) 0d0)
+                              ,(mix-float '(imagpart cplx) 0d0)))))))
            (let* ((layout (%instance-layout key))
                   (result (layout-clos-hash layout)))
              (declare (type fixnum result))
@@ -518,9 +597,9 @@
                    ;; This is a purposely not very strong hash so that it does not make any
                    ;; distinctions that EQUALP does not make. Computing a hash of the k/v pair
                    ;; vector would incorrectly take insertion order into account.
-                   (mix (mix 103924836 (hash-table-count key))
+                   (mix (mix 103924836 (hash-table-%count key))
                         (sxhash (hash-table-test key))))
-                  ((pathnamep key) (pathname-sxhash key))
+                  ((pathnamep key) (instance-sxhash key))
                   (t
                    (structure-object-psxhash key depthoid))))
            (list
@@ -566,3 +645,8 @@
 
 ;;; Not needed post-build
 (clear-info :function :inlining-data '%sxhash-simple-substring)
+(clear-info :function :inlining-data '%sxhash-simple-substring/truncating)
+
+;; interpreter stubs that are needed as soon as possible in warm build
+(defun get-lisp-obj-address (x) (get-lisp-obj-address x))
+(defun descriptor-hash32 (x) (descriptor-hash32 x))

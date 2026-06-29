@@ -123,7 +123,16 @@
                  ((char= char #\[)
                   (flush-pending-regulars)
                   (let ((close-bracket
-                          (position #\] namestr :start index :end end)))
+                          (loop with escaping = nil
+                                for i from index below end
+                                for char = (char namestr i)
+                                thereis (cond (escaping
+                                               (setf escaping nil))
+                                              ((char= char escape-char)
+                                               (setf escaping t)
+                                               nil)
+                                              ((char= char #\])
+                                               i)))))
                     (unless close-bracket
                       (error 'namestring-parse-error
                              :complaint "#\\[ with no corresponding #\\]"
@@ -159,39 +168,42 @@
   (let ((length 0)
         (complicated nil))
     (declare (type index length))
-    (labels ((needs-escaping-p (char index)
+    (labels ((needs-escaping-p (char index start-p)
                (or (char= char #\*) (char= char #\?)
                    (char= char #\[) (char= char escape-char)
                    (case escape-dot
-                     (:unless-at-start (and (plusp index) (char= char #\.)))
+                     (:unless-at-start
+                      (and (or (not start-p)
+                               (plusp index))
+                           (char= char #\.)))
                      ((t) (char= char #\.)))))
-             (inspect-fragment (fragment)
+             (inspect-fragment (fragment start-p)
                (etypecase fragment
                  ((eql :wild)
                   (incf length)
                   t)
                  (simple-string
                   (incf length (length fragment))
-                  (Loop with complicated = nil
+                  (loop with complicated = nil
                         for char across (the simple-string fragment)
                         for i from 0
-                        when (needs-escaping-p char i)
+                        when (needs-escaping-p char i start-p)
                         do (setf complicated t)
                            (incf length)
                         finally (return complicated)))
                  (pattern
-                  (mapcar (lambda (piece)
-                            (etypecase piece
-                              (simple-string
-                               (inspect-fragment piece))
-                              ((member :multi-char-wild :single-char-wild)
-                               (incf length 1)
-                               t)
-                              ((cons (eql :character-set))
-                               (incf length (+ 2 (length (cdr piece))))
-                               t)))
-                          (pattern-pieces fragment))))))
-      (setf complicated (inspect-fragment thing))
+                  (loop for first = t then nil
+                        for piece in (pattern-pieces fragment)
+                        collect (etypecase piece
+                                  (simple-string
+                                   (inspect-fragment piece first))
+                                  ((member :multi-char-wild :single-char-wild)
+                                   (incf length 1)
+                                   t)
+                                  ((cons (eql :character-set))
+                                   (incf length (+ 2 (length (cdr piece))))
+                                   t)))))))
+      (setf complicated (inspect-fragment thing t))
       (unless complicated
         (return-from unparse-physical-piece thing))
       (let ((result (make-string length))
@@ -202,37 +214,38 @@
                    (setf (aref result index) character)
                    (incf index))
                  (output-string (string)
-                   (declare (type (simple-array character 1) string))
+                   (declare (string string))
                    (setf (subseq result index) string)
                    (incf index (length string)))
-                 (unparse-fragment (fragment)
+                 (unparse-fragment (fragment start-p)
                    (etypecase fragment
                      ((eql :wild)
                       (output-character #\*))
                      (simple-string
                       (loop for char across (the simple-string fragment)
                             for i from 0
-                            when (needs-escaping-p char i)
+                            when (needs-escaping-p char i start-p)
                             do (output-character escape-char)
                             do (output-character char)))
                      (pattern
-                      (mapc (lambda (piece piece-complicated)
-                              (etypecase piece
-                                (simple-string
-                                 (if piece-complicated
-                                     (unparse-fragment piece)
-                                     (output-string piece)))
-                                ((eql :multi-char-wild)
-                                 (output-character #\*))
-                                ((eql :single-char-wild)
-                                 (output-character #\?))
-                                ((cons (eql :character-set))
-                                 (output-character #\[)
-                                 (output-string (cdr piece))
-                                 (output-character #\]))))
-                            (pattern-pieces fragment) complicated)))))
+                      (loop for first = t then nil
+                            for piece in (pattern-pieces fragment)
+                            for piece-complicated in complicated
+                            do (etypecase piece
+                                 (simple-string
+                                  (if piece-complicated
+                                      (unparse-fragment piece first)
+                                      (output-string piece)))
+                                 ((eql :multi-char-wild)
+                                  (output-character #\*))
+                                 ((eql :single-char-wild)
+                                  (output-character #\?))
+                                 ((cons (eql :character-set))
+                                  (output-character #\[)
+                                  (output-string (cdr piece))
+                                  (output-character #\]))))))))
           (declare (inline output-character output-string))
-          (unparse-fragment thing))
+          (unparse-fragment thing t))
         result))))
 
 (defun make-matcher (piece)
@@ -249,21 +262,20 @@
 (defun extract-name-type-and-version (namestr start end escape-char)
   (declare (type simple-string namestr)
            (type index start end))
-  (flet ((escape-p (i)
-           (and (>= i start) (char= (aref namestr i) escape-char))))
-    (let ((last-dot
-            (loop for i from (1- end) downto (1+ start)
-                  when (and (char= (aref namestr i) #\.)
-                            (or (not (escape-p (1- i)))
-                                (escape-p (- i 2))))
-                  return i)))
-      (if last-dot
-          (values (maybe-make-pattern namestr start last-dot escape-char)
-                  (maybe-make-pattern namestr (1+ last-dot) end escape-char)
-                  :newest)
-          (values (maybe-make-pattern namestr start end escape-char)
-                  nil
-                  :newest)))))
+  (let ((last-dot
+          (loop for i from (1- end) downto (1+ start)
+                when (and (char= (aref namestr i) #\.)
+                          (evenp (loop for i from (1- i) downto start
+                                       while (char= (char namestr i) escape-char)
+                                       count t)))
+                return i)))
+    (if last-dot
+        (values (maybe-make-pattern namestr start last-dot escape-char)
+                (maybe-make-pattern namestr (1+ last-dot) end escape-char)
+                :newest)
+        (values (maybe-make-pattern namestr start end escape-char)
+                nil
+                :newest))))
 
 
 ;;;; Grabbing the kind of file when we have a native-namestring.
@@ -409,7 +421,8 @@
                  (realpath
                   (parse realpath :as-directory t))
                  (errorp
-                  (file-perror filename errno "Couldn't resolve ~S" filename)))))
+                  (file-perror filename errno "Couldn't resolve ~S"
+                               filename)))))
            (resolve-problematic-symlink (filename errno realpath-failed)
              ;; SBCL has for many years had a policy that a pathname
              ;; that names an existing, dangling or self-referential
@@ -430,10 +443,6 @@
                            realpath-failed)
                        linkp)
                   (case query-for
-                    (:existence
-                     ;; We do this reparse so as to return a
-                     ;; normalized pathname.
-                     (parse filename))
                     (:truename
                      (let ((realpath (directory-part-realpath filename)))
                        (when realpath
@@ -443,31 +452,54 @@
                               (parse (car (last (pathname-directory pathname))))
                               pathname)))))
                     (:author (sb-unix:uid-username uid))
-                    (:write-date (+ unix-to-universal-time mtime))))
-                 ;; The file doesn't exist; maybe error.
-                 (errorp
-                  (file-perror
-                   pathname errno
-                   "Failed to find the ~A of ~A" query-for pathname))))))
+                    (:write-date (+ unix-to-universal-time mtime))))))))
     (binding* ((filename (native-namestring pathname :as-file t))
                ((existsp errno nil mode nil uid nil nil nil nil mtime)
                 (sb-unix:unix-stat filename)))
-      (if existsp
-          (case query-for
-            (:existence
-             (parse filename :as-directory (eql (logand mode sb-unix:s-ifmt)
-                                                sb-unix:s-ifdir)))
-            (:truename
-             ;; Note: in case the file is stat'able, POSIX
-             ;; realpath(3) gets us a canonical absolute filename,
-             ;; even if the post-merge PATHNAME is not absolute
-             (parse (or (sb-unix:unix-realpath filename)
-                        (resolve-problematic-symlink filename errno t))
-                    :as-directory (eql (logand mode sb-unix:s-ifmt)
-                                       sb-unix:s-ifdir)))
-            (:author (sb-unix:uid-username uid))
-            (:write-date (+ unix-to-universal-time mtime)))
-          (resolve-problematic-symlink filename errno nil)))))
+      (or (if existsp
+              (case query-for
+                (:existence
+                 (parse filename :as-directory (eql (logand mode sb-unix:s-ifmt)
+                                                    sb-unix:s-ifdir)))
+                (:truename
+                 ;; Note: in case the file is stat'able, POSIX
+                 ;; realpath(3) gets us a canonical absolute filename,
+                 ;; even if the post-merge PATHNAME is not absolute
+                 (multiple-value-bind (realpath errno2)
+                     (sb-unix:unix-realpath filename)
+                   (unless realpath
+                     (setq errno errno2)
+                     (setq realpath (resolve-problematic-symlink
+                                     filename errno t)))
+                   ;; The file could have been deleted since
+                   ;; SB-UNIX:UNIX-STAT succeeded.
+                   (when realpath
+                     (parse realpath
+                            :as-directory (eql (logand mode sb-unix:s-ifmt)
+                                               sb-unix:s-ifdir)))))
+                (:author (sb-unix:uid-username uid))
+                (:write-date (+ unix-to-universal-time mtime)))
+              ;; For :EXISTENCE testing, if stat() failed for whatever
+              ;; reason, then lstat() in RESOLVE-PROBLEMATIC-SYMLINK
+              ;; will similarly fail, barring race conditions --
+              ;; creating a file, changing mode bits, etc in between
+              ;; the two calls. So, don't try. There are some edge
+              ;; cases: suppose "foo.txt" is a symlink to
+              ;; "/nosuchthing". The old behavior of ENOENT was to
+              ;; return #P"foo.txt" despite that the link's target
+              ;; does not exist. If such behavior was desirable in the
+              ;; case where RESOLVE-PROBLEMATIC-SYMLINK dubiously
+              ;; returned a pathname, then any caller that uses this
+              ;; as a near-equivalent of FILE-EXISTS-P can just use
+              ;; that instead. Unfortunately FILE-EXISTS-P would need
+              ;; to become aware of logical pathnames. I claim that
+              ;; test-driven design says this is working as it should.
+              (unless (eq query-for :existence)
+                (resolve-problematic-symlink filename errno nil)))
+          (when errorp
+            (file-perror
+             pathname errno
+             "Failed to find the ~A of ~A" query-for pathname))))))
 
 (defun probe-file (pathspec)
   "Return the truename of PATHSPEC if the truename can be found,
@@ -647,7 +679,10 @@ exist or if is a file or a symbolic link."
                                       :as-directory directory))
            (probe (path)
              (let ((contrib (merge-pathnames "contrib/" path)))
-               (when (probe-file contrib)
+               ;; X_OK implies a searchable directory. Not defined on #+win32
+               (when #+unix (sb-unix:unix-access (namestring contrib)
+                                                 (logior sb-unix:r_ok sb-unix:x_ok))
+                     #-unix (probe-file contrib)
                  path)))
            (try-runtime-home (path)
              (or (probe path)
@@ -669,21 +704,18 @@ exist or if is a file or a symbolic link."
                                                      :type nil
                                                      :defaults truename))))))))))
 
-(flet ((not-empty (x)
-         (and (not (equal x "")) x))
-       (lose (&optional username)
-         (error "Couldn't find home directory~@[ for ~S~]." username)))
-
-  #-win32
-  (defun user-homedir-namestring (&optional username)
+(defun user-homedir-namestring (&optional username)
+  (flet ((not-empty (x)
+           (and (not (equal x "")) x))
+         (lose (&optional username)
+           (error "Couldn't find home directory~@[ for ~S~]." username)))
+    #-win32
     (if username
         (sb-unix:user-homedir username)
         (or (not-empty (posix-getenv "HOME"))
             (not-empty (sb-unix:uid-homedir (sb-unix:unix-getuid)))
-            (lose))))
-
-  #+win32
-  (defun user-homedir-namestring (&optional username)
+            (lose)))
+    #+win32
     (if username
         (lose username)
         (or (not-empty (posix-getenv "HOME"))

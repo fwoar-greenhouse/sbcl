@@ -33,8 +33,8 @@
     (let ((name (uncross name)))
       (setq *undefined-warnings*
             (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
+                         (and (eq (undefined-warning-kind x) kind)
+                              (equal (undefined-warning-name x) name)))
                        *undefined-warnings*))))
   (values))
 
@@ -159,6 +159,8 @@
 ;;; the default.
 (defun undefine-fun-name (name)
   (when name
+    #-sb-xc-host
+    (sb-impl::remove-specialized-xep name)
     (macrolet ((frob (&rest types)
                  `(clear-info-values
                    name ',(mapcar (lambda (x)
@@ -294,7 +296,7 @@
       (enable-package-locks
        (set-difference old names :test #'equal)))))
 
-(defvar *queued-proclaims* nil)
+#-sb-xc-host (declaim (global *queued-proclaims*))
 
 (defun process-variable-declaration (name kind info-value)
   (unless (symbolp name)
@@ -322,15 +324,7 @@
     (if (eq kind 'always-bound)
         (setf (info :variable :always-bound name) info-value)
         (setf (info :variable :kind name) info-value)))
-  #-sb-xc-host (unset-symbol-progv-optimize name))
-
-#-sb-xc-host
-(defun unset-symbol-progv-optimize (symbol)
-  (reset-header-bits symbol sb-vm::+symbol-fast-bindable+))
-
-(defun type-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'type-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
+  #-sb-xc-host (sb-impl::unset-symbol-progv-optimize name))
 
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
@@ -338,17 +332,29 @@
 
   (with-single-package-locked-error
       (:symbol name "globally declaring the TYPE of ~A")
-    (when (eq (info :variable :where-from name) :declared)
-      (let ((old-type (info :variable :type name)))
-        (when (type/= type old-type)
-          (type-proclamation-mismatch-warn
-           name (type-specifier old-type) type-specifier))))
+    (let (warned)
+     (when (eq (info :variable :where-from name) :declared)
+       (let ((old-type (info :variable :type name)))
+         (when (type/= type old-type)
+           (setf warned t)
+           (warn 'type-proclamation-mismatch-warning
+                 :name name
+                 :old (type-specifier old-type)
+                 :new type-specifier))))
+      (when (and (not warned)
+                 (boundp name))
+        #-sb-xc-host
+        (let ((value (symbol-value name)))
+          (when (multiple-value-bind (p really) (ctypep value type)
+                  (and really
+                       (not p)))
+            (warn 'type-proclamation-mismatch-warning
+                  :name name
+                  :old (type-of value)
+                  :value value
+                  :new type-specifier)))))
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
-
-(defun ftype-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'ftype-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
 
 (defun proclaim-ftype (name type-oid type-specifier where-from)
   (declare (type (or ctype defstruct-description) type-oid))
@@ -369,8 +375,10 @@
           (cond
             ((not (type/= type old-type)))    ; not changed
             ((not (info :function :info name)) ; not a known function
-             (ftype-proclamation-mismatch-warn
-              name (type-specifier old-type) type-specifier))
+             (warn 'ftype-proclamation-mismatch-warning
+                   :name name
+                   :old (type-specifier old-type)
+                   :new type-specifier))
             ((csubtypep type old-type)) ; tighten known function type
             (t
              (cerror "Continue"
@@ -451,9 +459,6 @@
             software version name replacement))
          (setf (info :variable :deprecated name) info))
         (type
-         (when (eq state :final)
-           (sb-impl::setup-type-in-final-deprecation
-            software version name replacement))
          (setf (info :type :deprecated name) info))))))
 
 (defun process-declaration-declaration (name form)
@@ -540,10 +545,8 @@
                                     (type #'proclaim-type)
                                     (ftype #'proclaim-ftype))
                             ctype type :declared)))
-             #-sb-xc-host
-             (push raw-form *queued-proclaims*)
-             #+sb-xc-host
-             (error "Type system not yet initialized.")))
+             #-sb-xc-host (push raw-form *queued-proclaims*)
+             #+sb-xc-host (error "Type system not yet initialized.")))
         (freeze-type
          (map-args #'process-freeze-type-declaration))
         ;; This only has compile-time effects.

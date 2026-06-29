@@ -44,7 +44,7 @@
        ((funcallable-instance) (funcallable-instance-p object))
        ((extended-sequence) (extended-sequence-p object))
        ((nil) nil)))
-    (numeric-type (number-typep object type))
+    (numeric-union-type (numeric-union-typep object type))
     (array-type
      (and (arrayp object)
           (or (eq (array-type-complexp type) :maybe)
@@ -273,7 +273,7 @@
 (defun ctypep (obj type)
   (declare (type ctype type))
   (typep-impl-macro (obj)
-    ((or numeric-type
+    ((or numeric-union-type
          named-type
          member-type
          character-set-type
@@ -332,6 +332,7 @@
 ;;; :SB-XREF-FOR-INTERNALS hangs on to more symbols. It is not also the intent
 ;;; to retain all toplevel definitions whether subsequently needed or not.
 ;;; That's an unfortunate side-effect; this macro is done being used now.
+#-sb-devel
 (fmakunbound 'typep-impl-macro)
 
 
@@ -450,9 +451,7 @@ Experimental."
                   (%make-array-type dims complexp etype etype)))
                (t
                 (let ((dims (make-list rank)))
-                  ;; Need ALLOCATE-LIST-ON-STACK for this decl. Can't use vop-exists-p
-                  ;; because can't macroexpand into DECLARE. Maybe sharp-dot it ?
-                  #+x86-64 (declare (dynamic-extent dims))
+                  (declare (dynamic-extent dims))
                   (dotimes (i rank)
                     (setf (nth i dims) (array-dimension x i)))
                   (%make-array-type dims complexp etype etype)))))))
@@ -472,11 +471,8 @@ Experimental."
                                 (specifier-type 'function))
                                (t
                                 (ctype-of cdr))))))
-      (character ; Why not return an EQL type?
-       (typecase x
-         (standard-char (specifier-type 'standard-char))
-         (base-char (specifier-type 'base-char))
-         (t (specifier-type 'extended-char))))
+      (character
+       (character-set-type-from-characters (list x)))
       #+sb-simd-pack
       (simd-pack (simd-subtype (%simd-pack-tag x) simd-pack))
       #+sb-simd-pack-256

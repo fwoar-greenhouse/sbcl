@@ -249,8 +249,10 @@ Examples:
   ;; I believe that most finalizers will *not* have the :DONT-SAVE flag set.
   ;; As evidence the https://github.com/trivial-garbage/trivial-garbage portability
   ;; library does not offer a way to specify :DONT-SAVE.
+  ;;
+  ;; FIXME: This is quite a lousy reason to reach for MAKE-VALUE-CELL.
   (let ((action
-         (if dont-save (sb-sys:%primitive sb-vm::make-value-cell function nil) function)))
+          (if dont-save (sb-vm::make-value-cell function) function)))
     (with-pinned-objects (object)
       #+weak-vector-readbarrier
       (with-system-mutex (*finalizer-lock*)
@@ -308,7 +310,7 @@ Examples:
       (sb-vm::reconstitute-object (sb-lockless:so-key node))))
 
 ;;; Perform various cleanups around finalizers
-(defglobal *saved-finalizers* nil)
+(define-load-time-global *saved-finalizers* nil)
 (defun finalizers-deinit (&aux save)
   (labels
       ((filter-actions (object actions)
@@ -414,20 +416,34 @@ Examples:
         (handler-case (let ((*in-a-finalizer* t)) (funcall fun))
           (error (c) (warn "Error calling finalizer ~S:~%  ~A" fun c)))))))
 
-#+sb-thread (define-alien-variable finalizer-thread-runflag int)
+#+sb-thread
+(progn
+(define-alien-variable finalizer-thread-runflag int)
+;; post-GC hooks are synchronously invoked after GC if #-sb-thread
+(define-load-time-global *after-gc-hooks* nil)
+(define-load-time-global *run-gc-hooks* 0)
+(declaim (fixnum *run-gc-hooks*)))
+
 ;;; Drain the queue of finalizers and return when empty.
 ;;; Concurrent invocations of this function in different threads are ok.
 ;;; Nested invocations (from a GC forced by a finalizer) are not ok.
 ;;; See the trace at the bottom of this file.
-(define-load-time-global *bg-compiler-function* nil)
+(define-load-time-global *bg-compiler-function* #'sb-c::default-compiler-worker)
 (defun run-pending-finalizers (&aux (system-finalizer-scratchpad (list 0)))
   (declare (dynamic-extent system-finalizer-scratchpad))
   (finalizers-rehash)
   (loop
-   ;; Perform no further work if trying to stop the thread, even if there is work.
-   #+sb-thread (when (zerop finalizer-thread-runflag) (return))
+   #+sb-thread
+   (progn
+     ;; Perform no further work if trying to stop the thread, even if there is work.
+     (when (zerop finalizer-thread-runflag) (return))
+     ;; If this thread is very slow to notice *RUN-GC-HOOKS* due to a slow finalizer,
+     ;; requests to run can stack up. A request will not be lost but may be delayed
+     (when (plusp *run-gc-hooks*)
+       (sb-vm:without-arena (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))
+       (atomic-decf *run-gc-hooks*)))
    (let ((ran-bg-compile ; Try to run a background compilation task
-          (when *bg-compiler-function* (funcall *bg-compiler-function*)))
+          (funcall *bg-compiler-function*))
          (ran-a-system-finalizer ; Try to run 1 system finalizer
           (sb-vm::immobile-code-dealloc-1 system-finalizer-scratchpad))
          (ran-a-user-finalizer ; Try to run 1 user finalizer
@@ -440,18 +456,22 @@ Examples:
 (declaim (type (or sb-thread:thread (eql :start) null) *finalizer-thread*))
 #+sb-thread
 (progn
-(defun finalizer-thread-notify ()
-  (alien-funcall (extern-alien "finalizer_thread_wake" (function void)))
+(defun finalizer-thread-notify (run-hooks)
+  (declare (bit run-hooks))
+  (without-interrupts ;; don't unwind while holding finalizer_mutex
+    (alien-funcall (extern-alien "finalizer_thread_wake" (function void int))
+                   run-hooks))
   nil)
 
 ;;; The following operations are synchronized by *MAKE-THREAD-LOCK* -
 ;;;   FINALIZER-THREAD-{START,STOP}, S-L-A-D, SB-POSIX:FORK
 (defun finalizer-thread-start ()
   (with-system-mutex (sb-thread::*make-thread-lock*)
-    #+(and unix sb-safepoint)
-    (sb-thread::make-system-thread "sigwait"
-                                   #'sb-unix::signal-handler-loop
-                                   nil 'sb-unix::*sighandler-thread*)
+    #+unix
+    (when (or #+sb-safepoint t (member :address-sanitizer *features*))
+      (sb-thread::make-system-thread "sigwait"
+                                     #'sb-unix::signal-handler-loop
+                                     nil 'sb-unix::*sighandler-thread*))
     (aver (not *finalizer-thread*))
     (setf finalizer-thread-runflag 1)
     (setq *finalizer-thread* :start)
@@ -461,6 +481,9 @@ Examples:
             (lambda ()
               (setf *finalizer-thread* sb-thread:*current-thread*)
               (loop (run-pending-finalizers)
+                    ;; a slight race here- technically the finalizer thread should not
+                    ;; put itself to sleep unless it has ascertained that there is no
+                    ;; background work while it holds a mutex on the various queues.
                     (alien-funcall (extern-alien "finalizer_thread_wait" (function void)))
                     (when (zerop finalizer-thread-runflag) (return)))
               (setq *finalizer-thread* nil))
@@ -472,18 +495,20 @@ Examples:
 ;;; You should almost always invoke this with *MAKE-THREAD-LOCK* held.
 ;;; Some tests violate that, but they know what they're doing.
 (defun finalizer-thread-stop ()
-  #+(and unix sb-safepoint)
+  #+unix ; there may or may not be a dedicated signal-receiving thread
   (let ((thread sb-unix::*sighandler-thread*))
-    (aver (sb-thread::thread-p thread))
-    (setq sb-unix::*sighandler-thread* nil)
-    ;; This kill causes the thread's sigwait() syscall to return normally
-    ;; and then not invoke any handler.
-    (sb-unix:pthread-kill (sb-thread::thread-os-thread thread) sb-unix:sigterm)
-    (sb-thread:join-thread thread))
+    (when (sb-thread::thread-p thread)
+      (setq sb-unix::*sighandler-thread* nil)
+      ;; This kill causes the thread's sigwait() syscall to return normally
+      ;; and then not invoke any handler.
+      (sb-unix:pthread-kill (sb-thread::thread-os-thread thread) sb-unix:sigterm)
+      (sb-thread:join-thread thread)))
   (let ((thread *finalizer-thread*))
     (aver (sb-thread::thread-p thread))
-    (alien-funcall (extern-alien "finalizer_thread_stop" (function void)))
-    (sb-thread:join-thread thread)))
+    (without-interrupts ;; don't unwind while holding finalizer_mutex
+      (alien-funcall (extern-alien "finalizer_thread_stop" (function void))))
+    (sb-thread:join-thread thread))
+  (sb-thread::%dispose-thread-structs))
 )
 
 (export 'show-finalizers)

@@ -673,13 +673,13 @@
                           ,@(case suffix
                               (-c/unsigned
                                `((:arg-types unsigned-num
-                                             (:constant (and (unsigned-byte 16) (not (integer 0 0)))))))
+                                             (:constant (and (unsigned-byte 16) (not (eql 0)))))))
                               (-c/signed
                                `((:arg-types signed-num
-                                             (:constant (and (unsigned-byte 16) (not (integer 0 0)))))))
+                                             (:constant (and (unsigned-byte 16) (not (eql 0)))))))
                               (-c/fixnum
                                `((:arg-types tagged-num
-                                             (:constant (and (unsigned-byte 14) (not (integer 0 0))))))))
+                                             (:constant (and (unsigned-byte ,(- 16 n-fixnum-tag-bits)) (not (eql 0))))))))
                          (:generator ,cost
                           ;; We could be a lot more sophisticated here and
                           ;; check for possibilities with ANDIS..
@@ -701,9 +701,9 @@
   (:arg-types (:constant (integer 0 29)) tagged-num)
   (:temporary (:scs (any-reg) :to (:result 0)) test)
   (:generator 4
-    (if (< y 14)
+    (if (< y (- 16 n-fixnum-tag-bits))
         (inst andi. test x (ash 1 (+ y n-fixnum-tag-bits)))
-        (inst andis. test x (ash 1 (- y 14))))
+        (inst andis. test x (ash 1 (- y (- 16 n-fixnum-tag-bits)))))
     (inst b? (if not-p :eq :ne) target)))
 
 #+nil (define-vop (fast-logbitp-c/signed fast-conditional-c/signed)
@@ -959,12 +959,11 @@
   (:arg-types unsigned-num)
   (:results (result :scs (descriptor-reg)))
   (:generator 3
-    (let ((done (gen-label)))
       (inst cmpdi digit 0)
       (move result null-tn)
       (inst blt done)
       (load-symbol result t)
-      (emit-label done))))
+      DONE))
 
 (define-vop (add-w/carry)
   (:translate sb-bignum:%add-with-carry)
@@ -1184,25 +1183,50 @@
     (inst mulld temp dividend c) ; want only the low 64 bits
     (inst mulhdu remainder temp divisor))) ; want only the high 64 bits
 
-(in-package "SB-C")
+(define-vop (fast-truncate/signed=>signed fast-safe-arith-op)
+  (:translate truncate)
+  (:args (x :scs (signed-reg) :to :result)
+         (y :scs (signed-reg) :to :result))
+  (:arg-types signed-num signed-num)
+  (:arg-refs nil y-ref)
+  (:results (quo :scs (signed-reg) :from :eval)
+            (rem :scs (signed-reg) :from :eval))
+  (:optional-results rem)
+  (:result-types signed-num signed-num)
+  (:note "inline (signed-byte 64) arithmetic")
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 33
+    (when (types-equal-or-intersect (tn-ref-type y-ref)
+                                    (specifier-type '(eql 0)))
+      (let ((zero (generate-error-code vop 'division-by-zero-error x)))
+        (inst cmpdi y 0)
+        (inst beq zero)))
+    (inst divd quo x y)
+    (unless (eq (tn-kind rem) :unused)
+      (inst mulld rem quo y)
+      (inst subf rem rem x))))
 
-#+nil
-(deftransform * ((x y)
-                 ((unsigned-byte 32) (constant-arg (unsigned-byte 32)))
-                 (unsigned-byte 32))
-  "recode as shifts and adds"
-  (let ((y (lvar-value y)))
-    (multiple-value-bind (result adds shifts)
-        (ub32-strength-reduce-constant-multiply 'x y)
-      (cond
-       ((typep y '(signed-byte 16))
-        ;; a mulli instruction has a latency of 5.
-        (when (> (+ adds shifts) 4)
-          (give-up-ir1-transform)))
-       (t
-        ;; a mullw instruction also has a latency of 5, plus two
-        ;; instructions (in general) to load the immediate into a
-        ;; register.
-        (when (> (+ adds shifts) 6)
-          (give-up-ir1-transform))))
-      (or result 0))))
+(define-vop (fast-truncate/unsigned=>unsigned fast-safe-arith-op)
+  (:translate truncate)
+  (:args (x :scs (unsigned-reg) :to :result)
+         (y :scs (unsigned-reg) :to :result))
+  (:arg-types unsigned-num unsigned-num)
+  (:arg-refs nil y-ref)
+  (:results (quo :scs (unsigned-reg) :from :eval)
+            (rem :scs (unsigned-reg) :from :eval))
+  (:optional-results rem)
+  (:result-types unsigned-num unsigned-num)
+  (:note "inline (unsigned-byte 64) arithmetic")
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 30
+    (when (types-equal-or-intersect (tn-ref-type y-ref)
+                                    (specifier-type '(eql 0)))
+      (let ((zero (generate-error-code vop 'division-by-zero-error x)))
+        (inst cmpdi y 0)
+        (inst beq zero)))
+    (inst divdu quo x y)
+    (unless (eq (tn-kind rem) :unused)
+      (inst mulld rem quo y)
+      (inst subf rem rem x))))

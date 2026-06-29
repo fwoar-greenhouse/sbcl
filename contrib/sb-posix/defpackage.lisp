@@ -20,7 +20,9 @@
            #:stat-gid #:stat-size #:stat-atime #:stat-mtime #:stat-ctime
            #:stat-rdev
            #:termios-iflag #:termios-oflag #:termios-cflag
-           #:termios-lflag #:termios-cc #:timeval-sec #:timeval-usec
+           #:termios-lflag #:termios-cc
+           #:termios-ispeed #:termios-ospeed
+           #:timeval-sec #:timeval-usec
            #:flock-type #:flock-whence #:flock-start #:flock-len
            #:flock-pid
 
@@ -29,6 +31,3 @@
            ))
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf (sb-int:system-package-p (find-package "SB-POSIX")) t))
-
-#+win32
-(sb-alien:load-shared-object "msvcrt.dll")

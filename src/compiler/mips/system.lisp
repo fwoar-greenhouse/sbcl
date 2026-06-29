@@ -14,6 +14,17 @@
 
 ;;;; Type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:policy :fast-safe)
+  (:generator 1
+    (inst li temp #x7FFFFFFC)
+    (inst and res arg temp)))
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -128,16 +139,6 @@
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
 
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:policy :fast-safe)
-  (:generator 1
-    (inst li temp (lognot fixnum-tag-mask))
-    (inst and res ptr temp)))
-
 
 ;;;; Allocation
 
@@ -183,7 +184,7 @@
   (:arg-types * fixnum)
   (:results (res :scs (unsigned-reg) :from (:argument 0)))
   (:result-types unsigned-num)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:generator 10
     (loadw res code 0 other-pointer-lowtag)
     (inst sll res res 2) ; shift out the GC bits

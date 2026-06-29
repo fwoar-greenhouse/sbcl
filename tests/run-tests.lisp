@@ -1,5 +1,15 @@
 (when (member "--gc-stress" *posix-argv* :test #'equal)
   (push :gc-stress *features*))
+(when (member "--slow" *posix-argv* :test #'equal)
+  (push :slow *features*))
+(when (member "--gc-verify" *posix-argv* :test #'equal)
+  (push :gc-verify *features*))
+(when (member "--coverage" *posix-argv* :test #'equal)
+  (assert (member :sb-cover-for-internals sb-impl::+internal-features+))
+  (push :coverage *features*))
+
+#+coverage
+(require :sb-cover)
 
 (load "test-util.lisp")
 (load "assertoid.lisp")
@@ -40,7 +50,8 @@
                   (error "~@<Invalid evaluator mode: ~A. Must be one ~
                            of interpret, compile.~@:>"
                          mode)))))
-            ((string= arg "--break-on-failure")
+            ((or (string= arg "--break-on-failure")
+                 (string= arg "-b"))
              (setf *break-on-error* t)
              (setf test-util:*break-on-failure* t))
             ((string= arg "--break-on-expected-failure")
@@ -48,9 +59,10 @@
             ((string= arg "--report-skipped-tests")
              (setf *report-skipped-tests* t))
             ((string= arg "--no-color"))
-            ((string= arg "--slow")
-             (push :slow *features*))
-            ((string= arg "--gc-stress"))
+            ((or (string= arg "--gc-stress")
+                 (string= arg "--slow")
+                 (string= arg "--gc-verify")
+                 (string= arg "--coverage")))
             ((string= arg "--skip-to")
              (setf skip-to (pop remainder)))
             (t
@@ -92,6 +104,7 @@
   (terpri)
   (format t "Finished running tests.~%")
   (let ((skipcount 0)
+        (unimplemented 0)
         (*print-pretty* nil))
     (cond (*all-failures*
            (format t "Status:~%")
@@ -106,13 +119,20 @@
                                           " Invalid exit status:")
                     (format t " ~a~%"
                             (enough-namestring (second fail))))
+                   ((eq (car fail) :skipped-unimplemented)
+                    (when *report-skipped-tests*
+                      (format t " ~20a ~a / ~a~%"
+                              "Skipped (unimplemented):"
+                              (enough-namestring (second fail))
+                              (third fail)))
+                    (incf skipcount))
                    ((eq (car fail) :skipped-disabled)
                     (when *report-skipped-tests*
                       (format t " ~20a ~a / ~a~%"
                               "Skipped (irrelevant):"
                               (enough-namestring (second fail))
                               (third fail)))
-                    (incf skipcount))
+                    (incf unimplemented))
                    (t
                     (output-colored-text
                      (first fail)
@@ -122,12 +142,16 @@
                        (:leftover-thread " Leftover thread (broken):")
                        (:unexpected-success " Unexpected success:")
                        (:skipped-broken " Skipped (broken):")
-                       (:skipped-disabled " Skipped (irrelevant):")))
+                       (:skipped-disabled " Skipped (irrelevant):")
+                       (:skipped-unimplemented " Skipped (unimplemented):")))
                     (format t " ~a / ~a~%"
                             (enough-namestring (second fail))
                             (third fail)))))
            (when (> skipcount 0)
-             (format t " (~a tests skipped for this combination of platform and features)~%"
+             (format t " (~a test~:p skipped for this combination of platform and features)~%"
+                     skipcount))
+           (when (> skipcount 0)
+             (format t " (~a test~:p skipped for features not implemented for this platform)~%"
                      skipcount)))
           (t
            (format t "All tests succeeded~%")))))
@@ -189,6 +213,27 @@
                             (namestring directory))))
     (unless (eq (pathname-host filename) sb-impl::*physical-host*)
       (return-from check-manifest))
+    ;; This special case fixes a new glitch that may occur in debug.impure.lisp.
+    ;; The call sequence in question is:
+    ;;  0xb800b72fbd [RUN-TESTS::CHECK-MANIFEST]
+    ;;  0xb800b77a8b [(LAMBDA (RUN-TESTS::F RUN-TESTS::FILENAME &REST RUN-TESTS::ARGS &KEY :DIRECTION &ALLOW-OTHER-KEYS) :IN RUN-TESTS::PURE-RUNNER)]
+    ;;  0xb800754aba [SB-DI::GET-FILE-TOPLEVEL-FORM]
+    ;;  0xb80075475e [SB-DI::GET-TOPLEVEL-FORM]
+    ;;  0xb800799dca [SB-DEBUG::CODE-LOCATION-SOURCE-FORM]
+    ;;  0xb80079a4cb [SB-DEBUG::LIST-LOCATIONS-DEBUG-COMMAND]
+    ;;  0xb800795597 [SB-DEBUG::DEBUG-LOOP-FUN]
+    ;; It's trying to find something about the file being loaded, but the pathname
+    ;; given to OPEN is STRING/= to *LOAD-PATHNAME*. We should allow it, obviously.
+    ;; Unfortunately if the input-manifest.lisp-expr file itself is missing, then the
+    ;; informational message "Assumed valid input file" is written to *ERROR-OUTPUT*.
+    ;; And that extra output corrupts the running test because the very thing
+    ;; the test asserts on is the contents of *ERROR-OUTPUT*.
+    ;; [why, you may wonder, can the input manifest file be missing? Because the tool
+    ;; which does the sandboxing doesn't send the input manifest itself to the test
+    ;; execution, it only sends the files dictated by the manifest]
+    (let ((lp *load-pathname*))
+      (when (and lp (stem= lp filename)) ; silently permit
+        (return-from check-manifest)))
     (let ((string (namestring filename)))
       (when (or (find #\* (stem-of filename)) ; wild
                 (starts-with-p string "/dev/") ; dev/null and dev/random
@@ -223,22 +268,30 @@
       sb-c::*compile-elapsed-time*
       sb-c::*compile-file-elapsed-time*
       sb-c::*phash-lambda-cache*
+      ,(maybe "SB-IMPL" "*RUN-GC-HOOKS*")
+      ,(maybe "SB-VM" "*FNAME-MAP-AVAILABLE-ELTS*")
+      ,(maybe "SB-VM" "*FNAME-MAP-OBSERVED-GC-EPOCH*")
+      ,(maybe "SB-UNIX" "*SIGHANDLER-THREAD*")
       sb-impl::**finalizer-store**
       sb-impl::*finalizer-rehashlist*
       sb-impl::*finalizers-triggered*
       sb-impl::*all-packages*
       sb-impl::*package-names-cookie*
       sb-impl::*available-buffers*
+      sb-impl::*available-char-buffers*
+      sb-impl::*available-ub8-buffers*
       sb-impl::*token-buf-pool*
       sb-impl::*user-hash-table-tests*
       sb-impl::*pn-dir-table*
       sb-impl::*pn-table*
+      sb-impl::*clear-resized-symbol-tables*
       sb-vm::*immobile-codeblob-tree*
       sb-vm::*dynspace-codeblob-tree*
       ,(maybe "SB-KERNEL" "*EVAL-CALLS*")
       sb-kernel::*type-cache-nonce*
       sb-ext:*gc-run-time*
       sb-ext:*gc-real-time*
+      sb-vm::*code-alloc-count*
       sb-kernel::*gc-epoch*
       sb-int:*n-bytes-freed-or-purified*
       ,(maybe "SB-APROF" "*ALLOCATION-PROFILE-METADATA*")
@@ -256,9 +309,12 @@
       ,(maybe "SB-SYS" "*THRUPTION-PENDING*")
       ,(maybe "SB-THREAD" "*ALLOCATOR-METRICS*")
       sb-pcl::*dfun-constructors*
+      sb-di::*uncompacted-fun-maps*
+      sb-di::*compiled-debug-funs*
       #+win32 sb-impl::*waitable-timer-handle*
       #+win32 sb-impl::*timer-thread*
-      sb-unicode::*name->char-buffers*)))
+      sb-unicode::*name->char-buffers*
+      sb-impl::*finalizer-thread*)))
 
 (defun collect-symbol-values ()
   (let (result)
@@ -385,9 +441,7 @@
     (dolist (package delete)
       (unuse-package (package-use-list package) package))
     ;; Then all deletions
-    (mapc 'delete-package delete)
-    (when delete
-      (format t "::: NOTE: Deleted ~D package~:P~%" (length delete))))
+    (mapc 'delete-package delete))
   ;; Remove PRINT-OBJECT methods specialized on uninterned symbols
   (let ((gf #'print-object))
     (dolist (method (sb-mop:generic-function-methods gf))
@@ -418,6 +472,8 @@
       (setf *input-manifest*
             (if manifest (read manifest) :ignore))))
   (format t "// Running pure tests (~a)~%" test-fun)
+  (when *break-on-error*
+    (enable-debugger))
   (let ((*failures* nil)
         ;; in case somebody corrupts CL-USER's use list, of course
         (standard-use-list (package-use-list "CL-USER")))
@@ -511,7 +567,11 @@
                            (cons :interpreter *features*)
                            *features*)))
                 (let ((start (get-internal-real-time)))
+                  #+coverage (sb-cover:reset-coverage)
                   (funcall test-fun file)
+                  #+coverage
+                  (let ((name (concatenate 'string (namestring file) ".coverage")))
+                    (sb-cover:save-coverage-in-file name))
                   (log-file-elapsed-time file start log))))
             (skip-file ())))
         (sb-impl::disable-stepping)
@@ -545,6 +605,9 @@
            "--noprint"
            "--disable-debugger"
            #+gc-stress "--eval" #+gc-stress "(push :gc-stress *features*)"
+           #+gc-verify "--eval" #+gc-verify "(push :gc-verify *features*)"
+           #+slow "--eval" #+slow "(push :slow *features*)"
+           #+coverage "--eval" #+coverage "(push :coverage *features*)"
            "--load" load
            "--eval" (write-to-string eval
                                      :right-margin 1000))
@@ -561,9 +624,7 @@
      ,*break-on-failure*
      ,*break-on-expected-failure*
      ,*break-on-error*
-     ,(eq *test-evaluator-mode* :interpret)
-     ,(and (member :slow *features*)
-           t))))
+     ,(eq *test-evaluator-mode* :interpret))))
 
 (defun impure-runner (files test-fun log)
   (when files
@@ -598,10 +659,8 @@
 
 (defun unexpected-failures ()
   (remove-if (lambda (x)
-               (or (eq (car x) :expected-failure)
-                   (eq (car x) :unexpected-success)
-                   (eq (car x) :skipped-broken)
-                   (eq (car x) :skipped-disabled)))
+               (member (car x) '(:expected-failure :unexpected-success :skipped-broken
+                                 :skipped-disabled :skipped-unimplemented)))
              *all-failures*))
 
 (defun filter-test-files (wild-mask)
@@ -629,23 +688,4 @@
   (filter-test-files "*.impure-cload.lisp"))
 
 (defun sh-files ()
-  (let ((result (filter-test-files "*.test.sh")))
-    #+unix result
-    ;; Rather than hack up the shell scripts which don't pass on #-unix
-    ;; (which would require at least a few lines of shell script and lisp
-    ;; to invoke SBCL and exit with some other code), just confine the kludge
-    ;; to this file.
-    #-unix
-    (if *explicit-test-files*
-        result
-      (remove-if
-       (lambda (x)
-         (member (pathname-name x)
-                 '("filesys.test" ; too many assertions about symlinks to care about just yet
-                   ;; foreign-test-noop-dlclose-test.c:1:10: fatal error: dlfcn.h: No such file or directory
-                   "foreign.test"
-                   ;; No built SBCL here (.../tests/run-sbcl-test-5863): run 'sh make.sh' first!
-                   "run-sbcl.test"
-                   "side-effectful-pathnames.test") ; no idea
-                 :test 'string=))
-        result))))
+  (filter-test-files "*.test.sh"))

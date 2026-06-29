@@ -30,9 +30,11 @@
 #include "search.h"
 #include "var-io.h"
 
-#include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
+#include "genesis/compiled-debug-info.h"
+#include "genesis/vector.h"
+#include "code.h"
 #include "core.h"
 #include "gc.h"
 
@@ -71,11 +73,47 @@ static void xgetbv(unsigned *eax, unsigned *edx)
 }
 
 #define VECTOR_FILL_T "VECTOR-FILL/T"
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+// the store to card table takes 3 bytes more encode
+static const int vector_fill_offset_to_check = 0x53;
+static const int vector_fill_offset_to_poke  = 0x5A;
+#else
+static const int vector_fill_offset_to_check = 0x50;
+static const int vector_fill_offset_to_poke  = 0x57;
+#endif
+static const unsigned char vector_fill_expect_bytes[] = {
+  0x48, 0x81, 0xF9, 0xBC, 0x02, 0x00, 0x00,
+  0xEB, 0x07
+};
 
 // Poke in a byte that changes an opcode to enable faster vector fill.
 // Using fixed offsets and bytes is no worse than what we do elsewhere.
 void tune_asm_routines_for_microarch(void)
 {
+    // Assign the static lisp symbol's value the address of the C function
+    // that assists calling C from Lisp.
+#ifdef LISP_FEATURE_SB_THREAD
+    extern void callback_wrapper_trampoline();
+    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = (lispobj)callback_wrapper_trampoline;
+#else
+    extern void funcall_alien_callback();
+    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = (lispobj)funcall_alien_callback;
+#endif
+
+    struct static_trailer_constants* consts =
+      (void*)((char*)STATIC_SPACE_END - sizeof (struct static_trailer_constants));
+#ifdef LAYOUT_OF_FUNCTION
+    consts->function_layout = LAYOUT_OF_FUNCTION << 32;
+#endif
+    consts->lisp_linkage_table = (uword_t)linkage_space;
+    consts->alien_linkage_table = ALIEN_LINKAGE_SPACE_START;
+    consts->msan_xor_constant = (uword_t)0x500000000000;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    consts->text_space_addr = TEXT_SPACE_START;
+    consts->text_card_count = text_space_size / IMMOBILE_CARD_BYTES;
+    consts->text_card_marks = (lispobj)text_page_touched_bits;
+#endif
+
     unsigned int eax, ebx, ecx, edx;
     unsigned int cpuid_fn1_ecx = 0;
 
@@ -96,11 +134,26 @@ void tune_asm_routines_for_microarch(void)
         }
     }
     int our_cpu_feature_bits = 0;
-    // avx2_supported gets copied into bit 1 of *CPU-FEATURE-BITS*
+    // avx2_supported gets copied into bit 1 of cpu_feature_bits
     if (avx2_supported) our_cpu_feature_bits |= 1;
-    // POPCNT = ECX bit 23, which gets copied into bit 2 in *CPU-FEATURE-BITS*
+    // POPCNT = ECX bit 23, which gets copied into bit 2 in cpu_feature_bits
     if (cpuid_fn1_ecx & (1<<23)) our_cpu_feature_bits |= 2;
-    SetSymbolValue(CPU_FEATURE_BITS, make_fixnum(our_cpu_feature_bits), 0);
+    consts->cpu_feature_bits = our_cpu_feature_bits;
+
+#ifdef LISP_FEATURE_WIN32
+    extern void set_up_win64_seh_thunk(lispobj*);
+    set_up_win64_seh_thunk((lispobj*)get_asm_routine_by_name("SEH-TRAMPOLINE", 0));
+#endif
+
+    unsigned char* asm_routine = (void*)get_asm_routine_by_name(VECTOR_FILL_T, 0);
+    if (!asm_routine) return;
+    // Since a particular runtime expects a particular core,
+    // mismatch of the ASM routine is a fatal error.
+    if (memcmp(asm_routine + vector_fill_offset_to_check,
+               vector_fill_expect_bytes,
+               sizeof vector_fill_expect_bytes))
+        lose("%s does not match expectation @ %p",
+             VECTOR_FILL_T, asm_routine + vector_fill_offset_to_check);
 
     // I don't know if this works on Windows
 #ifndef _MSC_VER
@@ -108,7 +161,8 @@ void tune_asm_routines_for_microarch(void)
     if (eax >= 7) {
         cpuid(7, 0, &eax, &ebx, &ecx, &edx);
         if (ebx & (1<<9)) // Enhanced Repeat Movs/Stos
-          asm_routine_poke(VECTOR_FILL_T, 0x12, 0x7C); // Change JMP to JL
+          asm_routine_poke(VECTOR_FILL_T, vector_fill_offset_to_poke,
+                           0x7C); // Change JMP to JL
     }
 #endif
 }
@@ -119,20 +173,17 @@ void tune_asm_routines_for_microarch(void)
    instructions that don't exist on some cpu family members */
 void untune_asm_routines_for_microarch(void)
 {
-    asm_routine_poke(VECTOR_FILL_T, 0x12, 0xEB); // Change JL to JMP
-    SetSymbolValue(CPU_FEATURE_BITS, 0, 0);
+    char* jmp_inst = get_asm_routine_by_name("SEH-TRAMPOLINE", 0) + 8;
+    char* indirect_addr = jmp_inst + 6 + (int32_t)UNALIGNED_LOAD32(jmp_inst+2);
+    memset(indirect_addr - 16, 0, 24); // erase foreign data
+    asm_routine_poke(VECTOR_FILL_T, vector_fill_offset_to_poke,
+                     0xEB); // Change JL to JMP
+    // ensure no random value lingering in static space on image save
+    struct static_trailer_constants* consts =
+      (void*)((char*)STATIC_SPACE_END - sizeof (struct static_trailer_constants));
+    memset(consts, 0, sizeof *consts);
+    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = 0;
 }
-
-#ifndef _WIN64
-os_vm_address_t
-arch_get_bad_addr(int __attribute__((unused)) sig,
-                  siginfo_t *code,
-                  os_context_t __attribute__((unused)) *context)
-{
-    return (os_vm_address_t)code->si_addr;
-}
-#endif
-
 
 /*
  * hacking signal contexts
@@ -165,33 +216,34 @@ void visit_context_registers(void (*proc)(os_context_register_t, void*),
 }
 #endif
 
-os_context_register_t *
-os_context_flags_addr(os_context_t *context)
-{
 #if defined __linux__
     /* KLUDGE: As of kernel 2.2.14 on Red Hat 6.2, there's code in the
      * <sys/ucontext.h> file to define symbolic names for offsets into
      * gregs[], but it's conditional on __USE_GNU and not defined, so
      * we need to do this nasty absolute index magic number thing
      * instead. */
-    return (os_context_register_t*)&context->uc_mcontext.gregs[17];
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.gregs[17]
 #elif defined LISP_FEATURE_SUNOS
-    return &context->uc_mcontext.gregs[REG_RFL];
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.gregs[REG_RFL]
 #elif defined LISP_FEATURE_FREEBSD || defined(__DragonFly__)
-    return &context->uc_mcontext.mc_rflags;
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.mc_rflags
 #elif defined __HAIKU__
-    return &context->uc_mcontext.rflags;
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.rflags
 #elif defined LISP_FEATURE_DARWIN
-    return CONTEXT_ADDR_FROM_STEM(rflags);
+#   define CONTEXT_FLAGS(c) CONTEXT_SLOT(c,rflags)
 #elif defined __OpenBSD__
-    return &context->sc_rflags;
+#   define CONTEXT_FLAGS(c) c->sc_rflags
 #elif defined __NetBSD__
-    return CONTEXT_ADDR_FROM_STEM(RFLAGS);
+#   define CONTEXT_FLAGS(c) CONTEXT_SLOT(c,RFLAGS)
 #elif defined _WIN64
-    return (os_context_register_t*)&context->win32_context->EFlags;
+#   define CONTEXT_FLAGS(c) c->win32_context->EFlags
 #else
 #error unsupported OS
 #endif
+
+os_context_register_t *os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t*)&(CONTEXT_FLAGS(context));
 }
 
 void arch_skip_instruction(os_context_t *context)
@@ -308,7 +360,7 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     *(pc-2) = 0x00240c81;
     *(pc-1) = 0x9d000001;
 #else
-    *os_context_flags_addr(context) |= 0x100;
+    CONTEXT_FLAGS(context) |= 0x100;
 #endif
 
     single_stepping = pc;
@@ -351,7 +403,7 @@ restore_breakpoint_from_single_step(os_context_t * context)
     *(single_stepping-2) = single_step_save2;
     *(single_stepping-1) = single_step_save3;
 #else
-    *os_context_flags_addr(context) &= ~0x100;
+    CONTEXT_FLAGS(context) &= ~0x100;
 #endif
     /* Re-install the breakpoint if possible. */
     if (((char *)OS_CONTEXT_PC(context) > (char *)single_stepping) &&
@@ -370,12 +422,6 @@ sigtrap_handler(int __attribute__((unused)) signal,
                 siginfo_t __attribute__((unused)) *info,
                 os_context_t *context)
 {
-#ifdef LISP_FEATURE_INT1_BREAKPOINTS
-    // ICEBP instruction = handle-pending-interrupt following pseudo-atomic
-    if (((unsigned char*)OS_CONTEXT_PC(context))[-1] == 0xF1)
-        return interrupt_handle_pending(context);
-#endif
-
     unsigned int trap;
 
     if (single_stepping) {
@@ -393,22 +439,6 @@ sigtrap_handler(int __attribute__((unused)) signal,
      * number of bytes will follow, the first is the length of the byte
      * arguments to follow. */
     trap = *(unsigned char *)OS_CONTEXT_PC(context);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    if (trap == trap_UndefinedFunction) {
-        // The interrupted PC pins this fdefn. Sigtrap is delivered on the ordinary stack,
-        // not the alternate stack.
-        // (FIXME: an interior pointer to an fdefn _should_ pin it, but doesn't)
-        lispobj* fdefn = (lispobj*)(OS_CONTEXT_PC(context) & ~LOWTAG_MASK);
-        if (fdefn && widetag_of(fdefn) == FDEFN_WIDETAG) {
-            // Return to undefined-tramp
-            OS_CONTEXT_PC(context) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
-            // with RAX containing the FDEFN
-            *os_context_register_addr(context,reg_RAX) =
-                make_lispobj(fdefn, OTHER_POINTER_LOWTAG);
-            return;
-        }
-    }
-#endif
     handle_trap(context, trap);
 }
 
@@ -419,7 +449,15 @@ sigill_handler(int __attribute__((unused)) signal,
     unsigned char* pc = (void*)OS_CONTEXT_PC(context);
     if (UNALIGNED_LOAD16(pc) == UD2_INST) {
         OS_CONTEXT_PC(context) += 2;
+#ifdef LISP_FEATURE_UD2_BREAKPOINTS
         return sigtrap_handler(signal, siginfo, context);
+#else
+        /* UD2 ends pseudo-atomic sequences and has no trailing bytes that encode the
+         * reason for the trap. So the normal instruction stream is fully decodable by 'gdb'
+         * - which shows 0xCE as "(bad)" - or other tools, being devoid of arbitrary bytes
+         * that encode error metadata after the trapping instruction */
+        return interrupt_handle_pending(context);
+#endif
     }
     // Interrupt if overflow (INTO) raises SIGILL in 64-bit mode
     if (*(unsigned char *)pc == INTO_INST) {
@@ -514,16 +552,21 @@ arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-    char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+    const unsigned int entries_per_group = 16;
+    unsigned int major_index = (unsigned int)index / entries_per_group;
+    unsigned int minor_index = (unsigned int)index % entries_per_group;
+    char* group_base = (major_index * entries_per_group * ALIEN_LINKAGE_TABLE_ENTRY_SIZE)
+                       + (char*)ALIEN_LINKAGE_SPACE_START;
+    char* data = group_base + minor_index*8;
+    *(uword_t*)data = (uword_t)target_addr;
+    int inst_offset = entries_per_group*N_WORD_BYTES + minor_index*8;
+    char *inst = inst_offset + group_base;
     if (datap) {
-        *(uword_t *)reloc_addr = (uword_t)target_addr;
-        return;
+        *(uword_t*)inst = (uword_t)0x0000000000841F0F; // 8-byte NOP
+    } else {
+        *(uword_t*)inst = (uword_t)0x90660000000025FF; // JMP [RIP+disp] + 2-byte NOP
+        UNALIGNED_STORE32((inst+2), (char*)data - (inst+6)); // inst length is 6
     }
-    reloc_addr[0] = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
-    reloc_addr[1] = 0x25; /* ModRM #b00 100 101, i.e. RIP-relative. */
-    UNALIGNED_STORE32((reloc_addr+2), 2); /* 32-bit displacement field = 2 */
-    reloc_addr[6] = 0x66; reloc_addr[7] = 0x90; /* 2-byte NOP */
-    *(void**)(reloc_addr+8) = target_addr;
 }
 
 /* These setup and check *both* the sse2 and x87 FPUs. While lisp code
@@ -599,22 +642,7 @@ lispobj entrypoint_taggedptr(uword_t entrypoint) {
     return make_lispobj(phdr, FUN_POINTER_LOWTAG);
 }
 
-/* Return the lisp object that fdefn's raw_addr slot jumps to.
- * In the event that the referenced object was forwarded, this returns the un-forwarded
- * object (the forwarded value is used to assert some invariants though).
- * If the fdefn jumps to the UNDEFINED-FDEFN routine, then return 0.
- *
- * Some legacy baggage is evident: in the first implementation of immobile fdefns,
- * an fdefn used a 'jmp rel32' (relative to itself), and so you could decode the
- * jump target only given the address of the fdefn. That is no longer true; fdefns use
- * absolute jumps. Therefore it is possible to call entrypoint_taggedptr() with any
- * raw_addr, whether or not you know the fdefn whence the raw_addr was obtained. */
-lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
-    return entrypoint_taggedptr((uword_t)fdefn->raw_addr);
-}
-
 #ifdef LISP_FEATURE_SB_THREAD
-#include "genesis/vector.h"
 #define LOCK_PREFIX 0xF0
 #undef SHOW_PC_RECORDING
 
@@ -785,6 +813,168 @@ lispobj call_into_lisp_first_time(lispobj fun, lispobj *args, int nargs) {
     extern lispobj call_into_lisp_first_time_(lispobj, lispobj *, int, struct thread *)
         __attribute__((sysv_abi));
     return call_into_lisp_first_time_(fun, args, nargs, get_sb_vm_thread());
+}
+
+/*
+ * On x86-64 we try to place the alien and lisp linkage tables in such a way
+ * that avoids extra load instructions when calling, but also allows those tables
+ * to be fully relocatable. It is best achieved by using PC-relative addressng,
+ * which works only for immobile text space. Failing that, we can place the
+ * linkage tables below NIL and use NIL-relative addressing.
+ * The core file makes no indication of the "effective size" of static space
+ * or text space, so we have to oversize them.
+ * It's a little confusing, so here are the possibilities:
+ *
+ * Supports           |   extra allocation amount
+ * Immobile | elfcode |      text         | static
+ * ---------|-----------------------------|-------------------------------------
+ *   Yes    |   No    | +AL +LL below     | none
+ *   Yes    |   Yes   |     n/a           | +AL below, +GC cards above
+ *   No     |   No    |     none          | +AL+LL below, +GC cards above
+ *   No     |   Yes   |     n/a           | +AL below, +GC cards above
+ *
+ * AL = alien linkage
+ * LL = lisp linkage
+ * n/a means the call does not occur for that space
+ *
+ * For #+immobile-space we want to end up with text space having both linkage subspaces
+ * (unless code-in-ELF)
+ *   | LISP LINKAGE | ALIEN LINKAGE | CODE OBJECTS ...
+ *   |<------------>|<------------->| ....
+ * For code-in-ELF then the lisp linkage space was preallocated to a .bss section,
+ * so we only oversize the static space by the alien linkage space size.
+ * If there is no text space (i.e. for #-immobile-space) then the linkage tables
+ * are below static space.
+ */
+os_vm_address_t coreparse_alloc_space(int space_id, int attr,
+                                      os_vm_address_t addr, os_vm_size_t size)
+{
+    if (size == 0) return addr;
+
+    long extra_below = 0, extra_above = 0;
+    extern int lisp_code_in_elf();
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (!lisp_code_in_elf()) { // a normal core
+        if (space_id == IMMOBILE_TEXT_CORE_SPACE_ID)
+            extra_below = LISP_LINKAGE_SPACE_SIZE + ALIEN_LINKAGE_SPACE_SIZE;
+    } else { // code-in-ELF core
+        if (space_id == STATIC_CORE_SPACE_ID)
+            extra_below = ALIEN_LINKAGE_SPACE_SIZE;
+    }
+#else
+    if (space_id == STATIC_CORE_SPACE_ID)
+        extra_below = LISP_LINKAGE_SPACE_SIZE + ALIEN_LINKAGE_SPACE_SIZE;
+#endif
+
+    if (space_id == STATIC_CORE_SPACE_ID) {
+        extra_above =
+# ifdef LISP_FEATURE_SB_SAFEPOINT // should just add 1 OS page but instead
+            BACKEND_PAGE_BYTES +  // it's a ridiculously generous bump up
+# endif
+                ALIGN_UP((1+gc_card_table_mask), os_reported_page_size);
+    }
+
+    addr -= extra_below; // endeavor to return the requested address as it was
+    size += extra_below + extra_above;
+    //fprintf(stderr, "requesting space for space_id %d, below=%x above=%x\n", space_id, extra_below, extra_above);
+    addr = os_alloc_gc_space(space_id, attr, addr, size);
+    if (!addr) lose("Can't allocate %#"OBJ_FMTX" bytes for space %d", size, space_id);
+
+    if (extra_below) { // it contains at least alien linkage if not also lisp linkage
+        if (extra_below > ALIEN_LINKAGE_SPACE_SIZE) linkage_space = (void*)addr;
+        addr += extra_below;
+        ALIEN_LINKAGE_SPACE_START = (uword_t)addr - ALIEN_LINKAGE_SPACE_SIZE;
+    }
+    return addr;
+}
+
+#if defined LISP_FEATURE_SB_FUTEX && !defined LISP_FEATURE_GS_SEG
+// Wait on a futex, but first end the surrounding pseudo-atomic section, handling
+// any deferred interrupt, and reinstate pseudo-atomicity upon return.
+extern int futex_wait(int*,int,long,unsigned long), futex_wake(int*, int);
+int futex_wait_allowing_gc(int *lock_word, int oldval)
+{
+    struct thread* th = get_sb_vm_thread();
+    /* This has a problem with #+gs-seg because RBP-TN is used for the arbitrary nonzero bits
+     * (with the low bit 0) stored in pa_bits - See NONZERO-BITS in EMIT-BEGIN-PSEUDO-ATOMIC
+     * in x86-64/macros.lisp. NULL-TN doesn't work because the low bit is 1.
+     * So good thing #+gs-seg is currently not working for reasons aside from this */
+    gc_assert((th->pseudo_atomic_bits & ~1) == (uword_t)th);
+    uword_t pa_bits = __sync_xor_and_fetch(&th->pseudo_atomic_bits, (uword_t)th);
+    if (pa_bits == 0) {
+        int result = futex_wait(lock_word, oldval, -1, 0);
+        th->pseudo_atomic_bits = (uword_t)th; // become pseudo-atomic again
+        return result;
+    }
+#ifdef LISP_FEATURE_UD2_BREAKPOINTS
+    asm volatile("ud2\n\t.byte %c0" : : "i"(trap_PendingInterrupt));
+#else // No trap code follows the UD2. See sigill_handler for explanation
+    asm volatile("ud2");
+#endif
+    int result = futex_wait(lock_word, oldval, -1, 0);
+    th->pseudo_atomic_bits = (uword_t)th;
+    return result;
+}
+#endif
+
+int handle_tls_deref_trap(os_context_t* context, os_vm_address_t addr)
+{
+    unsigned char* pc = (void*)os_context_pc(context);
+    if (!(addr == 0 && gc_managed_heap_space_p((lispobj)pc))) return 0;
+
+    int variant = 0;
+    // Check that the faulting instruction has one of two forms:
+    //   * MOV Rd,[Rn+1]
+    //   * CMP BYTE PTR [Rn+1], UNBOUND-MARKER-WIDETAG
+    if (((pc[0] == 0x48 || pc[0] == 0x4D) && pc[1] == 0x8B &&
+         (pc[2] & 0300) == 0100 && pc[3] == 1)) {
+        variant = 1; // MOV instruction
+    } else if (pc[0] == 0x80 && (pc[1] & 0370) == 0170 && pc[2] == 1 &&
+               pc[3] == UNBOUND_MARKER_WIDETAG) {
+        // 1 = (SYMBOL_VALUE_SLOT << WORD_SHIFT) - OTHER_POINTER_LOWTAG
+        variant = 2; // CMP instruction with no REX prefix
+    } else if (pc[0] == 0x41 && pc[1] == 0x80 && (pc[2] & 0370) == 0170 &&
+               pc[3] == 1 && pc[4] == UNBOUND_MARKER_WIDETAG) {
+        variant = 3; // CMP using any of R8 through R15
+    } else {
+      return 0;
+    }
+
+    struct code* code = (void*)component_ptr_from_pc((char*)pc);
+    if (!code) return 0;
+    struct compiled_debug_info* cdi = (void*)native_pointer(code->debug_info);
+    if (cdi->eh_locs == NIL) return 0;
+
+    struct vector* eh_locs = VECTOR(cdi->eh_locs);
+    uint32_t* data = (void*)eh_locs->data;
+    uint32_t pc_offset = (char*)pc - code_text_start(code);
+    int i = bsearch_greatereql_uint32(pc_offset, data, vector_len(eh_locs));
+    if (i<0 || data[i] != pc_offset) return 0;
+
+    int32_t disp;
+    switch (variant) {
+    case 1: case 2: case 3:
+        // The instruction preceding the faulting one is always 7 bytes:
+        //   498B85700F0000  MOV RAX, [R13+disp32]
+        pc -= 7;
+        disp = UNALIGNED_LOAD32(pc+3);
+        break;
+    }
+    int logical_index = disp >> (1+WORD_SHIFT);
+    lispobj symbol = tlsindex_to_symbol_map[logical_index];
+    gc_assert(symbol != NO_TLS_VALUE_MARKER);
+    /*fprintf(stderr, "TLS trap variant %d for %s\n", variant,
+            (char*)VECTOR(SYMBOL(symbol)->name)->data);*/
+    struct thread* th = get_sb_vm_thread();
+    lispobj* pcell = (lispobj*)(disp + (char*)th);
+    lispobj value = pcell[1];
+    if (value != NO_TLS_VALUE_MARKER)
+        lose("TLS should not trap on thread-locally bound symbol");
+    *pcell = symbol;
+    // Restart the 2-instruction sequence
+    OS_CONTEXT_PC(context) = (os_context_register_t)pc;
+    return 1;
 }
 
 #include "x86-arch-shared.inc"

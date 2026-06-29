@@ -23,12 +23,8 @@
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
-                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
+                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
-           (defregset (name &rest regs)
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
-                 (defparameter ,name
-                   (list ,@(mapcar #'(lambda (name) (symbolicate name "-OFFSET")) regs))))))
   ;; Wired zero register.
   (defreg zero 0) ; NULL
   ;; Reserved for assembler use.
@@ -193,11 +189,6 @@
   (non-descriptor-reg registers
    :locations #.non-descriptor-regs)
 
-  ;; Pointers to the interior of objects.  Used only as an temporary.
-  (interior-reg registers
-   :locations (#.lip-offset))
-
-
   ;; **** Things that can go in the floating point registers.
 
   ;; Non-Descriptor single-floats.
@@ -258,9 +249,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
   (defregtn zero any-reg)
   (defregtn nargs any-reg)
 
@@ -279,7 +268,8 @@
   (defregtn nsp any-reg)
 
   (defregtn code descriptor-reg)
-  (defregtn lip interior-reg))
+  (defregtn lip any-reg)
+  (defregtn lra any-reg))
 
 ;;; If VALUE can be represented as an immediate constant, then return the
 ;;; appropriate SC number, otherwise return NIL.
@@ -295,9 +285,6 @@
          nil))
     ((signed-byte 30)
      immediate-sc-number)
-    #-sb-xc-host ; There is no such object type in the host
-    (system-area-pointer
-     immediate-sc-number)
     (character
      immediate-sc-number)
     (structure-object
@@ -310,11 +297,6 @@
       (eql sc immediate-sc-number)))
 
 ;;;; Function Call Parameters
-
-;;; The SC numbers for register and stack arguments/return values.
-;;;
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -340,11 +322,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.

@@ -262,6 +262,26 @@
               (fast-nthcdr (mod n i) r-i))
            (declare (type fixnum i))))))))
 
+(declaim (inline nthcdr-check-bounds))
+(defun nthcdr-check-bounds (n list start end sequence)
+  (declare (index n))
+  (do ((i n (1- i))
+       (result list (cdr result)))
+      ((not (plusp i)) result)
+    (when (endp result)
+      (sequence-bounding-indices-bad-error sequence start end))))
+
+(declaim (inline reverse-into-vector-to-nthcdr-check-bounds))
+(defun reverse-into-vector-to-nthcdr-check-bounds (n list start end sequence)
+  (declare (index n))
+  (do ((result (make-array n))
+       (i (1- n) (1- i))
+       (cdr list (cdr cdr)))
+      ((< i 0) result)
+    (when (endp cdr)
+      (sequence-bounding-indices-bad-error sequence start end))
+    (setf (aref result i) (car cdr))))
+
 ;;; For [n]butlast
 (defun dotted-nthcdr (n list)
   (declare (fixnum n))
@@ -392,15 +412,24 @@
        (result '() (cons initial-element result)))
       ((<= count 0) result)
     (declare (type index count))))
+
+(defun %sys-make-list (size initial-element)
+  (declare (type index size)
+           (sb-c::tlab :system))
+  (do ((count size (1- count))
+       (result '() (cons initial-element result)))
+      ((<= count 0) result)
+    (declare (type index count))))
 
 (defun append (&rest lists)
   "Construct and return a list by concatenating LISTS."
-  (let* ((result (list nil))
+  (let* ((result (unaligned-dx-cons nil))
          (tail result)
          (index 0)
          (length (length lists))
          (last (1- length)))
-    (declare (dynamic-extent result))
+    (declare (dynamic-extent result)
+             (sb-c::no-debug result tail))
     (loop
      (cond
        ((< (truly-the index index) last)
@@ -980,15 +1009,15 @@
 
 (defun union (list1 list2 &key key (test nil testp) (test-not nil notp))
   "Return the union of LIST1 and LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  ;; "The result list may be eq to either list-1 or list-2 if appropriate."
-  ;; (and a 1000-element list unioned with NIL should not cons a hash-table)
-  (cond ((null list1) (return-from union list2))
-        ((null list2) (return-from union list1)))
   (with-member-test (member-test)
+    ;; "The result list may be eq to either list-1 or list-2 if appropriate."
+    ;; (and a 1000-element list unioned with NIL should not cons a hash-table)
+    (cond ((null list1) (return-from union list2))
+          ((null list2) (return-from union list1)))
     (let ((n1 (length list1))
           (n2 (length list2)))
       (if (hashing-p notp testp test n1 n2)
@@ -1007,13 +1036,13 @@
 
 (defun nunion (list1 list2 &key key (test nil testp) (test-not nil notp))
   "Destructively return the union of LIST1 and LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  (cond ((null list1) (return-from nunion list2))
-        ((null list2) (return-from nunion list1)))
   (with-member-test (member-test)
+    (cond ((null list1) (return-from nunion list2))
+          ((null list2) (return-from nunion list1)))
     (binding* ((n1 (length list1))
                (n2 (length list2))
                ((short long) (if (< n1 n2) (values list1 list2) (values list2 list1))))
@@ -1039,12 +1068,12 @@
 (defun intersection (list1 list2
                      &key key (test nil testp) (test-not nil notp))
   "Return the intersection of LIST1 and LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  (when (and list1 list2)
-    (with-member-test (member-test)
+  (with-member-test (member-test)
+    (when (and list1 list2)
       (let ((res nil))
         (dolist (elt list1)
           (when (funcall member-test elt list2 key test)
@@ -1054,12 +1083,12 @@
 (defun nintersection (list1 list2
                       &key key (test nil testp) (test-not nil notp))
   "Destructively return the intersection of LIST1 and LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  (when (and list1 list2)
-    (with-member-test (member-test)
+  (with-member-test (member-test)
+    (when (and list1 list2)
       (let ((res nil)
             (list1 list1))
         (do () ((endp list1))
@@ -1071,46 +1100,48 @@
 (defun set-difference (list1 list2
                        &key key (test nil testp) (test-not nil notp))
   "Return the elements of LIST1 which are not in LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  (if list2
-      (with-member-test (member-test)
+  (with-member-test (member-test)
+    (if list2
         (let ((res nil))
           (dolist (elt list1)
             (unless (funcall member-test elt list2 key test)
               (push elt res)))
-          res))
-      list1))
+          res)
+        list1)))
 
 (defun nset-difference (list1 list2
                         &key key (test nil testp) (test-not nil notp))
   "Destructively return the elements of LIST1 which are not in LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  (if list2
-      (with-member-test (member-test)
+  (with-member-test (member-test)
+    (if list2
         (let ((res nil)
               (list1 list1))
           (do () ((endp list1))
             (if (funcall member-test (car list1) list2 key test)
                 (setf list1 (cdr list1))
                 (shiftf list1 (cdr list1) res list1)))
-          res))
-      list1))
+          res)
+        list1)))
 
 (defun set-exclusive-or (list1 list2
                          &key key (test nil testp) (test-not nil notp))
   "Return new list of elements appearing exactly once in LIST1 and LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
   (let ((result nil))
     (with-member-test (member-test)
+      (cond ((null list1) (return-from set-exclusive-or list2))
+            ((null list2) (return-from set-exclusive-or list1)))
       (dolist (elt list1)
         (unless (funcall member-test elt list2 key test)
           (push elt result)))
@@ -1128,14 +1159,16 @@
                           &key key (test #'eql testp) (test-not #'eql notp))
   "Destructively return a list with elements which appear but once in LIST1
    and LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
   (let ((key (and key (%coerce-callable-to-fun key)))
         (test (if testp (%coerce-callable-to-fun test) test))
         (test-not (if notp (%coerce-callable-to-fun test-not) test-not)))
     (declare (type function test test-not))
+    (cond ((null list1) (return-from nset-exclusive-or list2))
+          ((null list2) (return-from nset-exclusive-or list1)))
     ;; The outer loop examines LIST1 while the inner loop examines
     ;; LIST2. If an element is found in LIST2 "equal" to the element
     ;; in LIST1, both are spliced out. When the end of LIST1 is
@@ -1187,8 +1220,8 @@
 
 (defun subsetp (list1 list2 &key key (test #'eql testp) (test-not nil notp))
   "Return T if every element in LIST1 is also in LIST2."
-  (declare (explicit-check))
-  (declare (dynamic-extent key test test-not))
+  (declare (dynamic-extent key test test-not)
+           (explicit-check key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
   (with-member-test (member-test)
@@ -1327,6 +1360,7 @@
         (if accumulate
             (cdr ret-list)
             non-acc-result))
+    (declare (dynamic-extent ret-list))
     (do ((l arglists (cdr l))
          (arg args (cdr arg)))
         ((null l))
@@ -1458,6 +1492,10 @@
       (funcall test x target))
   (def (test-not)
       (not (funcall test-not x target))))
+
+(defun sys-tlab-adjoin-eq (item list)
+  (declare (sb-c::tlab :system))
+  (if (memq item list) list (cons item list)))
 
 (defun sys-tlab-append (a b)
   (declare (sb-c::tlab :system))

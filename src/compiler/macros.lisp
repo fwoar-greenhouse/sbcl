@@ -216,21 +216,25 @@
                                       (if (ll-kwds-allowp llks)
                                           `((check-key-args-constant ,tail))
                                           `((check-transform-keys
-                                             ,tail ',(mapcar #'cdr keys))))))
+                                             ,tail ',(loop for (() . key) in keys
+                                                           collect (if (keywordp key)
+                                                                       key
+                                                                       (keywordicate key))))))))
                       ,error-form))))
         (when rest
           (binds `(,(car rest) ,tail)))
-        ;; Return list of bindings, the list of user-specified symbols,
-        ;; and the list of gensyms to be declared ignorable.
+        ;; Return list of bindings, the list of user-specified symbols
         (values (append (binds)
                         (mapcar (lambda (k)
-                                  `(,(car k)
-                                     (find-keyword-lvar ,tail ',(cdr k))))
+                                  (if (keywordp (cdr k))
+                                      `(,(car k)
+                                        (find-keyword-lvar ,tail ',(cdr k)))
+                                      ;; Abuse the &key syntax to specify both key and value
+                                      `((,(car k) ,(cdr k))
+                                        (find-keyword-lvar-pair ,tail ,(keywordicate (cdr k))))))
                                 keys))
                 (sort (append (nset-difference (mapcar #'car (binds)) all-dummies)
                                (mapcar #'car keys))
-                      #'string<)
-                (sort (intersection (mapcar #'car (binds)) (cdr all-dummies))
                       #'string<))))))
 ) ; EVAL-WHEN
 
@@ -289,23 +293,25 @@
 ;;;
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
-;;;               NIL,       then never print an efficiency note.
-;;;               :SLIGHTLY, then print a note if SPEED>INHIBIT-WARNINGS.
-;;;               T,         then print a note if SPEED>=INHIBIT-WARNINGS.
-;;;             :SLIGHTLY is the default.
+;;;              NIL,       then never print an efficiency note.
+;;;              T, the default, print a note if SPEED>INHIBIT-WARNINGS.
 ;;;   :VOP
 ;;;           - insert it at the front, stop other transforms from firing
 ;;;             if the function returns T.
+;;;   :BEFORE-VOP
+;;;           - an ordinary transform placed before VOP transforms.
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                                     (result-type '*)
                               &key result policy node defun-only
-                                   (important :slightly)
-                                   vop)
+                                   (important t)
+                                   vop
+                                   before-vop
+                                   priority)
                         &body body-decls-doc)
-  (declare (type (member nil :slightly t) important))
+  (declare (type boolean important))
   (when defun-only
-    (aver (eq important :slightly))     ; can't be specified
-    (aver (not policy)))            ; has no effect on the defun
+    (aver (eq important t))             ; can't be specified
+    (aver (not policy)))                ; has no effect on the defun
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
     (let ((n-node (or node '#:node))
           (n-decls '#:decls)
@@ -331,13 +337,13 @@
                                         :none
                                         :failure)))
                          `(multiple-value-bind (,n-lambda ,n-decls)
-                             (progn ,@body)
-                           (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
-                               ,n-lambda
-                               `(lambda ,',lambda-list
-                                  (declare (ignorable ,@',vars))
-                                  ,@,n-decls
-                                  ,,n-lambda))))))))
+                              (progn ,@body)
+                            (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
+                                ,n-lambda
+                                `(lambda ,',lambda-list
+                                   (declare (ignorable ,@',vars))
+                                   ,@,n-decls
+                                   ,,n-lambda))))))))
           (cond
             ((not defun-only)
              `(let ((fun (named-lambda (deftransform ,name) ,@stuff)))
@@ -348,17 +354,21 @@
                                                 ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
                                                 '(function ,types ,result-type)
                                                 fun
-                                                ,(if vop
-                                                     :vop
-                                                     important)))))
+                                                ,(cond (vop
+                                                        :vop)
+                                                       (before-vop
+                                                        :before-vop)
+                                                       (t
+                                                        important))
+                                                ,priority))))
             ((eq defun-only 'lambda)
              `(named-lambda ,name ,@stuff))
             (defun-only
-             `(defun ,name ,@stuff))))))))
+                `(defun ,name ,@stuff))))))))
 
 (defmacro deftransforms (names (lambda-list &optional (arg-types '*)
                                                       (result-type '*)
-                                &key result policy node (important :slightly))
+                                &key result policy node (important t))
                          &body body-decls-doc)
 
   (let ((transform-name (symbolicate (car names) '-transform))
@@ -375,6 +385,22 @@
                                      #',transform-name ,important))
                    names)))))
 
+
+(defun make-optimizer-name (name)
+  (flet ((function-name (name)
+           (etypecase name
+             (symbol name)
+             ((cons (eql setf) (cons symbol null))
+              (symbolicate (car name) "-" (cadr name))))))
+    (if (symbolp name)
+        name
+        (symbolicate (function-name (first name))
+                     "-"
+                     (if (consp (second name))
+                         (caadr name)
+                         (second name))
+                     "-OPTIMIZER"))))
+
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
 ;;; (FUN-NAME KIND) and does some KIND of optimization.
@@ -400,72 +426,71 @@
                               &optional (node (gensym))
                               &rest vars)
                         &body body)
-  (let ((name (flet ((function-name (name)
-                       (etypecase name
-                         (symbol name)
-                         ((cons (eql setf) (cons symbol null))
-                          (symbolicate (car name) "-" (cadr name))))))
-                (if (symbolp what)
-                    what
-                    (symbolicate (function-name (first what))
-                                 "-"
-                                 (if (consp (second what))
-                                     (caadr what)
-                                     (second what))
-                                 "-OPTIMIZER")))))
-    (if (typep what '(cons (eql vop-optimize)))
-        `(progn
-           (defun ,name (,lambda-list)
-             ,@body)
-           ,@(loop for vop-name in (ensure-list (second what))
-                   collect
-                   `(set-vop-optimizer (template-or-lose ',vop-name)
-                                       ,(if (cddr what)
-                                            `(cons #',name ',(caddr what))
-                                            `#',name))))
-        (binding* (((forms decls) (parse-body body nil))
-                   ((var-decls more-decls) (extract-var-decls decls vars))
-                   ((binds lambda-vars)
-                    (parse-deftransform lambda-list node
-                                        `(return-from ,name
-                                           ,(if (and (consp what)
-                                                     (eq (second what)
-                                                         'equality-constraint))
-                                                :give-up
-                                                nil))))
-                   (args (gensym)))
-          (declare (ignore lambda-vars))
-          `(progn
-             ;; We can't stuff the BINDS as &AUX vars into the lambda list
-             ;; because there can be a RETURN-FROM in there.
-             (defun ,name (,node ,@vars &rest ,args)
-               (declare (ignorable ,node ,@(butlast vars))
-                        (ignore ,args))
-               ,@(if var-decls (list var-decls))
-               (let* (,@binds)
-                 (declare (ignorable ,@(mapcar #'car binds)))
-                 ,@more-decls ,@forms))
-             ,@(when (consp what)
-                 `((setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
-                             (symbolicate "FUN-INFO-" (second what)))
-                          (fun-info-or-lose ',(first what)))
-                         #',name))))))))
+  (let ((name (make-optimizer-name what)))
+    (cond ((typep what '(cons (eql vop-optimize)))
+           `(progn
+              (defun ,name (,lambda-list)
+                ,@body)
+              ,@(loop for vop-name in (ensure-list (second what))
+                      collect
+                      `(set-vop-optimizer (template-or-lose ',vop-name)
+                                          ,(if (cddr what)
+                                               `(cons #',name ',(caddr what))
+                                               `#',name)))))
+          ((typep what '(cons t (cons (eql fold-p))))
+           `(progn
+              (defun ,name ,lambda-list
+                ,@body)
+              (setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
+                        (symbolicate "FUN-INFO-" (second what)))
+                     (fun-info-or-lose ',(first what)))
+                    #',name)))
+          (t
+           (binding* (((forms decls) (parse-body body nil))
+                      ((var-decls more-decls) (extract-var-decls decls vars))
+                      ((binds lambda-vars)
+                       (parse-deftransform lambda-list node
+                                           `(return-from ,name
+                                              ,(if (and (consp what)
+                                                        (eq (second what)
+                                                            'equality-constraint))
+                                                   :give-up
+                                                   nil))))
+                      (args (gensym)))
+             (declare (ignore lambda-vars))
+             `(progn
+                ;; We can't stuff the BINDS as &AUX vars into the lambda list
+                ;; because there can be a RETURN-FROM in there.
+                (defun ,name (,node ,@vars &rest ,args)
+                  (declare (ignorable ,node ,@(remove-if (lambda (v)
+                                                           (member v lambda-list-keywords))
+                                                         (butlast vars)))
+                           (ignore ,args))
+                  ,@(if var-decls (list var-decls))
+                  (binding* (,@binds)
+                    (declare (ignorable ,@(loop for (bind) in binds
+                                                if (consp bind)
+                                                append bind
+                                                else
+                                                collect bind)))
+                    ,@more-decls ,@forms))
+                ,@(when (consp what)
+                    `((setf (,(package-symbolicate #.(find-package "SB-C") "FUN-INFO-" (second what))
+                             (fun-info-or-lose ',(first what)))
+                            #',name)))))))))
 
 (defmacro defoptimizers (kind names (lambda-list
                                      &optional (node (gensym))
                                      &rest vars)
                          &body body)
-  (let ((optimizer-name (symbolicate (car names)
-                                     "-"
-                                     kind
-                                     "-OPTIMIZER")))
+  (let* ((name (list (car names) kind))
+         (optimizer-name (make-optimizer-name name)))
     `(progn
-       (defoptimizer ,optimizer-name
+       (defoptimizer ,name
            (,lambda-list ,node ,@vars)
          ,@body)
-       ,@(loop for name in names
-               collect `(setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
-                                  (symbolicate "FUN-INFO-" kind))
+       ,@(loop for name in (cdr names)
+               collect `(setf (,(package-symbolicate #.(find-package "SB-C") "FUN-INFO-" kind)
                                (fun-info-or-lose ',name))
                               #',optimizer-name)))))
 
@@ -607,11 +632,17 @@
            while ,node-var
            do (progn ,@body))))
 
-(defmacro do-nested-cleanups ((cleanup-var block &optional return-value)
+;;; Walk up the cleanup nesting starting from the cleanup in effect at
+;;; BLOCK-OR-NODE, binding CLEANUP-VAR to each cleanup.
+(defmacro do-nested-cleanups ((cleanup-var block-or-node &optional return-value)
                               &body body)
-  `(block nil
-     (map-nested-cleanups
-      (lambda (,cleanup-var) ,@body) ,block ,return-value)))
+  (once-only ((block-or-node block-or-node))
+    `(do ((,cleanup-var (if (node-p ,block-or-node)
+                            (node-enclosing-cleanup ,block-or-node)
+                            (block-end-cleanup ,block-or-node))
+                        (node-enclosing-cleanup (cleanup-mess-up ,cleanup-var))))
+         ((not ,cleanup-var) ,return-value)
+       ,@body)))
 
 ;;; Bind the IR1 context variables to the values associated with NODE,
 ;;; so that IR1 conversion can be done after the main conversion pass
@@ -620,8 +651,10 @@
   (once-only ((node node))
     `(let ((*current-component* (node-component ,node))
            (*lexenv* (node-lexenv ,node))
-           (*current-path* (node-source-path ,node)))
-       (aver-live-component *current-component*)
+           (*current-path* (node-source-path ,node))
+           (*inline-expansions* (if (basic-combination-p ,node)
+                                    (basic-combination-inline-expansions ,node)
+                                    *inline-expansions*)))
        ,@forms)))
 
 ;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
@@ -988,64 +1021,3 @@ specify bindings for printer control variables.")
         (nreverse (mapcar #'car *compiler-print-variable-alist*))
         (nreverse (mapcar #'cdr *compiler-print-variable-alist*))
       ,@forms)))
-
-#|
-In trying to figure out whether we can rectify the totally unobvious behavior
-that FUN-INFO-TRANSFORMS are tried in the reverse order of their definitions,
-it is helpful to understand when multiple transforms exist where more than
-one could be selected.
-In the absence of type overlap, it wouldn't matter what order they were attempted.
-Unfortunately there are plenty of cases where the _least_ _specific_ fun-type
-should be attempted first, which at least superfically makes no sense at all.
-
-(in-package sb-c)
-;; As a special case, delete any functions where there are 2 transforms
-;; and they can't possibly both apply. Just check the first arg.
-(defun domains-possibly-overlap (xforms)
-  (when (/= (length xforms) 2) ; lazy, just say yes
-    (return-from domains-possibly-overlap t))
-  (let ((t1 (transform-type (car xforms)))
-        (t2 (transform-type (cadr xforms))))
-    (unless (and (fun-type-p t1) (fun-type-p t2))
-      (return-from domains-possibly-overlap t))
-    (let ((req1 (car (fun-type-required t1)))
-          (req2 (car (fun-type-required t2))))
-      (unless (and req1 req2)
-        (return-from domains-possibly-overlap t))
-      (when (or (and (type= req1 (specifier-type 'single-float))
-                     (type= req2 (specifier-type 'double-float)))
-                (and (type= req1 (specifier-type 'double-float))
-                     (type= req2 (specifier-type 'single-float))))
-        (return-from domains-possibly-overlap nil))))
-  ;; The conservative answer is always T.
-  t)
-(let (list)
-  (do-all-symbols (s)
-    (dolist (name (list s `(setf ,s) `(cas ,s)))
-      (let* ((info (sb-int:info :function :info name))
-             (xforms (and info (sb-c::fun-info-transforms info))))
-        (when (and info
-                   (> (length xforms) 1)
-                   (not (assoc name list)))
-          (if (domains-possibly-overlap xforms)
-              (push (cons name xforms) list)
-              (format t "~&Nonoverlapping xforms on ~s~%" name))))))
-  (let ((*print-pretty* nil))
-    (dolist (x (sort (copy-list list) #'> :key (lambda (x) (length (cdr x))))
-               (format t "~s functions~%" (length list)))
-      (format t "~a~%" (car x))
-      (let ((i 0))
-        (dolist (xform (cdr x))
-          (incf i)
-          (format t " ~2d. ~s~%" i (sb-kernel:type-specifier
-                                  (sb-c::transform-type xform)))
-          (let* ((fun (sb-c::transform-function xform))
-                 (code (sb-kernel:fun-code-header fun))
-                 (info (sb-kernel:%code-debug-info code))
-                 (source (sb-c::compiled-debug-info-source info))
-                 (tlf (sb-c::compiled-debug-info-tlf-number info))
-                 (offs (sb-c::compiled-debug-info-char-offset info))
-                 (ns (sb-c::debug-source-namestring source))
-                 (doc (documentation (sb-c::transform-function xform) 'function)))
-            (format t "     ; ~a ~a ~d ~d~%" doc ns tlf offs)))))))
-|#

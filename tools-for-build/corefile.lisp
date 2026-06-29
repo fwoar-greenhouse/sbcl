@@ -6,8 +6,10 @@
            #:build-id-core-entry-type-code
            #:directory-core-entry-type-code
            #:initial-fun-core-entry-type-code
+           #:static-constants-core-entry-type-code
            #:page-table-core-entry-type-code
            #:alien-linkage-table-core-entry-type-code
+           #:lisp-linkage-space-core-entry-type-code
            #:end-core-entry-type-code
            ;;
            #:read-only-core-space-id
@@ -47,6 +49,8 @@
 (defconstant initial-fun-core-entry-type-code 3863)
 (defconstant page-table-core-entry-type-code 3880)
 (defconstant alien-linkage-table-core-entry-type-code 3881)
+(defconstant lisp-linkage-space-core-entry-type-code 3882)
+(defconstant static-constants-core-entry-type-code 3883)
 (defconstant end-core-entry-type-code 3840)
 
 (defconstant dynamic-core-space-id 1)

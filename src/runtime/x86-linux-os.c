@@ -32,7 +32,6 @@
 
 #include <sys/types.h>
 #include <signal.h>
-/* #include <sys/sysinfo.h> */
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -53,7 +52,8 @@ int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
 #ifdef LISP_FEATURE_SB_THREAD
     struct user_desc desc = {
-        0, (unsigned long) thread, dynamic_values_bytes,
+        0, (unsigned long) thread,
+        (dynamic_values_bytes>>12)-1,
         1, 0, 0, 1, 0, 1
     };
 

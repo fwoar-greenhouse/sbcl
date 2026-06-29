@@ -18,6 +18,7 @@
 #include "globals.h"
 #include "runtime.h"
 #include "genesis/cons.h"
+#include "genesis/hash-table.h"
 #include "genesis/vector.h"
 #include "genesis/symbol.h"
 #include "genesis/static-symbols.h"
@@ -27,6 +28,7 @@
 #include "interr.h"
 #include "immobile-space.h"
 #include "code.h"
+#include "search.h"
 #if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
 # include <dlfcn.h>
 #endif
@@ -45,6 +47,19 @@ os_vm_size_t os_vm_page_size = BACKEND_PAGE_BYTES;
 
 /* Expose to Lisp the value of the preprocessor define. Don't touch! */
 int install_sig_memory_fault_handler = INSTALL_SIG_MEMORY_FAULT_HANDLER;
+
+#ifdef ADDRESS_SANITIZER
+/* This trick prevents ASan from reporting false positives.
+ * Not only could I not get spurious errors to go away by sprinkling NO_SANITIZE_ADDRESS
+ * all over, even if I could, it was too invasive for my liking. The difficulty stemmed
+ * from the fact the sanitizer thought that sigcontexts from the kernel aren't usable
+ * (it said that reading them constituted a use-after-free bug) and so I couldn't so much
+ * as call arch_get_bad_addr() or take *os_context_pc_addr(context) without encountering
+ * recursive errors. Whereas this fixed it with fairly localized intervention */
+char enable_tls_indirection_preinit = 1;
+#else
+char enable_tls_indirection_preinit = 0;
+#endif
 
 /* Except for os_zero, these routines are only called by Lisp code.
  * These routines may also be replaced by os-dependent versions
@@ -166,6 +181,7 @@ os_sem_destroy(os_sem_t *sem)
  * table entry for each element of REQUIRED_FOREIGN_SYMBOLS.
  */
 
+void *os_dlsym_default(char *name);
 #ifndef LISP_FEATURE_WIN32
 void *
 os_dlsym_default(char *name)
@@ -177,39 +193,39 @@ os_dlsym_default(char *name)
 
 int alien_linkage_table_n_prelinked;
 extern lispobj* get_alien_linkage_table_initializer();
-void os_link_runtime()
+void os_link_runtime(lispobj vector, lispobj count)
 {
+    // name_table is the vector that backs the SB-SYS:*LINKAGE-INFO* hash-table.
+    // In genesis we create the vector as if it were a hash-table k/v vector.
+    struct vector* name_table = VECTOR(vector);
+    int name_index = 2, linkage_index = 0;
+    // Table is the possibly nonexistent array of words filled in by the system linker.
     lispobj* table = get_alien_linkage_table_initializer();
     if (table) {
-        // Prefill the alien linkage table so that shrinkwrapped executables which
-        // link in all their C library dependencies can avoid linking with -ldl
-        // but extern-alien still works for newly compiled code.
-        lispobj* ptr = table;
-        int n = alien_linkage_table_n_prelinked = *ptr++;
-        int index = 0;
-        for ( ; n-- ; index++ ) {
-            bool datap = *ptr == (lispobj)-1; // -1 can't be a function address
-            if (datap) ++ptr;
-            arch_write_linkage_table_entry(index, (void*)*ptr++, datap);
+        // Every entry in sb-sys:*linkage-info* is considered pre-linked
+        int n = alien_linkage_table_n_prelinked = fixnum_value(name_table->data[0]);
+        for ( ; n-- ; linkage_index++, name_index += 2, table++ ) {
+            lispobj name = name_table->data[name_index];
+            gc_assert(fixnum_value(name_table->data[1+name_index]) == linkage_index);
+            bool is_data = listp(name);
+            // Strings could be non-base but so far there's no need, and the likelihood
+            // of a toolchain fully supporting arbitrary characters is low.
+            gc_assert(simple_base_string_p(is_data ? CONS(name)->car : name));
+            arch_write_linkage_table_entry(linkage_index, (void*)*table, is_data);
         }
-        return;
-    }
-
-    struct vector* symbols = VECTOR(SymbolValue(REQUIRED_FOREIGN_SYMBOLS,0));
-    int n = alien_linkage_table_n_prelinked = vector_len(symbols);
-    int index;
-    for (index = 0 ; index < n ; ++index)
-    {
-        lispobj item = symbols->data[index];
-        bool datap = listp(item);
-        lispobj symbol_name = datap ? CONS(item)->car : item;
-        char *namechars = vector_sap(symbol_name);
-        void* result = os_dlsym_default(namechars);
-
-        if (result) {
-            arch_write_linkage_table_entry(index, result, datap);
-        } else { // startup might or might not work. ymmv
-            fprintf(stderr, "Missing required foreign symbol '%s'\n", namechars);
+    } else { // Process only 'count' entries by looking them up
+        int n = alien_linkage_table_n_prelinked = count;
+        for ( ; n-- ; linkage_index++, name_index += 2 ) {
+            lispobj item = name_table->data[name_index];
+            bool is_data = listp(item);
+            lispobj c_symbol_name = is_data ? CONS(item)->car : item;
+            char *namechars = vector_sap(c_symbol_name);
+            void* result = os_dlsym_default(namechars);
+            if (result) {
+                arch_write_linkage_table_entry(linkage_index, result, is_data);
+            } else { // startup might or might not work. ymmv
+                fprintf(stderr, "Missing required foreign symbol '%s'\n", namechars);
+            }
         }
     }
 }
@@ -231,6 +247,12 @@ bool gc_managed_heap_space_p(lispobj addr)
             addr < DYNAMIC_0_SPACE_START + dynamic_space_size)
         || (DYNAMIC_1_SPACE_START <= addr &&
             addr < DYNAMIC_1_SPACE_START + dynamic_space_size)
+#endif
+#ifndef LISP_FEATURE_IMMOBILE_SPACE // elf-sans-immobile needs this case
+        || (TEXT_SPACE_START <= addr && addr < (lispobj)text_space_highwatermark)
+#endif
+#ifdef LISP_FEATURE_PERMGEN
+        || (PERMGEN_SPACE_START <= addr && addr < (lispobj)permgen_space_free_pointer)
 #endif
 #ifdef LISP_FEATURE_DARWIN_JIT
         || (STATIC_CODE_SPACE_START <= addr && addr < STATIC_CODE_SPACE_END)
@@ -388,11 +410,11 @@ os_context_register_t* os_context_pc_addr(os_context_t* context) {
     return (os_context_register_t*)&(OS_CONTEXT_PC(context));
 }
 
-void *successful_malloc(size_t size)
+void *checked_malloc(size_t size)
 {
     void* result = malloc(size);
     if (0 == result) {
-        lose("malloc failure");
+        lose("malloc(%zu) failure", size);
     } else {
         return result;
     }
@@ -401,7 +423,7 @@ void *successful_malloc(size_t size)
 
 char *copied_string(char *string)
 {
-    return strcpy(successful_malloc(1+strlen(string)), string);
+    return strcpy(checked_malloc(1+strlen(string)), string);
 }
 
 lispobj* duplicate_codeblob_offheap(lispobj code)
@@ -421,7 +443,15 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
 #if defined LISP_FEATURE_SOFT_CARD_MARKS && !defined LISP_FEATURE_DARWIN_JIT
     // dynamic space should not have protections manipulated
-    if (find_page_index(address) >= 0)
+    /* KLUDGE: this assertion is correct, but was actually passing for the wrong reason
+     * some of the time! It passed because page_table_pages was 0 early in the sequence
+     * of parsing a core header. Therefore no unsigned int could satisfy the test
+     * "index < page_table_pages". However, now that page_table_pages is computed
+     * in compute_card_table_size() which occurs as soon as the BUILD_ID is read,
+     * we run the risk that until DYNAMIC_SPACE_START is set correctly,
+     * any pointer could spuriously satisfy the test. And for ELF cores, dynamic space
+     * is set only after text space is parsed, which is too late apparently */
+    if (DYNAMIC_SPACE_START != 0 && find_page_index(address) >= 0)
         lose("unexpected call to os_protect with software card marks");
 #endif
     if (sbcl_mprotect(address, length, prot) < 0) {
@@ -455,7 +485,9 @@ static void decode_flagbits(int flags, char result[40]) {
     if (flags & MAP_PRIVATE) APPEND("Pvt");
     if (flags & MAP_ANON) APPEND("Anon");
     if (flags & MAP_NORESERVE) APPEND("NoRsv");
+#ifdef MAP_JIT
     if (flags & MAP_JIT) APPEND("JIT");
+#endif
 #undef APPEND
     strcpy(p, "}");
 }
@@ -464,7 +496,7 @@ void* traced_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t 
     decode_protbits(prot, decoded_prot);
     decode_flagbits(flags, decoded_flags);
     void* result = mmap(addr, length, prot, flags, fd, offset);
-    fprintf(mmgr_debug_logfile, "mmap(%p,%lx,%s,%s,%d,%llx)=%p\n", addr, length,
+    fprintf(mmgr_debug_logfile, "mmap(%p,%lx,%s,%s,%d,%lx)=%p\n", addr, length,
             decoded_prot, decoded_flags, fd, offset, result);
     return result;
 }
@@ -483,7 +515,19 @@ int sbcl_mprotect(void* addr, size_t length, int prot) {
 #endif
 
 #ifdef LISP_FEATURE_ELF
+#if defined LISP_FEATURE_SUNOS && defined LISP_FEATURE_X86_64
+#define ELF_TARGET_AMD64
+#endif
 #include <elf.h>
+#ifdef LISP_FEATURE_OPENBSD
+#include <machine/reloc.h>
+#endif
+#ifdef LISP_FEATURE_HAIKU
+#include <arch_elf.h>
+#endif
+#ifndef SHF_GNU_RETAIN
+#define SHF_GNU_RETAIN (1 << 21)
+#endif
 
 static off_t lisp_rel_section_offset;
 static ssize_t lisp_rel_section_size;
@@ -564,4 +608,159 @@ int apply_pie_relocs(long code_space_translation,
     free(ptrs);
     return success;
 }
+
+#ifdef LISP_FEATURE_ARM64
+# define ELF_MACHINE EM_AARCH64
+# define CORE_ALIGNMENT 65536
+# define OUR_RELOC_KIND R_AARCH64_ABS64
+#elif defined LISP_FEATURE_PPC64 && defined LISP_FEATURE_LITTLE_ENDIAN /* assume abi v2 */
+# define ELF_MACHINE EM_PPC64
+# define CORE_ALIGNMENT 65536
+# define OUR_RELOC_KIND R_PPC64_ADDR64
+#elif defined LISP_FEATURE_X86_64
+# define ELF_MACHINE EM_X86_64
+# define CORE_ALIGNMENT 32768
+# define OUR_RELOC_KIND R_X86_64_64
 #endif
+
+#ifdef ELF_MACHINE
+static uint32_t add_string(char *buffer, uint32_t *current_size, const char *str) {
+    uint32_t offset = *current_size;
+    strcpy(buffer + offset, str);
+    *current_size += strlen(str) + 1;
+    return offset;
+}
+
+static void put_section(FILE* f, long offset, void* data, int size, int nmemb)
+{
+    fseek(f, offset, SEEK_SET);
+    fwrite(data, size, nmemb, f);
+}
+
+void generate_elfcore_obj(const char *filename,
+                          FILE* input_core,
+                          char **symbol_names, int symbol_count)
+{
+    size_t core_size = ftell(input_core);
+    rewind(input_core);
+
+    // Prepare Section Header String Table
+    char shstrtab[256] = {0};
+    uint32_t shstr_size = 0;
+    add_string(shstrtab, &shstr_size, "");
+    uint32_t core_shname   = add_string(shstrtab, &shstr_size, "lisp.core");
+    uint32_t table_shname  = add_string(shstrtab, &shstr_size, ".data"); // alien_table");
+    uint32_t rela_shname   = add_string(shstrtab, &shstr_size, ".rela.data"); // alien_table");
+    uint32_t note_shname   = add_string(shstrtab, &shstr_size, ".note.GNU-stack");
+    uint32_t shstr_shname  = add_string(shstrtab, &shstr_size, ".shstrtab");
+    uint32_t sym_shname = add_string(shstrtab, &shstr_size, ".symtab");
+    uint32_t str_shname = add_string(shstrtab, &shstr_size, ".strtab");
+
+    // Prepare String Table
+    const char anchor[] = "alien_linkage_values";
+    uint32_t strtab_size = 1 + sizeof anchor;
+    for (int i = 0; i < symbol_count; i++) strtab_size += strlen(symbol_names[i]) + 1;
+    char* strtab = malloc(strtab_size);
+    uint32_t str_ct = 0; // how many chars are written into strtab
+    add_string(strtab, &str_ct, "");
+    uint32_t anchor_strname = add_string(strtab, &str_ct, anchor);
+
+    // Prepare Symbol Table
+    //   Index 1: alien_linkage_values (Defined, Global)
+    //   Index 2...N: The External C symbols (Undefined, Global)
+    int total_elf_syms = symbol_count + 2;
+    Elf64_Sym *elf_syms = calloc(total_elf_syms, sizeof(Elf64_Sym));
+
+    elf_syms[1].st_name  = anchor_strname;
+    elf_syms[1].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+    elf_syms[1].st_shndx = 2; // Index of .alien_table
+    elf_syms[1].st_size  = 0;//symbol_count * N_WORD_BYTES;
+    for (int i = 0; i < symbol_count; i++) {
+        elf_syms[i+2].st_name  = add_string(strtab, &str_ct, symbol_names[i]);
+        elf_syms[i+2].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+        elf_syms[i+2].st_shndx = SHN_UNDEF;
+    }
+    gc_assert(str_ct == strtab_size);
+
+    // Prepare alien_linkage_values
+    size_t table_data_size = symbol_count * N_WORD_BYTES;
+    uint64_t *table_data = calloc((unsigned int)symbol_count, 8); // Initialized to 0
+    Elf64_Rela *relocs = calloc((unsigned int)symbol_count, sizeof(Elf64_Rela));
+    for (long i = 0; i < symbol_count; i++) {
+        relocs[i].r_offset = i * 8;
+        // Syms start at index 2
+        relocs[i].r_info   = ELF64_R_INFO(i + 2, OUR_RELOC_KIND);
+        relocs[i].r_addend = 0;
+    }
+
+    // Compute placement of data in the ELF file
+    // Force the core to start at the first 32K boundary after the ELF header
+    long core_offset  = CORE_ALIGNMENT;
+    long table_offset = core_offset + core_size; // alien_linkage_values array goes here
+    long rela_offset  = table_offset + ALIGN_UP(table_data_size, N_WORD_BYTES);
+    long note_offset  = rela_offset + ALIGN_UP(symbol_count * sizeof(Elf64_Rela), N_WORD_BYTES);
+    long shstr_offset = note_offset;
+    long sym_offset   = shstr_offset + ALIGN_UP(shstr_size, N_WORD_BYTES);
+    long str_offset   = sym_offset + ALIGN_UP(total_elf_syms * sizeof(Elf64_Sym), N_WORD_BYTES);
+    long header_table_offset = str_offset + ALIGN_UP(strtab_size, N_WORD_BYTES);
+
+    /* in a .symtab section:
+     *   sh_link is the index of its corresponding string section
+     *   sh_info is the index of the first global symbol
+     * in a .rela section:
+     *   sh_link is the index of the symbol section
+     *   sh_info is the section to patch
+     */
+    // 5. Section Headers (8 total: 0..7)
+    Elf64_Shdr shdr[8] = {0};
+    shdr[1] = (Elf64_Shdr){ .sh_name=core_shname,  .sh_type=SHT_PROGBITS,
+      .sh_flags=SHF_ALLOC|SHF_GNU_RETAIN,
+      .sh_offset=core_offset, .sh_size=core_size, .sh_addralign=CORE_ALIGNMENT
+    };
+    shdr[2] = (Elf64_Shdr){ .sh_name=table_shname, .sh_type=SHT_PROGBITS, .sh_flags=SHF_ALLOC|SHF_WRITE,
+      .sh_offset=table_offset, .sh_size=table_data_size, .sh_addralign=8
+    };
+    shdr[3] = (Elf64_Shdr){ .sh_name=rela_shname,  .sh_type=SHT_RELA,     .sh_offset=rela_offset,
+      .sh_size=symbol_count*sizeof(Elf64_Rela), .sh_link=6, .sh_info=2, .sh_entsize=sizeof(Elf64_Rela)
+    };
+    shdr[4] = (Elf64_Shdr){ .sh_name=note_shname,  .sh_type=SHT_PROGBITS, .sh_offset=note_offset };
+    shdr[5] = (Elf64_Shdr){ .sh_name=shstr_shname, .sh_type=SHT_STRTAB,   .sh_offset=shstr_offset,
+      .sh_size=shstr_size
+    };
+    shdr[6] = (Elf64_Shdr){ .sh_name=sym_shname,   .sh_type=SHT_SYMTAB,   .sh_offset=sym_offset,
+      .sh_size=total_elf_syms*sizeof(Elf64_Sym), .sh_link=7, .sh_info=1, .sh_entsize=sizeof(Elf64_Sym)
+    };
+    shdr[7] = (Elf64_Shdr){ .sh_name=str_shname,   .sh_type=SHT_STRTAB,   .sh_offset=str_offset,
+      .sh_size=strtab_size
+    };
+
+    Elf64_Ehdr ehdr = {
+        .e_ident = { ELFMAG0, ELFMAG1, ELFMAG2, ELFMAG3, ELFCLASS64, ELFDATA2LSB, EV_CURRENT },
+        .e_type = ET_REL, .e_machine = ELF_MACHINE, .e_version = EV_CURRENT,
+        .e_ehsize = sizeof(Elf64_Ehdr), .e_shentsize = sizeof(Elf64_Shdr),
+        .e_shnum = 8, .e_shstrndx = 5, .e_shoff = header_table_offset
+    };
+
+
+    FILE *f = fopen(filename, "wb");
+    char buffer[4096];
+    int nread;
+    fwrite(&ehdr, 1, sizeof(ehdr), f);
+    fseek(f, core_offset, SEEK_SET);
+    while ((nread = fread(buffer, 1, 4096, input_core)) > 0)
+      fwrite(buffer, 1, nread, f);
+
+    put_section(f, table_offset, table_data, table_data_size, 1);
+    put_section(f, rela_offset, relocs, sizeof(Elf64_Rela), symbol_count);
+    put_section(f, shstr_offset, shstrtab, shstr_size, 1);
+    put_section(f, sym_offset, elf_syms, sizeof(Elf64_Sym), total_elf_syms);
+    put_section(f, str_offset, strtab, strtab_size, 1);
+    put_section(f, header_table_offset, shdr, sizeof(Elf64_Shdr), 8);
+    fclose(f);
+    // Should really free() some stuff but it's not a leak since this program is now exiting
+}
+#else
+void generate_elfcore_obj() { lose("Unsupported: generate_elfcore_obj"); }
+#endif /* ELF_MACHINE */
+
+#endif /* LISP_FEATURE_ELF */

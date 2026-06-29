@@ -22,8 +22,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #ifdef LISP_FEATURE_WIN32
-/* I don't know where ffs() is prototyped */
-extern int ffs(int);
+// Provide ffs using __builtin_ffs for Windows
+static inline int ffs(int i) {
+    return __builtin_ffs(i);
+}
 #else
 /* https://www.freebsd.org/cgi/man.cgi?query=fls&sektion=3&manpath=FreeBSD+7.1-RELEASE
    says strings.h */
@@ -810,7 +812,7 @@ int hopscotch_delete(tableptr ht, uword_t key)
         return 0;
     ht->keys[physical_index] = 0;
     set_val(ht, physical_index, 0);
-    ht->hops[logical_index] ^= (1<<(physical_index - logical_index));
+    ht->hops[logical_index] ^= (1U<<(physical_index - logical_index));
     --ht->count;
     return 1;
 }

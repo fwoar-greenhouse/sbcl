@@ -199,6 +199,9 @@
 
 ;;; 32-bit is not done yet. Three slots are still used, instead of two.
 
+;;; TODO: this should probably become a BUILTIN-CLASSOID for the same reason
+;;; PATHNAME is (see rev 816d286a), namely to prevent use of COPY-STRUCTURE,
+;;; MAKE-INSTANCE, and (SETF SLOT-VALUE).
 (sb-xc:defstruct (layout (:copier nil)
                          ;; Parsing DEFSTRUCT uses a temporary layout
                          (:constructor make-temporary-layout
@@ -214,6 +217,14 @@
   ;; for classes named by a symbol, otherwise a pseudo-random value.
   ;; Must be acceptable as an argument to SB-INT:MIX
   (clos-hash (missing-arg) :type (and fixnum unsigned-byte))
+  ;; Vtable could be used to store the per-layout implementation of the combined methods for
+  ;; any single-dispatch function. The trick is to dynamically figure out when it would make
+  ;; sense to claim a unique index into the vtable. Certainly for a function that has about half
+  ;; as many methods as there are classes e.g. #<STANDARD-GENERIC-FUNCTION CL-PROTOBUFS:CLEAR (2017)>
+  ;; when there are 4000 classes. A PCL cache (key = layout, value = method) would take up double
+  ;; the space at least, plus all the unused cells required to make the probing strategy work.
+  ;; And it wouldn't be as quick as a direct lookup.
+  (vtable)
   ;; the class that this is a layout for
   (classoid (missing-arg) :type classoid)
   ;; The value of this slot can be:
@@ -269,6 +280,9 @@
   ;; access to slot-definitions and locations by name, etc.
   ;; See MAKE-SLOT-TABLE in pcl/slots-boot.lisp for further details.
   (slot-table #(1 nil) :type simple-vector)
+  ;; In lieu of card-marking, this should maintain a so-called intrusive
+  ;; linked list of layouts touched since last GC
+  ; (chain 0 :type sb-vm:word) ; not yet
   (id-word0 0 :type word)
   (id-word1 0 :type word)
   (id-word2 0 :type word)
@@ -567,12 +581,17 @@
   (let ((bits (logior (type-%bits x) (logand (ctype-random) +ctype-hash-mask+))))
     (etypecase x
       (member-type
-       (!alloc-member-type bits (member-type-xset x) (member-type-fp-zeroes x))))))
+       (!alloc-member-type bits (member-type-xset x))))))
 #-sb-xc-host
+(macrolet ((safe-member-type-elt-p (obj)
+             `(or (not (sb-vm:is-lisp-pointer (get-lisp-obj-address ,obj)))
+                  (heap-allocated-p ,obj))))
 (defun copy-ctype (x &optional (flags 0))
   (declare (type ctype x))
   (declare (sb-c::tlab :system) (inline !new-xset))
-  #+c-stack-is-control-stack (aver (stack-allocated-p x))
+  #.(cl:if (cl:and (cl:member :c-stack-is-control-stack sb-xc:*features*)
+                   sb-ext:*stack-allocate-dynamic-extent*)
+           '(aver (stack-allocated-p x)))
   (labels ((copy (x)
              ;; Return a heap copy of X if X was arena or stack-allocated.
              ;; I suspect it's quicker to copy always rather than conditionally.
@@ -593,9 +612,6 @@
              ;; If the XSET is represented as a hash-table, we may have another issue
              ;; which is not dealt with here (hash-table in the arena)
              (cond ((listp data)
-                    ;; the XSET can be empty if a MEMBER type contains only FP zeros.
-                    ;; While we could use (load-time-value) to referece a constant empty xset
-                    ;; there's really no point to doing that.
                     (collect ((elts))
                       (dolist (x data (!new-xset (elts) (xset-extra xset)))
                         (elts (cond ((numberp x) (sb-vm:copy-number-to-heap x))
@@ -625,17 +641,16 @@
                       (fun-type-wild-args x) (fun-type-returns x))))
            (%set-instance-layout copy (%instance-layout x))
            copy))
-        (numeric-type
-         (!alloc-numeric-type bits (numeric-type-aspects x)
-                              (copy (numeric-type-low x)) (copy (numeric-type-high x))))
+        (numeric-union-type
+         (!alloc-numeric-union-type bits (numeric-union-type-aspects x)
+                                    (map 'vector #'copy (numeric-union-type-ranges x))))
         (compound-type ; UNION or INTERSECTION
          (let ((copy (!alloc-union-type bits (compound-type-enumerable x)
                                         (compound-type-types x))))
            (%set-instance-layout copy (%instance-layout x))
            copy))
         (member-type
-         (!alloc-member-type bits (copy-xset (member-type-xset x))
-          (mapcar 'sb-vm:copy-number-to-heap (member-type-fp-zeroes x))))
+         (!alloc-member-type bits (copy-xset (member-type-xset x))))
         (array-type
          (!alloc-array-type bits (copy (array-type-dimensions x))
                             (array-type-complexp x) (array-type-element-type x)
@@ -654,10 +669,11 @@
         #+sb-simd-pack-256
         (simd-pack-256-type (!alloc-simd-pack-256-type bits (simd-pack-256-type-tag-mask x)))
         (alien-type-type (!alloc-alien-type-type bits (alien-type-type-alien-type x)))))))
+) ; end  MACROLET
 
 #-sb-xc-host
 (progn
-(defglobal *!initial-ctypes* nil)
+(define-load-time-global *!initial-ctypes* nil)
 (defun preload-ctype-hashsets ()
   (dolist (pair (nreverse *!initial-ctypes*))
     (let ((instance (car pair))
@@ -690,7 +706,7 @@
                        (bug "genesis dumped bad instance within ~X"
                             (get-lisp-obj-address instance)))))))
         (etypecase instance
-          ((or numeric-type member-type character-set-type ; nothing extra to do
+          ((or numeric-union-type member-type character-set-type ; nothing extra to do
            #+sb-simd-pack simd-pack-type #+sb-simd-pack-256 simd-pack-256-type
            hairy-type))
           (args-type

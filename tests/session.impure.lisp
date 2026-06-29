@@ -22,7 +22,7 @@
 
 (defun get-foreground-quietly ()
   (let ((*query-io* (make-quiet-io-stream)))
-    (sb-thread::get-foreground)))
+    (sb-thread:get-foreground)))
 
 ;; this used to deadlock on session-lock
 (with-test (:name (:no-session-deadlock))
@@ -45,8 +45,7 @@
     (sb-thread:join-thread thr1)
     (sb-thread:join-thread thr2)))
 
-(with-test (:name (:debugger-no-hang-on-session-lock-if-interrupted)
-            :broken-on :win32)
+(with-test (:name (:debugger-no-hang-on-session-lock-if-interrupted))
   (sb-debug::enable-debugger)
   (let ((main-thread sb-thread:*current-thread*))
     (make-join-thread
@@ -77,7 +76,7 @@
 ;;; The sequence of actions in this test creates a situation in which
 ;;; the list of interactive threads of the current session contains a
 ;;; single thread.
-(with-test (:name (sb-thread::get-foreground :inifite-loop :bug-1682671))
+(with-test (:name (sb-thread:get-foreground :infinite-loop :bug-1682671))
   (let ((state nil)
         (lock (sb-thread:make-mutex :name "get-foreground test lock"))
         (variable (sb-thread:make-waitqueue :name "get-foreground test waitqueue")))
@@ -117,7 +116,7 @@
 ;;; session. However, this did not previously include notifying the
 ;;; interactive threads waitqueue, resulting in GET-FOREGROUND hanging
 ;;; after termination of the previous foreground thread.
-(with-test (:name (sb-thread::get-foreground :hang :missing-broadcast))
+(with-test (:name (sb-thread:get-foreground :hang :missing-broadcast))
   (let ((thread (make-join-thread
                  (lambda () (sleep 1))
                  :name "get-foreground hang missing-broadcast test")))
@@ -127,7 +126,7 @@
 ;;; Releasing foreground to an already dead thread previously made the
 ;;; dead thread the foreground thread. At that point, all succeeding
 ;;; GET-FOREGROUND calls would just hang.
-(with-test (:name (sb-thread::get-foreground :hang :already-dead))
+(with-test (:name (sb-thread:get-foreground :hang :already-dead))
   (let ((thread (sb-thread:make-thread
                  (lambda ())
                  :name "get-foreground hang already-dead test")))

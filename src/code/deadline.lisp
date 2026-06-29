@@ -54,7 +54,7 @@
      (locally ; FIXME compiler should learn to figure that out
          (declare (type (integer 0 #.internal-seconds-limit) seconds))
        (seconds-to-internal-time seconds)))
-    ((single-float $0.0f0 #.(float safe-internal-seconds-limit $1.0f0))
+    ((single-float 0.0f0 #.(float safe-internal-seconds-limit 1.0f0))
      (seconds-to-internal-time seconds))
     ((and (not single-float) (real 0 #.safe-internal-seconds-limit))
      (seconds-to-internal-time seconds))))
@@ -196,12 +196,12 @@ If ABS-SEC and ABS-USEC are in the past, 0 0 is returned."
 ;;;
 ;;; If SECONDS is NIL and there is no *DEADLINE* all returned values
 ;;; are NIL.
-(declaim (ftype (function ((or null (real 0)))
-                          (values (or null internal-seconds)
-                                  (or null (mod 1000000))
-                                  (or null internal-seconds)
-                                  (or null (mod 1000000))
-                                  t))
+(declaim (ftype (sfunction ((or null (real 0)))
+                           (values (or null internal-seconds)
+                                   (or null (mod 1000000))
+                                   (or null internal-seconds)
+                                   (or null (mod 1000000))
+                                   boolean))
                 decode-timeout))
 (defun decode-timeout (seconds)
   "Decodes a relative timeout in SECONDS into five values, taking any

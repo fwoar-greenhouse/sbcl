@@ -181,7 +181,7 @@
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
@@ -197,7 +197,7 @@
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
@@ -218,7 +218,7 @@
                    :from (:argument 0) :to (:result 0)) cfunc)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
   (:temporary (:sc any-reg) temp)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc any-reg :offset lr-offset) lip)
   (:vop-var vop)
   (:generator 0
     (let ((call-into-c-fixup (gen-label))
@@ -375,25 +375,12 @@
 ;;; Callback
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
-  (let ((parsed-type type))
-    (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
-               (let ((byte-offset
-                      (cond ((< bits n-word-bits)
-                             (- n-word-bytes
-                                (ceiling bits n-byte-bits)))
-                            (t 0))))
-                 `(deref (sap-alien (sap+ ,sap
-                                          ,(+ byte-offset offset))
-                                    (* ,type)))))
-        `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
+  `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))
 
 #-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
   (flet ((make-tn (offset &optional (sc-name 'any-reg))
-           (make-random-tn :kind :normal
-                           :sc (sc-or-lose sc-name)
-                           :offset offset)))
+           (make-random-tn (sc-or-lose sc-name) offset)))
     (let* ((segment (make-segment))
            ;; How many arguments have been copied
            (arg-count 0)
@@ -403,7 +390,6 @@
            (r1-tn (make-tn 1))
            (r2-tn (make-tn 2))
            (r3-tn (make-tn 3))
-           (r4-tn (make-tn 4))
            (temp-tn (make-tn 5))
            (nsp-save-tn (make-tn 6))
            #-arm-softfp
@@ -509,21 +495,18 @@
                    (incf arg-count 1))
                   (t
                    (bug "Unknown alien floating point type: ~S" type)))))
-        ;; arg0 to FUNCALL3 (function)
-        (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
-        (loadw r0-tn r0-tn)
         ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
-        (inst mov r1-tn (fixnumize index))
+        (inst mov r0-tn (fixnumize index))
         ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
-        (inst mov r2-tn nsp-tn)
+        (inst mov r1-tn nsp-tn)
         ;; add room on stack for return value
         (inst sub nsp-tn nsp-tn 8)
         ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
-        (inst mov r3-tn nsp-tn)
+        (inst mov r2-tn nsp-tn)
 
         ;; Call
-        (load-immediate-word r4-tn (foreign-symbol-address "funcall3"))
-        (inst blx r4-tn)
+        (load-immediate-word r3-tn (callback_wrapper_trampoline))
+        (inst blx r3-tn)
 
         ;; Result now on top of stack, put it in the right register
         (cond

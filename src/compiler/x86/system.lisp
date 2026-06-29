@@ -13,6 +13,16 @@
 
 ;;;; type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg) :target res))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:generator 1
+    (move res arg)
+    (inst and res #x7FFFFFFC))) ; clear sign and fixnum tag bits
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -137,15 +147,6 @@
                  (ash mask -8)))
           (t
            (bug "Unimplemented")))))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg) :target res))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (move res ptr)
-    (inst and res (lognot fixnum-tag-mask))))
 
 ;;;; allocation
 

@@ -132,8 +132,6 @@ maintained."
 ;;;
 ;;; KLUDGE: Some functions (e.g. ANSI-STREAM-READ-LINE) use these variables
 ;;; directly, instead of indirecting through FAST-READ-CHAR.
-;;; When ANSI-STREAM-INPUT-CHAR-POS is non-null, we take care to update it,
-;;; but not for each character of input.
 (defmacro prepare-for-fast-read-char (stream &body forms)
   `(let* ((%frc-stream% ,stream)
           (%frc-method% (ansi-stream-in %frc-stream%))
@@ -151,10 +149,7 @@ maintained."
 ;;; If buffer refills occurred within FAST-READ-CHAR, the refill logic
 ;;; similarly scans the cin-buffer before placing anything new into it.
 (defmacro done-with-fast-read-char ()
-  `(progn
-     (when (ansi-stream-input-char-pos %frc-stream%)
-       (update-input-char-pos %frc-stream% %frc-index%))
-     (setf (ansi-stream-in-index %frc-stream%) %frc-index%)))
+  `(setf (ansi-stream-in-index %frc-stream%) %frc-index%))
 
 ;;; a macro with the same calling convention as READ-CHAR, to be used
 ;;; within the scope of a PREPARE-FOR-FAST-READ-CHAR.
@@ -208,22 +203,16 @@ maintained."
                 (type index ,f-index))
        (declare (disable-package-locks fast-read-byte))
        (flet ((fast-read-byte ()
-                (,@(cond ((equal '(unsigned-byte 8) type)
-                          ;; KLUDGE: For some reason I haven't tracked down
-                          ;; this makes a difference even in given the TRULY-THE.
-                          `(logand #xff))
-                         (t
-                          `(identity)))
-                 (truly-the ,type
-                            (cond
-                              ((not ,f-buffer)
-                               (funcall ,f-method ,f-stream ,eof-p ,eof-val))
-                              ((< ,f-index (length ,f-buffer))
-                               (prog1 (aref ,f-buffer ,f-index)
-                                 (setf (ansi-stream-in-index ,f-stream) (incf ,f-index))))
-                              (t
-                               (prog1 (fast-read-byte-refill ,f-stream ,eof-p ,eof-val)
-                                 (setq ,f-index (ansi-stream-in-index ,f-stream)))))))))
+                (truly-the ,type
+                           (cond
+                             ((not ,f-buffer)
+                              (funcall ,f-method ,f-stream ,eof-p ,eof-val))
+                             ((< ,f-index (length ,f-buffer))
+                              (prog1 (aref ,f-buffer ,f-index)
+                                (setf (ansi-stream-in-index ,f-stream) (incf ,f-index))))
+                             (t
+                              (prog1 (fast-read-byte-refill ,f-stream ,eof-p ,eof-val)
+                                (setq ,f-index (ansi-stream-in-index ,f-stream))))))))
          (declare (inline fast-read-byte))
          (declare (enable-package-locks fast-read-byte))
          (locally ,@body)))))
@@ -241,7 +230,7 @@ maintained."
         (cond ((< (truly-the index ,index) (length ,rest-var))
                (let ((,var (fast-&rest-nth ,index ,rest-var)))
                  ,@body)
-               (incf ,index))
+               (incf (truly-the index ,index)))
               (t
                (return ,result)))))))
 

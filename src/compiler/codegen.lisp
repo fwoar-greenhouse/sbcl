@@ -16,6 +16,15 @@
 
 ;;;; utilities used during code generation
 
+(defstruct (assembly ; result of calling the assembler
+             (:conc-name "ASM-")
+             (:constructor make-assembly
+                           (segment bytes text-length fun-table elsewhere-label
+                                    fixup-notes eh-locs alloc-sites))
+             (:copier nil))
+  segment bytes text-length fun-table elsewhere-label
+  fixup-notes eh-locs alloc-sites)
+
 ;;; KLUDGE: the assembler can not emit backpatches comprising jump tables without
 ;;; knowing the boxed code header length. But there is no compiler IR2 metaobject,
 ;;; for SB-FASL:*ASSEMBLER-ROUTINES*. We have to return a fixed answer for that.
@@ -61,11 +70,6 @@
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
     (when (ir2-environment-number-stack-p 2env)
       (ir2-component-nfp (component-info *component-being-compiled*)))))
-
-;;; the TN used for passing the return PC in a local call to the function
-;;; designated by 2ENV
-(defun callee-return-pc-tn (2env)
-  (ir2-environment-return-pc-pass 2env))
 
 ;;;; Fixups
 
@@ -240,7 +244,8 @@
 (defun generate-code (component &aux (ir2-component (component-info component)))
   (declare (type ir2-component ir2-component))
   (when *compiler-trace-output*
-    (let ((*print-pretty* nil)) ; force 1 line
+    (let ((*print-pretty* nil)          ; force 1 line
+          (*print-readably*))
       (format *compiler-trace-output* "~|~%assembly code for ~S~2%" component)))
   (let* ((prev-env nil)
          (sb-vm::*adjustable-vectors* nil)
@@ -267,7 +272,8 @@
             ;; FIXME: see comment in ASSEMBLE-SECTIONS - we *can* enforce larger
             ;; alignment than the size of a cons cell.
             (let ((alignp (let ((cloop (block-loop 1block)))
-                            (when (and cloop
+                            (when (and (policy (block-start-node 1block) (<= space 1))
+                                       cloop
                                        (loop-tail cloop)
                                        (not (loop-info cloop)))
                               ;; Mark the loop as aligned by saving the IR1 block aligned.
@@ -305,9 +311,11 @@
                    (setf vop (vop-next vop)))
                   (t
                    (funcall gen vop)))))))
-
-    (when *do-instcombine-pass*
-      #+(or arm64 x86-64)
+    #+(or arm64 x86-64)
+    (when (and *do-instcombine-pass*
+               (policy (block-home-lambda
+                        (block-next (component-head component)))
+                   (>= speed compilation-speed)))
       (sb-assem::combine-instructions (asmstream-code-section asmstream)))
 
     (emit (asmstream-data-section asmstream)
@@ -321,7 +329,7 @@
         ;; phase (codegen has not made use of component-header-length),
         ;; so extending can be done with impunity.
         #+arm64
-        (vector-push-extend (cons :coverage-marks (length coverage-map))
+        (vector-push-extend (list :coverage-marks (length coverage-map))
                             (ir2-component-constants ir2-component))
         (vector-push-extend
          (make-constant (cons 'coverage-map
@@ -340,26 +348,18 @@
            (skew (if (and (= code-boxed-words-align 1) (oddp n-boxed))
                      sb-vm:n-word-bytes
                      0)))
-      (multiple-value-bind (segment text-length fixup-notes fun-table)
-          (assemble-sections
-           asmstream
-           (ir2-component-entries ir2-component)
-           (make-segment :header-skew skew
-                         :run-scheduler (default-segment-run-scheduler)))
-        (values segment text-length fun-table
-                (asmstream-elsewhere-label asmstream) fixup-notes
-                (sb-assem::get-allocation-points asmstream))))))
+      (assemble-sections asmstream
+                         (ir2-component-entries ir2-component)
+                         (make-segment (default-segment-run-scheduler) skew)))))
 
-(defun label-elsewhere-p (label-or-posn kind)
-  (let ((elsewhere (label-position *elsewhere-label*))
-        (label (etypecase label-or-posn
-                 (label
-                  (label-position label-or-posn))
-                 (index
-                  label-or-posn))))
+(defun label-elsewhere-p (label-or-posn kind elsewhere-label)
+  (let ((elsewhere (label-position elsewhere-label))
+        (position (etypecase label-or-posn
+                    (label (label-position label-or-posn))
+                    (index label-or-posn))))
     (if (memq kind '(:single-value-return
                      :unknown-return
                      :known-return))
         ;; We're interested in what precedes the return, not after
-        (< elsewhere label)
-        (<= elsewhere label))))
+        (< elsewhere position)
+        (<= elsewhere position))))

@@ -53,7 +53,9 @@
 ;;;; the SEGMENT structure
 
 ;;; This structure holds the state of the assembler.
-(defstruct (segment (:copier nil))
+(defstruct (segment (:constructor make-segment
+                        (&optional run-scheduler (header-skew 0)))
+                    (:copier nil))
   ;; This is a vector where instructions are written.
   ;; It used to be an adjustable array, but we now do the array size
   ;; management manually for performance reasons (as of 2006-05-13 hairy
@@ -292,10 +294,8 @@
 (declaim (freeze-type stmt))
 (defmethod print-object ((stmt stmt) stream)
   (print-unreadable-object (stmt stream :type t :identity t)
-    (awhen (stmt-labels stmt)
-      (princ it stream)
-      (write-char #\space stream))
-    (princ (stmt-mnemonic stmt) stream)))
+    (format stream "~@[~A ~]~A ~:S"
+            (stmt-labels stmt) (stmt-mnemonic stmt) (stmt-operands stmt))))
 
 ;;; A section is just a doubly-linked list of statements with a head and
 ;;; tail pointer to allow insertion anywhere,
@@ -306,7 +306,8 @@
 (defun section-start (section) (car section))
 (defmacro section-tail (section) `(cdr ,section))
 
-(defstruct asmstream
+(defstruct (asmstream (:constructor make-asmstream ())
+                      (:copier nil))
   (data-section (make-section) :read-only t)
   (code-section (make-section) :read-only t)
   (elsewhere-section (make-section) :read-only t)
@@ -321,6 +322,8 @@
   ;; for deterministic allocation profiler (or possibly other tooling)
   ;; that wants to monkey patch the instructions at runtime.
   (alloc-points)
+  ;; Exception-handling locations (which can be handled in the C runtime)
+  (eh-locs)
   ;; for shrinking the size of the code fixups, we can choose to emit at most one call
   ;; from a dynamic space code component to a given assembly routine. The call goes
   ;; through an extra indirection in the component.
@@ -338,7 +341,7 @@
   ;; Convert the label positions to a packed integer
   ;; Utilize PACK-CODE-FIXUP-LOCS to perform compression.
   (awhen (mapcar 'label-posn (asmstream-alloc-points asmstream))
-    (sb-c:pack-code-fixup-locs it nil nil)))
+    (sb-c:pack-code-fixup-locs it)))
 
 ;;; Insert STMT after PREDECESSOR.
 (defun insert-stmt (stmt predecessor)
@@ -454,6 +457,10 @@
                          (#+sb-xc-host cl:macroexpand-1
                           #-sb-xc-host %macroexpand-1 '..inherited-labels.. env)
                        (if expanded expansion)))
+          ;; REMOVE-IF-NOT can tail-share with its input. For example:
+          ;;  * (defvar form '((inst add x y) ok (progn) done))
+          ;;  * (sort (remove-if-not #'atom form) #'string<) => (DONE OK)
+          ;;  * form => ((INST ADD X Y) OK (PROGN) OK) ; mutated by SORT
           (new-labels (sort (copy-list (remove-if-not #'label-name-p body)) #'string<)))
       ;; Compare for dups using STRING=. Two reasons to use that rather than EQ:
       ;; (1) the assembler input is generally string-like - consider that instruction
@@ -996,7 +1003,7 @@
        (emit-byte segment pattern)))
     ;; EMIT-LONG-NOP does not exist for most backends.
     ;; Better to get an ECASE error than undefined-function.
-    #+x86-64
+    #+(or x86-64 ppc64)
     ((eql :long-nop)
      (sb-vm:emit-long-nop segment amount)))
   (values))
@@ -1394,9 +1401,11 @@
   (defun extract-prefix-keywords (x) x)
   (defun decode-prefix (args) args))
 
-(defun dump-symbolic-asm (section stream &aux last-vop all-labels (n 0))
+(defun dump-symbolic-asm (start stream &aux last-vop all-labels (n 0))
   (format stream "~2&Assembler input:~%")
-  (do ((statement (stmt-next (section-start section)) (stmt-next statement))
+  (when (eq (stmt-mnemonic start) :ignore)
+    (setq start (stmt-next start))) ; Skip dummy head of statement list
+  (do ((statement start (stmt-next statement))
        (*print-pretty* nil))
       ((null statement))
     (incf n)
@@ -1471,7 +1480,7 @@
     (setf (segment-collect-dynamic-statistics segment) *collect-dynamic-statistics*)
     (when (and sb-c::*compiler-trace-output*
                (memq :symbolic-asm sb-c::*compile-trace-targets*))
-      (dump-symbolic-asm section sb-c::*compiler-trace-output*))
+      (dump-symbolic-asm (section-start section) sb-c::*compiler-trace-output*))
     (do ((statement (stmt-next (section-start section)) (stmt-next statement)))
         ((null statement))
       (awhen (stmt-vop statement) (setq *current-vop* it))
@@ -1539,9 +1548,7 @@
         ;; Since code can only go on pages reserved for code, there will be no smaller
         ;; object on the same page to cause misalignment.
         ;; Extra padding can be inserted before the trailing simple-fun table.
-        (let ((padding (if (eql n-entries 0)
-                           0
-                           (- index trailer-len (label-position end-text)))))
+        (let ((padding (- index trailer-len (label-position end-text))))
           (unless (and (typep trailer-len '(unsigned-byte 16))
                        (typep n-entries '(unsigned-byte 12))
                        ;; Padding must be representable in 4 bits at assembly time,
@@ -1564,10 +1571,12 @@
             (setf (sap-ref-32 sap index) val)
             (incf index 4)))))
     (aver (= index (- (length octets) 4)))
-    (values segment
-            (label-position end-text)
-            (segment-fixup-notes segment)
-            fun-offsets)))
+    (sb-c::make-assembly segment (segment-contents-as-vector segment)
+                         (label-position end-text) fun-offsets
+                         (asmstream-elsewhere-label asmstream)
+                         (segment-fixup-notes segment)
+                         (sort (mapcar 'label-posn (asmstream-eh-locs asmstream)) #'<)
+                         (get-allocation-points asmstream))))
 
 ;;; Most backends do not convert register TNs into a different type of
 ;;; internal object prior to handing the operands off to the emitter.
@@ -1652,7 +1661,8 @@
   "Emit LABEL at this location in the current section."
   (let ((s *current-destination*))
     (trace-inst s :label label)
-    (emit s label)))
+    (emit s label))
+  label)
 
 (defun emit-postit (function)
   (let ((s *current-destination*))
@@ -1729,21 +1739,28 @@
                                  total-bits assembly-unit-bits))
                         quo))
            (bytes (make-array num-bytes :initial-element nil))
-           (segment-arg (gensym "SEGMENT-")))
+           (segment-arg '#:segment))
       (dolist (byte-spec-expr byte-specs)
         (let* ((byte-spec (eval byte-spec-expr))
                (byte-size (byte-size byte-spec))
                (byte-posn (byte-position byte-spec))
-               (arg (gensym (format nil "~:@(ARG-FOR-~S-~)" byte-spec-expr))))
+               ;; if exactly one arg, then it is named literally #:integer
+               (arg (if (cdr byte-specs)
+                        (gensym (format nil "~:@(ARG-FOR-~S-~)" byte-spec-expr))
+                        '#:integer)))
           (when (ldb-test (byte byte-size byte-posn) overall-mask)
             (error "The byte spec ~S either overlaps another byte spec, or ~
                     extends past the end."
                    byte-spec-expr))
           (setf (ldb byte-spec overall-mask) -1)
           (arg-names arg)
-          (arg-types `(type (integer ,(ash -1 (1- byte-size))
-                                     ,(1- (ash 1 byte-size)))
-                            ,arg))
+          (arg-types
+           ;; the two arms of the IF are equivalent,
+           ;; but literal integers get ugly beyond a certain point.
+           (let ((spec (if (<= byte-size 16)
+                           `(integer ,(ash -1 (1- byte-size)) ,(1- (ash 1 byte-size)))
+                           `(or (signed-byte ,byte-size) (unsigned-byte ,byte-size)))))
+             `(type ,spec ,arg)))
           (multiple-value-bind (start-byte offset)
               (floor byte-posn assembly-unit-bits)
             (let ((end-byte (floor (1- (+ byte-posn byte-size))
@@ -1786,6 +1803,10 @@
                           (svref bytes end-byte))))))))))
       (unless (= overall-mask -1)
         (error "There are holes."))
+      ;; Note: the way this would typically be done efficiently
+      ;; (at least in the target) for 2 or 4 bytes is to first ensure
+      ;; adequate buffer space followed by exactly 1 store.
+      ;; For portability we have to split octets apart by hand.
       (let ((forms nil))
         (dotimes (i num-bytes)
           (let ((pieces (svref bytes i)))
@@ -1991,7 +2012,7 @@
 
 (defparameter *show-peephole-transforms-p* nil)
 (defglobal *asm-pattern-matchers* nil)
-(defglobal *asm-pattern-matchers-invoked* (make-array 20 :initial-element 0))
+(defglobal *asm-pattern-matchers-invoked* (make-array 32 :initial-element 0))
 (defun %defpattern (name opcodes1 opcodes2 applicator)
   (let ((entry (find name *asm-pattern-matchers* :test #'string= :key #'fifth)))
     (if entry

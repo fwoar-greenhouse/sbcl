@@ -29,12 +29,12 @@
   (case (info :variable :kind name)
     (:special
      (let ((variable (find-free-var name)))
-       (make-lambda-var :%source-name name
+       (make-lambda-var name
                         :type (leaf-type variable)
                         :where-from (leaf-where-from variable)
                         :specvar variable)))
     (t
-     (make-lambda-var :%source-name name
+     (make-lambda-var name
                       :source-form source-form))))
 
 ;;; Parse a lambda list into a list of VAR structures, stripping off
@@ -63,7 +63,7 @@
                  (vars var)
                  var))
              (add-info (var kind &key (default nil defaultp) suppliedp-var key)
-               (let ((info (make-arg-info :kind kind)))
+               (let ((info (make-arg-info kind)))
                  (when defaultp
                    (setf (arg-info-default info) default
                          (arg-info-default-p info) t))
@@ -163,7 +163,7 @@
                               :value-source-forms value-source-forms))
    (t
     (ctran-starts-block next)
-    (let ((cleanup (make-cleanup :kind :special-bind))
+    (let ((cleanup (make-cleanup :special-bind))
           (var (first svars))
           (bind-ctran (make-ctran))
           (cleanup-ctran (make-ctran)))
@@ -209,9 +209,6 @@
                                 value-source-forms)
   (declare (list body vars aux-vars aux-vals))
 
-  ;; We're about to try to put new blocks into *CURRENT-COMPONENT*.
-  (aver-live-component *current-component*)
-
   (let* ((bind (make-bind))
          (lambda (make-clambda :vars vars
                               :bind bind
@@ -255,8 +252,9 @@
         (setf (node-lexenv bind) *lexenv*)
 
         (let ((block (ctran-starts-block result-ctran)))
-          (let ((return (make-return :result result-lvar :lambda lambda))
-                (tail-set (make-tail-set :funs (list lambda))))
+          (declare (inline make-return))
+          (let ((return (make-return result-lvar lambda))
+                (tail-set (make-tail-set (list lambda))))
             (setf (lambda-tail-set lambda) tail-set)
             (setf (lambda-return lambda) return)
             (setf (lvar-dest result-lvar) return)
@@ -305,7 +303,7 @@
   (let* ((fvars (reverse vars))
          (arg-vars (mapcar (lambda (var)
                              (make-lambda-var
-                              :%source-name (leaf-source-name var)
+                              (leaf-source-name var)
                               :type (leaf-type var)
                               :where-from (leaf-where-from var)
                               :specvar (lambda-var-specvar var)))
@@ -449,18 +447,18 @@
             (body))
 
     (dolist (var (reverse entry-vars))
-      (arg-vars (make-lambda-var :%source-name (leaf-source-name var)
+      (arg-vars (make-lambda-var (leaf-source-name var)
                                  :type (leaf-type var)
                                  :where-from (leaf-where-from var))))
 
     (let* ((*allow-instrumenting* nil)
            (n-context (gensym "N-CONTEXT-"))
-           (context-temp (make-lambda-var :%source-name n-context
-                                          :arg-info (make-arg-info :kind :more-context)))
+           (context-temp (make-lambda-var n-context
+                                          :arg-info (make-arg-info :more-context)))
            (n-count (gensym "N-COUNT-"))
-           (count-temp (make-lambda-var :%source-name n-count
+           (count-temp (make-lambda-var n-count
                                         :type (specifier-type 'index)
-                                        :arg-info (make-arg-info :kind :more-count))))
+                                        :arg-info (make-arg-info :more-count))))
 
       (arg-vars context-temp count-temp)
 
@@ -502,6 +500,12 @@
                      (supplied-p (arg-info-supplied-p info))
                      (supplied-used-p (arg-info-supplied-used-p info))
                      (n-value (gensym "N-VALUE-"))
+                     (n-value-checked (if (eq (leaf-defined-type key) *universal-type*)
+                                          n-value-temp
+                                          (wrap-if (policy *lexenv* (plusp safety))
+                                                   '(locally (declare (optimize (safety 1))))
+                                                   `(the* (,(leaf-defined-type key) :context ,keyword)
+                                                          ,n-value-temp))))
                      (clause (cond (supplied-p
                                     (let ((n-supplied (gensym "N-SUPPLIED-")))
                                       (temps (list n-supplied
@@ -513,11 +517,11 @@
                                         (setq ,n-supplied ,(if supplied-used-p
                                                                t
                                                                1))
-                                        (setq ,n-value ,n-value-temp))))
+                                        (setq ,n-value ,n-value-checked))))
                                    (t
                                     (arg-vals n-value)
                                     `((,keyword)
-                                      (setq ,n-value ,n-value-temp))))))
+                                      (setq ,n-value ,n-value-checked))))))
                 (when (and (not allowp) (eq keyword :allow-other-keys))
                   (setq found-allow-p t)
                   (setq clause
@@ -633,11 +637,11 @@
         ;; ARG-INFO-DEFAULT for transforming (VALUES-LIST REST) into
         ;; (%MORE-ARG-VALUES CONTEXT 0 COUNT) when possible.
         (let* ((context-name (gensym "REST-CONTEXT-"))
-               (context (make-lambda-var :%source-name context-name
-                                         :arg-info (make-arg-info :kind :more-context)))
+               (context (make-lambda-var context-name
+                                         :arg-info (make-arg-info :more-context)))
                (count-name (gensym "REST-COUNT-"))
-               (count (make-lambda-var :%source-name count-name
-                                       :arg-info (make-arg-info :kind :more-count)
+               (count (make-lambda-var count-name
+                                       :arg-info (make-arg-info :more-count)
                                        :type (specifier-type 'index))))
           (setf (arg-info-default (lambda-var-arg-info rest)) (list context count)
                 (lambda-var-ever-used context) t
@@ -657,15 +661,14 @@
              (supplied-p (arg-info-supplied-p info))
              ;; was: (format nil "~A-DEFAULTING-TEMP" (leaf-source-name key))
              (n-val (make-symbol ".DEFAULTING-TEMP."))
-             (val-temp (make-lambda-var :%source-name n-val))
+             (val-temp (make-lambda-var n-val))
              (default `(with-source-form ,(lambda-var-source-form key)
                          ,default)))
         (main-vars val-temp)
         (bind-vars key)
         (cond ((or hairy-default supplied-p)
                (let* ((n-supplied (gensym "N-SUPPLIED-"))
-                      (supplied-temp (make-lambda-var
-                                      :%source-name n-supplied)))
+                      (supplied-temp (make-lambda-var n-supplied)))
                  (unless supplied-p
                    (setf (arg-info-supplied-p info) supplied-temp))
                  (when hairy-default
@@ -678,10 +681,14 @@
                                    (if supplied-p
                                        nil
                                        0))
-                        (bind-vals
-                         (if supplied-p
-                             `(if ,n-supplied ,n-val ,default)
-                             `(if (eq ,n-supplied 0) ,default ,n-val))))
+                        (let ((n-val (wrap-if
+                                      (neq (leaf-defined-type key) *universal-type*)
+                                      `(truly-the ,(leaf-defined-type key))
+                                      n-val)))
+                          (bind-vals
+                           (if supplied-p
+                               `(if ,n-supplied ,n-val ,default)
+                               `(if (eq ,n-supplied 0) ,default ,n-val)))))
                        (t
                         (main-vals default nil)
                         (bind-vals n-val)))
@@ -847,16 +854,16 @@
                                  &key post-binding-lexenv
                                  (source-name '.anonymous.)
                                  debug-name)
-  (declare (list body vars aux-vars aux-vals))
+  (declare (list body vars aux-vars aux-vals)
+           (inline make-optional-dispatch))
   (aver (or debug-name (neq '.anonymous. source-name)))
-  (let ((res (make-optional-dispatch :arglist vars
-                                     :allowp allowp
-                                     :keyp keyp
-                                     :%source-name source-name
-                                     :%debug-name debug-name
-                                     :source-path *current-path*))
+  (let ((res (make-optional-dispatch vars
+                                     allowp
+                                     keyp
+                                     source-name
+                                     debug-name
+                                     *current-path*))
         (min (or (position-if #'lambda-var-arg-info vars) (length vars))))
-    (aver-live-component *current-component*)
     (ir1-convert-hairy-args res () () () () vars nil body aux-vars aux-vals
                             source-name debug-name nil post-binding-lexenv)
     ;; ir1-convert-hairy-args can throw 'locall-already-let-converted
@@ -873,16 +880,54 @@
 
 (defun add-types-for-fixed-args (fun vars)
   (let ((fun-info (info :function :info fun)))
-    (when (and fun-info
-               (ir1-attributep (fun-info-attributes fun-info) fixed-args))
-      (loop for type in (fun-type-required (info :function :type fun))
+    (when (or (and fun-info
+                   (ir1-attributep (fun-info-attributes fun-info) fixed-args))
+              (typep fun '(cons (eql sb-impl::specialized-xep))))
+      (loop for type in (fun-type-required (if (typep fun '(cons (eql sb-impl::specialized-xep)))
+                                               (specifier-type `(function ,@(cddr fun)))
+                                               (info :function :type fun)))
             for var in vars
-            do (setf (lambda-var-type var) type))))
+            for intersection = (type-intersection type (lambda-var-type var))
+            unless (eq intersection *empty-type*)
+            do (setf (lambda-var-type var) intersection))))
   vars)
+
+(defun add-ftype (vars ftype explicit-check)
+  (flet ((check-p (var)
+           (and (neq explicit-check t)
+                (not (memq (lambda-var-%source-name var) explicit-check)))))
+    (loop for req in (fun-type-required ftype)
+          for var = (pop vars)
+          do
+          (unless (and var
+                       (not (lambda-var-arg-info var)))
+            (return-from add-ftype))
+          (when (check-p var)
+            (setf (leaf-defined-type var) req)))
+    (loop for opt in (fun-type-optional ftype)
+          for var = (pop vars)
+          do (unless (and var
+                          (let ((arg-info (lambda-var-arg-info var)))
+                            (and arg-info
+                                 (eq (arg-info-kind arg-info) :optional))))
+               (return-from add-ftype ))
+             (when (check-p var)
+               (setf (leaf-defined-type var) opt)))
+    (when (fun-type-keyp ftype)
+      (loop with keys = (fun-type-keywords ftype)
+            for var in vars
+            for info = (lambda-var-arg-info var)
+            when (and info
+                      (eq (arg-info-kind info) :keyword)
+                      (check-p var))
+            do (let ((type (find (arg-info-key info) keys :key #'key-info-name)))
+                 (when type
+                   (setf (leaf-defined-type var) (key-info-type type))))))))
 
 ;;; Convert a LAMBDA form into a LAMBDA leaf or an OPTIONAL-DISPATCH leaf.
 (defun ir1-convert-lambda (form &key (source-name '.anonymous.)
-                                     debug-name maybe-add-debug-catch)
+                                     debug-name maybe-add-debug-catch
+                                     ftype)
   (unless (consp form)
     (compiler-error "A ~S was found when expecting a lambda expression:~%  ~S"
                     (type-of form)
@@ -920,21 +965,27 @@
              (forms (if (eq result-type *wild-type*)
                         forms
                         `((the ,(type-specifier result-type) (progn ,@forms)))))
-             (res (if (or (find-if #'lambda-var-arg-info vars) keyp)
-                      (ir1-convert-hairy-lambda forms vars keyp
-                                                allow-other-keys
-                                                aux-vars aux-vals
-                                                :post-binding-lexenv post-binding-lexenv
-                                                :source-name source-name
-                                                :debug-name debug-name)
-                      (ir1-convert-lambda-body forms
-                                               (add-types-for-fixed-args source-name vars)
-                                               :aux-vars aux-vars
-                                               :aux-vals aux-vals
-                                               :post-binding-lexenv post-binding-lexenv
-                                               :source-name source-name
-                                               :debug-name debug-name
-                                               :local-policy local-policy))))
+             (res (progn
+                    (when (fun-type-p ftype)
+                      (add-ftype vars ftype explicit-check))
+                    (when (typep source-name '(cons (eql sb-impl::specialized-xep)))
+                      (push source-name
+                            (lexenv-user-data *lexenv*)))
+                    (if (or (find-if #'lambda-var-arg-info vars) keyp)
+                        (ir1-convert-hairy-lambda forms vars keyp
+                                                  allow-other-keys
+                                                  aux-vars aux-vals
+                                                  :post-binding-lexenv post-binding-lexenv
+                                                  :source-name source-name
+                                                  :debug-name debug-name)
+                        (ir1-convert-lambda-body forms
+                                                 (add-types-for-fixed-args source-name vars)
+                                                 :aux-vars aux-vars
+                                                 :aux-vals aux-vals
+                                                 :post-binding-lexenv post-binding-lexenv
+                                                 :source-name source-name
+                                                 :debug-name debug-name
+                                                 :local-policy local-policy)))))
     (when explicit-check
       (setf (getf (functional-plist res) 'explicit-check) explicit-check))
     (setf (functional-inline-expansion res) (or source-form form))
@@ -987,7 +1038,8 @@
 (defun ir1-convert-lambdalike (thing
                                &key
                                (source-name '.anonymous.)
-                               debug-name)
+                               debug-name
+                               ftype)
   (when (and (not debug-name) (eq '.anonymous. source-name))
     (setf debug-name (name-lambdalike thing)))
   (ecase (car thing)
@@ -995,7 +1047,8 @@
      (ir1-convert-lambda thing
                          :maybe-add-debug-catch t
                          :source-name source-name
-                         :debug-name debug-name))
+                         :debug-name debug-name
+                         :ftype ftype))
     ((named-lambda)
      (let* ((name (cadr thing))
             (lambda-expression `(lambda ,@(cddr thing)))
@@ -1029,7 +1082,8 @@
            (ir1-convert-lambda lambda-expression
                                :maybe-add-debug-catch t
                                :debug-name
-                               (or name (name-lambdalike thing))))))))
+                               (or name (name-lambdalike thing))
+                               :ftype ftype))))))
 
 (declaim (end-block))
 
@@ -1121,8 +1175,9 @@
 ;;; reflect the state at the definition site.
 (defun ir1-convert-inline-lambda (fun
                                   &key
-                                  (source-name '.anonymous.)
-                                  debug-name)
+                                    (source-name '.anonymous.)
+                                    debug-name
+                                    ftype)
   (when (and (not debug-name) (eq '.anonymous. source-name))
     (setf debug-name (name-lambdalike fun)))
   (destructuring-bind (decls &rest body)
@@ -1153,14 +1208,17 @@
                   (lexenv-flushable *lexenv*)
                   (lexenv-lambda *lexenv*)
                   *lexenv*)))
-           (*inlining* (1+ *inlining*))
+           (*inlining* (if (> *transforming* 0)
+                           *inlining*
+                           (1+ *inlining*)))
            (clambda (progn
                       (when notinlines
                         (setf (lexenv-funs *lexenv*)
                               notinlines))
                       (ir1-convert-lambda `(lambda ,@body)
                                           :source-name source-name
-                                          :debug-name debug-name))))
+                                          :debug-name debug-name
+                                          :ftype ftype))))
       (setf (functional-inline-expanded clambda) t)
       clambda)))
 
@@ -1183,11 +1241,13 @@
                      (not (info :function :inlinep name))))
            (let* ((where-from (leaf-where-from found))
                   (res (make-defined-fun
-                        :%source-name name
-                        :where-from (if (eq where-from :declared)
-                                        :declared
-                                        :defined-here)
-                        :type (leaf-type found))))
+                        name
+                        (if (eq where-from :declared-verify)
+                            (leaf-defined-type found)
+                            (leaf-type found))
+                        (if (memq where-from '(:declared :declared-verify))
+                            :declared
+                            :defined-here))))
              (substitute-leaf res found)
              (setf (gethash name free-funs) res)))
           ;; If FREE-FUNS has a previously converted definition
@@ -1206,9 +1266,9 @@
 (defun assert-new-definition (var fun)
   (let* ((type (massage-global-definition-type (leaf-type var) fun))
          (for-real (eq (leaf-where-from var) :declared))
-         (name (leaf-source-name var))
-         (info (info :function :info name))
          (explicit-check (getf (functional-plist fun) 'explicit-check)))
+    (when for-real
+      (setf (leaf-defined-type fun) type))
     (assert-definition-type
      fun type
      ;; KLUDGE: Common Lisp is such a dynamic language that in general
@@ -1219,9 +1279,6 @@
      ;; the mismatched data came from the same compilation unit, so we
      ;; can't do that. -- WHN 2001-02-11
      :lossage-fun #'compiler-style-warn
-     :unwinnage-fun (cond (info #'compiler-style-warn)
-                          (for-real #'compiler-notify)
-                          (t nil))
      :really-assert (if for-real
                         (explicit-check->really-assert explicit-check))
      :where (if for-real
@@ -1254,7 +1311,10 @@
   (let* ((name (leaf-source-name var))
          (fun (ir1-convert-lambda lambda
                                   :maybe-add-debug-catch t
-                                  :source-name name))
+                                  :source-name name
+                                  :ftype (and
+                                          (eq (leaf-where-from var) :declared)
+                                          (leaf-type var))))
          (info (info :function :info name)))
     (setf (functional-inlinep fun) (info :function :inlinep name))
     (unless (and info
@@ -1296,7 +1356,7 @@
 
 ;;; Convert a lambda for global inline expansion.
 ;;;
-;;; Unless a INLINE function, we temporarily clobber the inline
+;;; Unless an INLINE function, we temporarily clobber the inline
 ;;; expansion. This prevents recursive inline expansion of
 ;;; opportunistic pseudo-inlines.
 (defun ir1-convert-inline-expansion (var inlinep)
@@ -1306,26 +1366,13 @@
       (setf (defined-fun-inline-expansion var) nil))
     (let* ((name (leaf-source-name var))
            (fun (ir1-convert-inline-lambda var-expansion
-                                           :source-name name))
-           (info (info :function :info name)))
+                                           :source-name name
+                                           :ftype (and
+                                                   (eq (leaf-where-from var) :declared)
+                                                   (leaf-type var)))))
       (setf (functional-inlinep fun) inlinep)
       (assert-new-definition var fun)
       (setf (defined-fun-inline-expansion var) var-expansion)
-      ;;
-      ;; If definitely not an interpreter stub, then substitute for any
-      ;; old references.
-      (unless (or (eq (defined-fun-inlinep var) 'notinline)
-                  (not (block-compile *compilation*))
-                  (and info
-                       (or (fun-info-transforms info)
-                           (fun-info-templates info)
-                           (fun-info-ir2-convert info))))
-        (substitute-leaf fun var)
-        ;; If in a simple environment, then we can allow backward
-        ;; references to this function from following top-level
-        ;; forms.
-        (when (simple-lexical-environment-p *lexenv*)
-          (setf (defined-fun-functional var) fun)))
       fun)))
 
 
@@ -1350,6 +1397,7 @@
                                         (dxable-args
                                           (unless (keywordp extra-info)
                                             extra-info)))
+  (declare (inline make-dxable-args make-inlining-data))
   (cond (defstruct-snippet
          ;; In this case, NAME is a system-generated function. Warn if blowing away
          ;; a previously existing inline expansion coming from an ordinary DEFUN.
@@ -1410,7 +1458,7 @@ is potentially harmful to any already-compiled callers using (SAFETY 0)."
 ;;; * a possibly empty list of dynamic extent arguments.
 ;;; The inline lambda will be NIL for a structure accessor, predicate, or copier
 ;;; since those can always be reconstructed from a defstruct description.
-(defun %compiler-defun (name compile-toplevel inline-lambda extra-info)
+(defun %compiler-defun (name compile-toplevel inline-lambda extra-info &optional specialized-xep)
   (cond (compile-toplevel
          (let ((defined-fun nil))
            (with-single-package-locked-error
@@ -1418,17 +1466,24 @@ is potentially harmful to any already-compiled callers using (SAFETY 0)."
              (setf defined-fun (get-defined-fun name)))
            (when (boundp '*lexenv*)
              (aver (producing-fasl-file))
-             (if (member name (fun-names-in-this-file *compilation*) :test #'equal)
-                 (warn 'duplicate-definition :name name)
-                 (push name (fun-names-in-this-file *compilation*))))
+             (let ((names (fun-names-in-this-file *compilation*)))
+               (if (hashset-find names name)
+                   (warn 'duplicate-definition :name name)
+                   (hashset-insert names name))))
            ;; I don't know why this is guarded by (WHEN compile-toplevel),
            ;; because regular old %DEFUN is going to call this anyway.
            (%set-inline-expansion name defined-fun inline-lambda extra-info)))
         ((boundp 'sb-fasl::*current-fasl-group*)
-         (if (member name (sb-fasl::fasl-group-fun-names sb-fasl::*current-fasl-group*) :test #'equal)
-             (warn 'duplicate-definition :name name)
-             (push name (sb-fasl::fasl-group-fun-names sb-fasl::*current-fasl-group*)))))
+         (let ((names (sb-fasl::fasl-group-fun-names sb-fasl::*current-fasl-group*)))
+           (if (hashset-find names name)
+               (warn 'duplicate-definition :name name)
+               (hashset-insert names name)))))
 
   (become-defined-fun-name name)
+  (when specialized-xep
+    (setf (info :function :specialized-xep name) specialized-xep)
+    (let ((xep-name (list* 'sb-impl::specialized-xep name specialized-xep)))
+      (setf (info :function :type xep-name) (specifier-type `(function ,@specialized-xep))
+            (info :function :where-from xep-name) :declared)))
 
   (values))

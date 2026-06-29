@@ -34,68 +34,96 @@
 
 ;;;; routines for dealing with static symbols
 
-(defun static-symbol-p (symbol)
-  (or (null symbol)
-      (and (find symbol +static-symbols+) t)))
-
-;;; the byte offset of the static symbol SYMBOL
+;;; the distance from tagged ptr to NIL to tagged ptr to static SYMBOL, in bytes
 (defun static-symbol-offset (symbol)
   (if symbol
-      (let ((posn (position symbol +static-symbols+)))
-        (unless posn (error "~S is not a static symbol." symbol))
+      ;; STATIC-SYMBOL-P returns a generalized boolean: an integer indicating
+      ;; the index, or T if the argument is NIL, or NIL if non-static.
+      (let ((posn (static-symbol-p symbol)))
+        (unless (fixnump posn) (error "~S is not a static symbol." symbol))
+        #+x86-64
+        (case symbol
+          ((t) (- t-nil-offset))
+          (t (+ (* (1- posn) (pad-data-block symbol-size))
+                (- nil-value-offset)
+                (ash 258 word-shift) ; **PRIMITIVE-OBJECT-LAYOUTS**
+                other-pointer-lowtag)))
+        #-x86-64
         (+ (* posn (pad-data-block symbol-size))
            (pad-data-block (1- symbol-size))
            other-pointer-lowtag
            (- list-pointer-lowtag)))
       0))
 
-(symbol-macrolet ((alien-linkage-table-space-end
-                   (+ alien-linkage-table-space-start alien-linkage-table-space-size)))
+;; Return T if SYMBOL will have a nonzero TLS index at load time or sooner.
+;; True of all specials exported from CL:, all which expose slots of the thread
+;; structure, and any symbol that the compiler decides will eventually have a
+;; nonzero TLS index due to compiling a dynamic binding of it.
+;; A reason why you should prefer eager TLS assignment (for a slight reduction
+;; in number of instructions executed) - is that in well-crafted code, the user
+;; ought to have used DEFGLOBAL (or -LOAD-TIME) to define specials which are NOT
+;; thread-locally bound. Therefore all other special vars must have the expectation
+;; of at some point getting thread-locally bound. Assuming that to be the case,
+;; it is advantageous to wire in the TLS index for all non-globals.
+;; However, some applications - those which create symbols as data - create too
+;; many symbols to eagerly assign TLS indices, and so the default is NIL.
+(defparameter *eager-tls-assignment* nil)
+(defun symbol-always-has-tls-index-p (symbol)
+  (if *eager-tls-assignment*
+      (not (static-symbol-p symbol))
+      (not (null (info :variable :wired-tls symbol)))))
+
+#+x86-64
+;;; Alien linkage entries are bundled into groups of 16. Within a group, all pointer words
+;;; are adjacent, followed by the jump instructions corresponding to them (if relevant).
+;;; To see why this is more favorable to the CPU, consider trying to bring 8 consecutive
+;;; alien linkage entries into the CPU's L1 cache, and suppose cache lines are 64 bytes.
+;;; With I & D interleaved, 4 entries x 16 bytes per entry = 64 bytes. Those 64 bytes consume
+;;; both an L1 icache line _and_ an L1 dcache line. i.e identical bytes are in two caches.
+;;; Therefore 8 entries consume 4 lines.  However the same 8 entries using separated I & D
+;;; consume only 1 icache line and 1 dcache line, so 8 entries consume 2 lines.
+;;; Conclusion: non-interleaving improves theoretical density in L1 cache.
+;;; Though this is conditioned for x86-64, any of the architectures could (and probably
+;;; should) use a piecewise linear map from alien linkage index to table element, because
+;;; spacing data away from instructions by >1 cache line is generally the right thing.
+(symbol-macrolet ((entries-per-group 16))
+(defun alien-linkage-element-offset (i datap)
+  (multiple-value-bind (group-number index-in-group) (floor i entries-per-group)
+    (+ (* group-number entries-per-group alien-linkage-table-entry-size)
+       (if datap
+           ;; return the address of the indirection word
+           (* index-in-group sb-vm:n-word-bytes)
+           ;; return the address of the JMP instruction
+           (+ (* entries-per-group sb-vm:n-word-bytes) ; skip over N indirection words
+              (* index-in-group 8)))))) ; coincidentally it's 8 bytes for the JMP+padding
+
+(defun alien-linkage-index-from-addr (addr)
+  (let* ((offset (- addr alien-linkage-space-start))
+         (group-number (floor offset (* entries-per-group alien-linkage-table-entry-size)))
+         (index (* group-number entries-per-group)))
+    (dotimes (i entries-per-group) ; This is a very silly but simple technique
+      (when (or (= offset (alien-linkage-element-offset index nil))
+                (= offset (alien-linkage-element-offset index t)))
+        (return index))
+      (incf index))))
+
+(defun alien-linkage-index-to-addr (i &optional datap)
+  (+ (alien-linkage-element-offset i datap) alien-linkage-space-start)))
+
+#-x86-64 ; alien linkage index -> address mapping is strictly linear
+(symbol-macrolet ((space-end (+ alien-linkage-space-start alien-linkage-space-size)))
 ;;; the address of the linkage table entry for table index I.
-(defun alien-linkage-table-entry-address (i)
+(defun alien-linkage-index-to-addr (i &optional datap)
+  (declare (ignore datap))
   (ecase alien-linkage-table-growth-direction
-    (:up   (+ (* i alien-linkage-table-entry-size) alien-linkage-table-space-start))
-    (:down (- alien-linkage-table-space-end (* (1+ i) alien-linkage-table-entry-size)))))
+    (:up   (+ (* i alien-linkage-table-entry-size) alien-linkage-space-start))
+    (:down (- space-end (* (1+ i) alien-linkage-table-entry-size)))))
 
 #-sb-xc-host
-(defun alien-linkage-table-index-from-address (addr)
+(defun alien-linkage-index-from-addr (addr)
   (ecase alien-linkage-table-growth-direction
-    (:up
-     (floor (- addr alien-linkage-table-space-start) alien-linkage-table-entry-size))
-    (:down
-     (1- (floor (- alien-linkage-table-space-end addr) alien-linkage-table-space-end)))))
-)
-
-(defconstant-eqx +all-static-fdefns+
-    #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
-
-;;; Return the (byte) offset from NIL to the start of the fdefn object
-;;; for the static function NAME.
-(defun static-fdefn-offset (name)
-  (let ((static-fun-index (position name +all-static-fdefns+)))
-    (and static-fun-index
-         (+ (* (length +static-symbols+) (pad-data-block symbol-size))
-            (pad-data-block (1- symbol-size))
-            ;; sizeof SB-LOCKLESS:+TAIL+ is calculated as 1 user data slot,
-            ;; round-to-odd, add the header word.
-            (* (1+ (logior (1+ sb-vm:instance-data-start) 1)) n-word-bytes)
-            (- list-pointer-lowtag)
-            (* static-fun-index (pad-data-block fdefn-size))
-            other-pointer-lowtag))))
-
-;;; Return absolute address of the 'fun' slot in static fdefn NAME.
-(defun static-fdefn-fun-addr (name)
-  (+ nil-value
-     (static-fdefn-offset name)
-     (- other-pointer-lowtag)
-     (ash fdefn-fun-slot word-shift)))
-
-;;; Return the (byte) offset from NIL to the raw-addr slot of the
-;;; fdefn object for the static function NAME.
-(defun static-fun-offset (name)
-  (+ (static-fdefn-offset name)
-     (- other-pointer-lowtag)
-     (* fdefn-raw-addr-slot n-word-bytes)))
+    (:up   (floor (- addr alien-linkage-space-start) alien-linkage-table-entry-size))
+    (:down (1- (floor (- space-end addr) space-end))))))
 
 
 ;;;; interfaces to IR2 conversion
@@ -127,46 +155,60 @@
                       (nth n *register-arg-offsets*))
       (make-sc+offset control-stack-sc-number n)))
 
-(defstruct fixed-call-args-state
+(defstruct (fixed-call-args-state
+            (:copier nil)
+            (:predicate nil)
+            (:constructor make-fixed-call-args-state ()))
   (descriptors -1 :type fixnum)
   #-c-stack-is-control-stack
   (non-descriptors -1 :type fixnum)
   (float -1 :type fixnum))
 
-(declaim (#+sb-xc-host special
-          #-sb-xc-host sb-ext:global
-          *float-regs* *descriptor-args*
-          #-c-stack-is-control-stack *non-descriptor-args*))
+#-(or arm64 x86-64) (defvar *descriptor-args*)
+#-(or arm64 c-stack-is-control-stack) (defvar *non-descriptor-args*)
+#-(or x86 arm64 x86-64) (defvar *float-regs*)
 
 (defun fixed-call-arg-location (type state)
   (let* ((primtype (if (typep type 'primitive-type)
                        type
                        (primitive-type type)))
          (sc (find descriptor-reg-sc-number (sb-c::primitive-type-scs primtype) :test-not #'eql)))
-    (case (primitive-type-name primtype)
-      ((double-float single-float)
-       (make-wired-tn primtype
-                      sc
-                      (elt *float-regs* (incf (fixed-call-args-state-float state)))))
-      ((unsigned-byte-64 signed-byte-64)
-       (make-wired-tn primtype
-                      sc
-                      (elt #-c-stack-is-control-stack *non-descriptor-args*
-                           #+c-stack-is-control-stack *descriptor-args*
-                           (incf (#-c-stack-is-control-stack fixed-call-args-state-non-descriptors
-                                  #+c-stack-is-control-stack fixed-call-args-state-descriptors
-                                  state)))))
-      (t
-       (make-wired-tn primtype
-                      descriptor-reg-sc-number
-                      (elt *descriptor-args* (incf (fixed-call-args-state-descriptors state))))))))
+    (flet ((descriptor ()
+             (let ((index (incf (fixed-call-args-state-descriptors state)))
+                   (max-regs (length *descriptor-args*)))
+               (if (< index max-regs)
+                   (make-wired-tn primtype
+                                  descriptor-reg-sc-number
+                                  (elt *descriptor-args* index))
+                   (make-wired-tn primtype control-stack-sc-number (+ register-arg-count (- index max-regs)))))))
+      (case (primitive-type-name primtype)
+        ((double-float single-float)
+         (let ((n (incf (fixed-call-args-state-float state))))
+           (if (< n (length *float-regs*))
+               (make-wired-tn primtype
+                              sc
+                              (elt *float-regs* n))
+               (descriptor))))
+        ((unsigned-byte-64 signed-byte-64)
+         (let ((n (incf (#-c-stack-is-control-stack fixed-call-args-state-non-descriptors
+                         #+c-stack-is-control-stack fixed-call-args-state-descriptors
+                         state)))
+               (regs #-c-stack-is-control-stack *non-descriptor-args*
+                     #+c-stack-is-control-stack *descriptor-args*))
+           (if (< n (length regs))
+               (make-wired-tn primtype
+                              sc
+                              (elt regs n))
+               (descriptor))))
+        (t
+         (descriptor))))))
 
 ;;; Make a TN to hold the number-stack frame pointer.  This is allocated
 ;;; once per component, and is component-live.
-  #-c-stack-is-control-stack
+#-c-stack-is-control-stack
 (defun make-nfp-tn ()
   (component-live-tn
-   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nfp-offset)))
+   (make-wired-tn *fixnum-primitive-type* any-reg-sc-number nfp-offset)))
 
 ;;; Make an environment-live stack TN for saving the SP for NLX entry.
 (defun make-nlx-sp-tn (env)
@@ -249,7 +291,15 @@
        (not (types-equal-or-intersect
              (tn-ref-type tn-ref)
              (if permit-nil
-                 (specifier-type '(or cons . #1=(#+64-bit single-float function cons instance character)))
+                 (specifier-type '(or cons . #1=(#+64-bit single-float function instance character)))
+                 (specifier-type '(or list . #1#)))))))
+
+(defun number-or-other-pointer-tn-ref-p (tn-ref &optional permit-nil)
+  (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
+       (not (types-equal-or-intersect
+             (tn-ref-type tn-ref)
+             (if permit-nil
+                 (specifier-type '(or cons . #1=(function instance character)))
                  (specifier-type '(or list . #1#)))))))
 
 ;;; Can LOWTAG be distinguished from other tn lowtags by testing a single bit?
@@ -283,14 +333,14 @@
         (s character-widetag character)
         (s other-pointer-lowtag
            (if permit-nil
-               (specifier-type '(not (or cons . #1=(#+64-bit fixnum single-float function cons instance character))))
-               (specifier-type '(not (or list . #1#)))))
+               (specifier-type '(or null sb-c::other-pointer))
+               (specifier-type 'sb-c::other-pointer)))
         (let ((set-bit (logand lowtag-mask (logandc2 lowtag set)))
               (clear-bit (logandc2 lowtag-mask (logior lowtag clear))))
           (cond ((plusp set-bit)
-                 (values (sb-kernel::first-bit-set set-bit) 1))
+                 (values (count-trailing-zeros set-bit) 1))
                 ((plusp clear-bit)
-                 (values (sb-kernel::first-bit-set clear-bit) 0))))))))
+                 (values (count-trailing-zeros clear-bit) 0))))))))
 
 (defun fun-or-other-pointer-tn-ref-p (tn-ref &optional permit-nil)
   (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
@@ -307,6 +357,25 @@
 (defun instance-tn-ref-p (tn-ref)
   (csubtypep (tn-ref-type tn-ref) (specifier-type 'instance)))
 
+#+call-symbol
+(defun fun-tn-type (tn-ref)
+  (cond ((csubtypep (tn-ref-type tn-ref)
+                    (specifier-type 'function))
+         :function)
+        ((types-equal-or-intersect (tn-ref-type tn-ref)
+                                   (specifier-type 'function))
+         :designator)
+        (t
+         :symbol)))
+
+(defun remove-moves (tn)
+  (or (let ((write (sb-c::tn-writes tn)))
+        (when (and write (not (tn-ref-next write)))
+          (let ((vop (tn-ref-vop write)))
+            (when (and vop (eq (vop-name vop) 'move))
+              (remove-moves (tn-ref-tn (vop-args vop)))))))
+      tn))
+
 ;;; Note that this is a allowed to fail by returning NIL.
 ;;; So it's really testing "CERTAINLY-STACK-CONSED-P", which is
 ;;; T if and only if if knows, and NIL if it doesn't know,
@@ -314,7 +383,7 @@
 ;;; In general this is a crummy way to deduce the object's creator,
 ;;; because MOVE-OPERAND has a nasty way of interfering.
 (defun stack-consed-p (object)
-  (let ((write (sb-c::tn-writes object))) ; list of write refs
+  (let ((write (sb-c::tn-writes (remove-moves object)))) ; list of write refs
     (when (or (not write)    ; grrrr, the only write is from a LOAD tn
                                         ; and we don't know the corresponding normal TN?
               (tn-ref-next write))      ; can't determine if > 1 write
@@ -331,11 +400,11 @@
       ;; Should we try to detect a stack-consed LIST also?
       ;; I don't think that will work.
       ;; (And is there anything else interesting to try?)
-      (unless (member (vop-name vop) '(splat-word splat-small splat-any))
+      (unless (member (vop-name vop) '(splat-word splat-small splat-any splat))
         (return-from stack-consed-p nil))
       (let* ((splat-input (vop-args vop))
              (splat-input-source
-               (tn-ref-vop (sb-c::tn-writes (tn-ref-tn splat-input)))))
+               (tn-ref-vop (sb-c::tn-writes (remove-moves (tn-ref-tn splat-input))))))
         ;; How in the heck can there NOT be a vop??? Well, sometimes there isn't.
         (when (and splat-input-source
                    (eq (vop-name splat-input-source)
@@ -347,7 +416,7 @@
 (define-load-time-global *store-barriers-potentially-emitted* 0)
 (define-load-time-global *store-barriers-emitted* 0)
 
-(defun require-gengc-barrier-p (object value-tn-ref value-tn &optional allocator)
+(defun require-gengc-barrier-p (object value-tn-ref &optional allocator)
   (incf *store-barriers-potentially-emitted*)
   ;; If OBJECT is stack-allocated, elide the barrier
   (when (stack-consed-p object)
@@ -370,7 +439,7 @@
            ;; And elide for things like (OR FIXNUM NULL)
            (let ((type (tn-ref-type tn-ref)))
              (when (or (csubtypep type #1=(specifier-type '(or character sb-xc:fixnum boolean
-                                                         #+64-bit single-float)))
+                                                            #+64-bit single-float)))
                        (let ((diff (type-difference type #1#)))
                          (and (member-type-p diff)
                               #-sb-xc-host
@@ -381,6 +450,13 @@
                                              (and (symbolp member)
                                                   (logtest +symbol-initial-core+ (get-header-data member)))))))))
                (return-from potential-heap-pointer-p nil)))
+           (let ((write (sb-c::tn-writes tn)))
+             (when (and write
+                        (not (tn-ref-next write))
+                        (tn-ref-vop write)
+                        (memq (vop-name (tn-ref-vop write)) '(move-from-fixnum+1
+                                                              move-from-fixnum-1)))
+               (return-from potential-heap-pointer-p nil)))
            t)
          (boxed-tn-p (value-tn)
            (let* ((prim-type (sb-c::tn-primitive-type value-tn))
@@ -388,33 +464,30 @@
                             (sb-c::primitive-type-scs prim-type))))
              (or (singleton-p scs)
                  (not (member descriptor-reg-sc-number scs))))))
-    (cond (value-tn
-           (unless (eq (tn-ref-tn value-tn-ref) value-tn)
-             (aver (eq (tn-ref-load-tn value-tn-ref) value-tn)))
-           (unless (potential-heap-pointer-p value-tn value-tn-ref)
-             (return-from require-gengc-barrier-p nil)))
-          (value-tn-ref ; a list of refs linked through TN-REF-ACROSS
-           ;; (presumably from INSTANCE-SET-MULTIPLE)
-           (let ((any-pointer
-                  (do ((ref value-tn-ref (tn-ref-across ref)))
-                      ((null ref))
-                    (when (potential-heap-pointer-p (tn-ref-tn ref) ref)
-                      (return t)))))
-             (unless any-pointer
-               (return-from require-gengc-barrier-p nil)))))
-    (let (why)
-      (cond ((and value-tn
-                  value-tn-ref
-                  ;; Can this TN be boxed after the allocator?
-                  (boxed-tn-p value-tn)
-                  (or (eq allocator :allocator)
-                      (setf why
-                            (sb-c::set-slot-old-p (sb-c::vop-node (tn-ref-vop value-tn-ref))
-                                                  (vop-arg-position value-tn-ref (tn-ref-vop value-tn-ref))))))
-             (values nil why))
-            (t
-             (incf *store-barriers-emitted*)
-             t)))))
+    (when value-tn-ref
+      (let ((any-pointer
+              (do ((ref value-tn-ref (tn-ref-across ref)))
+                  ((null ref))
+                (let ((tn (tn-ref-tn ref)))
+                  (when (and (potential-heap-pointer-p tn ref)
+                             (not (and ;; Can this TN be boxed after the allocator?
+                                   (boxed-tn-p tn)
+                                   (or (eq allocator :allocator)
+                                       (let ((vop (tn-ref-vop ref)))
+                                        (and (neq (vop-name vop) 'instance-set-multiple)
+                                             (let ((node (sb-c::vop-node (tn-ref-vop ref))))
+                                               (multiple-value-bind (nth-object nth-value)
+                                                   (if (and (eq (vop-name vop) 'set-slot)
+                                                            (typep (sb-c::combination-fun-source-name node)
+                                                                   '(cons (eql setf))))
+                                                       (values 1 0)
+                                                       (values 0 (vop-arg-position value-tn-ref vop)))
+                                                 (sb-c::set-slot-old-p node nth-object nth-value)))))))))
+                    (return t))))))
+        (unless any-pointer
+          (return-from require-gengc-barrier-p nil))))
+    (incf *store-barriers-emitted*)
+    t))
 
 (defun vop-nth-arg (n vop)
   (let ((ref (vop-args vop)))
@@ -460,9 +533,9 @@
 
 ;;; Convert # of "big digits" (= words, sometimes called "limbs") to a header value.
 (defmacro bignum-header-for-length (n)
-  (logior (ash n n-widetag-bits) bignum-widetag))
+  `(logior (ash ,n n-widetag-bits) bignum-widetag))
 
-(defmacro id-bits-offset ()
+(defmacro id-bits-offset () ; FIXME: could this be a constant ?
   (let ((slot (get-dsd-index layout sb-kernel::id-word0)))
     (ash (+ sb-vm:instance-slots-offset slot) sb-vm:word-shift)))
 
@@ -493,7 +566,7 @@
 (defun compute-fastrem-coefficient (d n fraction-bits)
   (multiple-value-bind (smallest-f c)
       (flet ((is-pow2 (n)
-               (declare (unsigned-byte n))
+               (declare (type unsigned-byte n))
                (let ((l (integer-length n)))
                  (= n (ash 1 (1- l))))))
         (if (is-pow2 d)
@@ -504,7 +577,7 @@
                        (when (<= d (+ (mod 2^F d) (expt 2 L)))
                          (let ((c (ceiling (expt 2 F) d)))
                            (return (values F c))))))))
-    (cond ((eq fraction-bits :variable) ; return the smallest F
+    (cond ((eq fraction-bits :minimum) ; return the smallest F
            (values c smallest-f))
           (t
            ;; Otherwise hardwire F to 32 so the algorithm can use :DWORD
@@ -516,6 +589,18 @@
                     smallest-f d n))
            (values (ceiling (expt 2 fraction-bits) d) fraction-bits)))))
 
+(defun env-system-tlab-p (env)
+  #-system-tlabs (declare (ignore env))
+  #+system-tlabs
+  (or sb-c::*force-system-tlab*
+      (and env
+           (dolist (data (sb-c::lexenv-user-data env)
+                         (and (sb-c::lexenv-parent env)
+                              (env-system-tlab-p (sb-c::lexenv-parent env))))
+             (when (and (eq (first data) :declare)
+                        (eq (second data) 'sb-c::tlab))
+               (return (eq (third data) :system)))))))
+
 (defun system-tlab-p (type node)
   #-system-tlabs (declare (ignore type node))
   #+system-tlabs
@@ -525,16 +610,13 @@
                             ((sb-kernel::defstruct-description-p type)
                              (dd-name type)))))
         (when (and typename (sb-xc:subtypep typename 'ctype))
-          (error "~S instance constructor called in a non-system file"
-                 typename)))
+          ;; If stack-allocation occurs, we should never have to
+          ;; call this predicate to inquire which TLAB to use.
+          (#.(cl:if sb-ext:*stack-allocate-dynamic-extent* 'error 'sb-c:compiler-notify)
+             "~S instance constructor called" typename))
+        nil)
       (and node
-           (named-let search-env ((env (sb-c::node-lexenv node)))
-             (dolist (data (sb-c::lexenv-user-data env)
-                           (and (sb-c::lexenv-parent env)
-                                (search-env (sb-c::lexenv-parent env))))
-               (when (and (eq (first data) :declare)
-                          (eq (second data) 'sb-c::tlab))
-                 (return (eq (third data) :system))))))))
+           (env-system-tlab-p (sb-c::node-lexenv node)))))
 
 (defun call-out-pseudo-atomic-p (vop)
   (declare (ignorable vop))
@@ -542,7 +624,7 @@
   ;; occurs at the end. In that case, we can not prevent stop-for-GC
   ;; from occurring in the C code, because foreign code is allowed
   ;; to run during GC; it just can't go back into Lisp until GC is over.
-  #-sb-safepoint
+  #-(or sb-safepoint nonstop-foreign-call)
   (loop for e = (sb-c::node-lexenv (sb-c::vop-node vop))
         then (sb-c::lexenv-parent e)
         while e
@@ -563,3 +645,32 @@
            (when (and (member-type-p type)
                       (= (member-type-size type) 1))
              (the symbol (first (member-type-members type))))))))
+
+(defun aligned-stack-p (&optional dx)
+  (or (eq dx :aligned-stack)
+      (and sb-assem::*current-vop*
+           (let ((node (sb-c::vop-node sb-assem::*current-vop*)))
+             (and (sb-c::combination-p node)
+                  (eq (sb-c::combination-info node) :aligned-stack))))))
+
+(defun target-heap-prezeroed-p ()
+  (eq (sb-c::allocator-target *compilation*) :mark-region-gc))
+
+(defun target-heap-large-object-size ()
+  (ecase (sb-c::allocator-target *compilation*)
+    ;; Needless to say this violates the OAOO principle as the definition
+    ;; of the "constant" for this appears in late-objdef in addition to which
+    ;; it's a crummy assumption that page-size is the same for each GC.
+    ;; For I'm just trying to solve the minimal number of issues in terms
+    ;; of having the ability to target a fasl to a different GC.
+    (:gencgc (* 4 gencgc-page-bytes))
+    (:mark-region-gc (* 3/4 gencgc-page-bytes))))
+
+;;; Print registers from VOPs
+(defmacro mprint (value)
+  `(let ((*location-context* ',value))
+     (emit-error-break sb-assem::*current-vop* cerror-trap (error-number-or-lose 'sb-kernel::mprint-error)
+                       (list ,value))))
+
+(defmacro callback_wrapper_trampoline ()
+    '(foreign-symbol-address "callback_wrapper_trampoline"))

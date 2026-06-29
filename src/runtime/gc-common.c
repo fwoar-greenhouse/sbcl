@@ -42,10 +42,10 @@
 #include "code.h"
 #include "align.h"
 #include "genesis/primitive-objects.h"
-#include "genesis/binding.h"
 #include "genesis/hash-table.h"
 #include "genesis/split-ordered-list.h"
 #include "genesis/static-symbols.h"
+#include "genesis/compiled-debug-info.h"
 #include "var-io.h"
 #include "search.h"
 #include "murmur_hash.h"
@@ -219,7 +219,9 @@ void heap_scavenge(lispobj *start, lispobj *end)
 // that must not contain any object headers.
 sword_t scavenge(lispobj *start, sword_t n_words)
 {
+#ifdef LISP_FEATURE_GENCGC
     gc_dcheck(compacting_p());
+#endif
     lispobj *end = start + n_words;
     lispobj *object_ptr;
     for (object_ptr = start; object_ptr < end; object_ptr++) {
@@ -483,31 +485,9 @@ static sword_t size_code_blob(lispobj *where)
     return code_total_nwords((struct code*)where);
 }
 
-#ifdef RETURN_PC_WIDETAG
-static sword_t
-scav_return_pc_header(lispobj *where, lispobj object)
-{
-    lose("attempted to scavenge a return PC header where=%p object=%"OBJ_FMTX,
-         where, object);
-    return 0; /* bogus return value to satisfy static type checking */
-}
-
-static lispobj
-trans_return_pc_header(lispobj object)
-{
-    struct simple_fun *return_pc = (struct simple_fun *) native_pointer(object);
-    uword_t offset = HeaderValue(return_pc->header) * N_WORD_BYTES;
-
-    /* Transport the whole code object */
-    struct code *code = trans_code((struct code *) ((uword_t) return_pc - offset));
-
-    return make_lispobj((char*)code + offset, OTHER_POINTER_LOWTAG);
-}
-#endif /* RETURN_PC_WIDETAG */
-
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
+#if FUN_SELF_FIXNUM_TAGGED
 /* Closures hold a pointer to the raw simple-fun entry address instead of the
- * tagged object so that CALL [RAX+const] can be used to invoke it. */
+ * tagged object so that a native call instruction can be used more easily */
 static sword_t
 scav_closure(lispobj *where, lispobj header)
 {
@@ -809,10 +789,55 @@ static lispobj trans_boxed(lispobj object) {
 }
 
 /* Symbol */
+
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+static void scav_linkage_cell(int linkage_index)
+{
+    if (!linkage_index) return;
+    lispobj entrypoint = linkage_space[linkage_index];
+    if (!entrypoint) return;
+    lispobj taggedptr = linkage_val_to_fun_ptr(entrypoint);
+    lispobj new = taggedptr;
+    scav1(&new, new);
+    if (new != taggedptr) linkage_space[linkage_index] = new + (entrypoint - taggedptr);
+}
+#endif
+void scav_code_linkage_cells(__attribute__((unused)) struct code* c)
+{
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    const unsigned int smallvec_elts =
+        (GENCGC_PAGE_BYTES - offsetof(struct vector,data)) / N_WORD_BYTES;
+    lispobj integer = barrier_load(&c->fixups);
+    if (!integer) return; // do no work for leaf codeblobs
+    lispobj name_map = barrier_load(&SYMBOL(LINKAGE_NAME_MAP)->value);
+    gc_assert(simple_vector_p(name_map));
+    struct vector* outer_vector = VECTOR(name_map);
+    struct varint_unpacker unpacker;
+    varint_unpacker_init(&unpacker, integer);
+    int prev_index = 0, index;
+    while (varint_unpack(&unpacker, &index) && index != 0) {
+        index += prev_index;
+        prev_index = index;
+        int index_high = (unsigned int)index / smallvec_elts;
+        int index_low = (unsigned int)index % smallvec_elts;
+        lispobj smallvec = barrier_load(&outer_vector->data[index_high]);
+        gc_assert(other_pointer_p(smallvec));
+        struct vector* inner_vector = VECTOR(smallvec);
+        // Ensure liveness of function name
+        scavenge(&inner_vector->data[index_low], 1);
+    }
+#endif
+}
+
 static sword_t scav_symbol(lispobj *where,
                            __attribute__((unused)) lispobj header) {
     struct symbol* s = (void*)where;
 #ifdef LISP_FEATURE_64_BIT
+# ifdef LISP_FEATURE_LINKAGE_SPACE
+    // Skip the hash slot, it isn't a tagged descriptor
+    scavenge(&s->value, 3); // value, fdefn, info
+    scav_linkage_cell(symbol_linkage_index(s));
+# else
     /* The first 4 slots of a symbol are all boxed words, but vary in meaning
      * based on #+relocatable-static-space. Scanning the hash is harmless - though
      * unnecessary - at present, since it is of descriptor nature, be it fixnum,
@@ -820,6 +845,7 @@ static sword_t scav_symbol(lispobj *where,
      * 1 bit, we could make hash a raw slot in which case we'd have to use care
      * to avoid reading it. trace-object.inc uses three separate operations */
     scavenge(where + 1, 4);
+# endif
     lispobj name = decode_symbol_name(s->name);
     lispobj new = name;
     scavenge(&new, 1);
@@ -994,41 +1020,61 @@ static lispobj trans_bignum(lispobj object)
                                       unboxed_region, PAGE_TYPE_UNBOXED);
 }
 
-#ifndef LISP_FEATURE_X86_64
+// Return the lisp object that fdefn jumps to.
 lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    extern lispobj entrypoint_taggedptr(uword_t);
+    int index = fdefn_linkage_index(fdefn);
+    return index ? entrypoint_taggedptr(linkage_space[index]) : 0;
+#else
     lispobj raw_addr = (lispobj)fdefn->raw_addr;
     if (!raw_addr || points_to_asm_code_p(raw_addr))
         // technically this should return the address of the code object
         // containing asm routines, but it's fine to return 0.
         return 0;
     return raw_addr - FUN_RAW_ADDR_OFFSET;
-}
 #endif
+}
 
 static sword_t
 scav_fdefn(lispobj *where, lispobj __attribute__((unused)) object)
 {
     struct fdefn *fdefn = (struct fdefn *)where;
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+    scavenge(where + 2, 2); // 'name' and 'fun'
+    scav_linkage_cell(fdefn_linkage_index(fdefn));
+#else
     scavenge(where + 1, 2); // 'name' and 'fun'
     lispobj obj = decode_fdefn_rawfun(fdefn);
     lispobj new = obj;
     scavenge(&new, 1);
     if (new != obj) fdefn->raw_addr += (sword_t)(new - obj);
+#endif
     // Payload length is not computed from the header
     return FDEFN_SIZE;
 }
 static lispobj trans_fdefn(lispobj object) {
-    return gc_copy_object(object, FDEFN_SIZE,
-                          small_mixed_region, PAGE_TYPE_SMALL_MIXED);
+    return gc_copy_object(object, FDEFN_SIZE, small_mixed_region, PAGE_TYPE_SMALL_MIXED);
 }
 static sword_t size_fdefn(lispobj __attribute__((unused)) *where) {
     return FDEFN_SIZE;
 }
 
+/* Unboxed objects other than vector and bignum all have a payload length expressible
+ * in 1 byte. They use the scav/trans/size functions below */
+static inline sword_t size_unboxed(lispobj *where) {
+    unsigned char byte =
+#ifdef LISP_FEATURE_BIG_ENDIAN
+      (*where >> 8) & 0xFF;
+#else
+      1[(unsigned char*)where];
+#endif
+    return ALIGN_UP((byte + 1), 2);
+}
 static sword_t
 scav_unboxed(lispobj __attribute__((unused)) *where, lispobj object)
 {
-    sword_t length = HeaderValue(object) + 1;
+    sword_t length = (HeaderValue(object) & 0xFF) + 1;
     return ALIGN_UP(length, 2);
 }
 
@@ -1036,8 +1082,7 @@ static lispobj
 trans_unboxed(lispobj object)
 {
     gc_dcheck(lowtag_of(object) == OTHER_POINTER_LOWTAG);
-    sword_t length = HeaderValue(*native_pointer(object)) + 1;
-    return copy_unboxed_object(object, ALIGN_UP(length, 2));
+    return copy_unboxed_object(object, size_unboxed(native_pointer(object)));
 }
 
 static lispobj
@@ -1260,20 +1305,22 @@ void smash_weak_pointers(void)
         }
     }
     weak_vectors = 0;
+
+    if (!tlsindex_to_symbol_map) return;
+    /* If the weak map is present, Lisp could potentially recycle unused TLS indices
+     * by finding an empty element below the free TLS index.  Not currently done */
+    int i;
+    int n_elements = dynamic_values_bytes / bytes_per_tls_symbol;
+    for (i=0; i<n_elements; ++i) {
+        lispobj symbol = tlsindex_to_symbol_map[i];
+        if (symbol != NO_TLS_VALUE_MARKER) {
+            TEST_WEAK_CELL(tlsindex_to_symbol_map[i], symbol, NO_TLS_VALUE_MARKER);
+        }
+    }
 }
 
 
 /* Hash tables */
-
-#if N_WORD_BITS == 32
-#define EQ_HASH_MASK 0x1fffffff
-#elif N_WORD_BITS == 64
-#define EQ_HASH_MASK 0x1fffffffffffffff
-#endif
-
-/* Compute the EQ-hash of KEY. This must match POINTER-HASH in
- * target-hash-table.lisp.  */
-#define EQ_HASH(key) ((key) & EQ_HASH_MASK)
 
 /* List of weak hash tables chained through their NEXT-WEAK-HASH-TABLE
  * slot. Set to NULL at the end of a collection.
@@ -1426,12 +1473,26 @@ pthread_cond_t finalizer_condvar = PTHREAD_COND_INITIALIZER;
 #endif
 void finalizer_thread_wait () {
     ignore_value(mutex_acquire(&finalizer_mutex));
-    if (finalizer_thread_runflag)
+    /* Sleep only if we should be running but there is no post-GC hook to run.
+     * Finalizers per se do not have an assurance of quick execution. Namely,
+     * there is a race between deciding to wait and testing whether a finalizer
+     * should run. That's OK, though in fact it would be fairly simple to
+     * examine FINALIZERS_TRIGGERED as part of the condition here */
+    if (finalizer_thread_runflag && SYMBOL(RUN_GC_HOOKS)->value == 0)
         CONDITION_VAR_WAIT(&finalizer_condvar, &finalizer_mutex);
     ignore_value(mutex_release(&finalizer_mutex));
 }
-void finalizer_thread_wake () {
-    CONDITION_VAR_WAKE_ALL(&finalizer_condvar);
+void finalizer_thread_wake (int run_hooks) {
+    if (run_hooks) {
+        ignore_value(mutex_acquire(&finalizer_mutex));
+        // This has to be atomic because the finalizer thread doesn't acquire
+        // the mutex when decrementing
+        __sync_add_and_fetch(&SYMBOL(RUN_GC_HOOKS)->value, make_fixnum(1));
+        CONDITION_VAR_WAKE_ALL(&finalizer_condvar);
+        ignore_value(mutex_release(&finalizer_mutex));
+    } else { // just poke the finalizer thread and hope it runs something
+        CONDITION_VAR_WAKE_ALL(&finalizer_condvar);
+    }
 }
 void finalizer_thread_stop () {
     ignore_value(mutex_acquire(&finalizer_mutex));
@@ -1442,7 +1503,7 @@ void finalizer_thread_stop () {
 #endif
 
 #ifdef TRACE_MMAP_SYSCALLS
-FILE* mmgr_debug_logfile;
+extern FILE* mmgr_debug_logfile;
 void set_page_type_impl(struct page* pte, int newval)
 {
     if (newval != pte->type) /* too "noisy" without this pre-test */
@@ -1690,7 +1751,12 @@ scav_vector_t(lispobj *where, lispobj header)
 }
 
 /* Walk through the chain whose first element is *FIRST and remove
- * dead weak entries.
+ * dead weak entries. Such entries are linked into a list which is distinct
+ * from the list of free entries linked through the table's "next" vector.
+ * Because GC can run in the middle of any hash-table modification -
+ * since we no longer use WITHOUT-GCING around every weak table operation -
+ * this has to avoid touching the table structure itself. But it's fairly easy
+ * to create an ordinary list which is amenable to SB-EXT:ATOMIC-POP.
  * Return the new value for 'should rehash'.
  *
  * This operation might have to touch a hash-table that is currently
@@ -1726,13 +1792,14 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table,
         // Lisp might not have gotten around to pruning a chain
         // containing previously culled items.
         if (key == empty_symbol && value == empty_symbol) continue;
-        // If the pair doesn't have both halves empty,
-        // then it mustn't have either half empty.
-        // FIXME: this looks like a potential data race - do we definitely store
-        // the key and value before inserting into a chain? Probably.
-        gc_assert(key != empty_symbol);
-        gc_assert(value != empty_symbol);
+        /* There is one situation to be mildy cautious of: stopped for GC after key was stored but
+         * value was not. Such a pair must certainly be live regardless of the table weakness kind.
+         * This is assured due to WITH-WEAK-HASH-TABLE-ENTRY using WITH-PINNED-OBJECTS on KEY,
+         * and empty_symbol being an immediate object (always "live"). Therefore, we assert that
+         * both K and V were stored only if actually culling a pair from its bucket. */
         if (!alivep_test(key, value)) {
+            gc_assert(key != empty_symbol);
+            gc_assert(value != empty_symbol);
             if (debug_weak_ht)
                 fprintf(stderr, "<%"OBJ_FMTX",%"OBJ_FMTX"> is dead\n", key, value);
             gc_assert(hash_table->_count > 0);
@@ -1904,6 +1971,10 @@ size_lose(lispobj *where)
          (void*)where, widetag_of(where));
     return 1; /* bogus return value to satisfy static type checking */
 }
+
+bool sized_widetag_p(unsigned char widetag) {
+    return sizetab[widetag] != size_lose;
+}
 
 /*
  * initialization
@@ -1950,7 +2021,9 @@ lispobj simple_fun_name_from_pc(char *pc, lispobj** pfun)
         struct simple_fun* fun = (void*)(insts + offsets[-i]);
         if ((char*)fun < pc) {
             if (pfun) *pfun = (lispobj*)fun;
-            return code->constants[i*CODE_SLOTS_PER_SIMPLE_FUN];
+            struct compiled_debug_info* cdi = (void*)native_pointer(code->debug_info);
+            lispobj* fundata = &cdi->rest;
+            return fundata[i*CODE_SLOTS_PER_SIMPLE_FUN];
         }
     }
     return 0; // oops, how did this happen?
@@ -2062,20 +2135,6 @@ properly_tagged_p_internal(lispobj pointer, lispobj *start_addr)
                                  (struct simple_fun*)potential_fun) >= 0)
                 return 1;
         }
-#ifdef RETURN_PC_WIDETAG
-        /* LRA objects are similar to simple-funs in that they are
-         * embedded objects. We can't actually do as precise a test
-         * as for simple-funs, since we don't know where the LRAs are.
-         * Nonetheless, the check of header validity should produce
-         * very few false positives */
-        if (lowtag_of(pointer) == OTHER_POINTER_LOWTAG) {
-            lispobj *potential_lra = native_pointer(pointer);
-            if ((widetag_of(potential_lra) == RETURN_PC_WIDETAG) &&
-                ((potential_lra - HeaderValue(potential_lra[0])) == start_addr)) {
-                return 1; /* It's as good as we can verify. */
-            }
-        }
-#endif
     }
     return 0; // no good
 }
@@ -2121,6 +2180,11 @@ static bool can_invoke_post_gc(__attribute__((unused)) struct thread* th,
                                   sigset_t *context_sigmask)
 {
 #ifdef LISP_FEATURE_SB_THREAD
+    /* TODO: with #+sb-thread, running post-GC actions is as simple as bumping the
+     * value in the static symbol *RUN-GC-HOOKS* and waking the finalizer thread,
+     * which is done in a C function. Therefore all this complicated logic around whether
+     * Lisp can/should execute user code is for nothing- the finalizer is always alive,
+     * and either executing a thunk of user code, or idle */
     lispobj obj = th->lisp_thread;
     /* Ok, I seriously doubt that this can happen now. Don't we create
      * the 'struct thread' with a pointer to its SB-THREAD:THREAD right away?
@@ -2176,7 +2240,7 @@ bool maybe_gc(os_context_t *context)
      * A kludgy alternative is to propagate the sigmask change to the
      * outer context.
      */
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     check_gc_signals_unblocked_or_lose(os_context_sigmask_addr(context));
     unblock_gc_stop_signal();
 #endif
@@ -2214,7 +2278,7 @@ bool maybe_gc(os_context_t *context)
              * post-GC code. Except that we do it while the interrupt context
              * is still on the stack */
             thread_sigmask(SIG_SETMASK, context_sigmask, 0);
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
             check_gc_signals_unblocked_or_lose(0);
 #endif
 #endif
@@ -2237,44 +2301,18 @@ bool maybe_gc(os_context_t *context)
     return (gc_happened != NIL);
 }
 
-#define BYTES_ZERO_BEFORE_END (1<<12)
-
-/* There used to be a similar function called SCRUB-CONTROL-STACK in
- * Lisp and another called zero_stack() in cheneygc.c, but since it's
- * shorter to express in, and more often called from C, I keep only
- * the C one after fixing it. -- MG 2009-03-25 */
-
 /* Zero the unused portion of the control stack so that old objects
- * are not kept alive because of uninitialized stack variables.
- *
- * "To summarize the problem, since not all allocated stack frame
- * slots are guaranteed to be written by the time you call an another
- * function or GC, there may be garbage pointers retained in your dead
- * stack locations. The stack scrubbing only affects the part of the
- * stack from the SP to the end of the allocated stack." - ram, on
- * cmucl-imp, Tue, 25 Sep 2001
- *
- * So, as an (admittedly lame) workaround, from time to time we call
- * scrub-control-stack to zero out all the unused portion. This is
- * supposed to happen when the stack is mostly empty, so that we have
- * a chance of clearing more of it: callers are currently (2002.07.18)
- * REPL, SUB-GC and sig_stop_for_gc_handler. */
-
-/* Take care not to tread on the guard page and the hard guard page as
- * it would be unkind to sig_stop_for_gc_handler. Touching the return
- * guard page is not dangerous. For this to work the guard page must
- * be zeroed when protected. */
-
-/* FIXME: I think there is no guarantee that once
- * BYTES_ZERO_BEFORE_END bytes are zero the rest are also zero. This
- * may be what the "lame" adjective in the above comment is for. In
- * this case, exact gc may lose badly. */
+ * are not kept alive because of uninitialized stack variables. */
 void
 scrub_control_stack()
 {
     scrub_thread_control_stack(get_sb_vm_thread());
 }
 
+/* Take care not to tread on the guard page and the hard guard page as
+ * it would be unkind to sig_stop_for_gc_handler. Touching the return
+ * guard page is not dangerous. For this to work the guard page must
+ * be zeroed when protected. */
 void
 scrub_thread_control_stack(struct thread *th)
 {
@@ -2283,43 +2321,75 @@ scrub_thread_control_stack(struct thread *th)
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
     /* On these targets scrubbing from C is a bad idea, so we punt to
      * a routine in $ARCH-assem.S. */
-    extern void arch_scrub_control_stack(struct thread *, os_vm_address_t, os_vm_address_t)
+    extern void arch_scrub_control_stack(struct thread *, os_vm_address_t, os_vm_address_t, unsigned)
 #ifdef LISP_FEATURE_X86_64
-    __attribute__((sysv_abi))
+        __attribute__((sysv_abi))
 #endif
-    ;
-    arch_scrub_control_stack(th, guard_page_address, hard_guard_page_address);
+        ;
+    arch_scrub_control_stack(th, guard_page_address, hard_guard_page_address, STACK_GUARD_SIZE);
 #else
-    lispobj *sp = access_control_stack_pointer(th);
- scrub:
-    if ((((os_vm_address_t)sp < (hard_guard_page_address + os_vm_page_size)) &&
-         ((os_vm_address_t)sp >= hard_guard_page_address)) ||
-        (((os_vm_address_t)sp < (guard_page_address + os_vm_page_size)) &&
-         ((os_vm_address_t)sp >= guard_page_address) &&
-         th->state_word.control_stack_guard_page_protected))
-        return;
+    os_vm_address_t sp = (os_vm_address_t)access_control_stack_pointer(th);
 #ifdef LISP_FEATURE_STACK_GROWS_DOWNWARD_NOT_UPWARD
-    do {
-        *sp = 0;
-    } while (((uword_t)sp--) & (BYTES_ZERO_BEFORE_END - 1));
-    if ((os_vm_address_t)sp < (hard_guard_page_address + os_vm_page_size))
-        return;
-    do {
-        if (*sp)
-            goto scrub;
-    } while (((uword_t)sp--) & (BYTES_ZERO_BEFORE_END - 1));
+    os_vm_address_t start = guard_page_address + STACK_GUARD_SIZE;
+    if (!th->state_word.control_stack_guard_page_protected) {
+        /* Scrub the guard page first, touching the return page first
+         * will reprotect it */
+        if (sp < start) {
+            gc_assert(sp > guard_page_address);
+            memset(guard_page_address, 0, sp - guard_page_address);
+            return;
+        } else {
+            memset(guard_page_address, 0, STACK_GUARD_SIZE);
+        }
+    }
+    gc_assert(start <= sp);
+    memset(start, 0, sp - start);
 #else
-    do {
-        *sp = 0;
-    } while (((uword_t)++sp) & (BYTES_ZERO_BEFORE_END - 1));
-    if ((os_vm_address_t)sp >= hard_guard_page_address)
-        return;
-    do {
-        if (*sp)
-            goto scrub;
-    } while (((uword_t)++sp) & (BYTES_ZERO_BEFORE_END - 1));
+    os_vm_address_t end = guard_page_address;
+    if (!th->state_word.control_stack_guard_page_protected) {
+        /* Scrub the guard page first, touching the return page first
+         * will reprotect it */
+        if (sp >= end) {
+            gc_assert(sp <= hard_guard_page_address);
+            memset(sp, 0, hard_guard_page_address - sp);
+            return;
+        } else {
+            memset(guard_page_address, 0, STACK_GUARD_SIZE);
+        }
+    }
+    gc_assert(sp <= end);
+    memset(sp, 0, end - sp);
 #endif
 #endif /* LISP_FEATURE_C_STACK_IS_CONTROL_STACK */
+}
+
+void scrub_control_stacks () {
+    if (!conservative_stack)
+        return;
+
+#if defined LISP_FEATURE_SB_SAFEPOINT &&                                \
+    !defined LISP_FEATURE_C_STACK_IS_CONTROL_STACK /* can't scrub stacks of other threads
+                                                      and not strictly neccesary */
+    /* In this case, scrub all stacks right here from the GCing thread
+     * instead of doing what the comment below says.  Suboptimal, but
+     * easier. */
+    struct thread *th;
+    for_each_thread(th)
+        scrub_thread_control_stack(th);
+    /* Scrub the unscavenged control stack space, so that we can't run
+     * into any stale pointers in a later GC (this is done by the
+     * stop-for-gc handler in the other threads). */
+#elif defined LISP_FEATURE_NONSTOP_FOREIGN_CALL && !defined LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+    struct thread *th;
+    for_each_thread(th) {
+        /* Threads stopped by gc_stop_the_world scrub the stack on
+         * their own in sig_stop_for_gc_handler. */
+        if (csp_around_foreign_call(th) != 0)
+            scrub_thread_control_stack(th);
+    }
+#else
+    scrub_control_stack();
+#endif
 }
 
 #if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64)
@@ -2375,266 +2445,6 @@ scavenge_control_stack(struct thread *th)
         }
     }
 }
-
-#ifdef reg_CODE
-/* Scavenging Interrupt Contexts */
-
-static int boxed_registers[] = BOXED_REGISTERS;
-
-// Nothing uses os_context_pc_addr any more, except ACCESS_INTERIOR_POINTER_pc.
-// I didn't see a good way to remove that one.
-extern os_context_register_t* os_context_pc_addr(os_context_t*);
-
-/* The GC has a notion of an "interior pointer" register, an unboxed
- * register that typically contains a pointer to inside an object
- * referenced by another pointer.  The most obvious of these is the
- * program counter, although many compiler backends define a "Lisp
- * Interior Pointer" register known to the runtime as reg_LIP, and
- * various CPU architectures have other registers that also partake of
- * the interior-pointer nature.  As the code for pairing an interior
- * pointer value up with its "base" register, and fixing it up after
- * scavenging is complete is horribly repetitive, a few macros paper
- * over the monotony.  --AB, 2010-Jul-14 */
-
-/* These macros are only ever used over a lexical environment which
- * defines a pointer to an os_context_t called context, thus we don't
- * bother to pass that context in as a parameter. */
-
-/* Define how to access a given interior pointer. */
-#define ACCESS_INTERIOR_POINTER_pc \
-    *os_context_pc_addr(context)
-#define ACCESS_INTERIOR_POINTER_lip \
-    *os_context_register_addr(context, reg_LIP)
-#define ACCESS_INTERIOR_POINTER_lr \
-    *os_context_lr_addr(context)
-#define ACCESS_INTERIOR_POINTER_npc \
-    *os_context_npc_addr(context)
-#define ACCESS_INTERIOR_POINTER_ctr \
-    *os_context_ctr_addr(context)
-
-#define INTERIOR_POINTER_VARS(name) \
-    uword_t name##_offset;    \
-    int name##_register_pair
-
-#define PAIR_INTERIOR_POINTER(name)                             \
-    pair_interior_pointer(context,                              \
-                          ACCESS_INTERIOR_POINTER_##name,       \
-                          &name##_offset,                       \
-                          &name##_register_pair,                \
-                          #name)
-
-/* One complexity here is that if a paired register is not found for
- * an interior pointer, then that pointer does not get updated.
- * Originally, there was some commentary about using an index of -1
- * when calling os_context_register_addr() on SPARC referring to the
- * program counter, but the real reason is to allow an interior
- * pointer register to point to the runtime, read-only space, or
- * static space without problems. */
-#define FIXUP_INTERIOR_POINTER(name)                                    \
-    do {                                                                \
-        /* fprintf(stderr, "Fixing interior ptr "#name"\n"); */         \
-        if (name##_register_pair >= 0) {                                \
-            ACCESS_INTERIOR_POINTER_##name =                            \
-                (*os_context_register_addr(context,                     \
-                                           name##_register_pair)        \
-                 & ~LOWTAG_MASK)                                        \
-                + name##_offset;                                        \
-        }                                                               \
-    } while (0)
-
-#ifdef LISP_FEATURE_PPC64
-// reg_CODE holds a native pointer on PPC64
-#define plausible_base_register(val,reg) (is_lisp_pointer(val)||reg==reg_CODE)
-#else
-#define plausible_base_register(val,reg) (is_lisp_pointer(val))
-#endif
-
-static void
-pair_interior_pointer(os_context_t *context, uword_t pointer,
-                      uword_t *saved_offset, int *register_pair,
-                      char *regname)
-{
-    unsigned int i;
-
-    /*
-     * I (RLT) think this is trying to find the boxed register that is
-     * closest to the LIP address, without going past it.  Usually, it's
-     * reg_CODE or reg_LRA.  But sometimes, nothing can be found.
-     */
-    /* 0x7FFFFFFF on 32-bit platforms;
-       0x7FFFFFFFFFFFFFFF on 64-bit platforms */
-    *saved_offset = (((uword_t)1) << (N_WORD_BITS - 1)) - 1;
-    *register_pair = -1;
-    for (i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
-        uword_t offset;
-
-        int regindex = boxed_registers[i];
-        uword_t regval = *os_context_register_addr(context, regindex);
-
-        /* An interior pointer is never relative to a non-pointer
-         * register (an oversight in the original implementation).
-         * The simplest argument for why this is true is to consider
-         * the fixnum that happens by coincide to be the word-index in
-         * memory of the header for some object plus two.  This is
-         * happenstance would cause the register containing the fixnum
-         * to be selected as the register_pair if the interior pointer
-         * is to anywhere after the first two words of the object.
-         * The fixnum won't be changed during GC, but the object might
-         * move, thus destroying the interior pointer.  --AB,
-         * 2010-Jul-14 */
-
-        // Note this can produce weird pairings that seem not to adversely
-        // affect anything. For instance if reg_LIP points lower than anything
-        // in a boxed register except for let's say register A0 which is
-        // currently NIL, then we'll say that LIP was based on A0 + huge offset.
-        // NIL doesn't move, so we won't alter LIP. But what if A0 had something
-        // random in it and lower than LIP? It will pair with LIP and then
-        // adjust LIP to point to garbage.  This is "harmless" because
-        // we never actually treat LIP as an exact root.
-
-        if (plausible_base_register(regval, regindex) &&
-            ((regval & ~LOWTAG_MASK) <= pointer)) {
-            offset = pointer - (regval & ~LOWTAG_MASK);
-            if (offset < *saved_offset) {
-                *saved_offset = offset;
-                *register_pair = regindex;
-            }
-        }
-    }
-#if 0
-    if (*register_pair >= 0)
-        fprintf(stderr, "pair_interior_ptr: %-3s=%p based on %s=%p + %x\n",
-                regname, (void*)pointer,
-                lisp_register_names[*register_pair],
-                (void*)(((uword_t)*os_context_register_addr(context, *register_pair))
-                        & ~LOWTAG_MASK),
-                (int)*saved_offset);
-    else
-        fprintf(stderr, "pair_interior_ptr: %-3s=%#lx not based\n", regname, pointer);
-#endif
-}
-
-static void
-scavenge_interrupt_context(os_context_t * context)
-{
-    unsigned int i;
-
-    /* FIXME: The various #ifdef noise here is precisely that: noise.
-     * Is it possible to fold it into the macrology so that we have
-     * one set of #ifdefs and then INTERIOR_POINTER_VARS /et alia/
-     * compile out for the registers that don't exist on a given
-     * platform? */
-
-#ifdef reg_LRA
-    INTERIOR_POINTER_VARS(pc);
-#endif
-
-#ifdef reg_LIP
-    INTERIOR_POINTER_VARS(lip);
-#endif
-#ifdef ARCH_HAS_LINK_REGISTER
-    INTERIOR_POINTER_VARS(lr);
-#endif
-#ifdef ARCH_HAS_NPC_REGISTER
-    INTERIOR_POINTER_VARS(npc);
-#endif
-#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
-    INTERIOR_POINTER_VARS(ctr);
-#endif
-
-    /* Platforms without LRA pin on-stack code. Furthermore, the PC
-       must not be paired, as even on platforms with $CODE, there is
-       nothing valid to pair PC with immediately upon function
-       return. */
-#ifdef reg_LRA
-    PAIR_INTERIOR_POINTER(pc);
-#endif
-
-#ifdef reg_LIP
-    PAIR_INTERIOR_POINTER(lip);
-#endif
-
-#ifdef ARCH_HAS_LINK_REGISTER
-    {
-      PAIR_INTERIOR_POINTER(lr);
-    }
-#endif
-
-#ifdef ARCH_HAS_NPC_REGISTER
-    PAIR_INTERIOR_POINTER(npc);
-#endif
-#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
-    PAIR_INTERIOR_POINTER(ctr);
-#endif
-
-    /* Scavenge all boxed registers in the context. */
-    for (i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
-        os_context_register_t *boxed_reg;
-        lispobj datum;
-
-        /* We can't "just" cast os_context_register_addr() to a
-         * pointer to lispobj and pass it to scavenge, because some
-         * systems can have a wider register width than we use for
-         * lisp objects, and on big-endian systems casting a pointer
-         * to a narrower target type doesn't work properly.
-         * Therefore, we copy the value out to a temporary lispobj
-         * variable, scavenge there, and copy the value back in.
-         *
-         * FIXME: lispobj is unsigned, os_context_register_t may be
-         * signed or unsigned, are we truncating or sign-extending
-         * values here that shouldn't be modified?  Possibly affects
-         * any architecture that has 32-bit and 64-bit variants where
-         * we run in 32-bit mode on 64-bit hardware when the OS is set
-         * up for 64-bit from the start.  Or an environment with
-         * 32-bit addresses and 64-bit registers. */
-
-        boxed_reg = os_context_register_addr(context, boxed_registers[i]);
-        datum = *boxed_reg;
-        if (compacting_p()) scavenge(&datum, 1); else gc_mark_obj(datum);
-        *boxed_reg = datum;
-    }
-
-    /* Now that the scavenging is done, repair the various interior
-     * pointers. */
-#ifdef reg_LRA
-    FIXUP_INTERIOR_POINTER(pc);
-#endif
-
-#ifdef reg_LIP
-    FIXUP_INTERIOR_POINTER(lip);
-#endif
-#ifdef ARCH_HAS_LINK_REGISTER
-
-    {
-        FIXUP_INTERIOR_POINTER(lr);
-    }
-#endif
-#ifdef ARCH_HAS_NPC_REGISTER
-    FIXUP_INTERIOR_POINTER(npc);
-#endif
-#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
-    FIXUP_INTERIOR_POINTER(ctr);
-#endif
-}
-
-void
-scavenge_interrupt_contexts(struct thread *th)
-{
-    int i, index;
-    os_context_t *context;
-
-    index = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
-
-#if defined(DEBUG_PRINT_CONTEXT_INDEX)
-    printf("Number of active contexts: %d\n", index);
-#endif
-
-    for (i = 0; i < index; i++) {
-        context = nth_interrupt_context(i, th);
-        scavenge_interrupt_context(context);
-    }
-}
-#endif /* !REG_CODE */
 #endif /* x86oid targets */
 
 /* Finalizer table based on Split-Ordered Lists */
@@ -3335,28 +3145,6 @@ extern void check_barrier (lispobj young, lispobj old, int wp) {
 }
 #endif
 
-// Return a native representation of the perturbed h0 supplied as a fixnum.
-unsigned prefuzz_ht_hash(lispobj h0)
-{
-#ifdef LISP_FEATURE_64_BIT
-    /* Cautiously compute in the Lisp representation
-     * to ensure total consistency with the Lisp code.
-     * e.g. (SB-IMPL::EQ-HASH -1s0) => -2323857407723175924
-     * All of the shifts are to the right, so we needn't consider
-     * overflow but we do need to kill the tag bit(s).
-     * The sum can wrap, but that's OK because it gets chopped at the end */
-#define fixnum_ashr(val,count) ((val>>count)&~(uword_t)FIXNUM_TAG_MASK)
-    sword_t sum = (h0 ^ make_fixnum(0x39516A7))
-      + fixnum_ashr(h0, 3)
-      + fixnum_ashr(h0, 12)
-      + fixnum_ashr(h0, 20);
-    // the mask looks wrong for 32-bit, but I'm not trying to debug 32-bit.
-    return fixnum_value(sum & (make_fixnum((1L<<31)-1)));
-#else
-    lose("Unimplemented");
-#endif
-}
-
 #ifdef LISP_FEATURE_MARK_REGION_GC
 static void maybe_fix_hash_table(struct hash_table* ht, bool fix_bad)
 {
@@ -3400,7 +3188,7 @@ static void verify_hash_table_if_possible(struct hash_table* ht, bool fix_bad)
     maybe_fix_hash_table(ht, fix_bad);
 }
 
-static uword_t verify_tables_in_range(lispobj* start, lispobj* end, uword_t fix_bad)
+static uword_t verify_tables_in_range(lispobj* start, lispobj* end, void* fix_bad)
 {
     lispobj* where = next_object(start, 0, end); /* find first marked object */
     lispobj layout;
@@ -3408,15 +3196,116 @@ static uword_t verify_tables_in_range(lispobj* start, lispobj* end, uword_t fix_
         if (widetag_of(where) == INSTANCE_WIDETAG &&
             (layout = instance_layout(where)) != 0 &&
             layout_depth2_id(LAYOUT(layout)) == HASH_TABLE_LAYOUT_ID)
-            verify_hash_table_if_possible((struct hash_table*)where, fix_bad);
+            verify_hash_table_if_possible((struct hash_table*)where, (uintptr_t)fix_bad);
         sword_t nwords = object_size(where);
         where = next_object(where, nwords, end);
     }
     return 0;
 }
 
-void verify_hash_tables(bool fix_bad)
+void verify_hash_tables(uintptr_t fix_bad)
 {
-    walk_generation(verify_tables_in_range, -1, fix_bad);
+    walk_generation(verify_tables_in_range, -1, (void*)fix_bad);
 }
 #endif
+
+/* This limit is adequate for testing, but a better way to handle it
+ * would be to size the remset at half the objects in core permgen.
+ * If that limit is reached, then don't remember individual objects
+ * but instead flag all of permgen as needing to be scavenged. */
+#define REMSET_GLOBAL_MAX 20000
+lispobj permgen_remset[REMSET_GLOBAL_MAX];
+int permgen_remset_count;
+lispobj remset_transfer_list;
+
+static void remset_append1(lispobj x)
+{
+    int n = permgen_remset_count;
+    if (n == REMSET_GLOBAL_MAX) lose("global remset overflow");
+    permgen_remset[n] = x;
+    ++permgen_remset_count;
+}
+
+void remset_union(lispobj remset)
+{
+    while (remset) {
+        struct vector* v = VECTOR(remset);
+        int count = fixnum_value(v->data[0]);
+        int i;
+        for (i=0; i<count; ++i) remset_append1(v->data[i+2]);
+        remset = v->data[1];
+    }
+}
+
+void remember_all_permgen()
+{
+    permgen_bounds[1] = PERMGEN_SPACE_START;
+    memset(permgen_remset, 0, permgen_remset_count*N_WORD_BYTES);
+    permgen_remset_count = 0;
+}
+
+void illegal_linkage_space_call() {
+    lose("jumped via obsolete linkage entry");
+}
+
+void sweep_linkage_space()
+{
+    // Erase linkage cells whose name got NILed in the weak vector clearing pass
+    struct vector* outer = VECTOR(SYMBOL(LINKAGE_NAME_MAP)->value);
+    int outer_len = vector_len(outer), index1 = 0, linkage_index = 0;
+    for ( ; index1 < outer_len ; ++index1) {
+        lispobj v = outer->data[index1];
+        if (!v) break;
+        struct vector* inner = VECTOR(v);
+        int index2 = 0, limit = vector_len(inner);
+        for ( ; index2 < limit ; ++index2, ++linkage_index )
+            if (inner->data[index2] == NIL && linkage_space[linkage_index])
+                linkage_space[linkage_index] = (uword_t)illegal_linkage_space_call;
+    }
+}
+
+#ifdef MEASURE_STOP_THE_WORLD_PAUSE
+static long timespec_diff(struct timespec* begin, struct timespec* end)
+{
+#ifdef LISP_FEATURE_64_BIT
+    return (end->tv_sec - begin->tv_sec) * 1000000000L + (end->tv_nsec - begin->tv_nsec) ;
+#else
+    return (end->tv_sec - begin->tv_sec) * 1000000L + (end->tv_nsec - begin->tv_nsec) / 1000;
+#endif
+}
+void thread_accrue_stw_time(void* opaque_thread,
+                            struct timespec* begin_real,
+                            struct timespec* begin_cpu)
+{
+    struct thread* th = opaque_thread;
+    /* A non-Lisp thread calling into Lisp via DEFINE-ALIEN-CALLABLE
+     * can receive SIG_STOP_FOR_GC as soon as it has a 'struct thread'
+     * and _before_ a thread instance has been consed */
+    if (th->lisp_thread) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        unsigned long elapsed = timespec_diff(begin_real, &now);
+        struct thread_instance* ti = (void*)INSTANCE(th->lisp_thread);
+        if (elapsed > ti->uw_max_stw_pause) ti->uw_max_stw_pause = elapsed;
+        ti->uw_sum_stw_pause += elapsed;
+        ++ti->uw_ct_stw_pauses;
+        if (begin_cpu) {
+#ifdef CLOCK_THREAD_CPUTIME_ID
+          clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+          ti->uw_gc_virtual_time += timespec_diff(begin_cpu, &now);
+#endif
+        }
+    }
+}
+#endif
+
+/* Not safe in general, but if your thread names are all
+ * simple-base-string and won't move, this is slightly ok */
+char* vm_thread_name(struct thread* th)
+{
+    if (!th) return "non-lisp";
+    struct thread_instance *lispthread = (void*)INSTANCE(th->lisp_thread);
+    lispobj name = lispthread->_name;
+    if (simple_base_string_p(name)) return vector_sap(name);
+    return "?";
+}

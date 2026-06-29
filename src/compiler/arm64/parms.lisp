@@ -16,7 +16,7 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 4)
 
-(defconstant +backend-fasl-file-implementation+ :arm64)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :arm64)
 
   ;; Can be in the range 4K-64K
 (defconstant +backend-page-bytes+ 65536)
@@ -69,11 +69,13 @@
 
 ;;;; Where to put the different spaces.
 
-(gc-space-setup #+(or linux openbsd netbsd freebsd)
+(gc-space-setup #+(or linux openbsd netbsd freebsd win32)
                      #x2F0000000
                      #+darwin #x300000000
                      #-darwin :read-only-space-size #-darwin 0
-                     :fixedobj-space-size #.(* 65536 1024)
+                     :fixedobj-space-start 0
+                     :fixedobj-space-size 0
+                     :text-space-start #x0A00000000
                      :text-space-size #.(* 2 65536 1024)
                      :dynamic-space-start
                      #-darwin #x1000000000
@@ -81,6 +83,11 @@
 
 (defconstant alien-linkage-table-growth-direction :up)
 (defconstant alien-linkage-table-entry-size 16)
+  ;; text space:
+  ;;   | ALIEN LINKAGE | CODE OBJECTS ...
+  ;;   |<------------->|
+#+(and sb-xc-host immobile-space)
+(defparameter alien-linkage-space-start (- text-space-start alien-linkage-space-size))
 
 ;;;; other miscellaneous constants
 

@@ -15,7 +15,6 @@
 #include <signal.h>
 #include <string.h>
 #include <strings.h>
- /* #include <dlfcn.h> */
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -31,7 +30,6 @@ typedef int os_vm_prot_t;
 
 #include "target-arch-os.h"
 #include "target-arch.h"
-#define linuxversion(a, b, c) (((a)<<16)+((b)<<8)+(c))
 
 #define SIG_MEMORY_FAULT SIGSEGV
 

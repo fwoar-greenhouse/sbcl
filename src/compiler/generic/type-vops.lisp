@@ -11,7 +11,7 @@
 (in-package "SB-VM")
 
 
-(defvar *other-pointer-type-vops*
+(defglobal *other-pointer-type-vops*
   ;; A special case due to NIL
   `(symbolp (,symbol-widetag)))
 
@@ -112,9 +112,6 @@
 (define-type-vop weak-pointer-p (weak-pointer-widetag))
 
 (define-type-vop code-component-p (code-header-widetag))
-
-#-(or x86 x86-64 arm64 riscv)
-(define-type-vop lra-p (return-pc-widetag))
 
 (define-type-vop fdefn-p (fdefn-widetag))
 

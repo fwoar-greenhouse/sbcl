@@ -44,8 +44,14 @@ struct memsize_options {
     int present_in_core;
 };
 
-extern lispobj load_core_file(char *file, os_vm_offset_t file_offset,
-                              int merge_core_pages);
+struct initfunctions {
+    lispobj c_linkage_count;
+    lispobj c_linkage_vector;
+    lispobj tls_map_starting_offset;
+    lispobj lispfun;
+};
+extern struct initfunctions load_core_file(char *file, os_vm_offset_t file_offset,
+                                           int merge_core_pages);
 extern os_vm_offset_t search_for_embedded_core(char *filename,
                                                struct memsize_options *memsize_options);
 

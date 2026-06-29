@@ -138,8 +138,8 @@
                                       (declare (ignore f stuff))))))
 
 (defparameter *breakpoint-tracing-expectations*
-  '(:fails-on (or :arm :arm64)
-    :broken-on (or :freebsd :ppc :ppc64)))
+  '(:fails-on (or :arm :riscv :ppc64 :ppc :sparc :mips)
+    :broken-on (or :loongarch64 :freebsd)))
 
 ;;; bug 379
 (with-test (:name (trace :encapsulate nil)
@@ -174,6 +174,22 @@
     (assert (search "returned 1" output))
     (assert (search "returned 120" output))))
 
+(with-test (:name (trace :encapsulate nil :recursive :threads)
+            :broken-on (:not :arm64))
+  (with-traced-function (trace-fact :encapsulate nil)
+    (let ((threads '()))
+      (dotimes (repeat 4)
+        (push (sb-thread:make-thread
+               (lambda ()
+                 (let ((output
+                         (with-output-to-string (*trace-output*)
+                           (assert (= 120 (trace-fact 5))))))
+                   (assert (search "TRACE-FACT" output))
+                   (assert (search "returned 1" output))
+                   (assert (search "returned 120" output)) )))
+              threads))
+      (mapc #'sb-thread:join-thread threads))))
+
 (defun trace-and-fmakunbound-this (x)
   x)
 
@@ -189,7 +205,7 @@
 (with-test (:name (trace :report nil :smoke))
   (let ((output (with-traced-function (trace-this :report nil)
                   (assert (eq 'ok (trace-this))))))
-    (assert (sequence:emptyp output))))
+    (assert (string= output ""))))
 
 (with-test (:name (trace :report nil :print))
   (let ((output (with-traced-function
@@ -201,7 +217,7 @@
 
 (defvar *collected-traces*)
 (defun custom-trace-report (depth what when frame values)
-  (push (list* depth what when (sb-debug::frame-p frame) values)
+  (push (list* depth what when (sb-di:frame-p frame) values)
         *collected-traces*))
 
 (with-test (:name (trace :custom-report))
@@ -456,6 +472,51 @@
                  '((0 (flet body :in (compiler-macro fn-with-cmac)) :enter)
                    (0 (flet body :in (compiler-macro fn-with-cmac)) :exit 42)))))
 
+(defun fn-known-values-return (x)
+  (flet ((g (x)
+           x))
+    (g x)
+    (g x)
+    (g x)))
+
+(with-test (:name (trace :flet :known-values-return)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet g :in fn-known-values-return))
+                   (fn-known-values-return 9))
+                 '((0 (flet g :in fn-known-values-return) :enter 9)
+                   (0 (flet g :in fn-known-values-return) :exit 9)
+                   (0 (flet g :in fn-known-values-return) :enter 9)
+                   (0 (flet g :in fn-known-values-return) :exit 9)
+                   (0 (flet g :in fn-known-values-return) :enter 9)
+                   (0 (flet g :in fn-known-values-return) :exit 9)))))
+
+(defun fn-known-values-return-multiple (x)
+  (flet ((g (x)
+           (values x x x x x x x)))
+    (g x)
+    (g x)
+    (g x)))
+
+(with-test (:name (trace :flet :known-values-return-multiple)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert
+   (equal
+    (collecting-traces ((flet g :in fn-known-values-return-multiple))
+      (fn-known-values-return-multiple 9))
+    '((0 (flet g :in fn-known-values-return-multiple) :enter 9)
+      (0 (flet g :in fn-known-values-return-multiple) :exit 9 9 9 9 9 9 9)
+      (0 (flet g :in fn-known-values-return-multiple) :enter 9)
+      (0 (flet g :in fn-known-values-return-multiple) :exit 9 9 9 9 9 9 9)
+      (0 (flet g :in fn-known-values-return-multiple) :enter 9)
+      (0 (flet g :in fn-known-values-return-multiple) :exit 9 9 9 9 9 9 9)))))
+
+(with-test (:name (trace :flet :within-compiler-macro)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet body :in (compiler-macro fn-with-cmac)))
+                                    (compile nil '(lambda () (fn-with-cmac 0))))
+                 '((0 (flet body :in (compiler-macro fn-with-cmac)) :enter)
+                   (0 (flet body :in (compiler-macro fn-with-cmac)) :exit 42)))))
+
 (defun call-with-compiler-macro-redefined (fn)
   (eval `(define-compiler-macro fn-with-cmac (x)
            (declare (ignore x) (optimize (debug 3)))
@@ -468,7 +529,6 @@
              (flet ((body () 42))
                (body))))))
 
-#-(or ppc ppc64)
 (with-test (:name (trace :compiler-macro :redefined)
                   . #.*breakpoint-tracing-expectations*)
   (assert (equal (collecting-traces ((compiler-macro fn-with-cmac)
@@ -568,7 +628,6 @@
                (labels ((fact (x) (if (zerop x) 1 (* x (fact (1- x))))))
                  (fact x)))))))
 
-#-(or ppc ppc64)
 (with-test (:name (trace :macro :redefined)
                   . #.*breakpoint-tracing-expectations*)
   (assert (equal (collecting-traces (macro-fact
@@ -779,47 +838,55 @@
       (declare (ignore object))
       (assert (not valid-p)))))
 
+;; A hack to get around non-buffering input io with string streams.
+(defvar *ok-p*)
+
 (defun test-debugger (control form &rest targets)
   (let ((out (make-string-output-stream))
-        (oops t))
-    (unwind-protect
-         (progn
-           (with-simple-restart (debugger-test-done! "Debugger Test Done!")
-             (let* ((*debug-io* (make-two-way-stream
-                                 (make-string-input-stream control)
-                                 (make-broadcast-stream out #+nil *standard-output*)))
-                    ;; Initial announcement goes to *ERROR-OUTPUT*
-                    (*error-output* *debug-io*)
-                    (*invoke-debugger-hook* nil))
-               (handler-bind ((error #'invoke-debugger))
-                 (eval form))))
-           (setf oops nil))
-      (when oops
-        (error "Uncontrolled unwind from debugger test.")))
-    ;; For sanity's sake this is outside the *debug-io* rebinding -- otherwise
-    ;; it could swallow our asserts!
-    (with-input-from-string (s (get-output-stream-string out))
-      (loop for line = (read-line s nil)
-            while line
-            do (assert targets nil "Line = ~a" line)
-               #+nil
-               (format *error-output* "Got: ~A~%" line)
-               (let ((match (pop targets)))
-                 (if (eq '* match)
-                     ;; Whatever, till the next line matches.
-                     (let ((text (pop targets)))
-                       #+nil
-                       (format *error-output* "Looking for: ~A~%" text)
-                       (unless (search text line)
-                         (push text targets)
-                         (push match targets)))
-                     (unless (search match line)
-                       (format *error-output* "~&Wanted: ~S~%   Got: ~S~%" match line)
-                       (setf oops t))))))
+        (oops t)
+        (*ok-p* nil))
+    (tagbody
+       (unwind-protect
+            (progn
+              (with-simple-restart (debugger-test-done! "Debugger Test Done!")
+                (let* ((*debug-io* (make-two-way-stream
+                                    (make-string-input-stream control)
+                                    (make-broadcast-stream out #+nil *standard-output*)))
+                       ;; Initial announcement goes to *ERROR-OUTPUT*
+                       (*error-output* *debug-io*)
+                       (*invoke-debugger-hook* nil))
+                  (handler-bind ((error #'invoke-debugger))
+                    (eval form))))
+              (setf oops nil))
+         (when oops
+           (when *ok-p*
+             (go :continue))
+           (error "Uncontrolled unwind from debugger test.")))
+       ;; For sanity's sake this is outside the *debug-io* rebinding -- otherwise
+       ;; it could swallow our asserts!
+       :continue
+       (with-input-from-string (s (get-output-stream-string out))
+         (loop for line = (read-line s nil)
+               while line
+               do (assert targets nil "Line = ~a" line)
+                  #+nil
+                  (format *error-output* "Got: ~A~%" line)
+                  (let ((match (pop targets)))
+                    (if (eq '* match)
+                        ;; Whatever, till the next line matches.
+                        (let ((text (pop targets)))
+                          #+nil
+                          (format *error-output* "Looking for: ~A~%" text)
+                          (unless (search text line)
+                            (push text targets)
+                            (push match targets)))
+                        (unless (search match line)
+                          (format *error-output* "~&Wanted: ~S~%   Got: ~S~%" match line)
+                          (setf oops t)))))))
     ;; Check that we saw everything we wanted
     (when targets
       (error "Missed: ~S" targets))
-    (assert (not oops))))
+    (assert (or (not oops) *ok-p*))))
 
 (with-test (:name (:debugger :source 1))
   (test-debugger
@@ -879,6 +946,84 @@
    "undefined function"
    '*
    "1]"))
+
+(defun ! (n)
+  (declare (optimize debug))
+  (if (zerop n)
+      1
+      (* n (! (1- n)))))
+
+(with-test (:name (:debugger :list-locations)
+            ;; there's an extra location on arm for some reason.
+            :fails-on (or :arm :loongarch64 :riscv :ppc :ppc64 :sparc :mips))
+  (test-debugger
+   "ll #'!
+    debugger-test-done!"
+   '(break)
+   '*
+   "debugger invoked"
+   '*
+   "0]"
+   "0: (DEFUN ! (N)"
+   "     (DECLARE (OPTIMIZE DEBUG))"
+   "     (IF (ZEROP N)"
+   "         1"
+   "         (* N (! (1- N)))))"
+   "1: (ZEROP N)"
+   "2: (* N (! (1- N)))"
+   "3: (1- N)"
+   "4: (! (1- N))"
+   "5: (* N (! (1- N)))"
+   "6: (DEFUN ! (N)"
+   "     (DECLARE (OPTIMIZE DEBUG))"
+   "     (IF (ZEROP N)"
+   "         1"
+   "         (* N (! (1- N)))))"
+   "7: (IF (ZEROP N)"
+   "       1"
+   "       (* N (! (1- N))))"
+   "0]"))
+
+(with-test (:name (:debugger :breakpoint-and-step)
+            :fails-on (:or :freebsd :arm :riscv))
+  (test-debugger
+   "ll #'!
+    br #.(progn (setq *ok-p* t) 2)"
+   '(break)
+   '*
+   "debugger invoked"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "1: 2 in !"
+   "added"
+   "0]")
+  (test-debugger
+   "step* 1
+    step* 1
+    debugger-test-done!"
+   `(! 10)
+   '*
+   "*Breakpoint hit*"
+   '*
+   "(! 10)"
+   "   source: (* N (! (1- N)))"
+   "0]"
+   "(! 10)"
+   "   source: (1- N)"
+   "0]"
+   '*
+   "*Breakpoint hit*"
+   '*
+   "(! 9)"
+   "   source: (* N (! (1- N)))"
+   "0]"))
 
 (with-test (:name (disassemble :high-debug-eval))
   (eval `(defun this-will-be-disassembled (x)
@@ -1058,11 +1203,11 @@
                             (sb-debug:map-backtrace
                              (lambda (frame)
                                (let ((name (sb-debug::frame-call frame))
-                                     (location (sb-debug::frame-code-location frame))
-                                     (d-fun (sb-debug::frame-debug-fun frame)))
+                                     (location (sb-di:frame-code-location frame))
+                                     (d-fun (sb-di:frame-debug-fun frame)))
                                  (when (eq name 'test)
-                                   (assert (sb-debug::debug-var-info-available d-fun))
-                                   (dolist (v (sb-debug::ambiguous-debug-vars d-fun ""))
+                                   (assert (sb-di:debug-var-info-available d-fun))
+                                   (dolist (v (sb-di:ambiguous-debug-vars d-fun ""))
                                      (assert (not (sb-debug::var-valid-in-frame-p v location frame))))
                                    (return))))))))
       (funcall
@@ -1184,13 +1329,7 @@
                                                    (function int unsigned unsigned))
                                      ptr base)
                       1)))
-          ;; For architectures that don't use LRAs, there are exactly 'n-entries'
-          ;; properly tagged interior pointers. For those which do use LRAs,
-          ;; there are at least that many, because we allow pointing to LRAs,
-          ;; but they aren't enumerable so we don't know the actual count.
-          (assert (#+(or x86 x86-64 arm64) =
-                   #-(or x86 x86-64 arm64) >
-                     (loop for ptr from (+ base (* 2 sb-vm:n-word-bytes))
+          (assert (= (loop for ptr from (+ base (* 2 sb-vm:n-word-bytes))
                            below limit count (properly-tagged-p ptr))
                      n))
           ;; Verify that the binary search algorithm for simple-fun-index works.

@@ -109,6 +109,7 @@
    ("attempt to THROW to a non-existent tag" unseen-throw-tag 1)
    ("division by zero" division-by-zero 1)
    ("Object is of the wrong type." object-not-type 2)
+   ("check-type error" check-type 3)
    ("ECASE failure" ecase-failure 2)
    ("ETYPECASE failure" etypecase-failure 2)
    ("odd number of &KEY arguments" odd-key-args 0)
@@ -132,7 +133,11 @@
    ("Sub overflow" sub-overflow2 2)
    ("Mul overflow" mul-overflow2 2)
    ("ASH overflow" ash-overflow2 2)
-   ("Negate overflow" negate-overflow 1))
+   ("Negate overflow" negate-overflow 1)
+   ("FILL-POINTER error" fill-pointer 1)
+   ("MPRINT" mprint 1)
+   ("Operation not of type" op-not-type2 2)
+   ("Operation not of type" op-not-type1 1))
   ;; (II) All the type specifiers X for which there is a unique internal
   ;;      error code corresponding to a primitive object-not-X-error.
   function
@@ -244,9 +249,11 @@
   ((or index list) object-not-index-or-list)
   condition
   sb-pcl::fast-method-call
-  ((or symbol string) object-not-or-symbol-string)
+  ((or symbol string) object-not-symbol-or-string)
+  ((or symbol string character) object-not-string-designator)
   ((and unsigned-byte fixnum) object-not-unsigned-fixnum)
-  bit-index))
+  bit-index
+  ((vector t) object-not-vector-t)))
 
 (defun error-number-or-lose (name)
   (or (position name sb-c:+backend-internal-errors+

@@ -24,12 +24,7 @@
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(progn
                   (defconstant ,offset-sym ,offset)
-                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-             `(defglobal ,name
-                  (list ,@(mapcar #'(lambda (name)
-                                      (symbolicate name "-OFFSET")) regs)))))
+                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg nl0 0)
   (defreg nl1 1)
@@ -50,24 +45,22 @@
   (defreg r5 15)
   (defreg r6 16)
   (defreg r7 17)
-  (defreg #-darwin r8 #+darwin reserved 18)
+  ;; x18 is reserved on Darwin (macOS) and Windows (TEB pointer)
+  (defreg #-(or darwin win32) r8 #+(or darwin win32) reserved 18)
   (defreg r9 19)
 
-  (defreg #+darwin r8 #-darwin r10 20)
-  #+sb-thread
-  (defreg thread 21)
-  #-sb-thread
-  (defreg r11 21)
+  (defreg r10 20)
+  (defreg #+sb-thread thread #-sb-thread r11 21)
 
   (defreg lexenv 22)
 
   (defreg nargs 23)
   (defreg nfp 24)
   (defreg ocfp 25)
-  (defreg cfp 26)
+  (defreg null 26)
   (defreg csp 27)
   (defreg cardtable 28) ; preserved across C calls
-  (defreg null 29)
+  (defreg cfp 29)
   (defreg lr 30)
   (defreg nsp 31)
   (defreg zr 31)
@@ -76,7 +69,7 @@
       null cfp nsp lr)
 
   (defregset descriptor-regs
-      r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 #-darwin r10 #-sb-thread r11 lexenv)
+      r0 r1 r2 r3 r4 r5 r6 r7 #-(or darwin win32) r8 r9 r10 #-sb-thread r11 lexenv)
 
   ;; nl9 can't be selected by PACK as it is a freely usable temp reg
   (defregset non-descriptor-regs
@@ -84,7 +77,7 @@
 
   (defregset boxed-regs
       r0 r1 r2 r3 r4 r5 r6
-      r7 r8 r9 #-darwin r10 #-sb-thread r11 lexenv)
+      r7 #-(or darwin win32) r8 r9 r10 #-sb-thread r11 lexenv)
 
   ;; registers used to pass arguments
   ;;
@@ -92,8 +85,8 @@
   (defconstant register-arg-count 4)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2 r3)
-  (defparameter *register-arg-names* '(r0 r1 r2 r3))
-  (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 r8 r9)
+  (defconstant-eqx register-arg-names '(r0 r1 r2 r3) #'equal)
+  (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 #-(or darwin win32) r8 r9 r10)
   (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8)
   (defglobal *float-regs* (loop for i below 32 collect i)))
 
@@ -203,15 +196,18 @@
               :save-p t
               :alternate-scs (double-stack))
 
+  (complex-single-immediate immediate-constant)
+  (complex-double-immediate immediate-constant)
+
   (complex-single-reg float-registers
                       :locations #.(loop for i below 32 collect i)
-                      :constant-scs ()
+                      :constant-scs (complex-single-immediate)
                       :save-p t
                       :alternate-scs (complex-single-stack))
 
   (complex-double-reg float-registers
                       :locations #.(loop for i below 32 collect i)
-                      :constant-scs ()
+                      :constant-scs (complex-double-immediate)
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
@@ -225,9 +221,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defglobal ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn null descriptor-reg)
   (defregtn lexenv descriptor-reg)
@@ -243,6 +237,9 @@
   (defregtn lr any-reg)
   #+sb-thread
   (defregtn thread any-reg))
+
+(defglobal wzr-tn (make-random-tn (sc-or-lose '32-bit-reg) zr-offset))
+
 
 ;;; If VALUE can be represented as an immediate constant, then return the
 ;;; appropriate SC number, otherwise return NIL.
@@ -261,6 +258,10 @@
      double-immediate-sc-number)
     (single-float
      single-immediate-sc-number)
+    ((complex double-float)
+     complex-double-immediate-sc-number)
+    ((complex single-float)
+     complex-single-immediate-sc-number)
     (structure-object
      (when (eq value sb-lockless:+tail+)
        immediate-sc-number))))
@@ -269,10 +270,6 @@
   (eql sc immediate-sc-number))
 
 ;;;; function call parameters
-
-;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)
@@ -286,11 +283,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This function is called by debug output routines that want a pretty name
@@ -320,9 +315,7 @@
   nil)
 
 (defun 32-bit-reg (tn)
-  (make-random-tn :kind :normal
-                  :sc (sc-or-lose '32-bit-reg)
-                  :offset (tn-offset tn)))
+  (make-random-tn (sc-or-lose '32-bit-reg) (tn-offset tn)))
 
 ;;; null-tn will be used for setting it, just check the lowtag
 #+sb-thread

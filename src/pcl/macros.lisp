@@ -26,7 +26,7 @@
 
 (in-package "SB-PCL")
 
-(defglobal *optimize-speed*
+(define-load-time-global *optimize-speed*
   '(optimize (speed 3) (safety 0) (sb-ext:inhibit-warnings 3) (debug 0)))
 
 (declaim (declaration
@@ -70,9 +70,11 @@
                            (or (condition-classoid-p classoid)
                                (defstruct-classoid-p classoid)))
                   (ensure-non-standard-class symbol classoid))))))
-      (when errorp
+
+      (progn
         (check-class-name symbol)
-        (error 'class-not-found-error :name symbol))))
+        (when errorp
+          (error 'class-not-found-error :name symbol)))))
 
 (defun find-class (symbol &optional (errorp t) environment)
   (declare (ignore environment) (explicit-check))
@@ -123,17 +125,37 @@
          (aver (constantp slot-name env))
          `(funcall #',(funcall gf-nameize (constant-form-value slot-name env))
                    ,@newval ,object)))
-  (defmacro accessor-slot-boundp (object slot-name &environment env)
+  (defun accessor-slot-boundp (object slot-name)
+    (slot-boundp object slot-name))
+  (define-compiler-macro accessor-slot-boundp (object slot-name &environment env)
+    (aver (constantp slot-name env))
+    `(slot-boundp ,object ',(constant-form-value slot-name env)))
+  (defmacro %accessor-slot-boundp (object slot-name &environment env)
     (call-gf 'slot-boundp-name object slot-name env))
 
-  (defmacro accessor-slot-makunbound (object slot-name &environment env)
+  (defun accessor-slot-makunbound (object slot-name)
+    (slot-makunbound object slot-name))
+  (define-compiler-macro accessor-slot-makunbound (object slot-name &environment env)
+    (aver (constantp slot-name env))
+    `(slot-makunbound ,object ',(constant-form-value slot-name env)))
+  (defmacro %accessor-slot-makunbound (object slot-name &environment env)
     (call-gf 'slot-makunbound-name object slot-name env))
 
-  (defmacro accessor-slot-value (object slot-name &environment env)
+  (defun accessor-slot-value (object slot-name)
+    (slot-value object slot-name))
+  (define-compiler-macro accessor-slot-value (object slot-name &environment env)
+    (aver (constantp slot-name env))
+    `(slot-value ,object ',(constant-form-value slot-name env)))
+  (defmacro %accessor-slot-value (object slot-name &environment env)
     `(truly-the (values t &optional)
                 ,(call-gf 'slot-reader-name object slot-name env)))
 
-  (defmacro accessor-set-slot-value (object slot-name new-value &environment env)
+  (defun accessor-set-slot-value (object slot-name new-value)
+    (setf (slot-value object slot-name) new-value))
+  (define-compiler-macro accessor-set-slot-value (object slot-name new-value &environment env)
+    (aver (constantp slot-name env))
+    `(set-slot-value ,object ',(constant-form-value slot-name env) ,new-value))
+  (defmacro %accessor-set-slot-value (object slot-name new-value &environment env)
     ;; Expand NEW-VALUE before deciding not to bind a temp var for OBJECT,
     ;; which should be eval'd first. We skip the binding if either new-value
     ;; is constant or a plain variable. This is still subtly wrong if NEW-VALUE

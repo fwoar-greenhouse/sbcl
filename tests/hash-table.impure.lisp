@@ -38,12 +38,14 @@
 (with-test (:name (hash-table :eql-hash-symbol-not-eq-based))
   ;; If you ask for #'EQ as the test, then everything is address-sensitive,
   ;; though this is not technically a requirement.
-  (let ((ht (make-hash-table :test 'eq)))
+  (let ((ht (make-hash-table :test 'eq :size 128)))
+    (assert (not (sb-impl::flat-hash-table-p ht)))
     (setf (gethash (make-symbol "GOO") ht) 1)
     (assert (is-address-sensitive ht)))
   ;; EQUAL tables don't use SYMBOL-HASH
   (dolist (test '(eql equalp))
-    (let ((ht (make-hash-table :test test)))
+    (let ((ht (make-hash-table :test test :size 128)))
+      (assert (not (sb-impl::flat-hash-table-p ht)))
       (setf (gethash (make-symbol "GOO") ht) 1)
       (assert (not (is-address-sensitive ht))))))
 
@@ -51,12 +53,14 @@
 
 (with-test (:name (hash-table :equal-hash-std-object-not-eq-based))
   (dolist (test '(eq eql))
-    (let ((ht (make-hash-table :test test)))
+    (let ((ht (make-hash-table :test test :size 128)))
+      (assert (not (sb-impl::flat-hash-table-p ht)))
       (setf (gethash (make-instance 'ship) ht) 1)
       (assert (is-address-sensitive ht))))
   ;; EQUAL tables don't use INSTANCES-SXHASH
   (dolist (test '(equalp))
-    (let ((ht (make-hash-table :test test)))
+    (let ((ht (make-hash-table :test test :size 128)))
+      (assert (not (sb-impl::flat-hash-table-p ht)))
       (setf (gethash (make-instance 'ship) ht) 1)
       (assert (not (is-address-sensitive ht))))))
 
@@ -83,7 +87,9 @@
             :skipped-on (or :mark-region-gc :gc-stress))
   (let ((h (make-hash-table :weakness :key)))
     (setq *gc-after-rehash-me* h)
-    (dotimes (i 50) (setf (gethash (list (gensym)) h) i))
+    (dotimes (i 50)
+      (setf (gethash (list (gensym)) h) i)
+      (assert (is-address-sensitive h)))
     (setf (gethash (cons 1 2) h) 'foolz))
   (assert (>= *rehash+gc-count* 10)))
 
@@ -179,6 +185,11 @@
             do (setf (aref pairs i) i))) ; highly illegal!
     ;; try to find an address-sensitive key
     (assert (not (gethash '(foo) tbl)))
+    ;; Address-sensitivity is sticky.
+    (assert (= (vector-flag-bits (sb-impl::hash-table-pairs tbl))
+               (+ sb-vm:vector-addr-hashing-flag
+                  sb-vm:vector-hashing-flag)))
+    (clrhash tbl)
     (assert (= (vector-flag-bits (sb-impl::hash-table-pairs tbl))
                ;; Table is no longer address-sensitive
                sb-vm:vector-hashing-flag))))
@@ -214,7 +225,7 @@
     (with-locked-hash-table (h) (setf (gethash 'foo h) 1))))
 
 (with-test (:name :hash-table-iterator-no-notes
-                  :fails-on (:or :arm :ppc :ppc64))
+                  :fails-on (:or :arm :ppc :ppc64 :loongarch64 :riscv :sparc :mips))
   (let ((f
          (checked-compile
           '(lambda (h)
@@ -258,3 +269,22 @@
           (if (/= 0 (svref (sb-impl::hash-table-pairs table) 1))
               (format t "~S wants rehash~%" table)
               (error "~S should be marked for rehash" table)))))))
+
+(with-test (:name :clrhash-empty-weak-table)
+  (let ((ht (make-hash-table :weakness :key)))
+    (loop repeat 3
+          do
+          (clrhash ht)
+          (dotimes (i 100)
+            (setf (gethash (list i) ht) i))
+          (sb-sys:scrub-control-stack)
+          (sb-ext:gc :full t))))
+
+(with-test (:name :hash-table-equalp)
+  (assert (equalp (opaque-identity (make-hash-table :rehash-threshold 0.3))
+                  (opaque-identity (make-hash-table :rehash-threshold 0.9))))
+  ;; general-hash-table vs hash-table
+  (assert (equalp (opaque-identity (make-hash-table :rehash-threshold 0.3))
+                  (opaque-identity (make-hash-table))))
+  (equalp (opaque-identity (make-hash-table :weakness :key))
+          (opaque-identity (make-hash-table))))

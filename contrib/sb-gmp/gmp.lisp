@@ -97,17 +97,15 @@
 
 ;;; types and initialization
 
-(define-alien-type gmp-limb
-  #-(and win32 x86-64) unsigned-long
-  #+(and win32 x86-64) unsigned-long-long)
+(define-alien-type gmp-limb word)
 
 (deftype ui ()
-  #-(and win32 x86-64) 'sb-vm:word
-  #+(and win32 x86-64) '(unsigned-byte 32))
+  #-(and win32 64-bit) 'sb-vm:word
+  #+(and win32 64-bit) '(unsigned-byte 32))
 
 (deftype si ()
-  #-(and win32 x86-64) 'sb-vm:signed-word
-  #+(and win32 x86-64) '(signed-byte 32))
+  #-(and win32 64-bit) 'sb-vm:signed-word
+  #+(and win32 64-bit) '(signed-byte 32))
 
 (define-alien-type nil
     (struct gmpint
@@ -345,7 +343,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 (defmacro with-mpz-results (pairs &body body)
   (loop for (gres size) in pairs
         for res = (gensym "RESULT")
-        collect `(when (> ,size sb-kernel:maximum-bignum-length)
+        collect `(when (> ,size sb-bignum:maximum-bignum-length)
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,gres (struct gmpint)) into declares
         collect `(,res (allocate-bignum ,size))
@@ -405,7 +403,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
         collect `(__gmpz_init (addr ,gres)) into inits
         collect `(,size (abs (slot ,gres 'mp_size)))
           into resinits
-        collect `(when (> ,size (1- sb-kernel:maximum-bignum-length))
+        collect `(when (> ,size (1- sb-bignum:maximum-bignum-length))
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,res (allocate-bignum (1+ ,size)))
           into resallocs

@@ -390,12 +390,6 @@ uid_homedir(uid_t uid)
  * variable locations change between compile time and run time.)
  */
 
-char **
-wrapped_environ()
-{
-    return environ;
-}
-
 #ifdef LISP_FEATURE_WIN32
 #include <windows.h>
 #include <time.h>
@@ -549,7 +543,8 @@ void sb_nanosleep_float(float seconds) {
 }
 #endif
 
-#ifdef LISP_FEATURE_NETBSD
+/* 64-bit timeval */
+#if !defined(LISP_FEATURE_64_BIT) || defined (LISP_FEATURE_NETBSD)
 /* These thin wrappers are needed due to "linker rewriting"
  * acording to git revision 9304704f68 */
 int sb_getrusage(int who, struct rusage *rusage)
@@ -615,5 +610,9 @@ SB_TRIG_WRAPPER(atanh)
 double sb_hypot (double x, double y) {
     return hypot(x, y);
 }
-
+double sb_hypotf (double x, double y) {
+    return hypotf(x, y);
+}
 #endif
+
+int sb_fileno(FILE* f) { return fileno(f); } // might be a C macro

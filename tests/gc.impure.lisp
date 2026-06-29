@@ -16,7 +16,7 @@
 (defvar *weak-vect* (make-weak-vector 8))
 (defmacro wvref (v i) `(sb-int:weak-vector-ref ,v ,i))
 (with-test (:name :weak-vector
-            :fails-on :win32)
+            :fails-on (and :c-stack-is-control-stack :win32))
   (let ((a *weak-vect*)
         (random-symbol (make-symbol "FRED")))
     (flet ((x ()
@@ -103,7 +103,7 @@
       (assert (= (aref a (1+ i)) (1+ (aref a i)))))))
 
 (with-test (:name :list-allocated-objects
-            :skipped-on :weak-vector-readbarrier) ; uses more weak-pointers
+            :skipped-on (or :sb-cover-for-internals :weak-vector-readbarrier)) ; uses more weak-pointers
   ;; Assert that if :COUNT is supplied as a higher number
   ;; than number of objects that exists, the output is
   ;; not COUNT many items long.
@@ -168,10 +168,10 @@
     (assert (= (sb-kernel:generation-of (sb-int:find-fdefn '(setf car)))
                (sb-kernel:generation-of #'car)))))
 
-(with-test (:name :static-fdefn-space)
+(with-test (:name :static-fdefn-space :skipped-on :linkage-space)
   (sb-int:dovector (name sb-vm:+static-fdefns+)
     (assert (eq (sb-ext:heap-allocated-p (sb-int:find-fdefn name))
-                (or #+(and immobile-code x86-64) :immobile :static)))))
+                :static))))
 
 ;;; SB-EXT:GENERATION-* accessors returned bogus values for generation > 0
 (with-test (:name :bug-529014)
@@ -302,7 +302,7 @@
   (assert (not (sb-kernel:immobile-space-addr-p
                 (+ sb-vm:fixedobj-space-start
                    sb-vm:fixedobj-space-size
-                   sb-vm:alien-linkage-table-space-size
+                   sb-vm:alien-linkage-space-size
                    sb-vm:text-space-size)))))
 
 (with-test (:name :unique-code-serialno :skipped-on :interpreter)
@@ -311,6 +311,9 @@
      (lambda (obj type size)
        (declare (ignore size))
        (when (and (= type sb-vm:code-header-widetag)
+                  ;; ppc64 allocates unusual-looking code when binding a
+                  ;; closure or funinstance to a global function name.
+                  #+ppc64 (sb-kernel:%instancep (sb-kernel:%code-debug-info obj))
                   (plusp (sb-kernel:code-n-entries obj)))
          (let ((serial (sb-kernel:%code-serialno obj)))
            (assert (zerop (aref a serial)))
@@ -419,7 +422,7 @@
                              #+win32
                              (alien-funcall (extern-alien "Sleep" (function void int))  300)
                              #-win32
-                             (alien-funcall (extern-alien "sb_nanosleep" (function void int int)) 0 300000000)
+                             (alien-funcall (extern-alien "sb_nanosleep" (function void sb-unix:time-t int)) 0 300000000)
                              (values a b c d e f g h i j k l m))))
          (thr (sb-thread:make-thread (lambda ()
                                        (let ((args #1=(list (LIST 'A) (LIST 'B) (LIST 'C)
@@ -526,8 +529,13 @@
            (assert (= (sb-sys:sap-ref-word sap (ash i sb-vm:word-shift)))))))))
 
 (with-test (:name :rospace-strings
-                  :fails-on :darwin-jit)
+                  :fails-on (or :darwin-jit :sparc))
   (let ((err (handler-case (setf (char (opaque-identity (symbol-name '*readtable*)) 0) #\*)
                (sb-sys:memory-fault-error (c)
                  (write-to-string c :escape nil)))))
     (assert (search "modify a read-only object" err))))
+
+(with-test (:name :time-measures
+            :skipped-on (:not (:and (:or :linux :darwin) :sb-thread)))
+  (assert (plusp (sb-thread::thread-sum-stw-pause sb-thread:*current-thread*)))
+  (assert (plusp (sb-thread::thread-gc-virtual-time sb-thread:*current-thread*))))

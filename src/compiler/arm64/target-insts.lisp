@@ -275,31 +275,73 @@
                        "2D"))))
       (destructuring-bind (q immh offset) value
         (format stream "V~d.~a" offset
-                (cond ((logbitp 0 immh)
+                (cond ((= immh 1)
                        (if (zerop q)
                            "8B"
                            "16B"))
-                      ((logbitp 1 immh)
+                      ((= (ash immh -1) 1)
                        (if (zerop q)
                            "4H"
                            "8H"))
-                      ((logbitp 2 immh)
+                      ((= (ash immh -2) 1)
                        (if (zerop q)
                            "2S"
-                           "4S")))))))
+                           "4S"))
+                      ((= (ash immh -3) 1)
+                       "2D"))))))
+
+(defun print-simd-immh-shift-right (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (immh immb) value
+    (let ((imm (logior (ash immh 3) immb)))
+      (format stream "#~a" (- (ash 1 (1- (integer-length imm)))
+                              (ldb (byte (1- (integer-length imm)) 0)
+                                   imm))))))
+(defun print-simd-immh-shift-left (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (immh immb) value
+    (let ((imm (logior (ash immh 3) immb)))
+      (format stream "#~a" (ldb (byte (1- (integer-length imm)) 0)
+                                imm)))))
 
 (defun print-simd-reg-cmode (value stream dstate)
   (declare (ignore dstate))
-  (destructuring-bind (q cmode offset) value
+  (destructuring-bind (q cmode offset op) value
     (format stream "V~d.~a" offset
             (cond ((eq cmode #b1110)
+                   (if (eq op 1)
+                       (if (zerop q)
+                           ""
+                           "2D")
+                       (if (zerop q)
+                           "8B"
+                           "16B")))
+                  ((eq (logandc2 cmode #b10) #b1000)
                    (if (zerop q)
-                       "8B"
-                       "16B"))
+                       "4H"
+                       "8H"))
                   ((zerop (logand cmode #b1001))
                    (if (zerop q)
                        "2S"
                        "4S"))))))
+
+(defun print-simd-table-regs (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (len offset) value
+    (format stream "{")
+    (loop for i to len
+          do (format stream " V~d.16B" (+ i offset))
+             (unless (= i len)
+               (write-char #\, stream)))
+    (format stream " }")))
+
+(defun print-simd-b-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (q offset) value
+    (format stream "V~d.~a" offset
+            (if (zerop q)
+                "8B"
+                "16B"))))
 
 (defun print-simd-modified-imm (value stream dstate)
   (declare (ignore dstate))
@@ -308,7 +350,8 @@
             (cond ((eq cmode #b1110)
                    0)
                   ((zerop (logand cmode #b1001))
-                   (ash cmode 2)))))
+                   (ash cmode 2))
+                  (t 0))))
       (princ (dpb abc (byte 3 5) defgh) stream)
       (when (plusp shift)
         (format stream ", LSL #~d" shift)))))
@@ -399,6 +442,31 @@
              (if imm4
                  (ash imm4 (- index))
                  (ash imm5 (- (1+ index))))))))
+
+(defun print-simd-dup-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (offset q imm5) value
+    (format stream "V~d.~a" offset
+            (cond ((= imm5 #b1)
+                   (if (zerop q)
+                       "8B"
+                       "16B"))
+                  ((= imm5 #b10)
+                   (if (zerop q)
+                       "4H"
+                       "8H"))
+                  ((= imm5 #b100)
+                   (if (zerop q)
+                       "2S"
+                       "4S"))
+                  ((= imm5 #b1000)
+                   "2D")))))
+
+(defun print-simd-float-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (q size offset) value
+    (format stream "V~d.~a" offset
+            (decode-vector-size q (logior #b10 size)))))
 
 (defun print-sys-reg (value stream dstate)
   (declare (ignore dstate))
@@ -505,7 +573,8 @@
   (let* ((inst (current-instruction dstate))
          (float (ldb-test (byte 1 26) inst)))
     (unless float
-      (let ((value (find-value-from-previous-inst value dstate)))
+      (let ((value (and (seg-code (sb-disassem:dstate-segment dstate))
+                        (find-value-from-previous-inst value dstate))))
         (when value
           (annotate-ldr-str (ldb (byte 5 5) inst) value dstate))))))
 
@@ -541,6 +610,20 @@
                        (format stream "~(~a~).{free-pointer, end-addr}" (slot-name slot1))
                        (format stream "~(~A, ~A~)" (slot-name slot1) (slot-name slot2))))
                  dstate)))))))
+
+(defun print-stlxr/ldaxr-mnemonic (dchunk inst stream dstate)
+  (declare (ignore dstate))
+  ;; SIZE can't be constrained in the :PRINTER spec because there are two
+  ;; different values that should print the same. Also, we're printing the wrong
+  ;; size for 4 byte because 32-BIT-REGISTER-P tests bit index 31, but it's index 30
+  ;; that distinguishes those two cases. The 2-bit field would probably need to
+  ;; become two 1-bit fields to correct the disassembly.
+  (let ((suffix (case (ldb (byte 2 30) dchunk)
+                  (#b00 "B")
+                  (#b01 "H")
+                  (t ""))))
+    (when stream
+      (format stream "~A~A" (sb-disassem::inst-print-name inst) suffix))))
 
 (defun annotate-ldr-literal (value stream dstate)
   (declare (ignore stream))

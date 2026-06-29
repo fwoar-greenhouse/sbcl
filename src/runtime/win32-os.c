@@ -41,7 +41,6 @@
 #include "lispregs.h"
 #include "runtime.h"
 #include "genesis/primitive-objects.h"
-#include "dynbind.h"
 
 #include <sys/types.h>
 #include <sys/time.h>
@@ -84,6 +83,8 @@ typedef WCHAR console_char;
 typedef CHAR console_char;
 #endif
 
+int sb_GetTID() { return GetCurrentThreadId(); }
+
 /* The exception handling function looks like this: */
 EXCEPTION_DISPOSITION handle_exception(EXCEPTION_RECORD *,
                                        struct lisp_exception_frame *,
@@ -114,7 +115,9 @@ static void set_seh_frame(void *frame)
 
 void alloc_gc_page()
 {
-#ifndef LISP_FEATURE_64_BIT // 64-bit uses the page below the card mark table
+#ifndef LISP_FEATURE_64_BIT
+    // 32-bit: reserve and commit safepoint page.
+    // 64-bit x86-64: allocated as part of static space (extra_above in x86-64-arch.c).
     gc_assert(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                            MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
 #endif
@@ -143,179 +146,21 @@ void alloc_gc_page()
  */
 void map_gc_page()
 {
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
     DWORD oldProt;
     gc_assert(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                              PAGE_READWRITE, &oldProt));
+#endif
 }
 
 void unmap_gc_page()
 {
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
     DWORD oldProt;
     gc_assert(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                              PAGE_NOACCESS, &oldProt));
+#endif
 }
-
-/* This feature has already saved me more development time than it
- * took to implement.  In its current state, ``dynamic RT<->core
- * linking'' is a protocol of initialization of C runtime and Lisp
- * core, populating SBCL linkage table with entries for runtime
- * "foreign" symbols that were referenced in cross-compiled code.
- *
- * How it works: a sketch
- *
- * Last Genesis (resulting in cold-sbcl.core) binds foreign fixups in
- * x-compiled lisp-objs to sequential addresses from the beginning of
- * linkage-table space; that's how it ``resolves'' foreign references.
- * Obviously, this process doesn't require pre-built runtime presence.
- *
- * When the runtime loads the core (cold-sbcl.core initially,
- * sbcl.core later), runtime should do its part of the protocol by (1)
- * traversing a list of ``runtime symbols'' prepared by Genesis and
- * dumped as a static symbol value, (2) resolving each name from this
- * list to an address (stubbing unresolved ones with
- * undefined_alien_address or undefined_alien_function), (3) adding an
- * entry for each symbol somewhere near the beginning of linkage table
- * space (location is provided by the core).
- *
- * The implementation of the part described in the last paragraph
- * follows. C side is currently more ``hackish'' and less clear than
- * the Lisp code; OTOH, related Lisp changes are scattered, and some
- * of them play part in complex interrelations -- beautiful but taking
- * much time to understand --- but my subset of PE-i386 parser below
- * is in one place (here) and doesn't have _any_ non-trivial coupling
- * with the rest of the Runtime.
- *
- * What do we gain with this feature, after all?
- *
- * One things that I have to do rather frequently: recompile and
- * replace runtime without rebuilding the core. Doubtlessly, slam.sh
- * was a great time-saver here, but relinking ``cold'' core and bake a
- * ``warm'' one takes, as it seems, more than 10x times of bare
- * SBCL.EXE build time -- even if everything is recompiled, which is
- * now unnecessary. Today, if I have a new idea for the runtime,
- * getting from C-x C-s M-x ``compile'' to fully loaded SBCL
- * installation takes 5-15 seconds.
- *
- * Another thing (that I'm not currently using, but obviously
- * possible) is delivering software patches to remote system on
- * customer site. As you are doing minor additions or corrections in
- * Lisp code, it doesn't take much effort to prepare a tiny ``FASL
- * bundle'' that rolls up your patch, redumps and -- presto -- 100MiB
- * program is fixed by sending and loading a 50KiB thingie.
- *
- * However, until LISP_FEATURE_ALIEN_LINKAGE_TABLE, if your bug were fixed
- * by modifying two lines of _C_ sources, a customer described above
- * had to be ready to receive and reinstall a new 100MiB
- * executable. With the aid of code below, deploying such a fix
- * requires only sending ~300KiB (when stripped) of SBCL.EXE.
- *
- * But there is more to it: as the common linkage-table is used for
- * DLLs and core, its entries may be overridden almost without a look
- * into SBCL internals. Therefore, ``patching'' C runtime _without_
- * restarting target systems is also possible in many situations
- * (it's not as trivial as loading FASLs into a running daemon, but
- * easy enough to be a viable alternative if any downtime is highly
- * undesirable).
- *
- * During my (rather limited) commercial Lisp development experience
- * I've already been through a couple of situations where such
- * ``deployment'' issues were important; from my _total_ programming
- * experience I know -- _sometimes_ they are a two orders of magnitude
- * more important than those I observed.
- *
- * The possibility of entire runtime ``hot-swapping'' in running
- * process is not purely theoretical, as it could seem. There are 2-3
- * problems whose solution is not obvious (call stack patching, for
- * instance), but it's literally _nothing_ if compared with
- * e.g. LISP_FEATURE_SB_AUTO_FPU_SWITCH.  By the way, one of the
- * problems with ``hot-swapping'', that could become a major one in
- * many other environments, is nonexistent in SBCL: we already have a
- * ``global quiesce point'' that is generally required for this kind
- * of worldwide revolution -- around collect_garbage.
- *
- * If we look at the majority of the ``new style'' code units, it's a
- * common thing to observe how #+-ifdeffery _vanishes_ instead of
- * multiplying: #-sb-xc, #+sb-xc-host and #-sb-xc-host end up
- * needing the same code. Runtime checks of static v. dynamic symbol
- * disappear even faster. STDCALL mangling and leading underscores go
- * out of scope (and GCed, hopefully) instead of surfacing here and
- * there as a ``special case for core static symbols''. What I like
- * the most about CL development in general is a frequency of solving
- * problems and fixing bugs by simplifying code and dropping special
- * cases.
- *
- * Last important thing about the following code: besides resolving
- * symbols provided by the core itself, it detects runtime's own
- * build-time prerequisite DLLs. Any symbol that is unresolved against
- * the core is looked up in those DLLs (normally kernel32, msvcrt,
- * ws2_32... I could forget something). This action (1) resembles
- * implementation of foreign symbol lookup in SBCL itself, (2)
- * emulates shared library d.l. facilities of OSes that use flat
- * dynamic symbol namespace (or default to it). Anyone concerned with
- * portability problems of this PE-i386 stuff below will be glad to
- * hear that it could be ported to most modern Unices _by deletion_:
- * raw dlsym() with null handle usually does the same thing that i'm
- * trying to squeeze out of MS Windows by the brute force.
- *
- * My reason for _desiring_ flat symbol namespace, populated from
- * link-time dependencies, is avoiding any kind of ``requested-by-Lisp
- * symbol lists to be linked statically'', providing core v. runtime
- * independence in both directions. Minimizing future maintenance
- * effort is very important; I had gone for it consistently, starting
- * by turning "CloseHandle@4" into a simple "CloseHandle", continuing
- * by adding intermediate Genesis resulting in autogenerated symbol
- * list (farewell, void scratch(); good riddance), going to take
- * another great step for core/runtime independence... and _without_
- * flat namespace emulation, the ghosts and spirits exiled at the
- * first steps would come and take revenge: well, here are the symbols
- * that are really in msvcrt.dll.. hmm, let's link statically against
- * them, so the entry is pulled from the import library.. and those
- * entry has mangled names that we have to map.. ENOUGH, I though
- * here: fed up with stuff like that.
- *
- * Now here we are, without import libraries, without mangled symbols,
- * and without nm-generated symbol tables. Every symbol exported by
- * the runtime is added to SBCL.EXE export directory; every symbol
- * requested by the core is looked up by GetProcAddress for SBCL.EXE,
- * falling back to GetProcAddress for MSVCRT.dll, etc etc.. All ties
- * between SBCL's foreign symbols with object file symbol tables,
- * import libraries and other pre-linking symbol-resolving entities
- * _having no representation in SBCL.EXE_ were teared.
- *
- * This simplistic approach proved to work well; there is only one
- * problem introduced by it, and rather minor: in real MSVCRT.dll,
- * what's used to be available as open() is now called _open();
- * similar thing happened to many other `lowio' functions, though not
- * every one, so it's not a kind of name mangling but rather someone's
- * evil creative mind in action.
- *
- * When we look up any of those poor `uglified' functions in CRT
- * reference on MSDN, we can see a notice resembling this one:
- *
- * `unixishname()' is obsolete and provided for backward
- * compatibility; new standard-compliant function, `_unixishname()',
- * should be used instead.  Sentences of that kind were there for
- * several years, probably even for a decade or more (a propos,
- * MSVCRT.dll, as the name to link against, predates year 2000, so
- * it's actually possible). Reasoning behing it (what MS people had in
- * mind) always seemed strange to me: if everyone uses open() and that
- * `everyone' is important to you, why rename the function?  If no one
- * uses open(), why provide or retain _open() at all? <kidding>After
- * all, names like _open() are entirely non-informative and just plain
- * ugly; compare that with CreateFileW() or InitCommonControlsEx(),
- * the real examples of beauty and clarity.</kidding>
- *
- * Anyway, if the /standard/ name on Windows is _open() (I start to
- * recall, vaguely, that it's because of _underscore names being
- * `reserved to system' and all other ones `available for user', per
- * ANSI/ISO C89) -- well, if the /standard/ name is _open, SBCL should
- * use it when it uses MSVCRT and not some ``backward-compatible''
- * stuff. Deciding this way, I added a hack to SBCL's syscall macros,
- * so "[_]open" as a syscall name is interpreted as a request to link
- * agains "_open" on win32 and "open" on every other system.
- *
- * Of course, this name-parsing trick lacks conceptual clarity; we're
- * going to get rid of it eventually. */
 
 uint32_t os_get_build_time_shared_libraries(uint32_t excl_maximum,
                                        void* opt_root,
@@ -428,14 +273,41 @@ void* os_dlsym_default(char* name)
 {
     unsigned int i;
     void* result = 0;
+
     buildTimeImages[0] = (void*)runtime_module_handle;
     if (buildTimeImageCount == 0) {
         buildTimeImageCount =
             1 + os_get_build_time_shared_libraries(15u,
-            NULL, 1+(void**)buildTimeImages, NULL);
+                                                   NULL, 1+(void**)buildTimeImages, NULL);
     }
     for (i = 0; i<buildTimeImageCount && (!result); ++i) {
         result = GetProcAddress(buildTimeImages[i], name);
+    }
+    return result;
+}
+BOOL K32EnumProcessModules(HANDLE  hProcess, HMODULE *lphModule, DWORD cb, LPDWORD lpcbNeeded);
+
+void* sb_dlsym(char* name)
+{
+    unsigned int i;
+    void* result = 0;
+
+    if ((result = GetProcAddress(GetModuleHandle(NULL), name)))
+        return result;
+
+    HANDLE process = GetCurrentProcess();
+    HMODULE modules[1024];
+    DWORD needed;
+    if (K32EnumProcessModules(process, modules, sizeof(modules), &needed)) {
+        DWORD fetched = (needed / sizeof(HMODULE));
+
+        if (fetched > sizeof(modules))
+            fetched = sizeof(modules);
+
+        for (i = 0; i < fetched; i++) {
+            if ((result = GetProcAddress(modules[i], name)))
+                return result;
+        }
     }
     return result;
 }
@@ -637,71 +509,35 @@ typedef struct _UNWIND_INFO {
   ULONG ExceptionData[1];
 } UNWIND_INFO;
 
-struct win64_seh_data {
-    uint8_t direct_thunk[8];
-    uint8_t indirect_thunk[8];
-    uint8_t handler_trampoline[16];
-    UNWIND_INFO ui; // needs to be DWORD-aligned
-    RUNTIME_FUNCTION rt;
-};
+static struct win64_seh_data { RUNTIME_FUNCTION rt; } seh_data;
 
-static void
-set_up_win64_seh_thunk(size_t page_size)
+void set_up_win64_seh_thunk(lispobj* asm_routine)
 {
-    if (page_size < sizeof(struct win64_seh_data))
-        lose("Not enough space to allocate struct win64_seh_data");
+    // TODO: make asm routines findable in cold-init
+    if (!asm_routine) return; // (though cold-init is ok w/o this exception handler)
+    gc_assert(sizeof (UNWIND_INFO) <= 16);
 
-    gc_assert(VirtualAlloc(WIN64_SEH_DATA_ADDR, page_size,
-                           MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    char* jmp_inst = (char*)(asm_routine + 1);
+    char* indirect_addr = jmp_inst + 6 + (int32_t)UNALIGNED_LOAD32(jmp_inst+2);
+    *(lispobj*)indirect_addr = (lispobj)handle_exception;
 
-    struct win64_seh_data *seh_data = (void *) WIN64_SEH_DATA_ADDR;
-    DWORD64 base = (DWORD64) seh_data;
-
-    // 'volatile' works around "warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]"
-    volatile uint8_t *dthunk = seh_data->direct_thunk;
-    dthunk[0] = 0x41; // pop r15
-    dthunk[1] = 0x5F;
-    dthunk[2] = 0xFF; // call rbx
-    dthunk[3] = 0xD3;
-    dthunk[4] = 0x41; // push r15
-    dthunk[5] = 0x57;
-    dthunk[6] = 0xC3; // ret
-    dthunk[7] = 0x90; // nop (padding)
-
-    volatile uint8_t *ithunk = seh_data->indirect_thunk;
-    ithunk[0] = 0x41; // pop r15
-    ithunk[1] = 0x5F;
-    ithunk[2] = 0xFF; // call qword ptr [rbx]
-    ithunk[3] = 0x13;
-    ithunk[4] = 0x41; // push r15
-    ithunk[5] = 0x57;
-    ithunk[6] = 0xC3; // ret
-    ithunk[7] = 0x90; // nop (padding)
-
-    volatile uint8_t *tramp = seh_data->handler_trampoline;
-    tramp[0] = 0xFF; // jmp qword ptr [rip+2]
-    tramp[1] = 0x25;
-    UNALIGNED_STORE32((void*volatile)(tramp+2), 2);
-    tramp[6] = 0x66; // 2-byte nop
-    tramp[7] = 0x90;
-    *(void **)(tramp+8) = handle_exception;
-
-    UNWIND_INFO *ui = &seh_data->ui;
+    UNWIND_INFO *ui = (void*)(indirect_addr - 16);
     ui->Version = 1;
     ui->Flags = UNW_FLAG_EHANDLER;
     ui->SizeOfProlog = 0;
     ui->CountOfCodes = 0;
     ui->FrameRegister = 0;
     ui->FrameOffset = 0;
-    ui->ExceptionHandler = (DWORD64) tramp - base;
+    ui->ExceptionHandler = jmp_inst - (char*)ui;
     ui->ExceptionData[0] = 0;
 
-    RUNTIME_FUNCTION *rt = &seh_data->rt;
-    rt->BeginAddress = 0;
-    rt->EndAddress = 16;
-    rt->UnwindData = (DWORD64) ui - base;
+    RUNTIME_FUNCTION *rt = &seh_data.rt;
+    rt->BeginAddress = (char*)asm_routine - (char*)ui;
+    rt->EndAddress = rt->BeginAddress + 16;
+    rt->UnwindData = 0;
 
-    gc_assert(RtlAddFunctionTable(rt, 1, base));
+    BOOLEAN ok = RtlAddFunctionTable(rt, 1, (DWORD64)ui);
+    gc_assert(ok);
 }
 #endif
 
@@ -789,10 +625,6 @@ void os_init()
         system_info.dwPageSize : BACKEND_PAGE_BYTES;
     os_number_of_processors = system_info.dwNumberOfProcessors;
 
-#ifdef LISP_FEATURE_X86_64
-    set_up_win64_seh_thunk(os_vm_page_size);
-#endif
-
     resolve_optional_imports();
     runtime_module_handle = (HMODULE)win32_get_module_handle_by_address(&runtime_module_handle);
 }
@@ -824,9 +656,16 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
 
     if (!actual) {
         if (!(attributes & MOVABLE)) {
-            fprintf(stderr,
-                    "VirtualAlloc: wanted %lu bytes at %p, actually mapped at %p\n",
-                    (unsigned long) len, addr, actual);
+            DWORD err = GetLastError();
+            LPSTR msg = NULL;
+            if (FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                               FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                               NULL, err, 0, (LPSTR)&msg, 0, NULL)) {
+                fprintf(stderr, "VirtualAlloc: failed to map %zu bytes at %p: %s", len, addr, msg);
+                LocalFree(msg);
+            } else {
+                fprintf(stderr, "VirtualAlloc: failed to map %zu bytes at %p: error code %lu\n", len, addr, err);
+            }
             fflush(stderr);
             return 0;
         }
@@ -840,7 +679,10 @@ os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size
 
 void os_commit_memory(os_vm_address_t addr, os_vm_size_t len)
 {
-    if (len) gc_assert(VirtualAlloc(addr, len, MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (len) {
+        gc_assert(addr);
+        gc_assert(VirtualAlloc(addr, len, MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    }
 }
 
 /*
@@ -859,28 +701,38 @@ void os_commit_memory(os_vm_address_t addr, os_vm_size_t len)
 void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len,
                       int is_readonly_space)
 {
-    os_commit_memory(addr, len);
+    if (addr) {
+        os_commit_memory(addr, len);
+    } else {
+        addr = VirtualAlloc(NULL, len, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        gc_assert(addr);
+    }
 #ifdef LISP_FEATURE_64_BIT
     os_vm_offset_t res = _lseeki64(fd, offset, SEEK_SET);
 #else
     os_vm_offset_t res = lseek(fd, offset, SEEK_SET);
 #endif
     gc_assert(res == offset);
-    size_t count;
+    int count;
 
     os_vm_address_t original_addr = addr;
     os_vm_size_t original_len = len;
     while (len) {
         unsigned to_read = len > INT_MAX ? INT_MAX : len;
         count = read(fd, addr, to_read);
+        if (count == -1) {
+            perror("read() failed"); fflush(stderr);
+        }
         addr += count;
         len -= count;
-        gc_assert(count == to_read);
+        gc_assert(count == (int) to_read);
     }
     DWORD old;
     if (is_readonly_space) VirtualProtect(original_addr, original_len, PAGE_READONLY, &old);
-    return (void*)0;
+
+    return original_addr;
 }
+
 static DWORD os_protect_modes[8] = {
     PAGE_NOACCESS,
     PAGE_READONLY,
@@ -896,7 +748,6 @@ void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
     DWORD old_prot;
-
     DWORD new_prot = os_protect_modes[prot];
     gc_assert(VirtualProtect(address, length, new_prot, &old_prot)||
               (VirtualAlloc(address, length, MEM_COMMIT, new_prot) &&
@@ -911,16 +762,19 @@ extern int internal_errors_enabled;
 
 extern void exception_handler_wrapper();
 
-#ifdef LISP_FEATURE_X86
+#if defined(LISP_FEATURE_X86)
 #define voidreg(ctxptr,name) ((void*)((ctxptr)->E##name))
-#else
+#elif defined(LISP_FEATURE_X86_64)
 #define voidreg(ctxptr,name) ((void*)((ctxptr)->R##name))
+#else // ARM64 and others. Stub out for now.
+#define voidreg(ctxptr,name) (0)
 #endif
 
 
 static int
 handle_single_step(os_context_t *ctx)
 {
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     if (!single_stepping)
         return -1;
 
@@ -929,19 +783,48 @@ handle_single_step(os_context_t *ctx)
     restore_breakpoint_from_single_step(ctx);
 
     return 0;
+#else
+    return -1;
+#endif
 }
 
-#ifdef LISP_FEATURE_UD2_BREAKPOINTS
-#define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_ILLEGAL_INSTRUCTION
-#define TRAP_CODE_WIDTH 2
-#else
-#define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_BREAKPOINT
-#define TRAP_CODE_WIDTH 1
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+  #ifdef LISP_FEATURE_UD2_BREAKPOINTS
+    #define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_ILLEGAL_INSTRUCTION
+    #define TRAP_CODE_WIDTH 2
+  #else
+    #define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_BREAKPOINT
+    #define TRAP_CODE_WIDTH 1
+  #endif
+#elif defined(LISP_FEATURE_ARM64)
+  // On Windows ARM64, BRK instructions trigger EXCEPTION_ILLEGAL_INSTRUCTION, not EXCEPTION_BREAKPOINT
+  #define SBCL_EXCEPTION_BREAKPOINT EXCEPTION_ILLEGAL_INSTRUCTION
+  #define TRAP_CODE_WIDTH 4 // ARM breakpoint instruction is 4 bytes
 #endif
 
 static int
 handle_breakpoint_trap(os_context_t *ctx, struct thread* self)
 {
+#if defined(LISP_FEATURE_ARM64)
+    uint32_t trap_instruction = *(uint32_t *)OS_CONTEXT_PC(ctx);
+    unsigned int trap;
+
+    // Check for BRK instruction format used by SBCL. The high bits are
+    // 11010100001, which is 0x6a1.
+    if ((trap_instruction >> 21) == 0x6a1) {
+        // Extract 8-bit trap code from bits 5..12 (matching sigtrap_handler on Linux)
+        trap = (trap_instruction >> 5) & 0xFF;
+    } else {
+        // Not a recognized SBCL trap, could be a debugger breakpoint
+        // or a real illegal instruction. Let other handlers deal with it.
+        return -1;
+    }
+
+    /* On ARM64, do NOT advance PC past the BRK instruction here.
+     * The Lisp-side internal-error-args reads the BRK instruction from
+     * the context PC to decode error number and arguments.
+     * PC will be advanced by arch_skip_instruction after error handling. */
+#else /* Not ARM64 */
 #ifdef LISP_FEATURE_UD2_BREAKPOINTS
     if (((unsigned short *)OS_CONTEXT_PC(ctx))[0] != 0x0b0f)
         return -1;
@@ -954,42 +837,34 @@ handle_breakpoint_trap(os_context_t *ctx, struct thread* self)
     /* Now EIP points just after the INT3 byte and aims at the
      * 'kind' value (eg trap_Cerror). */
     unsigned trap = *(unsigned char *)OS_CONTEXT_PC(ctx);
+#endif
 
     /* Before any other trap handler: gc_safepoint ensures that
        inner alloc_sap for passing the context won't trap on
        pseudo-atomic. */
     /* Now that there is no alloc_sap, I don't know what happens here. */
     if (trap == trap_PendingInterrupt) {
-        /* Done everything needed for this trap, except EIP
-           adjustment */
+        /* Advance PC past the trap instruction and any trailing data. */
         arch_skip_instruction(ctx);
+#ifdef LISP_FEATURE_ARM64
+        fake_foreign_function_call(ctx);
+#endif
         thread_interrupted(ctx);
+#ifdef LISP_FEATURE_ARM64
+        undo_fake_foreign_function_call(ctx);
+#endif
         return 0;
     }
 
+#ifndef LISP_FEATURE_ARM64
     /* This is just for info in case the monitor wants to print an
      * approximation. */
-    access_control_stack_pointer(self) =
-        (lispobj *)*os_context_sp_addr(ctx);
+    access_control_stack_pointer(self) = (lispobj *)*os_context_sp_addr(ctx);
+#endif
 
     WITH_GC_AT_SAFEPOINTS_ONLY() {
-        block_blockable_signals(&ctx->sigmask);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-        if (trap == trap_UndefinedFunction) {
-            lispobj* fdefn = (lispobj*)(OS_CONTEXT_PC(ctx) & ~LOWTAG_MASK);
-            if (fdefn && widetag_of(fdefn) == FDEFN_WIDETAG) {
-                // Return to undefined-tramp
-                OS_CONTEXT_PC(ctx) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
-                // with RAX containing the FDEFN
-                *os_context_register_addr(ctx,reg_RAX) =
-                    make_lispobj(fdefn, OTHER_POINTER_LOWTAG);
-            }
-        } else
-#endif
-        {
-            handle_trap(ctx, trap);
-        }
-        thread_sigmask(SIG_SETMASK,&ctx->sigmask,NULL);
+        block_blockable_signals(0);
+        handle_trap(ctx, trap);
     }
 
     /* Done, we're good to go! */
@@ -1015,9 +890,9 @@ handle_access_violation(os_context_t *ctx,
              win32_context->Edi,
              fault_address,
              exception_record->ExceptionInformation[0]);
-#else
+#elif defined(LISP_FEATURE_X86_64)
     odxprint(pagefaults,
-             "SEGV. ThSap %p, Eip %p, Esp %p, Esi %p, Edi %p, "
+             "SEGV. ThSap %p, Rip %p, Rsp %p, Rsi %p, Rdi %p, "
              "Addr %p Access %d\n",
              self,
              win32_context->Rip,
@@ -1026,15 +901,34 @@ handle_access_violation(os_context_t *ctx,
              win32_context->Rdi,
              fault_address,
              exception_record->ExceptionInformation[0]);
+#elif defined(LISP_FEATURE_ARM64)
+    odxprint(pagefaults,
+             "SEGV. ThSap %p, Pc %p, Sp %p, "
+             "Addr %p Access %d\n",
+             self,
+             win32_context->Pc,
+             win32_context->Sp,
+             fault_address,
+             exception_record->ExceptionInformation[0]);
 #endif
 
     /* Safepoint pages */
     if (fault_address == (void *) GC_SAFEPOINT_TRAP_ADDR) {
+#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+        /* x86/x86-64: set_csp_from_context arranges for the conservative
+         * stack scan to cover the CONTEXT, so register values are found. */
         thread_in_lisp_raised(ctx);
+#else
+        /* ARM64: separate control and C stacks.  The register context must
+         * be explicitly saved so that GC can scan Lisp register values. */
+        fake_foreign_function_call(ctx);
+        thread_in_lisp_raised(ctx);
+        undo_fake_foreign_function_call(ctx);
+#endif
         return 0;
     }
 
-    if ((1+THREAD_HEADER_SLOTS)+(lispobj*)fault_address == (lispobj*)self) {
+    if (1+(lispobj*)fault_address == (lispobj*)self) {
         thread_in_safety_transition(ctx);
         return 0;
     }
@@ -1042,7 +936,15 @@ handle_access_violation(os_context_t *ctx,
     /* dynamic space */
     page_index_t page = find_page_index(fault_address);
 #ifdef LISP_FEATURE_SOFT_CARD_MARKS
-    if (page >= 0) lose("should not get access violation in dynamic space");
+    if (page >= 0) {
+        /* With soft card marks, pages are never write-protected, so a
+         * dynamic space access violation means the page needs committing.
+         * (Windows reserves the full dynamic space but only commits pages
+         * on demand or via prepare_pages/gc_alloc_large.) */
+        os_commit_memory(PTR_ALIGN_DOWN(fault_address, os_vm_page_size),
+                         os_vm_page_size);
+        return 0;
+    }
 #else
     if (page != -1 && !PAGE_WRITEPROTECTED_P(page)) {
         os_commit_memory(PTR_ALIGN_DOWN(fault_address, os_vm_page_size),
@@ -1054,11 +956,8 @@ handle_access_violation(os_context_t *ctx,
     }
 #endif
 
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    extern int immobile_space_handle_wp_violation(void*);
-    if (immobile_space_handle_wp_violation(fault_address)) {
-        return 0;
-    }
+#ifdef LISP_FEATURE_TLS_LOAD_INDIRECT
+    if (handle_tls_deref_trap(ctx, fault_address)) return 0;
 #endif
     if (handle_guard_page_triggered(ctx, fault_address)) {
         return 0;
@@ -1066,6 +965,8 @@ handle_access_violation(os_context_t *ctx,
 
     return -1;
 }
+
+void lisp_memory_fault_warning(os_context_t *context, os_vm_address_t addr);
 
 static void
 signal_internal_error_or_lose(os_context_t *ctx,
@@ -1078,26 +979,35 @@ signal_internal_error_or_lose(os_context_t *ctx,
      * set up, or drop to LDB.
      */
 
-    if (internal_errors_enabled) {
+    if ((long int)exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        lisp_memory_fault_warning(ctx, fault_address);
+    }
 
+    if (internal_errors_enabled) {
+        /* The exception system doesn't automatically clear pending
+         * exceptions, so we lose as soon as we execute any FP
+         * instruction unless we do this first. */
+        #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
         asm("fnclex");
+#endif
         /* We're making the somewhat arbitrary decision that having
          * internal errors enabled means that lisp has sufficient
          * marbles to be able to handle exceptions, but exceptions
          * aren't supposed to happen during cold init or reinit
          * anyway. */
-
-        block_blockable_signals(&ctx->sigmask);
+        sigset_t oldmask;
+        block_blockable_signals(&oldmask);
         fake_foreign_function_call(ctx);
 
         WITH_GC_AT_SAFEPOINTS_ONLY() {
             DX_ALLOC_SAP(context_sap, ctx);
             DX_ALLOC_SAP(exception_record_sap, exception_record);
-            thread_sigmask(SIG_SETMASK, &ctx->sigmask, NULL);
+            thread_sigmask(SIG_SETMASK, &oldmask, NULL);
 
-            /* The exception system doesn't automatically clear pending
-             * exceptions, so we lose as soon as we execute any FP
-             * instruction unless we do this first. */
+#if defined(LISP_FEATURE_X86_64)
+            asm("fninit");
+#endif
+
             /* Call into lisp to handle things. */
             funcall2(StaticSymbolFunction(HANDLE_WIN32_EXCEPTION),
                      context_sap,
@@ -1105,7 +1015,6 @@ signal_internal_error_or_lose(os_context_t *ctx,
         }
         /* If Lisp doesn't nlx, we need to put things back. */
         undo_fake_foreign_function_call(ctx);
-        thread_sigmask(SIG_SETMASK, &ctx->sigmask, NULL);
         /* FIXME: HANDLE-WIN32-EXCEPTION should be allowed to decline */
         return;
     }
@@ -1114,17 +1023,7 @@ signal_internal_error_or_lose(os_context_t *ctx,
             (void*)(intptr_t)exception_record->ExceptionCode);
     fprintf(stderr, "Faulting IP: %p.\n",
             (void*)(intptr_t)exception_record->ExceptionAddress);
-    if ((long int)exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        MEMORY_BASIC_INFORMATION mem_info;
 
-        if (VirtualQuery(fault_address, &mem_info, sizeof mem_info)) {
-            fprintf(stderr, "page status: 0x%lx.\n", mem_info.State);
-        }
-
-        fprintf(stderr, "Was writing: %p, where: %p.\n",
-                (void*)exception_record->ExceptionInformation[0],
-                fault_address);
-    }
 
     fflush(stderr);
 
@@ -1179,6 +1078,7 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
     /* For EXCEPTION_ACCESS_VIOLATION only. */
     void *fault_address = (void *)exception_record->ExceptionInformation[1];
 
+    #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     odxprint(seh,
              "SEH: rec %p, ctxptr %p, rip %p, fault %p\n"
              "... code %p, rcx %p, fp-tags %p\n\n",
@@ -1189,6 +1089,15 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
              (void*)(intptr_t)code,
              voidreg(win32_context,cx),
              win32_context->FloatSave.TagWord);
+#else // ARM64
+    odxprint(seh,
+             "SEH: rec %p, ctxptr %p, pc %p, fault %p, code %p\n\n",
+             exception_record,
+             win32_context,
+             (void*)win32_context->Pc,
+             fault_address,
+             (void*)(intptr_t)code);
+#endif
 
     /* This function had become unwieldy.  Let's cut it down into
      * pieces based on the different exception codes.  Each exception
@@ -1233,8 +1142,10 @@ handle_exception_ex(EXCEPTION_RECORD *exception_record,
         /* All else failed, drop through to the lisp-side exception handler. */
         signal_internal_error_or_lose(ctx, exception_record, fault_address);
 
-    if (self)
+    if (self) {
         thread_extra_data(self)->carried_base_pointer = oldbp;
+        thread_extra_data(self)->blocked_signal_set = context.sigmask;
+    }
 
     errno = lastErrno;
     SetLastError(lastError);
@@ -1269,7 +1180,7 @@ handle_exception(EXCEPTION_RECORD *exception_record,
     return handle_exception_ex(exception_record, exception_frame, win32_context, FALSE);
 }
 
-#ifdef LISP_FEATURE_X86_64
+#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
 
 #define RESTORING_ERRNO()                                       \
     int sbcl__lastErrno = errno;                                \
@@ -1295,7 +1206,11 @@ veh(EXCEPTION_POINTERS *ep)
             return EXCEPTION_CONTINUE_SEARCH;
     }
 
+#if defined(LISP_FEATURE_X86_64)
     DWORD64 rip = ep->ContextRecord->Rip;
+#elif defined(LISP_FEATURE_ARM64)
+    DWORD64 rip = ep->ContextRecord->Pc;
+#endif
     long int code = ep->ExceptionRecord->ExceptionCode;
     BOOL from_lisp =
         (rip >= DYNAMIC_SPACE_START && rip < DYNAMIC_SPACE_START+dynamic_space_size) ||
@@ -1342,7 +1257,7 @@ wos_install_interrupt_handlers
     handler->next_frame = get_seh_frame();
     handler->handler = (void*)exception_handler_wrapper;
     set_seh_frame(handler);
-#else
+#elif defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
     static int once = 0;
     if (!once++)
         AddVectoredExceptionHandler(1,veh);
@@ -1734,9 +1649,10 @@ win32_write_console(HANDLE handle, void * buf, int count)
     }
 }
 
-int
-win32_unix_write(HANDLE handle, void * buf, int count)
+ssize_t
+win32_unix_write(HANDLE handle, void * buf, size_t requested_count)
 {
+    int count = requested_count > INT_MAX ? INT_MAX : requested_count;
     DWORD written_bytes;
     OVERLAPPED overlapped;
     struct thread * self = get_sb_vm_thread();
@@ -1809,9 +1725,10 @@ win32_unix_write(HANDLE handle, void * buf, int count)
 }
 
 
-int
-win32_unix_read(HANDLE handle, void * buf, int count)
+ssize_t
+win32_unix_read(HANDLE handle, void * buf, size_t requested_count)
 {
+    int count = requested_count > INT_MAX ? INT_MAX : requested_count;
     OVERLAPPED overlapped = {.Internal=0};
     DWORD read_bytes = 0;
     struct thread * self = get_sb_vm_thread();
@@ -2047,12 +1964,6 @@ int sb_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
     }
   }
   return 0;
-}
-
-int sb_pthr_kill(struct thread* thread, int signum)
-{
-    __sync_fetch_and_or(&thread_extra_data(thread)->pending_signal_set, 1<<signum);
-    return 0;
 }
 
 /* Signals */

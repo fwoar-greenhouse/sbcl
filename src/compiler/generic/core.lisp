@@ -32,11 +32,6 @@
 (define-load-time-global *allocation-patch-points*
   (make-hash-table :test 'eq :weakness :key :synchronized t))
 
-#-x86-64
-(progn
-(defun sb-vm::statically-link-code-obj (code fixups)
-  (declare (ignore code fixups))))
-
 ;;; Point FUN's 'self' slot to FUN.
 ;;; FUN must be pinned when calling this.
 #-darwin-jit ; done entirely by C for #+darwin-jit
@@ -44,37 +39,43 @@
   `(let* ((fun ,fun)
           (self
            ;; a few architectures store the untagged address of the entrypoint in 'self'
-           #+(or x86 x86-64 arm64)
+           #+(or arm64 ppc64 x86 x86-64)
            (%make-lisp-obj
             (truly-the word (+ (get-lisp-obj-address fun)
                                (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift)
                                (- sb-vm:fun-pointer-lowtag))))
            ;; all others store the function itself (what else?) in 'self'
-           #-(or x86 x86-64 arm64) fun))
+           #-(or arm64 ppc64 x86 x86-64) fun))
      (setf (sb-vm::%simple-fun-self fun) self)))
 
-(define-load-time-global sb-fasl::*asm-routine-index-to-name* #())
-(declaim (simple-vector sb-fasl::*asm-routine-index-to-name*))
-
-(flet ((fixup (code-obj offset name kind flavor preserved-lists statically-link-p
-               real-code-obj)
-         (declare (ignorable statically-link-p preserved-lists))
+(flet ((fixup (code-obj offset name kind flavor-id real-code-obj callees
+               &aux (flavor (aref +fixup-flavors+ flavor-id)))
          ;; NAME depends on the kind and flavor of fixup.
-         ;; PRESERVED-LISTS is a vector of lists of locations (by kind)
-         ;; at which fixup must be re-applied after code movement.
          ;; CODE-OBJ must already be pinned in order to legally call this.
          ;; One call site that reaches here is below at MAKE-CORE-COMPONENT
          ;; and the other is LOAD-CODE, both of which pin the code.
          (sb-vm:fixup-code-object
                  code-obj offset
-                 (ecase flavor
-                   ((:assembly-routine :assembly-routine*)
-                    (or (get-asm-routine name (eq flavor :assembly-routine*))
-                        (error "undefined assembler routine: ~S" name)))
-                   (:alien-code-linkage-index (sb-impl::ensure-alien-linkage-index name nil))
-                   (:alien-data-linkage-index (sb-impl::ensure-alien-linkage-index name t))
-                   (:foreign (foreign-symbol-address name))
-                   (:foreign-dataref (foreign-symbol-address name t))
+                 (fixup-flavor-case flavor-id
+                   (:assembly-routine
+                    (let* ((asm-code *assembler-routines*)
+                           (index (if (fixnump name)
+                                      name
+                                      (or (cddr (gethash name (sb-fasl::%asm-routine-table asm-code)))
+                                          (error "Unknown asm routine ~S" name)))))
+                      (sap-int (sap+ (code-instructions asm-code)
+                                     (aref *asm-routine-offsets* index)))))
+                   ((:foreign :foreign-dataref)
+                    (let* ((datap (eq flavor-id #.(encoded-fixup-flavor :foreign-dataref)))
+                           (index (sb-impl::ensure-alien-linkage-index name datap)))
+                      #-x86-64 (sb-vm::alien-linkage-index-to-addr index datap)
+                      #+x86-64 index))
+                   #+linkage-space
+                   (:linkage-cell
+                    (let* ((warn #+x86-64 (= (sap-ref-32 (code-instructions code-obj) offset) 1))
+                           (index (ensure-linkage-index name (not warn))))
+                      (unless (permanent-fname-p name) (setq callees (adjoin index callees)))
+                      index))
                    (:code-object (get-lisp-obj-address real-code-obj))
                    #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index name))
                    (:layout (get-lisp-obj-address
@@ -82,21 +83,14 @@
                    (:layout-id (layout-id name))
                    (:card-table-index-mask (extern-alien "gc_card_table_nbits" int))
                    (:immobile-symbol (get-lisp-obj-address name))
-                   ;; It is legal to take the address of symbol-value only if the
-                   ;; value is known to be an immobile object
-                   ;; (whose address we don't want to wire in).
-                   (:symbol-value (get-lisp-obj-address (symbol-global-value name)))
-                   #+(and immobile-code x86-64)
-                   (:fdefn-call
-                    (prog1 (sb-vm::fdefn-entry-address name) ; creates if didn't exist
-                      (when statically-link-p
-                        (push (cons offset (find-fdefn name)) (elt preserved-lists 0)))))
-                   #+(and immobile-code x86-64)
-                   (:static-call (sb-vm::function-raw-address name kind)))
-                 kind flavor))
-
-       (finish-fixups (code-obj preserved-lists)
-         (declare (ignorable code-obj))
+                   (t (bug "bad fixup flavor ~s" flavor)))
+                 kind flavor)
+         callees)
+       (finish-fixups (code-obj callees other-fixups)
+         (declare (ignorable code-obj callees))
+         (setf (sb-vm::%code-fixups code-obj)
+               #+linkage-space (join-varint-streams (pack-code-fixup-locs callees) other-fixups)
+               #-linkage-space other-fixups)
          ;; Assign all SIMPLE-FUN-SELF slots unless #+darwin-jit in which case the simple-funs
          ;; are assigned by jit_memcpy_codeblob()
          #-darwin-jit
@@ -113,56 +107,45 @@
          ;; x86 doesn't need it, and darwin-jit doesn't do it because the
          ;; temporary object is not executable.
          #-(or x86 x86-64 darwin-jit) (sb-vm:sanctify-for-execution code-obj)
-         ;; Return fixups amenable to static linking
-         (aref preserved-lists 0)))
+         nil))
 
-  (defun apply-fasl-fixups (code-obj fixups index count real-code-obj &aux (end (1- (+ index count))))
-    (dx-let ((preserved (make-array 5 :initial-element nil)))
-      (let ((retained-fixups (svref fixups index)))
-        (incf index)
-        (unless (eql retained-fixups 0)
-          (setf (sb-vm::%code-fixups code-obj) retained-fixups)))
+  (defun apply-fasl-fixups (code-obj fixups index count real-code-obj
+                            &aux (end (1- (+ index count))))
+    (let ((retained-fixups (svref fixups index))
+          callees)
+      (incf index)
       (awhen (svref fixups index)
         (setf (gethash code-obj *allocation-patch-points*) it))
       (loop
         (when (>= index end) (return))
-        (binding* (((offset kind flavor data)
+        (binding* (((offset kind flavor-id data)
                     (sb-fasl::!unpack-fixup-info (svref fixups (incf index))))
-                   (name
-                    (cond ((member flavor '(:code-object :card-table-index-mask)) nil)
-                          ((and (plusp data)
-                                (member flavor '(:assembly-routine :assembly-routine*)))
-                           (aref sb-fasl::*asm-routine-index-to-name* data))
-                          (t (svref fixups (incf index))))))
-          (fixup code-obj offset name kind flavor preserved nil real-code-obj)))
-      (finish-fixups code-obj preserved)))
+                   (name (if (eql 0 data) (svref fixups (incf index)) data)))
+          (setq callees (fixup code-obj offset name kind flavor-id real-code-obj callees))))
+      (finish-fixups code-obj callees retained-fixups)))
 
   (defun apply-core-fixups (code-obj fixup-notes retained-fixups real-code-obj)
     (declare (list fixup-notes))
-    (unless (eql retained-fixups 0)
-      (setf (sb-vm::%code-fixups code-obj) retained-fixups))
-    (dx-let ((preserved (make-array 5 :initial-element nil)))
+    (let (callees)
       (dolist (note fixup-notes)
         (let ((fixup (fixup-note-fixup note))
               (offset (fixup-note-position note)))
-          (fixup code-obj offset
-                 (fixup-name fixup)
-                 (fixup-note-kind note)
-                 (fixup-flavor fixup)
-                 preserved t
-                 real-code-obj)))
-      (finish-fixups code-obj preserved))))
+          (setq callees
+                (fixup code-obj offset
+                       (fixup-name fixup)
+                       (fixup-note-kind note)
+                       (encoded-fixup-flavor (fixup-flavor fixup))
+                       real-code-obj callees))))
+      (finish-fixups code-obj callees retained-fixups))))
 
 ;;; Dump a component to core. We pass in the assembler fixups, code
 ;;; vector and node info.
-(defun make-core-component (component segment length fixup-notes alloc-points object)
+(defun make-core-component (component assembly object)
   (declare (type component component)
-           (type segment segment)
-           (type index length)
-           (list fixup-notes)
+           (type assembly assembly)
            (type core-object object))
   (binding*
-      ((debug-info (debug-info-for-component component))
+      ((debug-info (debug-info-for-component component assembly))
        (2comp (component-info component))
        (constants (ir2-component-constants 2comp))
        (n-boxed-words (length constants))
@@ -170,39 +153,33 @@
         ;; <header, boxed_size, debug_info, fixups> are absent from the simple-vector
         (or #+darwin-jit
             (make-array (- n-boxed-words sb-vm:code-constants-offset) :initial-element 0)))
-       (const-patch-start-index
-        (+ sb-vm:code-constants-offset (* (length (ir2-component-entries 2comp))
-                                          sb-vm:code-slots-per-simple-fun)))
-       ;; Pre-scan for all fdefinitions to ensure their existence, which guarantees that
-       ;; storing them into the boxed words can't can't create an old->young pointer.
-       ;; This is essential since gencgc will miss them when scanning the code header
-       ;; for such tagged pointers.
-       (n-fdefns
-        (do ((count 0)
-             (index const-patch-start-index (1+ index)))
-            ((>= index n-boxed-words) count)
+       (const-patch-start-index sb-vm:code-constants-offset)
+       ;; Ensure existence of FDEFNs before allocating code. This potentially reduces
+       ;; the number of old->young pointers when assigning boxed words.
+       (nil
+        (do ((index const-patch-start-index (1+ index)))
+            ((>= index n-boxed-words))
           (let ((const (aref constants index)))
             (when (typep const '(cons (eql :fdefinition)))
-              (incf count)
               (setf (second const) (find-or-create-fdefn (second const)))))))
-       (retained-fixups (sb-fasl::pack-fixups-for-reapplication fixup-notes))
+       (fixup-notes (asm-fixup-notes assembly))
+       (retained-fixups (sb-c::pack-fixups-for-reapplication fixup-notes))
+       (bytes (the (simple-array assembly-unit 1) (asm-bytes assembly)))
        ((code-obj total-nwords)
         (allocate-code-object (component-mem-space component)
                               (align-up n-boxed-words code-boxed-words-align)
-                              length))
-       (bytes
-        (the (simple-array assembly-unit 1) (segment-contents-as-vector segment)))
+                              (length bytes)))
        (n-simple-funs (length (ir2-component-entries 2comp)))
        (named-call-fixups nil)
        (real-code-obj code-obj))
     (declare (ignorable boxed-data))
     (sb-fasl::with-writable-code-instructions
-        (code-obj total-nwords debug-info n-fdefns n-simple-funs)
+        (code-obj total-nwords debug-info n-simple-funs)
         :copy (%byte-blt bytes 0 (code-instructions code-obj) 0 (length bytes))
         :fixup (setq named-call-fixups
                      (apply-core-fixups code-obj fixup-notes retained-fixups real-code-obj)))
 
-    (when alloc-points
+    (binding* ((alloc-points (asm-alloc-sites assembly) :exit-if-null))
       #+(and x86-64 sb-thread)
       (if (= (extern-alien "alloc_profiling" int) 0) ; record the object for later
           (setf (gethash code-obj *allocation-patch-points*) alloc-points)
@@ -212,53 +189,35 @@
 
     ;; Don't need code pinned now
     ;; (It will implicitly be pinned on the conservatively scavenged backends)
-    (macrolet ((set-boxed-word (i val &optional fdefnp)
-                 (declare (ignorable fdefnp))
-                 ;; Thankfully we don't mix untagged fdefns with darwin-jit
+    (macrolet ((set-boxed-word (i val)
                  #+darwin-jit
                  `(setf (svref boxed-data (- ,i ,sb-vm:code-constants-offset)) ,val)
                  #-darwin-jit
-                 (if (not fdefnp)       ; statically not an fdefn
-                     `(setf (code-header-ref code-obj ,i) ,val)
-                     `(if ,fdefnp    ; else choose which setter to use
-                          (set-code-fdefn code-obj ,i ,val)
-                          (setf (code-header-ref code-obj ,i) ,val)))))
+                 `(setf (code-header-ref code-obj ,i) ,val)))
 
       (let* ((entries (ir2-component-entries 2comp))
              (fun-index (length entries)))
         (dolist (entry-info entries)
-          (let ((fun (%code-entry-point code-obj (decf fun-index)))
-                (w (+ sb-vm:code-constants-offset
-                      (* sb-vm:code-slots-per-simple-fun fun-index))))
+          (let ((fun (%code-entry-point code-obj (decf fun-index))))
             (aver (functionp fun)) ; in case %CODE-ENTRY-POINT returns NIL
-            (set-boxed-word (+ w sb-vm:simple-fun-name-slot) (entry-info-name entry-info))
-            (set-boxed-word (+ w sb-vm:simple-fun-arglist-slot) (entry-info-arguments entry-info))
-            (set-boxed-word (+ w sb-vm:simple-fun-source-slot) (entry-info-form/doc entry-info))
-            (set-boxed-word (+ w sb-vm:simple-fun-info-slot) (entry-info-type/xref entry-info))
             (setf (gethash entry-info (core-object-entry-table object)) fun))))
 
       (do ((index const-patch-start-index (1+ index)))
           ((>= index n-boxed-words))
-        (let* ((const (aref constants index))
-               (kind (if (listp const) (car const) const)))
-          (set-boxed-word
-           index
-           (etypecase kind
-             ((eql :entry)
-              (the function (gethash (leaf-info (cadr const))
-                                     (core-object-entry-table object))))
-             ((eql :fdefinition) (cadr const))
-             ((eql :known-fun) (%coerce-name-to-fun (cadr const)))
-             #+arm64
-             ((eql :tls-index)
-              (ash (ensure-symbol-tls-index (cdr const)) (- sb-vm:n-fixnum-tag-bits)))
-             (constant (constant-value const)))
-           (eq kind :fdefinition))))
+        (let ((const (aref constants index)))
+          (set-boxed-word index
+                (if (constant-p const)
+                    (constant-value const)
+                    (destructuring-bind (kind payload) const
+                      (ecase kind
+                        (:fdefinition payload)
+                        (:entry
+                         (the function (gethash (leaf-info payload)
+                                                (core-object-entry-table object))))
+                        (:known-fun (%coerce-name-to-fun payload))))))))
 
       #+darwin-jit (assign-code-constants code-obj boxed-data))
 
-    (when (and named-call-fixups (immobile-space-obj-p code-obj))
-      (sb-vm::statically-link-code-obj code-obj named-call-fixups))
     (sb-fasl::possibly-log-new-code code-obj "core")))
 
 ;;; Call the top level lambda function dumped for ENTRY, returning the
@@ -286,17 +245,10 @@
 ;;; so that it jumps to a tracing routine and then back again.
 ;;; The code that gets copied is just the tracing wrapper.
 ;;; See the example at COMPILE-FUNOBJ-ENCAPSULATION in ntrace
-#+(or x86 x86-64)
+#+(or ppc64 x86 x86-64)
 (defun copy-code-object (code)
   ;; Must have one simple-fun
   (aver (= (code-n-entries code) 1))
-  ;; Disallow relative instruction operands.
-  ;; (This restriction could be removed by actually performing fixups)
-  ;; x86-64 absolute fixups are OK since they will only point to static objects.
-  #+x86-64
-  (aver (not (nth-value
-              1 (sb-c:unpack-code-fixup-locs (sb-vm::%code-fixups code)))))
-  (aver (zerop (nth-value 1 (code-header-fdefn-range code))))
   (let* ((nbytes (code-object-size code))
          (boxed (code-header-words code)) ; word count
          (unboxed (- nbytes (ash boxed sb-vm:word-shift))) ; byte count
@@ -337,12 +289,12 @@
 ;;; are 0, so the jump table count is 0.
 ;;; Similar considerations pertain to x86[-64] fixups within the machine code.
 
-(defun code-header/trailer-adjust (code-obj expected-nwords n-fdefns)
-  (declare (ignorable expected-nwords n-fdefns))
+(defun code-header/trailer-adjust (code-obj expected-nwords)
+  (declare (ignorable expected-nwords))
   ;; Serial# shares a word with the jump-table word count,
   ;; so we can't assign serial# until after all raw bytes are copied in.
   ;; Do we need unique IDs on the various strange kind of code blobs? These would
-  ;; include code from MAKE-SIMPLIFYING-TRAMPOLINE, ENCAPSULATE-FUNOBJ, MAKE-BPT-LRA.
+  ;; include code from MAKE-TRAMPOLINE, ENCAPSULATE-FUNOBJ, MAKE-BPT-LRA.
   (let* ((serialno (ldb (byte (byte-size sb-vm::code-serialno-byte) 0)
                         (atomic-incf *code-serialno*)))
          (insts (code-instructions code-obj))
@@ -355,9 +307,6 @@
   (let ((base (sap+ (int-sap (get-lisp-obj-address code-obj)) (- sb-vm:other-pointer-lowtag)))
         (physical-nwords ; upper 4 bytes of the header word
          (ash (get-header-data code-obj) -24)))
-    (setf (sap-ref-32 base (+ (ash sb-vm:code-boxed-size-slot sb-vm:word-shift)
-                              #+little-endian 4))
-          n-fdefns)
     (when (/= physical-nwords expected-nwords)
       ;; Oversized allocation must be exactly 2 words more than requested
       (aver (= (- physical-nwords 2) expected-nwords))
@@ -390,12 +339,3 @@
           (list* code data (nconc (coerce data 'list) sb-vm::*pinned-objects*))))
     (sb-vm::jit-copy-code-constants (get-lisp-obj-address code)
                                     (get-lisp-obj-address data))))
-
-(defun set-code-fdefn (code index fdefn)
-  #+untagged-fdefns
-  (with-pinned-objects (fdefn)
-    (setf (code-header-ref code index)
-          (%make-lisp-obj (logandc2 (get-lisp-obj-address fdefn)
-                                    sb-vm:lowtag-mask))))
-  #-untagged-fdefns
-  (setf (code-header-ref code index) fdefn))

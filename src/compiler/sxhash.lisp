@@ -25,7 +25,8 @@
     ;; and also common to create custom hash calculations on structures with such slots.
     ;; So it makes sense for the compiler to try to pick off cases where the slot type
     ;; has a specialized hash computation via sxhash after picking off NIL.
-    (or (dolist (case '((simple-string . %sxhash-simple-string)
+    (or (dolist (case '((instance . sb-impl::instance-sxhash)
+                        (simple-string . %sxhash-simple-string)
                         (string . %sxhash-string)
                         (simple-bit-vector . %sxhash-simple-bit-vector)
                         (bit-vector . %sxhash-bit-vector)))
@@ -34,9 +35,6 @@
                 ((csubtypep type (specifier-type `(or null ,(car case))))
                  (return `(if x (,(cdr case) x) ,(sb-xc:sxhash nil))))))
         (give-up-ir1-transform))))
-
-(deftransform sxhash ((x) (number)) `(sb-impl::number-sxhash x))
-(deftransform sxhash ((x) (integer)) `(sb-impl::integer-sxhash x))
 
 ;;; Note about signed zeros with respect to SXHASH (but not PSXHASH!) -
 
@@ -121,15 +119,21 @@
 ;;; that the distinction between +0 and -0 makes no difference *ANYWHERE* that uses
 ;;; floating-point literals, I think there is no argument here.
 
-;;; SXHASH of FLOAT values is defined directly in terms of DEFTRANSFORM in
-;;; order to avoid boxing.
-(deftransform sxhash ((x) (single-float)) '#.(sxhash-single-float-xform 'x))
-
-;;; SXHASH of FIXNUM values is defined as a DEFTRANSFORM because it's so
-;;; simple.
-(deftransform sxhash ((x) (fixnum)) '#.(sxhash-fixnum-xform 'x))
-
-(deftransform sxhash ((x) (double-float)) '#.(sxhash-double-float-xform 'x))
+;;; SXHASH of various numeric types tries to avoid boxing and/or uses a
+;;; type-specific hash function. Also, allow NULL into the type of X
+;;; which efficiently handles (SXHASH (MYSTRUCT-MYVAL s)) in
+;;; (defstruct mystruct (myval nil :type (or null single-float)))
+(deftransform sxhash ((x) ((or number null)))
+  (let* ((type (lvar-type x))
+         (numberp (csubtypep type (specifier-type 'number)))
+         (num (if numberp type (type-difference type (specifier-type 'null))))
+         (expr
+          (cond ((csubtypep num (specifier-type 'fixnum)) '#.(sxhash-fixnum-xform 'x))
+                ((csubtypep num (specifier-type 'single-float)) '#.(sxhash-single-float-xform 'x))
+                ((csubtypep num (specifier-type 'double-float)) '#.(sxhash-double-float-xform 'x))
+                ((csubtypep num (specifier-type 'integer)) '(sb-impl::integer-sxhash x))
+                (t '(sb-impl::number-sxhash x)))))
+    (if numberp expr `(if x ,expr (sb-xc:sxhash nil)))))
 
 ;;; All symbols have a precomputed hash.
 ;;; Here are the behaviors I plan on implementing:
@@ -166,9 +170,6 @@
 
 (deftransform hash-as-if-symbol-name ((object) (symbol) * :important nil)
   `(symbol-name-hash object))
-
-#-salted-symbol-hash
-(define-source-transform symbol-name-hash (s) `(ldb (byte 32 0) (symbol-hash ,s)))
 
 (intern "SCRAMBLE" "SB-C")
 (intern "TAB" "SB-C")
@@ -333,20 +334,74 @@
 (setf (info :function :compiler-macro-function 'uint32-modularly)
       #'sb-c::optimize-for-calc-phash)
 
+;;; Compute a bitmask over the possible types in OBJECTS
+(defconstant mph-keys-have-symbol 1)
+(defconstant mph-keys-have-fixnum 2)
+(defconstant mph-keys-have-char   4)
+(defconstant mph-keys-have-other  8)
+(defun minperfhash-key-universe-type (objects)
+  (let ((types 0))
+    (dolist (object objects (if (/= types 0) types))
+      (setq types (logior (typecase object
+                            (sb-xc:fixnum mph-keys-have-fixnum)
+                            (symbol       mph-keys-have-symbol)
+                            (character    mph-keys-have-char)
+                            (t (return nil)))
+                          types)))))
+
+;;; Construct a form which computes a 32-bit hash from OBJ whose value
+;;; should be - but might not be - one of the choices in KEYS.
+;;; If it is not, the expression's result should be irrelevant.
+;;; (Calling code has to do some kind of "hit" test)
+;;; TODO: consider putting in a "miss" label that this code bail out to
+;;; if there is an unexpected object type.
+;;; The 32-bit hash is then fed into a perfect hash expression.
+(defun prehash-expr-for-perfect-hash (obj keys)
+  (let ((type (minperfhash-key-universe-type keys)))
+    (cond
+      #-64-bit ; avoid working with raw 32 bit quantities if we can
+      ((= type mph-keys-have-char)
+       `(if (characterp ,obj) (char-code (truly-the character ,obj)) 0))
+      ((logtest type mph-keys-have-symbol) ; some symbol in the keyset
+        (multiple-value-bind (guard hash)
+           (if (vop-existsp :translate hash-as-if-symbol-name)
+               (values `(pointerp ,obj) `(hash-as-if-symbol-name ,obj))
+               ;; NON-NULL-SYMBOL-P is the less expensive test as it omits the OR
+               ;; which accepts NIL along with OTHER-POINTER objects.
+               (values `(,(if (member nil keys) 'symbolp 'non-null-symbol-p) ,obj)
+                       `(symbol-name-hash (truly-the symbol ,obj))))
+         `(if ,guard
+              ,hash
+              ;; If the only accepted inputs are symbols, then any non-symbol can
+              ;; get 0 for its hash
+              ,(if (= type mph-keys-have-symbol) 0 `(descriptor-hash32 ,obj)))))
+      (t
+       ;; LDB is a nop-op for 32-bit word size
+       `(ldb (byte 32 0) (get-lisp-obj-address ,obj))))))
+
+;;; This is for use at compile-time, to build the array of uint32_t inputs
+;;; to the MPH generator after choosing the manner of prehashing.
+;;; TODO: the prehash suld be rejiggered to use UNSIGNED-REG consistently, because the
+;;; symbol-name hash vop returns unsigned-reg, and since we're willing to lose bits of precison
+;;; in DESCRIPTOR-HASH32 there is really no reason to clear the fixnum tag mask.
+;;; So just take 32 bits either from the symbol, or the low 32 descriptor bits as-is.
+;;; However, to be even more flexible, then if there are hash collisions on the low 32 bits of
+;;; the descriptor, we could look for any chunk of 32 bits that works out well.
+(defun prehash-function-for-mph-generator (type)
+  (cond
+    #-64-bit ((= type mph-keys-have-char) #'char-code)
+    ((logtest type mph-keys-have-symbol)
+     (lambda (x)
+       (etypecase x
+         (symbol (symbol-name-hash x))
+         ((or sb-xc:fixnum character) (descriptor-hash32 x)))))
+    (t (lambda (x) (ldb (byte 32 0) (get-lisp-obj-address x))))))
+
 ;;; The CASE macro can use this predicate to decide whether to expand in a way
 ;;; that selects a clause via a perfect hash versus the customary expansion
 ;;; as a sequence of IFs.
 (defun perfectly-hashable (objects)
-  (flet ((hash (x)
-           (cond ((fixnump x) (ldb (byte 32 0) x))
-                 ((symbolp x) (symbol-name-hash x))
-                 ((characterp x) (char-code x)))))
-    (let* ((n (length objects))
-           (hashes (make-array n :element-type '(unsigned-byte 32))))
-      (loop for o in objects
-            for i from 0
-            do (let ((h (hash o)))
-                 (if h
-                     (setf (aref hashes i) h)
-                     (return-from perfectly-hashable nil))))
-      (make-perfect-hash-lambda hashes objects))))
+  (binding* ((type (minperfhash-key-universe-type objects) :exit-if-null)
+             (hashfn (prehash-function-for-mph-generator type))
+             (hashes (map '(simple-array (unsigned-byte 32) 1) hashfn objects)))
+    (make-perfect-hash-lambda hashes objects)))

@@ -113,7 +113,49 @@ tree structure resulting from the evaluation of EXPRESSION."
               entry-points
               (not (member name entry-points :test #'equal))))))
 
-(flet ((defun-expander (env name lambda-list body snippet &optional source-form)
+(defun specialized-xep-for-type-p (lambda-list name)
+  (let ((type (info :function :type name)))
+    (and #-(or arm64 x86-64) nil
+         (fun-type-p type)
+         (eq (info :function :where-from name) :declared)
+         (not (or (fun-type-optional type)
+                  (fun-type-keyp type)
+                  (fun-type-rest type)))
+         (if (boundp 'sb-c:*compilation*)
+             ;; Don't mix block compilation and specialized xeps. It
+             ;; appears to break things and it's unclear which calling
+             ;; convention needs to be preferred.
+             (not (sb-c::block-compile sb-c:*compilation*))
+             (eq *evaluator-mode* :compile))
+         (multiple-value-bind (llks required) (parse-lambda-list lambda-list)
+           (and (zerop llks)
+                (= (length required)
+                   (length (fun-type-required type)))))
+         (or (loop for arg in (fun-type-required type)
+                   thereis (csubtypep arg (specifier-type 'double-float)))
+             (let ((return (fun-type-returns type)))
+               (and (values-type-p return)
+                    (not (or (values-type-optional return)
+                             (values-type-rest return)))
+                    (loop for value in (values-type-required return)
+                          thereis (csubtypep value (specifier-type 'double-float))))))
+         (cdr (type-specifier type)))))
+
+(defun make-specialized-xep-stub (name specialized
+                                  &optional (xep-name
+                                             `(specialized-xep ,name ,@specialized)))
+  (let ((vars (loop for arg in (car specialized)
+                    for i from 0
+                    collect (make-symbol (format nil "A~a" i)))))
+    (values
+     `(named-lambda ,xep-name ,vars
+        (declare (notinline ,name)
+                 (muffle-conditions warning)
+                 (optimize inhibit-warnings))
+        (funcall ',name ,@vars))
+     xep-name)))
+
+(flet ((defun-expander (env name lambda-list body snippet &optional source-form always-store-source-form)
   (multiple-value-bind (forms decls doc) (parse-body body t)
     ;; Maybe kill docstring, but only under the cross-compiler.
     #+(and (not sb-doc) sb-xc-host) (setq doc nil)
@@ -138,7 +180,11 @@ tree structure resulting from the evaluation of EXPRESSION."
                            #-sb-xc-host sb-c:maybe-compiler-notify
                            "lexical environment too hairy, can't inline DEFUN ~S"
                            name)
-                          nil))))))
+                          nil)))))
+           (specialized-xep (and (not (or inline-thing
+                                          (info :function :info name)
+                                          (eq (info :function :inlinep name) 'notinline)))
+                                 (specialized-xep-for-type-p lambda-list name))))
       (when (and (eq snippet :constructor)
                  (not (typep inline-thing '(cons (eql sb-c:lambda-with-lexenv)))))
         ;; constructor in null lexenv need not save the expansion
@@ -147,29 +193,59 @@ tree structure resulting from the evaluation of EXPRESSION."
         (setq inline-thing (list 'quote inline-thing)))
       (when (and extra-info (not (keywordp extra-info)))
         (setq extra-info (list 'quote extra-info)))
-      (let ((definition
-              (if (block-compilation-non-entry-point name)
-                  `(progn
-                     (sb-c::%refless-defun ,named-lambda)
-                     ',name)
-                  `(%defun ',name ,named-lambda
-                           ,@(when (or inline-thing extra-info) `(,inline-thing))
-                           ,@(when extra-info `(,extra-info))))))
-       `(progn
-          (eval-when (:compile-toplevel)
-            (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
-          ,(if source-form
-               `(sb-c::with-source-form ,source-form ,definition)
-               definition)
-          ;; This warning, if produced, comes after the DEFUN happens.
-          ;; When compiling, there's no real difference, but when interpreting,
-          ;; if there is a handler for style-warning that nonlocally exits,
-          ;; it's wrong to have skipped the DEFUN itself, since if there is no
-          ;; function, then the warning ought not to have been issued at all.
-          ,@(when (typep name '(cons (eql setf)))
-              `((eval-when (:compile-toplevel :execute)
-                  (sb-c::warn-if-setf-macro ',name))
-                ',name))))))))
+      `(progn
+         ,@(let ((existing-specialized-xep (info :function :specialized-xep name)))
+             (if (and existing-specialized-xep
+                      (not (equal existing-specialized-xep specialized-xep)))
+                 (multiple-value-bind (xep xep-name)
+                     (make-specialized-xep-stub name existing-specialized-xep)
+                   `((progn
+                       (eval-when (:compile-toplevel)
+                         (clear-info :function :specialized-xep ',name))
+                       (when (fdefinition ',xep-name)
+                         (setf (fdefinition ',xep-name) ,xep)))))))
+         ,@(if specialized-xep
+               (let ((xep-name `(specialized-xep ,name ,@specialized-xep)))
+                 `((eval-when (:compile-toplevel)
+                     (sb-c:%compiler-defun ',name t nil nil ',specialized-xep))
+                    (let ((xep (named-lambda ,xep-name ,(third named-lambda)
+                                 (declare (sb-c::source-form ,source-form))
+                                 ,@(cdddr named-lambda))))
+                      (sb-impl::%defun-specialized-xep
+                       ',name
+                       (named-lambda ,name ,lambda-list
+                         ,@(when *top-level-form-p* '((declare (sb-c::top-level-form))))
+                         (declare (muffle-conditions compiler-note))
+                         ,@(when doc (list doc))
+                         (multiple-value-prog1
+                             (funcall xep ,@lambda-list)
+                           ;; Avoid tail calls for unboxed returns.
+                           (values)))
+                       xep
+                       ',specialized-xep))))
+               (let ((definition
+                       (if (block-compilation-non-entry-point name)
+                           `(progn
+                              (sb-c::%refless-defun ,named-lambda)
+                              ',name)
+                           `(%defun ',name ,named-lambda
+                                    ,@(when (or inline-thing extra-info) `(,inline-thing))
+                                    ,@(when extra-info `(,extra-info))))))
+                 `((eval-when (:compile-toplevel)
+                     (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
+                   ,(if (and source-form
+                             always-store-source-form)
+                        `(sb-c::with-source-form ,source-form ,definition)
+                        definition)
+                   ;; This warning, if produced, comes after the DEFUN happens.
+                   ;; When compiling, there's no real difference, but when interpreting,
+                   ;; if there is a handler for style-warning that nonlocally exits,
+                   ;; it's wrong to have skipped the DEFUN itself, since if there is no
+                   ;; function, then the warning ought not to have been issued at all.
+                   ,@(when (typep name '(cons (eql setf)))
+                       `((eval-when (:compile-toplevel :execute)
+                           (sb-c::warn-if-setf-macro ',name))
+                         ',name))))))))))
 
 ;;; This is one of the major places where the semantics of block
 ;;; compilation is handled. Substitution for global names is totally
@@ -177,17 +253,17 @@ tree structure resulting from the evaluation of EXPRESSION."
 ;;; (block-compile *compilation*) is true and entry points are
 ;;; specified, then we don't install global definitions for non-entry
 ;;; functions (effectively turning them into local lexical functions.)
-  (sb-xc:defmacro defun (&environment env name lambda-list &body body)
+  (sb-xc:defmacro defun (&whole whole &environment env name lambda-list &body body)
     "Define a function at top level."
     (check-designator name 'defun #'legal-fun-name-p "function name")
     #+sb-xc-host
     (unless (cl:symbol-package (fun-name-block-name name))
       (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
-    (defun-expander env name lambda-list body nil))
+    (defun-expander env name lambda-list body nil whole))
 
   ;; extended defun as used by defstruct
   (sb-xc:defmacro sb-c:xdefun (&environment env name snippet source-form lambda-list &body body)
-    (defun-expander env name lambda-list body snippet source-form)))
+    (defun-expander env name lambda-list body snippet source-form t)))
 
 ;;;; DEFCONSTANT, DEFVAR and DEFPARAMETER
 
@@ -269,21 +345,18 @@ tree structure resulting from the evaluation of EXPRESSION."
   ;; :macro-expansion of something that is getting defined as constant.
   (clear-info :variable :macro-expansion name)
   (clear-info :source-location :symbol-macro name)
+  #+sb-xc-host ;; Define the constant in the cross-compilation host, since the
+               ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
+               ;; which reference the constant.
+  (progn (eval `(unless (boundp ',name) (defconstant ,name ',value)))
+         (setf (info :variable :kind name) :constant))
   #-sb-xc-host
-  (progn
-    (when docp
-      (setf (documentation name 'variable) doc))
-    (%set-symbol-value name value))
-  ;; Define the constant in the cross-compilation host, since the
-  ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
-  ;; which reference the constant.
-  #+sb-xc-host
-  (eval `(unless (boundp ',name) (defconstant ,name ',value)))
-  (setf (info :variable :kind name) :constant)
-  ;; Deoptimize after changing it to :CONSTANT, and not before, though tbh
-  ;; if your code cares about the timing of PROGV relative to DEFCONSTANT,
-  ;; well, I can't even.
-  #-sb-xc-host (sb-c::unset-symbol-progv-optimize name)
+  (progn (%set-symbol-global-value name value)
+         (setf (info :variable :kind name) :constant)
+         ;; Deoptimize after changing it to :CONSTANT, and not before, though if user code
+         ;; cares about the timing of PROGV relative to DEFCONSTANT, it's buggy anyway.
+         (unset-symbol-progv-optimize name)
+         (when docp (setf (documentation name 'variable) doc)))
   name)
 
 (sb-xc:defmacro defvar (var &optional (val nil valp) (doc nil docp))
@@ -539,7 +612,7 @@ evaluated as a PROGN."
   ;; optional dispatch mechanism for the M-V-B gets increasingly
   ;; hairy.
   (let ((val (and (constantp n env) (constant-form-value n env))))
-    (if (and (integerp val) (<= 0 val (or #+(or x86-64 arm64 riscv) ;; better DEFAULT-UNKNOWN-VALUES
+    (if (and (integerp val) (<= 0 val (or #+(or x86-64 arm64 riscv loongarch64) ;; better DEFAULT-UNKNOWN-VALUES
                                           1000
                                           10))) ; Arbitrary limit.
         (let ((dummy-list (make-gensym-list val))
@@ -665,24 +738,29 @@ invoked. In that case it will store into PLACE and start over."
   ;; variable to work around Python's blind spot in type derivation.
   ;; For more complex places getting the type derived should not
   ;; matter so much anyhow.
-  (let ((expanded (%macroexpand place env))
-        (type (let ((ctype (sb-c::careful-specifier-type type)))
-                (if ctype
-                    (type-specifier ctype)
-                    type))))
-    (if (symbolp expanded)
-        `(do ()
-             ((typep ,place ',type))
-           (setf ,place (check-type-error ',place ,place ',type
-                                          ,@(and type-string
-                                                 `(,type-string)))))
-        (let ((value (gensym)))
-          `(do ((,value ,place ,place))
-               ((typep ,value ',type))
-             (setf ,place
-                   (check-type-error ',place ,value ',type
-                                     ,@(and type-string
-                                            `(,type-string)))))))))
+  (let* ((expanded (%macroexpand place env))
+         (ctype (sb-c::careful-specifier-type type))
+         (type (if ctype
+                   (type-specifier ctype)
+                   type))
+         (value (gensym)))
+    (cond ((stringp type)
+           `(the ,type ,place)) ;; bad type
+          ((symbolp expanded)
+           `(let ((,value ,(wrap-if ctype `(the* (,type :use-annotations t)) place)))
+              (unless (typep ,value ',type)
+                (setf ,place
+                      ,(if type-string
+                           `(check-type-error-trap '(,place . ,type) ,value (the string ,type-string))
+                           `(check-type-error-trap ',place ,value ',type)))
+                nil)))
+          (t
+           `(do ((,value ,(wrap-if ctype `(the* (,type :use-annotations t)) place) ,place))
+                ((typep ,value ',type))
+              (setf ,place
+                    (check-type-error ',place ,value ',type
+                                      ,@(and type-string
+                                             `(,type-string)))))))))
 
 ;;;; DEFINE-SYMBOL-MACRO
 
@@ -760,7 +838,7 @@ invoked. In that case it will store into PLACE and start over."
     (lambda (condition stream)
       (format stream
         "Duplicate key ~S in ~S form, ~
-         occurring in~{~#[~; and~]~{ the ~:R clause:~%~<  ~S~:>~}~^,~}."
+         occurring in~{~#[~; and~]~{ clause ~a:~%~<  ~S~:>~}~^,~}."
         (case-warning-key condition)
         (case-warning-case-kind condition)
         (duplicate-case-key-warning-occurrences condition)))))
@@ -798,6 +876,8 @@ invoked. In that case it will store into PLACE and start over."
 
 (declaim (ftype function sb-pcl::emit-cache-lookup))
 (defun optimize-%typecase-index (layout-lists object sealed)
+  ;; If no new subtypes can be defined, then there is a compiled-time-computable
+  ;; mapping from CLOS-hash to jump table index.
   ;; Try the hash-based expansion if applicable. It's allowed to fail, as it will
   ;; when 32-bit hashes are nonunique.
   (when sealed
@@ -840,7 +920,9 @@ invoked. In that case it will store into PLACE and start over."
   ;; The generated s-expression is too sensitive to the order LOAD-TIME-VALUE fixups are
   ;; patched in by cold-init. You'll have a bad time if CACHE-CELL is an unbound-marker.
   #+sb-xc-host (error "PCL cache won't work for cross-compiled TYPECASE")
-  ;; Use a PCL cache
+  ;; Use a PCL cache when the sealed logic was inapplicable (or failed due to hash collisions).
+  ;; A cache is usually an improvement over sequential tests but it's impossible to know
+  ;; (the first clause could get taken 99% of the time)
   (let ((n (length layout-lists)))
     `(truly-the
       (integer 0 ,n)
@@ -867,6 +949,35 @@ invoked. In that case it will store into PLACE and start over."
            MISS
              (return (sb-pcl::%struct-typecase-miss ,object cache-cell)))))))
 
+;;; Decide whether to bind EXPR to a random gensym or a COPY-SYMBOL, or not at all,
+;;; for purposes of CASE/TYPECASE. Lexical vars don't require rebinding because
+;;; no SET can occur in dispatching to a clause, and multiple refs are devoid
+;;; of side-effects (such as UNBOUND-SYMBOL or undefined-alien trap)
+(defun choose-tempvar (bind expr env)
+  (let ((bind
+         (cond ((or bind (consp expr)) t)
+               ((not (symbolp expr)) nil)
+               (t
+                (let ((found (and (sb-c::lexenv-p env)
+                                  (sb-c:lexenv-find expr vars :lexenv env))))
+                  (cond ((or (sb-c::global-var-p found)
+                             (listp found) ; special, macro, or not found
+                             (eq found :bogus)) ; PCL walker shenanigans
+                         t)
+                        ((sb-c::lambda-var-specvar found)
+                         (bug "can't happen"))
+                        (t
+                         nil)))))))
+    (cond ((not bind) expr)
+          ((and (symbolp expr)
+                ;; Some broken 3rd-party code walker is confused by #:_
+                ;; and this hack of forcing a random gensym seems
+                ;; to partially cure whatever the problem is.
+                (string/= expr "_"))
+           (copy-symbol expr))
+          (t
+           (gensym)))))
+
 ;;; Given an arbitrary TYPECASE, see if it is a discriminator over
 ;;; an assortment of structure-object subtypes. If it is, potentially turn it
 ;;; into a dispatch based on layout-clos-hash.
@@ -883,11 +994,12 @@ invoked. In that case it will store into PLACE and start over."
 ;;; In fact as far as I can tell, redefining a standard class doesn't require a new hash
 ;;; because the obsolete layout always gets clobbered to 0, and cache lookups always check
 ;;; for a match on both the hash and the layout.
-(defun expand-struct-typecase (keyform temp normal-clauses type-specs default errorp)
+(defun expand-struct-typecase (keyform normal-clauses type-specs default errorp env)
   (let* ((n (length type-specs))
          (n-base-types 0)
          (layout-lists (make-array n))
          (exhaustive-list) ; of classoids
+         (temp (choose-tempvar t keyform nil))
          (all-sealed t))
     (labels
         ((ok-classoid (classoid)
@@ -916,9 +1028,12 @@ invoked. In that case it will store into PLACE and start over."
       ;; For each clause, if it effectively an OR over acceptable instance types,
       ;; collect the layouts of those types.
       (loop for i from 0 for spec in type-specs
-            do (let ((parse (specifier-type spec)))
+            do (let ((parse (handler-bind ((parse-unknown-type #'muffle-warning))
+                              (specifier-type spec))))
                  (setf (aref layout-lists i) (or (get-layouts parse)
                                                  (return-from expand-struct-typecase nil)))))
+      ;; The number of base types is an upper bound on the number of different TYPEP
+      ;; executions that could occur.
       ;; Let's say 1 to 4 TYPEP tests isn't to bad. Just do them sequentially.
       ;; But given something like:
       ;; (typecase x
@@ -926,23 +1041,50 @@ invoked. In that case it will store into PLACE and start over."
       ;;   ((or parent4 parent5 parent6) ...)
       ;; where eaach parent has dozens of children (directly or indirectly),
       ;; it may be worse to use a hash-based lookup.
-      (when (or (< n-base-types 5)
-                (> (length exhaustive-list) (* 3 n-base-types)))
+      (when (or (< n-base-types 5) ; too few cases
+                (> (length exhaustive-list) (* 3 n-base-types))) ; too much "bloat"
         (return-from expand-struct-typecase))
-      ;; If no new subtypes can be defined, then there is a compiled-time-computable
-      ;; mapping from CLOS-hash to jump table index.
-      ;; The number of base types is an upper bound on the number of different TYPEP
-      ;; executions that could occur. Use a cache if it exceeds 8 but the sealed logic
-      ;; was inapplicable. A cache is usually an improvement over sequential tests
-      ;; but it's impossible to know (the first clause could get taken 99% of the time)
+      ;; I don't know if these criteria are sane: Use hashing only if either all sealed,
+      ;; or very large? Why is this an additional restriction beyond the above heuristics?
       (when (or all-sealed (>= n-base-types 8))
+        (when all-sealed
+          (let ((i -1) (consts (make-array (length normal-clauses))))
+            (dolist (clause normal-clauses)
+              (let ((expr `(progn ,@(cdr clause))))
+                ;; If compiling to file, the constants allowed are restricted because
+                ;; there are inevitably complications arising from creating arrays of
+                ;; constants the user didn't ask for, such as when the value of a form
+                ;; is a self-evaluating object lacking a make-load-form.
+                (cond ((and (constantp expr env)
+                            (let ((val (setf (aref consts (incf i))
+                                             (constant-form-value expr env))))
+                              (if (sb-c::producing-fasl-file)
+                                  (sb-xc:typep val '(or symbol number))
+                                  t))))
+                      (t
+                       (setq consts nil)
+                       (return)))))
+            (when consts ; use an array of values
+              (return-from expand-struct-typecase
+                `(let* ((,temp ,keyform)
+                        (#1=#:index (sb-kernel::%typecase-index ,layout-lists ,temp t)))
+                   (if (eq #1# 0)
+                       ,(if errorp
+                            `(etypecase-failure ,temp ',type-specs)
+                            `(progn ,@(cdr default)))
+                       (svref ,consts (1- #1#))))))))
         `(let ((,temp ,keyform))
            (case (sb-kernel::%typecase-index ,layout-lists ,temp ,all-sealed)
-             ,@(loop for i from 1 for clause in normal-clauses
+             ,@(loop for i from 1
+                     for clause in normal-clauses
                      collect `(,i
-                                   ;; CLAUSE is ((TYPEP #:G 'a-type) . forms)
-                                   (sb-c::%type-constraint ,temp ,(third (car clause)))
-                                   ,@(cdr clause)))
+                               ;; CLAUSE is ((TYPEP #:G 'a-type) . forms)
+                               (sb-c::%type-constraint
+                                ,temp
+                                ,(third (if (eq (caar clause) 'sb-c::with-source-form)
+                                            (third (car clause))
+                                            (car clause))))
+                               ,@(cdr clause)))
              (0 ,@(if errorp
                           `((etypecase-failure ,temp ',type-specs))
                           (cdr default)))))))))
@@ -969,13 +1111,14 @@ invoked. In that case it will store into PLACE and start over."
 ;;; and gets the compiled code that the host produced in make-host-1.
 ;;; If recompiled, you do not want an interpreted definition that might come
 ;;; from EVALing a toplevel form - the stack blows due to infinite recursion.
-(defun case-body (whole lexenv test errorp
+(defun parse-case-clauses
+    (whole lexenv test errorp
                   &aux (clauses ())
                        (case-clauses (if (eq test 'typep) '(0))) ; generalized boolean
                        (keys))
   (destructuring-bind (name keyform &rest specified-clauses
-                       &aux (keyform-value
-                             (if (symbolp keyform) (copy-symbol keyform) (gensym))))
+                       &aux (keyform-value (choose-tempvar (eq errorp 'cerror)
+                                                           keyform lexenv)))
       whole
     (unless (or (cdr whole) (not errorp))
       (warn "no clauses in ~S" name))
@@ -996,11 +1139,17 @@ invoked. In that case it will store into PLACE and start over."
                  (dolist (k case-keys)
                    (setf (gethash k keys-seen) record))))
              (testify (k)
-               `(,test ,keyform-value
-                       ,(if (and (eq test 'eql) (self-evaluating-p k)) k `',k))))
+               (wrap-if
+                (and (eq test 'typep)
+                     (sb-c::compiling-p lexenv))
+                `(sb-c::with-source-form ,clause)
+                `(,test
+                  ,keyform-value
+                  ,(if (and (eq test 'eql) (self-evaluating-p k)) k `',k)))))
         (unless (list-of-length-at-least-p clause 1)
           (with-current-source-form (cases)
-            (error "~S -- bad clause in ~S" clause name)))
+            (warn "~S -- bad clause in ~S" clause name)
+            (go next)))
         (with-current-source-form (clause)
           ;; https://sourceforge.net/p/sbcl/mailman/message/11863996/ contains discussion
           ;; of whether to warn when seeing OTHERWISE in a normal-clause position, but
@@ -1020,24 +1169,32 @@ invoked. In that case it will store into PLACE and start over."
                    (cond ((null (cdr cases))
                           (push `(t ,@forms) clauses))
                          ((eq name 'case)
-                          (error 'simple-reference-error
-                                 :format-control
-                            "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
+                          (push `(t ,@forms) clauses)
+                          (setf specified-clauses
+                                (ldiff specified-clauses (cdr cases)))
+                          (warn 'simple-reference-warning
+                                :format-control
+                                "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
                            designator only in the final otherwise-clause, not in a ~
                            normal-clause. Use (~S) instead, or move the clause to the ~
                            correct position.~:@>"
-                            :format-arguments (list 'case clause keyoid keyoid)
-                            :references `((:ansi-cl :macro case))))
+                                :format-arguments (list 'case clause keyoid keyoid)
+                                :references `((:ansi-cl :macro case)))
+                          (return))
                          (t
+                          (push `(t ,@forms) clauses)
+                          (setf specified-clauses
+                                (ldiff specified-clauses (cdr cases)))
                           ;; OTHERWISE is a redundant bit of the behavior of TYPECASE
                           ;; since T is the universal type. OTHERWISE could not legally
                           ;; be DEFTYPEed so this _must_ be a misplaced clause.
-                          (error 'simple-reference-error
+                          (warn 'simple-reference-warning
                                      :format-control
                             "~@<~IBad ~S clause:~:@_  ~S~:@_~S is allowed only in the final clause. ~
                            Use T instead, or move the clause to the correct position.~:@>"
                             :format-arguments (list 'typecase clause keyoid)
-                            :references `((:ansi-cl :macro typecase))))))
+                            :references `((:ansi-cl :macro typecase)))
+                          (return))))
                   ((and (listp keyoid) (eq test 'eql))
                    (unless (proper-list-p keyoid) ; REVERSE would err with unclear message
                      (error "~S is not a proper list" keyoid))
@@ -1056,9 +1213,7 @@ invoked. In that case it will store into PLACE and start over."
                      ;; - if ERRORP is non-nil, though this isn't technically an "otherwise"
                      ;;   clause, in acts just like one.
                      (if errorp
-                         (setq errorp :none)
-                         (style-warn "T clause in ~S makes subsequent clauses unreachable:~%~S"
-                                     name specified-clauses)))
+                         (setq errorp :none)))
                    (when case-clauses ; try the TYPECASE into CASE reduction
                      (let ((typespec (ignore-errors (typexpand keyoid))))
                        (cond ((typep typespec '(cons (eql member) (satisfies proper-list-p)))
@@ -1069,113 +1224,123 @@ invoked. In that case it will store into PLACE and start over."
                               (setq case-clauses nil)))))
                    (push keyoid keys)
                    (check-clause (list keyoid))
-                   (push `(,(testify keyoid) ,@forms) clauses)))))))
+                   (push `(,(testify keyoid) ,@forms) clauses))))))
+      next)
     (when (eq errorp :none)
       (setq errorp nil))
 
+    ;; For a TYPECASE, attempt to inform the user if a later clause is shadowed by
+    ;; an earlier one, unless converting to CASE which will warn about it as well.
+    ;; However, this seems not to do exactly what it attempts to.
+    ;; single-float followed by short-float avoids warning, but the opposite order warns.
+    ;; Same for double then long does not warn; flipped warns.
+    (when (and (eq test 'typep) (not case-clauses))
+      (loop with types = nil
+            for clause in specified-clauses
+            do
+        (with-current-source-form (clause)
+          (let* ((key (car clause))
+                 (type (unless (eq key 'otherwise)
+                         (handler-bind ((parse-unknown-type #'muffle-warning))
+                           (specifier-type key)))))
+            (when (and type (neq type *empty-type*))
+              (let ((existing
+                     (loop for (prev . spec) in types
+                           when
+                           (and (csubtypep type prev)
+                                (not (or (and (eq prev (specifier-type 'single-float))
+                                              (eq key 'short-float))
+                                         #-long-float
+                                         (and (eq prev (specifier-type 'double-float))
+                                              (eq key 'long-float))
+                                         (and (csubtypep type (specifier-type 'array))
+                                              ;; Ignore due to upgrading
+                                              (sb-kernel::ctype-array-any-specialization-p prev)))))
+                           return spec)))
+                (if existing
+                    (style-warn "Clause ~s is shadowed by ~s" key existing)
+                    (push (cons type key) types))))))))
+    (list* keyform-value keys errorp
+           (if case-clauses
+               (list t (append (cdr (reverse case-clauses)) ; 1st elt was a boolean flag
+                               (when (eq (caar clauses) t) (list (car clauses)))))
+               (list nil clauses)))))
+
+(defun case-body (whole lexenv test errorp)
+  (destructuring-bind (keyform-value keys errorp expand-as-case clauses
+                              &aux (name (car whole))
+                                   (keyform (cadr whole)))
+      (parse-case-clauses whole lexenv test errorp)
     ;; [EC]CASE has an advantage over [EC]TYPECASE in that we readily notice when
     ;; the expansion can use symbol-hash to pick the clause.
-    (when case-clauses
+    (when expand-as-case
       (return-from case-body
         `(,(cond ((not errorp) 'case) ((eq name 'ctypecase) 'ccase) (t 'ecase))
-           ,keyform
-          ,@(cdr (reverse case-clauses)) ; 1st elt was a boolean flag
-          ,@(when (eq (caar clauses) t) (list (car clauses))))))
+          ,keyform ,@clauses)))
 
     (setq keys
           (nreverse (mapcon (lambda (tail)
                               (unless (member (car tail) (cdr tail))
                                 (list (car tail))))
                             keys)))
-
     ;; Try hash-based dispatch only if expanding for the compiler
     (when (and (neq errorp 'cerror)
-               (boundp 'sb-c:*compilation*)
-               #+sb-fasteval
-               (not (typep lexenv 'sb-interpreter:basic-env))
-               #+sb-eval
-               (not (typep lexenv 'sb-eval::eval-lexenv))
-               (sb-c:policy lexenv (> sb-c:jump-table 0))
+               (sb-c::compiling-p lexenv)
+               ;; See slow-findhash-allowed
+               (sb-c:policy lexenv (and (>= speed compilation-speed)
+                                        (> sb-c:jump-table 0)))
                (sb-c::vop-existsp :named sb-c:jump-table))
       (let* ((default (if (eq (caar clauses) 't) (car clauses)))
              (normal-clauses (reverse (if default (cdr clauses) clauses))))
         ;; Try expanding a using perfect hash and either a jump table or k/v vectors
         ;; depending on constant-ness of results.
-        (cond ((and (eq test 'eql)
-                    (should-attempt-hash-based-case-dispatch keys))
-               (let* ((constants
-                        (when (every (lambda (clause) (constantp `(progn ,@(cdr clause))))
-                                     normal-clauses)
-                          ;; TODO: use specialized vector if possible
-                          (block nil
-                            (map 'simple-vector
-                                 (lambda (clause)
-                                   (let ((value
-                                           (constant-form-value `(progn ,@(cdr clause)) lexenv)))
-                                     (if (typep value '(or symbol number
-                                                        character (and array (not (array t)))))
-                                         value
-                                         (return))))
-                                 normal-clauses))))
-                      (seen (alloc-xset))
-                      (tested (if default (butlast specified-clauses) specified-clauses))
-                      (key-lists
-                        (loop for clause in tested
-                              collect (mapcan (lambda (key)
-                                                (unless (xset-member-p key seen)
-                                                  (add-to-xset key seen)
-                                                  (list key)))
-                                              (ensure-list (car clause))))))
-                 (return-from case-body
-                   `(let ((,keyform-value ,keyform))
-                      ,(if constants
-                           `(sb-c:case-to-jump-table ,keyform-value ',key-lists ',constants
-                                                     ,(if default
-                                                          `(lambda () (progn ,@(cdr default))))
-                                                     ',errorp)
-                           `(sb-c::%jump-table (sb-c:case-to-jump-table ,keyform-value ',key-lists)
-                                               ,@(loop for (nil . form) in tested
-                                                       for keys in key-lists
-                                                       collect `(lambda ()
-                                                                  (sb-c::%type-constraint ,keyform-value '(member ,@keys))
-                                                                  ,@form))
-                                               (lambda ()
-                                                 (sb-c::%type-constraint ,keyform-value '(not (member ,@keys)))
-                                                 ,@(if errorp
-                                                       `((ecase-failure ,keyform-value ,(coerce keys 'simple-vector)))
-                                                       (cdr default)))))))))
-              ((eq test 'typep)
-               (awhen (expand-struct-typecase keyform keyform-value normal-clauses keys
-                                              default errorp)
+        (cond ((eq test 'typep)
+               (awhen (expand-struct-typecase keyform normal-clauses keys
+                                              default errorp lexenv)
                  (return-from case-body it))))))
 
     (setq clauses (nreverse clauses))
 
     (let ((expected-type `(,(if (eq test 'eql) 'member 'or) ,@keys)))
-     (if (eq errorp 'cerror) ; CCASE or CTYPECASE
+      (when (eq errorp 'cerror) ; CCASE or CTYPECASE
+        (return-from case-body
       ;; It is not a requirement to evaluate subforms of KEYFORM once only, but it often
       ;; reduces code size to do so, as the update form will take advantage of typechecks
       ;; already performed. (Nor is it _required_ to re-evaluate subforms)
-      (binding* ((switch (make-symbol "SWITCH"))
-                 (retry
-                  ;; TODO: consider using the union type simplifier algorithm here
-                  `(case-body-error ',name ',keyform ,keyform-value ',expected-type ',keys))
-                 ((vars vals stores writer reader) (get-setf-expansion keyform)))
-        `(let* ,(mapcar #'list vars vals)
-           (named-let ,switch ((,keyform-value ,reader))
-             (cond ,@clauses
-                   (t (multiple-value-bind ,stores ,retry (,switch ,writer)))))))
+          (binding* ((switch (make-symbol "SWITCH"))
+                     (retry
+                      ;; TODO: consider using the union type simplifier algorithm here
+                      `(case-body-error ',name ',keyform ,keyform-value ',expected-type ',keys))
+                     ((vars vals stores writer reader) (get-setf-expansion keyform)))
+          `(let* ,(mapcar #'list vars vals)
+             (named-let ,switch ((,keyform-value ,reader))
+               (cond ,@clauses
+                     (t (multiple-value-bind ,stores ,retry (,switch ,writer)))))))))
 
-    `(let ((,keyform-value ,keyform))
-       (declare (ignorable ,keyform-value)) ; e.g. (CASE KEY (T))
-       (cond ,@clauses
-             ,@(when errorp
-                 `((t ,(ecase name
-                         (etypecase
-                          `(etypecase-failure
-                            ,keyform-value ,(etypecase-error-spec keys)))
-                         (ecase
-                          `(ecase-failure ,keyform-value ',keys))))))))))))
+      (when (and (eq keyform-value keyform) (not keys))
+        (setq keyform-value '#:dummy)) ; force a rebinding to "use" the value
+      (let ((switch
+             `(cond
+                ,@clauses
+                ,@(when errorp
+                    `((t
+                       ,(wrap-if
+                         (sb-c::compiling-p lexenv)
+                         '(locally (declare (muffle-conditions code-deletion-note)))
+                         (ecase name
+                           (etypecase
+                             `(etypecase-failure
+                                 ,keyform-value ,(etypecase-error-spec keys)))
+                           (ecase
+                             `(ecase-failure ,keyform-value ',keys))))))))))
+        (if (eq keyform-value keyform)
+            switch
+            `(let ((,keyform-value ,keyform))
+               ;; binding must be IGNORABLE in either of these expressions:
+               ;;   (CASE KEY (() 'res))
+               ;;   (CASE KEY (T 'res))
+               (declare (ignorable ,keyform-value))
+               ,switch))))))
 
 ;;; ETYPECASE over clauses that form a "simpler" type specifier should use that,
 ;;; e.g. partitions of INTEGER:
@@ -1196,7 +1361,9 @@ invoked. In that case it will store into PLACE and start over."
           ;;    is /type equivalent/ to (or type1 type2 ...)"
           (when (symbolp unparsed)
             (return-from etypecase-error-spec `',unparsed))))))
-  `',types)
+  ;; This constant can make its way into generic function dispatch.
+  ;; The compiled code must not to point to an arena if one is active.
+  `',(ensure-heap-list types))
 
 (sb-xc:defmacro case (&whole form &environment env &rest r)
   (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
@@ -1259,6 +1426,8 @@ invoked. In that case it will store into PLACE and start over."
 ;;;; WITH-FOO i/o-related macros
 
 (sb-xc:defmacro with-open-stream ((var stream) &body body)
+  (when (typep stream '(cons (eql open) (cons t)))
+    (setf stream `(open ,@(cdr stream) :auto-close nil)))
   (multiple-value-bind (forms decls) (parse-body body nil)
     `(let ((,var ,stream))
        ,@decls
@@ -1270,7 +1439,7 @@ invoked. In that case it will store into PLACE and start over."
                                 &body body)
   (multiple-value-bind (forms decls) (parse-body body nil)
     (let ((abortp (gensym)))
-      `(let ((,stream (open ,filespec ,@options))
+      `(let ((,stream (open ,filespec ,@options :auto-close nil))
              (,abortp t))
          ,@decls
          (unwind-protect
@@ -1279,6 +1448,13 @@ invoked. In that case it will store into PLACE and start over."
                 (setq ,abortp nil))
            (when ,stream
              (close ,stream :abort ,abortp)))))))
+
+(sb-xc:defmacro sb-debug::with-debug-io-syntax (() &body body)
+  (let ((thunk (gensym "THUNK")))
+    `(dx-flet ((,thunk ()
+                 ,@body))
+       (sb-debug::funcall-with-debug-io-syntax #',thunk))))
+
 
 ;;;; Iteration macros:
 
@@ -1363,6 +1539,58 @@ invoked. In that case it will store into PLACE and start over."
        (declare (type unsigned-byte ,var))
        ,@body)))
 
+(defun segregate-dolist-decls (var decls)
+  (collect ((bound-type-decls)
+            (bound-nontype-decls)
+            (free-decls))
+    (dolist (decl decls)
+      (aver (eq (car decl) 'declare))
+      (dolist (expr (cdr decl))
+        (let ((head (car expr))
+              (tail (cdr expr)))
+          (cond ((consp head) ; compound type specifier
+                 (when (member var tail) (bound-type-decls head))
+                 (awhen (remove var tail) (free-decls `(,head ,@it))))
+                ((not (symbolp head)) (free-decls expr)) ; bogus
+                (t
+                 (case head
+                   ((special dynamic-extent)
+                    ;; dynamic-extent makes no sense but this logic has to correctly
+                    ;; recognize all the standard atoms that DECLARE accepts.
+                    (when (member var tail) (bound-nontype-decls `(,head ,var)))
+                    (awhen (remove var tail) (free-decls `(,head ,@it))))
+                   (type
+                    (when (member var (cdr tail)) (bound-type-decls (cadr expr)))
+                    (awhen (remove var (cdr tail)) (free-decls `(type ,(cadr expr) ,@it))))
+                   ((ignore ignorable)
+                    (awhen (remove var tail) (free-decls `(,head ,@it))))
+                   ((optimize ftype inline notinline maybe-inline
+                     muffle-conditions unmuffle-conditions)
+                    (free-decls expr))
+                   (t
+                    ;; Assume that any decl pertaining to bindings must have the symbol appear
+                    ;; in TAIL. Is this true of custom decls? I would certainly think so.
+                    (cond ((not (member var tail)) (free-decls expr))
+                          ((info :declaration :known head)
+                           ;; Declaimed declaration can't be a type decl.
+                           (bound-nontype-decls expr))
+                          ((not (sb-c::careful-specifier-type head))
+                           ;; If can't be parsed, then what is it? A free decl is as good as anything
+                           (free-decls expr))
+                          ((contains-unknown-type-p (sb-c::careful-specifier-type head))
+                           ;; Stuff it into bound-nontype decls which is no worse
+                           ;; than what FILTER-DOLIST-DECLARATIONS could do.
+                           (bound-nontype-decls expr))
+                          (t
+                           ;; A valid type declaration can pertain to some non-bound vars and/or
+                           ;; the bound var, nicely handling (STRING x y iterationvar).
+                           (when (member var tail) (bound-type-decls head))
+                           (awhen (remove var tail) (free-decls `(,head ,@it))))))))))))
+    (values (mapcar (lambda (x) `(type ,x ,var)) (bound-type-decls))
+            (mapcar (lambda (x) `(type (or null ,x) ,var)) (bound-type-decls))
+            (bound-nontype-decls)
+            (free-decls))))
+
 (sb-xc:defmacro dolist ((var list &optional (result nil)) &body body &environment env)
   ;; We repeatedly bind the var instead of setting it so that we never
   ;; have to give the var an arbitrary value such as NIL (which might
@@ -1373,6 +1601,8 @@ invoked. In that case it will store into PLACE and start over."
   ;; since we don't want to use IGNORABLE on what might be a special
   ;; var.
   (binding* (((forms decls) (parse-body body nil))
+             ((iter-type-decl res-type-decl other-decl free-decl)
+              (segregate-dolist-decls var decls))
              (n-list (gensym "LIST"))
              (start (gensym "START"))
              ((clist members clist-ok)
@@ -1402,27 +1632,23 @@ invoked. In that case it will store into PLACE and start over."
                            ;; But it doesn't detect the mismatch because the SETF
                            ;; mixes in T with the initial type.
                            `(the* (list :use-annotations t :source-form ,list) ,list))))
+         ,@(when free-decl `((declare ,@free-decl)))
          (tagbody
             ,start
             (unless (endp ,n-list)
               (let ((,var ,(if clist-ok
                                `(truly-the (member ,@members) (car ,n-list))
                                `(car ,n-list))))
-                (declare (ignorable ,var))
-                ,@decls
+                (declare ,@iter-type-decl ,@other-decl (ignorable ,var))
                 (setq ,n-list (cdr ,n-list))
                 (tagbody ,@forms))
-              (go ,start))))
-       ,(if result
-            `(let ((,var nil))
-               ;; Filter out TYPE declarations (VAR gets bound to NIL,
-               ;; and might have a conflicting type declaration) and
-               ;; IGNORE (VAR might be ignored in the loop body, but
-               ;; it's used in the result form).
-               ,@(filter-dolist-declarations decls)
+              (go ,start)))
+         ;; still within the scope of decls pertinent to other than the VAR binding
+         ,@(when result
+            `((let ((,var nil))
+               ,@(if (or res-type-decl other-decl) `((declare ,@res-type-decl ,@other-decl)))
                ,var
-               ,result)
-            nil))))
+               ,result)))))))
 
 
 ;;;; Miscellaneous macros:
@@ -1530,7 +1756,7 @@ invoked. In that case it will store into PLACE and start over."
 ;;;; SB-EXT:COMPARE-AND-SWAP is the public API for now.
 ;;;;
 ;;;; Internally our interface has CAS, GET-CAS-EXPANSION,
-;;;; DEFCAS, and #'(CAS ...) functions.
+;;;; and #'(CAS ...) functions.
 
 (defun expand-structure-slot-cas (info name place)
   (let* ((dd (car info))
@@ -1541,9 +1767,9 @@ invoked. In that case it will store into PLACE and start over."
          (casser
            (case (dsd-raw-type slotd)
              ((t) '%instance-cas)
-             #+(or arm64 ppc ppc64 riscv x86 x86-64)
+             #+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
              ((word) '%raw-instance-cas/word)
-             #+(or arm64 riscv x86 x86-64)
+             #+(or arm64 loongarch64 riscv x86 x86-64)
              ((sb-vm:signed-word) '%raw-instance-cas/signed-word))))
     (unless casser
       (error "Cannot use COMPARE-AND-SWAP with structure accessor ~
@@ -1694,7 +1920,7 @@ of PLACE: if the returned value is EQ to OLD, the swap was carried out.
 PLACE must be an CAS-able place. Built-in CAS-able places are accessor forms
 whose CAR is one of the following:
 
- CAR, CDR, FIRST, REST, SVREF, SYMBOL-PLIST, SYMBOL-VALUE, SVREF, SLOT-VALUE
+ CAR, CDR, FIRST, REST, SVREF, SYMBOL-PLIST, SYMBOL-VALUE, SLOT-VALUE
  SB-MOP:STANDARD-INSTANCE-ACCESS, SB-MOP:FUNCALLABLE-STANDARD-INSTANCE-ACCESS,
 
 or the name of a DEFSTRUCT created accessor for a slot whose storage type

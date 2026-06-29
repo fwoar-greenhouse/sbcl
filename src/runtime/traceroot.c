@@ -6,14 +6,13 @@
 #include "code.h"
 #include "genesis/closure.h"
 #include "genesis/cons.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 #include "genesis/gc-tables.h"
 #include "genesis/hash-table.h"
 #include "genesis/instance.h"
 #include "genesis/package.h"
 #include "genesis/vector.h"
 #include "search.h"
-#include "genesis/avlnode.h"
 #include "genesis/sap.h"
 #include "print.h"
 
@@ -141,6 +140,8 @@ static inline lispobj canonical_obj(lispobj obj)
     return obj;
 }
 
+#define slot_index_of(tag_,slot_) offsetof(struct tag_,slot_)/N_WORD_BYTES
+
 /* Return the word index of the pointer in 'source' which references 'target'.
  * Return -1 on failure. (This is an error if it happens)
  */
@@ -180,6 +181,14 @@ static int find_ref(lispobj* source, lispobj target)
     case CODE_HEADER_WIDETAG:
         scan_limit = code_header_words((struct code*)source);
         break;
+    case SYMBOL_WIDETAG: {
+        struct symbol* sym = (void*)source;
+        check_ptr(slot_index_of(symbol,value), sym->value);
+        check_ptr(slot_index_of(symbol,info), sym->info);
+        check_ptr(slot_index_of(symbol,fdefn), sym->fdefn);
+        check_ptr(slot_index_of(symbol,name), decode_symbol_name(sym->name));
+        return -1;
+    }
     case FDEFN_WIDETAG:
         check_ptr(3, decode_fdefn_rawfun((struct fdefn*)source));
         scan_limit = 3;
@@ -205,11 +214,8 @@ static lispobj* valid_ambiguous_pointer_p(lispobj ptr, int registerp)
     // exact pointer is always a winner
     if (compute_lispobj(start) == ptr) return start;
     unsigned char widetag = widetag_of(start);
-    // allow untagged and/or interior pointer to code, fdefn, funcallable-instance
-    // FIXME: could add a few more rejection filters
-    //        such as untagged ptr to 2nd word of fdefn
+    // allow untagged and/or interior pointer to code, funcallable-instance
     if (widetag == CODE_HEADER_WIDETAG ||
-        widetag == FDEFN_WIDETAG ||
         widetag == FUNCALLABLE_INSTANCE_WIDETAG)
         return start;
     // allow in-register untagged pointer to lockfree list node
@@ -234,8 +240,14 @@ static os_context_t* get_register_context(struct thread* th)
 static lispobj* get_stackptr(struct thread* th)
 {
     if (th == get_sb_vm_thread()) return (lispobj*)cur_thread_stackptr_at_entry;
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    lispobj* csp = th->control_stack_pointer;
+    if (csp) return csp;
+#endif
+
     os_context_t* context = get_register_context(th);
     if (context) return (lispobj*)(uword_t)*os_context_sp_addr(context);
+
     lose("No stack pointer for %p", th);
 }
 
@@ -286,18 +298,13 @@ deduce_thread(uword_t pointer, char** pc)
 }
 #endif
 
-static int non_nil_symbolp(lispobj x) {
-    return lowtag_of(x) == OTHER_POINTER_LOWTAG
-      && widetag_of((lispobj*)(x-OTHER_POINTER_LOWTAG)) == SYMBOL_WIDETAG;
-}
-
 static __attribute__((unused)) int tls_index_ok(lispobj tlsindex, struct vector* ignored_objects)
 {
     if (ignored_objects) {
         int i;
         for (i = vector_len(ignored_objects)-1; i >= 0; --i) {
             lispobj x = ignored_objects->data[i];
-            if (non_nil_symbolp(x) && tls_index_of(SYMBOL(x)) == tlsindex) return 0;
+            if (non_nil_symbol_p(x) && tls_index_of(SYMBOL(x)) == tlsindex) return 0;
         }
     }
     return 1; // is OK
@@ -476,7 +483,7 @@ static void maybe_show_object_name(lispobj obj, FILE* stream)
 
 static bool root_p(lispobj ptr, int criterion)
 {
-    if (ptr <= STATIC_SPACE_END) return 1; // always a root
+    if (ptr >= STATIC_SPACE_START && ptr < STATIC_SPACE_END) return 1; // always a root
     // 0 to 2 are in order of weakest to strongest condition for stopping,
     // i.e. criterion 0 implies that that largest number of objects
     // are considered roots.
@@ -657,23 +664,22 @@ static lispobj trace1(lispobj object,
         lispobj ptr = next.object;
         path = mkcons(mkcons(ptr, make_fixnum(next.wordindex)), path);
         target = native_pointer(ptr)[next.wordindex];
-        // Special-case a few combinations of <type,wordindex>
-        switch (next.wordindex) {
-        case 0:
-            if (instancep(ptr) || functionp(ptr))
-                target = instance_layout(native_pointer(ptr));
-            break;
+        /* Special-case a few combinations of <type,wordindex>.
+         * And don't assume that each special case is uniquely identified
+         * by a wordindex. Coincidentally they are, but it would be incredibly
+         * unmaintainable to assume that */
+        if (next.wordindex == 0 && (instancep(ptr) || functionp(ptr))) {
+            target = instance_layout(native_pointer(ptr));
+        }
 #if FUN_SELF_FIXNUM_TAGGED
-        case 1:
-            if (functionp(ptr) && widetag_of(native_pointer(ptr)) == CLOSURE_WIDETAG)
-                target = fun_taggedptr_from_self(target);
-            break;
+        else if (next.wordindex == 1 && functionp(ptr)
+                 && widetag_of(native_pointer(ptr)) == CLOSURE_WIDETAG) {
+            target = fun_taggedptr_from_self(target);
+        }
 #endif
-        case 3:
-            if (lowtag_of(ptr) == OTHER_POINTER_LOWTAG &&
-                widetag_of(&FDEFN(ptr)->header) == FDEFN_WIDETAG)
-                target = decode_fdefn_rawfun((struct fdefn*)native_pointer(ptr));
-            break;
+        else if (next.wordindex == 3 && lowtag_of(ptr) == OTHER_POINTER_LOWTAG &&
+                 widetag_of(&FDEFN(ptr)->header) == FDEFN_WIDETAG) {
+            target = decode_fdefn_rawfun((struct fdefn*)native_pointer(ptr));
         }
         target = canonical_obj(target);
         struct layer* next_layer = top_layer->next;
@@ -734,9 +740,9 @@ static bool ignorep(lispobj* base_ptr, lispobj ignored_objects)
     return 0;
 }
 
-static uword_t build_refs(lispobj* where, lispobj* end,
-                          struct scan_state* ss)
+static uword_t build_refs(lispobj* where, lispobj* end, void* arg)
 {
+    struct scan_state* ss = arg;
     lispobj layout;
     sword_t nwords, scan_limit, i;
     uword_t n_objects = 0, n_scanned_words = 0,
@@ -781,6 +787,14 @@ static uword_t build_refs(lispobj* where, lispobj* end,
         case CODE_HEADER_WIDETAG:
             scan_limit = code_header_words((struct code*)where);
             break;
+        case SYMBOL_WIDETAG: {
+            // I think it's OK to omit 'package'. It's seldom interesting
+            // to discover a path involving a symbol back to its package.
+            struct symbol* s = (void*)where;
+            check_ptr(s->value); check_ptr(s->info); check_ptr(s->fdefn);
+            check_ptr(decode_symbol_name(s->name));
+            continue;
+            }
         case FDEFN_WIDETAG:
             check_ptr(decode_fdefn_rawfun((struct fdefn*)where));
             scan_limit = 3;
@@ -860,7 +874,7 @@ static uword_t build_refs(lispobj* where, lispobj* end,
 static void scan_spaces(struct scan_state* ss)
 {
     struct scan_state old = *ss;
-    build_refs((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, ss);
+    build_refs(NIL_SYMBOL_SLOTS_START, NIL_SYMBOL_SLOTS_END, ss);
     build_refs((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, ss);
     show_tally(old, ss, "static");
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -870,8 +884,7 @@ static void scan_spaces(struct scan_state* ss)
     show_tally(old, ss, "text");
 #endif
     old = *ss;
-    walk_generation((uword_t(*)(lispobj*,lispobj*,uword_t))build_refs,
-                    -1, (uword_t)ss);
+    walk_generation(build_refs, -1, ss);
     show_tally(old, ss, "dynamic");
 }
 

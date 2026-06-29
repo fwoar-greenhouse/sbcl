@@ -73,28 +73,17 @@
 ;;; return instructions.
 
 (defmacro lisp-jump (fun)
-  "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
+  "Jump to the lisp function FUNCTION.  LIP is lip-tn"
   `(progn
      (inst j ,fun
            (- (ash simple-fun-insts-offset word-shift) fun-pointer-lowtag))
-     (move code-tn ,fun)))
+     (inst nop)))
 
-(defmacro lisp-return (return-pc &key (offset 0) (frob-code t))
+(defmacro lisp-return (return-pc &key (offset 0))
   "Return to RETURN-PC."
   `(progn
-     (inst j ,return-pc
-           (- (* (1+ ,offset) n-word-bytes) other-pointer-lowtag))
-     ,(if frob-code
-          `(move code-tn ,return-pc)
-          '(inst nop))))
-
-(defmacro emit-return-pc (label)
-  "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
-  `(progn
-     (emit-alignment n-lowtag-bits)
-     (emit-label ,label)
-     (inst lra-header-word)))
-
+     (inst j ,return-pc (+ 8 (* ,offset n-word-bytes)))
+     (inst nop)))
 
 
 ;;;; stack TN's
@@ -131,6 +120,19 @@
 
 
 ;;;; Storage allocation:
+
+(defun generate-stack-overflow-check (vop size temp)
+  (let ((overflow (generate-error-code vop
+                                       'stack-allocated-object-overflows-stack-error
+                                       size)))
+    #-sb-thread
+    (load-symbol-value temp *control-stack-end*)
+    #+sb-thread
+    (loadw temp thread-tn thread-control-stack-end-slot)
+    (inst sub temp temp csp-tn)
+    (inst cmp temp size)
+    (inst b :le overflow)
+    (inst nop)))
 
 ;;;; Allocation macro
 ;;;;
@@ -213,9 +215,7 @@
             (without-scheduling ()
               ;; Encode the RESULT-TN, SIZE, and TYPE in an OR instruction
               ;; which is never executed.
-              (inst or (make-random-tn :sc (sc-or-lose 'unsigned-reg)
-                                       :kind :normal
-                                       :offset (if (eq type 'list) 1 0))
+              (inst or (make-random-tn (sc-or-lose 'unsigned-reg) (if (eq type 'list) 1 0))
                     result-tn size)
               (emit-label FULL-ALLOC)
               ;; Trap into the C allocator
@@ -254,7 +254,7 @@
     (emit-internal-error kind code values
                          :trap-emitter (lambda (tramp-number)
                                          (inst unimp tramp-number)))
-    (emit-alignment word-shift)))
+    (emit-alignment 2)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*

@@ -62,7 +62,7 @@
 
     (test-case 1.1s0 'complex                                      #C(1.1s0 .0s0)   t)
     (test-case 1.1s0 '(complex real)                               #C(1.1s0 .0s0)   t)
-    (test-case 1.1s0 '(complex (real 1))                           nil              t)
+    (test-case 1.1s0 '(complex (real 1))                           #C(1.1s0 0s0)    t)
     (test-case 1.1s0 '(complex rational)                           nil              t)
     (test-case 1.1s0 '(complex (rational 1))                       nil              t)
     (test-case 1.1s0 '(complex (or (rational -3 -2) (rational 1))) nil              t)
@@ -70,7 +70,7 @@
     (test-case 1.1s0 '(complex double-float)                       (coerce #C(1.1s0 .0s0) '(complex double-float)))
     (test-case 1.1s0 '(complex single-float)                       #C(1.1s0 .0s0))
     (test-case 1.1s0 '(complex integer)                            nil              t)
-    (test-case 1.1s0 '(complex (or (real 1) (integer -1 0)))       nil              t)
+    (test-case 1.1s0 '(complex (or (real 1) (integer -1 0)))       #C(1.1s0 0s0)    t)
 
     (test-case   1/2 'complex                                      1/2              t)
     (test-case   1/2 '(complex real)                               1/2              t)
@@ -164,3 +164,59 @@
       `(lambda (a)
          (coerce a 'array))
     ((#(1)) #(1) :test #'equalp)))
+
+(with-test (:name :coerce-vector-no-warnings)
+  (checked-compile '(lambda (x)
+                     (typecase x
+                       (vector 1)
+                       (t
+                        (coerce x '(vector t))))))
+  (checked-compile '(lambda (x)
+                     (typecase x
+                       ((vector t) 1)
+                       (t
+                        (coerce x '(vector t)))))))
+
+(with-test (:name :coerce-object-type)
+  (assert-type
+     (lambda (x y)
+       (coerce (the float x) y))
+     (or float (complex float)))
+  (assert-type
+     (lambda (x y)
+       (coerce (the array x) y))
+     (or array sequence character))
+  (assert-type
+     (lambda (y)
+       (coerce "ab" y))
+     (or list (simple-array * (*)) sb-kernel:extended-sequence))
+  (assert-type
+   (lambda (x y)
+     (coerce (the function x) y))
+   (or function sequence))
+  (assert-type
+   (lambda (x y)
+     (coerce (the (and symbol (not null)) x) y))
+   (or (and symbol (not null)) function character))
+  (assert-type
+   (lambda (x y)
+     (coerce (the symbol x) y))
+   (or symbol (simple-array * (0)) sb-kernel:extended-sequence function character))
+  (assert-type
+   (lambda (x y)
+     (coerce (the (not single-float) x) y))
+   t))
+
+(with-test (:name :coerce-constructed-type)
+  (assert-type
+   (lambda (x n)
+     (coerce x `(vector ,n)))
+   vector)
+  (assert-type
+   (lambda (x n)
+     (coerce (the list x) `(vector ,n)))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (x n)
+     (coerce n (if x 'single-float 'double-float)))
+   float))

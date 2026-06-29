@@ -1,7 +1,15 @@
-#+gc-stress
-(sb-thread:make-thread (lambda ()
-                         (loop (gc :full t) (sleep 0.001)))
-                       :name "gc stress")
+#+(and gc-stress (not gc-stress-delay))
+(progn
+  #+sb-thread
+  (sb-thread:make-thread (lambda ()
+                           (loop (gc :full t) (sleep 0.001)))
+                         :name "gc stress")
+  #-sb-thread
+  (sb-ext:schedule-timer (make-timer (lambda () (gc :full t))) 0.1 :repeat-interval 0.005))
+
+#+gc-verify
+(setf (sb-alien:extern-alien "verify_gens" char) 0
+      (extern-alien "pre_verify_gen_0" int) 1)
 
 (defpackage :test-util
   (:use :cl :sb-ext)
@@ -47,7 +55,9 @@
            #:generate-test-directory-name
            #:*test-directory*
            #:opaque-identity
-           #:runtime #:split-string #:integer-sequence #:shuffle))
+           #:runtime #:split-string #:integer-sequence #:shuffle
+           #:compile-so
+           :vop-existsp))
 
 (in-package :test-util)
 
@@ -109,12 +119,12 @@
 ;;; This isn't a great name. Prefer to use TYPE-SPECIFIERS-EQUAL instead
 (defun ctype= (a b) (type-specifiers-equal a b))
 
-(defmacro assert-tri-eq (expected-result expected-certainp form)
-  (sb-int:with-unique-names (result certainp)
-    `(multiple-value-bind (,result ,certainp) ,form
-       (assert (eq ,expected-result ,result))
-       (assert (eq ,expected-certainp ,certainp)))))
+(defun elements-eq (list1 list2)
+  (every #'eq list1 list2))
 
+(defmacro assert-tri-eq (expected-result expected-certainp form)
+  `(assert (elements-eq '(,expected-result ,expected-certainp)
+                        (multiple-value-list ,form))))
 
 ;;; Thread tools
 
@@ -122,7 +132,6 @@
   #-sb-thread (error "can't make-kill-thread ~s" args)
   #+sb-thread
   (let ((thread (apply #'sb-thread:make-thread args)))
-    #-win32 ;; poor thread interruption on safepoints
     (when (boundp '*threads-to-kill*)
       (push thread *threads-to-kill*))
     thread))
@@ -186,12 +195,12 @@
           (*threads-to-join* nil)
           (*threads-to-kill* nil))
       (handler-bind ((error (lambda (error)
-                              (if (expected-failure-p fails-on)
+                              (if (skipped-p fails-on)
                                   (fail-test :expected-failure name error)
                                   (fail-test :unexpected-failure name error))
                               (return-from run-test)))
                      (timeout (lambda (error)
-                                (if (expected-failure-p fails-on)
+                                (if (skipped-p fails-on)
                                     (fail-test :expected-failure name error t)
                                     (fail-test :unexpected-failure name error t))
                                 (return-from run-test))))
@@ -219,7 +228,7 @@
           (when any-leftover
             (fail-test :leftover-thread name any-leftover)
             (return-from run-test)))
-        (if (expected-failure-p fails-on)
+        (if (skipped-p fails-on)
             (fail-test :unexpected-success name nil)
             ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
             (log-msg/non-pretty *trace-output* "Success ~S" name)))))
@@ -256,7 +265,7 @@
 ;;; The purpose of running tests in parallel is to exercise the compiler
 ;;; to show that it works without acquiring the world lock,
 ;;; but the nice side effect is that the tests finish quicker.
-(defmacro with-test ((&key fails-on broken-on skipped-on name serial slow)
+(defmacro with-test ((&key fails-on broken-on skipped-on implemented-on name serial slow)
                      &body body)
   ;; Failing and skipped tests are written into a summary file which is later read back.
   ;; To guarantee readability there can't be symbols in random packages.
@@ -273,7 +282,7 @@
                  (character `(code-char ,(char-code x)))
                  (string x))))
   (cond
-    ((broken-p broken-on)
+    ((skipped-p broken-on)
      `(progn
         (start-test)
         (fail-test :skipped-broken ',name "Test broken on this platform")))
@@ -281,10 +290,16 @@
      `(progn
         (start-test)
         (fail-test :skipped-disabled ',name "Test disabled for this combination of platform and features")))
+    ((and implemented-on
+          (not
+           (skipped-p implemented-on)))
+     `(progn
+        (start-test)
+        (fail-test :skipped-unimplemented ',name "Test for a feature not implemented for this platform")))
     ((and (boundp '*deferred-test-forms*)
           (not serial)
           (or (not fails-on)
-              (not (expected-failure-p fails-on))))
+              (not (skipped-p fails-on))))
      ;; To effectively parallelize calls to COMPILE, we must defer compilation
      ;; until a worker thread has picked off the test from shared worklist.
      ;; Thus we push only the form to be compiled, not a lambda.
@@ -331,14 +346,37 @@
               *break-on-expected-failure*)
       (really-invoke-debugger condition))))
 
-(defun expected-failure-p (fails-on)
-  (sb-impl::featurep fails-on))
+(defun vop-existsp (name &optional (query :translate))
+  (ecase query
+    (:named
+     (gethash name sb-c::*backend-template-names*))
+    (:translate
+     (let ((info (sb-int:info :function :info name)))
+       (when info
+         (sb-c::fun-info-templates info))))))
 
-(defun broken-p (broken-on)
-  (sb-impl::featurep broken-on))
-
-(defun skipped-p (skipped-on)
-  (sb-impl::featurep skipped-on))
+(defun skipped-p (x)
+  (typecase x
+    (cons
+     (case (car x)
+       (:vop-existsp
+        (vop-existsp (second x) (or (third x)
+                                    :translate)))
+       ((:not not)
+        (cond
+          ((cddr x)
+           (error "too many subexpressions in feature expression: ~S" x))
+          ((null (cdr x))
+           (error "too few subexpressions in feature expression: ~S" x))
+          (t (not (skipped-p (cadr x))))))
+       ((:and and) (every #'skipped-p (cdr x)))
+       ((:or or) (some #'skipped-p (cdr x)))
+       (t
+        (error "unknown operator in feature expression: ~S." x))))
+    (symbol
+     (and (member x *features*) t))
+    (t
+     (error "invalid feature expression: ~S" x))))
 
 ;;;; MAP-{OPTIMIZATION-QUALITY-COMBINATIONS,OPTIMIZE-DECLARATIONS}
 
@@ -458,7 +496,13 @@
                      (= safety 3))))
     ((eql :safe)
      (list :filter (lambda (&key speed safety &allow-other-keys)
-                     (and (> safety 0) (>= safety speed)))))
+                     (and (> safety 0) (>= safety speed)))
+           :compilation-speed 1 :space 1))
+    ((eql :safe-debug)
+     (list :filter (lambda (&key speed safety debug &allow-other-keys)
+                     (and (> safety 0) (>= safety speed)
+                          (> debug 1)))
+           :compilation-speed 1 :space 1))
     ((eql :quick)
      '(:compilation-speed 1 :space 1))
     ((eql :quick/incomplete)
@@ -690,18 +734,31 @@
           (multiple-value-bind (values conditions)
               (apply #'call-capturing-values-and-conditions function args)
             (typecase expected
-              ((cons (eql condition) (cons t null))
+              ((cons (eql condition))
                (let* ((expected-condition-type (second expected))
                       (unexpected (remove-if (lambda (condition)
                                                (typep condition
                                                       expected-condition-type))
                                              conditions))
+                      (test (third expected))
+                      (test-description (fourth expected))
                       (expected (set-difference conditions unexpected)))
                  (cond
                    (unexpected
                     (signaled-unexpected unexpected))
                    ((null expected)
-                    (failed-to-signal expected-condition-type)))))
+                    (failed-to-signal expected-condition-type)))
+                 (when (and test
+                            (not (every test conditions)))
+
+                   (error "~@<Calling the result of compiling~
+                      ~/test-util::print-form-and-optimize/ ~
+                      ~/test-util::print-arguments/~
+                      signaled unexpected condition~P~
+                      ~/test-util::print-signaled-conditions/~
+                      not matching~% ~a.~@:>"
+                          (cons form optimize) args (length conditions) conditions
+                          test-description))))
               (t
                (let ((expected (funcall expected)))
                  (cond
@@ -758,10 +815,12 @@
 ;;;
 ;;; If VALUES-FORM is of the form
 ;;;
-;;;   (CONDITION CONDITION-TYPE)
+;;;   (CONDITION CONDITION-TYPE &OPTIONAL FUNCTION)
 ;;;
 ;;; the function call is expected to signal the designated condition
 ;;; instead of returning values. CONDITION-TYPE is evaluated.
+;;;
+;;; FUNCTION is called with CONDITION.
 ;;;
 ;;; The OPTIMIZE keyword parameter controls the optimization policies
 ;;; (or policy) used when compiling FORM. The argument is interpreted
@@ -782,14 +841,14 @@
                (destructuring-bind (args values &key (test ''equal testp)
                                                      allow-conditions)
                    case
-                 (let ((conditionp (typep values '(cons (eql condition) (cons t null)))))
+                 (let ((conditionp (typep values '(cons (eql condition)))))
                    (when (and testp conditionp)
                      (sb-ext:with-current-source-form (case)
                        (error "~@<Cannot use ~S with ~S ~S.~@:>"
                               values :test test)))
                    `(list (lambda () (values ,@args))
                           ,(if conditionp
-                               `(list 'condition ,(second values))
+                               `(list 'condition ,(second values) ,(third values) ',(third values))
                                `(lambda () (multiple-value-list ,values)))
                           ,test
                           ,allow-conditions))))))
@@ -1064,3 +1123,22 @@
   (funcall
    (compile nil
             `(lambda () (sb-kernel:%make-funcallable-instance ,n)))))
+
+(defun compile-so (file so-name)
+  (if (probe-file so-name)
+      ;; Assume the test automator built this for us
+      (sb-alien:load-shared-object (truename so-name))
+      ;; Otherwise, write into /tmp so that we never fail to rebuild
+      ;; the '.so' if it gets changed, and assume that it's OK to
+      ;; delete a mapped file (which it is for *nix).
+      (with-scratch-file (solib (or #+win32 "dll" "so"))
+        #+win32
+        (sb-ext:run-program (or #+arm64 "clang" "gcc")
+                            `("-shared" "-o" ,solib ,file)
+                            :search t)
+        #-win32
+        (sb-ext:run-program "/bin/sh"
+                            `("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
+                              "-o" ,solib ,file)
+                            :output t :error :output)
+        (sb-alien:load-shared-object solib))))

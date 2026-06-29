@@ -38,7 +38,6 @@ CLOBBER_INTERNAL_FEATURES="(handler-bind ((simple-error #'continue))
 ### heap object aside from the package itself.
 ### Because SAVE-LISP-AND-DIE coalesces strings, this test provides confidence
 ### that no string anywhere in the heap is STRING= to a package name.
-### The better test is Test 2 below, which only passes on x86[-64] as yet.
 
 run_sbcl <<EOF
 #+cheneygc (exit) ; not much can be done for cheney to make this pass
@@ -163,8 +162,9 @@ run_sbcl <<\EOF
   (print (read-from-string "keyword:x") (make-broadcast-stream))
   ;; Now walk all heap objects
   (macrolet ((visit (that)
-	       `(check-undesired
-		 this ,that undesired-symbols undesired-strings hashes)))
+	       `(unless (sb-ext:stack-allocated-p ,that)
+                  (check-undesired
+		   this ,that undesired-symbols undesired-strings hashes))))
     (sb-vm:map-allocated-objects
      (lambda (this type size)
        (declare (ignore type size))

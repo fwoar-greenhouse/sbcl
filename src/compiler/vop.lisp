@@ -70,7 +70,9 @@
 ;;; done on the basis of the primitive types of the operands, and the
 ;;; primitive type of a value is used to constrain the possible
 ;;; representations of that value.
-(defstruct (primitive-type (:copier nil))
+(defstruct (primitive-type (:constructor make-primitive-type (name scs specifier))
+                           (:copier nil)
+                           (:predicate nil))
   ;; the name of this PRIMITIVE-TYPE
   (name nil :type symbol :read-only t)
   ;; a list of the SC numbers for all the SCs that a TN of this type
@@ -135,7 +137,7 @@
 (defstruct (ir2-block (:constructor make-ir2-block (block))
                       (:copier nil))
   ;; The IR1 block that this block is in the INFO for.
-  (block (missing-arg) :type cblock)
+  (block (missing-arg) :type cblock :read-only t)
   ;; the next and previous block in emission order (not DFO). This
   ;; determines which block we drop though to, and is also used to
   ;; chain together overflow blocks that result from splitting of IR2
@@ -162,9 +164,6 @@
   ;; first.
   (start-stack () :type list)
   (end-stack () :type list)
-  ;; list of all lvars ever pushed onto the stack when control reaches
-  ;; the start of this block.
-  (stack-mess-up () :type list)
   ;; the first and last VOP in this block. If there are none, both
   ;; slots are null.
   (start-vop nil :type (or vop null))
@@ -227,6 +226,7 @@
 ;;; function result LVAR or that receive MVs.
 (defstruct (ir2-lvar
             (:constructor make-ir2-lvar (primitive-type))
+            (:predicate nil)
             (:copier nil))
   ;; If this is :DELAYED, then this is a single value LVAR for which
   ;; the evaluation of the use is to be postponed until the evaluation
@@ -253,7 +253,7 @@
   ;; restrictive than the tn-primitive-type of the value TN. This is
   ;; becase the value TN must hold any possible type that could be
   ;; computed (before type checking.) XXX
-  (primitive-type nil :type (or primitive-type null))
+  (primitive-type nil :type (or primitive-type null) :read-only t)
   ;; Locations used to hold the values of the LVAR. If the number of
   ;; values if fixed, then there is one TN per value. If the number of
   ;; values is unknown, then this is a two-list of TNs holding the
@@ -270,7 +270,8 @@
 
 ;;; An IR2-COMPONENT serves mostly to accumulate non-code information
 ;;; about the component being compiled.
-(defstruct (ir2-component (:copier nil))
+(defstruct (ir2-component (:copier nil)
+                          (:constructor make-ir2-component))
   ;; the counter used to allocate global TN numbers
   (global-tn-counter 0 :type index)
   ;; NORMAL-TNS is the head of the list of all the normal TNs that
@@ -296,10 +297,6 @@
   #-c-stack-is-control-stack
   ;; If this component has a NFP, then this is it.
   (nfp nil :type (or tn null))
-  ;; a list of the explicitly specified save TNs (kind
-  ;; :SPECIFIED-SAVE). These TNs will also appear in the
-  ;; {NORMAL,RESTRICTED,WIRED} TNs as appropriate to their location.
-  (specified-save-tns () :type list)
   ;; a list of all the blocks whose IR2-BLOCK has a non-null value for
   ;; POPPED. This slot is initialized by LTN-ANALYZE as an input to
   ;; STACK-ANALYZE.
@@ -313,8 +310,7 @@
   ;; constant pool. A non-immediate :CONSTANT TN with offset 0 refers
   ;; to the constant in element 0, etc. Normal constants are
   ;; represented by the placing the CONSTANT leaf in this vector. A
-  ;; load-time constant is distinguished by being a cons
-  ;; (KIND WHAT TN).
+  ;; load-time constant is distinguished by being a cons (KIND WHAT).
   ;; KIND is a keyword indicating how the constant is computed, and
   ;; WHAT is some context.
   ;;
@@ -336,11 +332,14 @@
   ;;    Is replaced with the result of executing the forms
   ;;    to compute <handle>.
   ;;
+  ;; as well as a few other forms of magic - see DUMP-CODE-OBJECT.
+  ;; (:coverage-marks )
+
   ;; A null entry in this vector is a placeholder for implementation
   ;; overhead that is eventually stuffed in somehow.
   ;; Prior to performing SORT-BOXED-CONSTANTS, the index 0 is reserved
   ;; to signify something (other than NIL) if stored as a TN-OFFSET,
-  ;; though nothing makes use of this at present.
+  ;; though nothing makes use of this at present. (Uh, what did I mean by this?)
   (constants (make-array 10 :fill-pointer 1 :adjustable t
                          :initial-element :ignore)
              :type vector :read-only t)
@@ -375,7 +374,9 @@
 ;;; since IR2 conversion may need to compile a forward reference. In
 ;;; this case the slots aren't actually initialized until entry
 ;;; analysis runs.
-(defstruct (entry-info (:copier nil))
+(defstruct (entry-info (:copier nil)
+                       (:predicate nil)
+                       (:constructor make-entry-info ()))
   ;; TN, containing closure (if needed) for this function in the home
   ;; environment.
   (closure-tn nil :type (or null tn))
@@ -401,7 +402,9 @@
 
 ;;; An IR2-ENVIRONMENT is used to annotate non-LET LAMBDAs with their
 ;;; passing locations. It is stored in the ENVIRONMENT-INFO.
-(defstruct (ir2-environment (:copier nil))
+(defstruct (ir2-environment (:copier nil)
+                            (:predicate nil)
+                            (:constructor make-ir2-environment (closure return-pc-pass)))
   ;; TN info for closed-over things within the function: an alist
   ;; mapping from NLX-INFOs and LAMBDA-VARs to TNs holding the
   ;; corresponding thing within this function
@@ -461,44 +464,49 @@
 ;;; A RETURN-INFO is used by GTN to represent the return strategy and
 ;;; locations for all the functions in a given TAIL-SET. It is stored
 ;;; in the TAIL-SET-INFO.
-(defstruct (return-info (:copier nil))
+(defstruct (return-info (:copier nil)
+                        (:predicate nil)
+                        (:constructor make-return-info (kind count primitive-types types
+                                                        &optional locations)))
   ;; The return convention used:
   ;; -- If :UNKNOWN, we use the standard return convention.
   ;; -- If :FIXED, we use the known-values convention.
-  (kind (missing-arg) :type (member :fixed :unknown :unboxed))
+  (kind (missing-arg) :type (member :fixed :unknown :unboxed) :read-only t)
   ;; the number of values returned, or :UNKNOWN if we don't know.
   ;; COUNT may be known when KIND is :UNKNOWN, since we may choose the
   ;; standard return convention for other reasons.
-  (count (missing-arg) :type (or index (member :unknown)))
+  (count (missing-arg) :type (or index (member :unknown)) :read-only t)
   ;; If count isn't :UNKNOWN, then this is a list of the
   ;; primitive-types of each value.
-  (primitive-types () :type list)
-  (types nil :type list)
+  (primitive-types () :type list :read-only t)
+  (types nil :type list :read-only t)
   ;; If kind is :FIXED, then this is the list of the TNs that we
   ;; return the values in.
-  (locations () :type list))
+  (locations () :type list :read-only t))
 (defprinter (return-info)
   kind
   count
   types
   locations)
 
-(defstruct (ir2-nlx-info (:copier nil))
+(defstruct (ir2-nlx-info (:copier nil)
+                         (:predicate nil)
+                         (:constructor make-ir2-nlx-info (home save-sp block-tn)))
   ;; If the kind is :ENTRY (a lexical exit), then in the home
   ;; environment, this holds a VALUE-CELL object containing the unwind
   ;; block pointer. In the other cases nobody directly references the
   ;; unwind-block, so we leave this slot null.
-  (home nil :type (or tn null))
+  (home nil :type (or tn null) :read-only t)
   ;; the saved control stack pointer
-  (save-sp nil :type (or tn null))
+  (save-sp nil :type (or tn null) :read-only t)
   ;; the list of dynamic state save TNs
   #-unbind-in-unwind
   (dynamic-state (list* (make-stack-pointer-tn)
                         (make-dynamic-state-tns))
                  :type list)
   ;; the target label for NLX entry
-  (target (gen-label) :type label)
-  (block-tn nil :type (or tn null)))
+  (target (gen-label) :type label :read-only t)
+  (block-tn nil :type (or tn null) :read-only t))
 (defprinter (ir2-nlx-info)
   home
   save-sp
@@ -512,7 +520,7 @@
 (defstruct (vop (:constructor make-vop (block node info args results))
                 (:copier nil))
   ;; VOP-INFO structure containing static info about the operation
-  (info nil :type vop-info)
+  (info nil :type vop-info :read-only t)
   ;; the IR2-BLOCK this VOP is in
   (block (missing-arg) :type ir2-block)
   ;; VOPs evaluated after and before this one. Null at the
@@ -522,8 +530,8 @@
   (prev nil :type (or vop null))
   ;; heads of the TN-REF lists for operand TNs, linked using the
   ;; ACROSS slot
-  (args nil :type (or tn-ref null))
-  (results nil :type (or tn-ref null))
+  (args nil :type (or tn-ref null) :read-only t)
+  (results nil :type (or tn-ref null) :read-only t)
   ;; head of the list of write refs for each explicitly allocated
   ;; temporary, linked together using the ACROSS slot
   (temps nil :type (or tn-ref null))
@@ -535,7 +543,7 @@
   ;; codegen. The meaning of this slot is totally dependent on the VOP.
   codegen-info
   ;; the node that generated this VOP, for keeping track of debug info
-  (node nil :type (or node null))
+  (node nil :type (or node null) :read-only t)
   ;; LOCAL-TN-BIT-VECTOR representing the set of TNs live after args
   ;; are read and before results are written. This is only filled in
   ;; when VOP-INFO-SAVE-P is non-null.
@@ -545,11 +553,12 @@
 ;;; to a TN. The information in TN-REFs largely determines how TNs are
 ;;; packed.
 (defstruct (tn-ref (:constructor make-tn-ref (tn write-p))
-                   (:copier nil))
+                   (:copier nil)
+                   (:predicate nil))
   ;; the TN referenced
   (tn (missing-arg) :type tn)
   ;; Is this is a write reference? (as opposed to a read reference)
-  (write-p nil :type boolean)
+  (write-p nil :type boolean :read-only t)
   ;; the link for a list running through all TN-REFs for this TN of
   ;; the same kind (read or write)
   (next nil :type (or tn-ref null))
@@ -731,8 +740,12 @@
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1)))
   (optimizer nil :type (or null function (cons function symbol)))
   (optional-results nil :type list)
-  move-vop-p
-  (after-sc-selection nil :type (or null function) :read-only t))
+  (move-vop-p nil)
+  (after-sc-selection nil :type (or null function) :read-only t)
+  (gc-barrier nil)
+  (translate nil)
+  ;; A bit mask of arguments for which this VOP checks the type
+  (check-type 0 :type fixnum))
 (!set-load-form-method vop-info (:xc :target) :ignore-it)
 
 (declaim (inline vop-name))
@@ -801,7 +814,8 @@
 
 ;;; The SB structure represents the global information associated with
 ;;; a storage base.
-(defstruct (storage-base (:copier nil) (:conc-name sb-))
+(defstruct (storage-base (:copier nil) (:conc-name sb-)
+                         (:predicate nil))
   ;; name, for printing and reference
   (name nil :type symbol :read-only t)
   ;; the kind of storage base (which determines the packing
@@ -826,7 +840,8 @@
   ;; current-size must always be a multiple of this. It is assumed
   ;; to be a power of two.
   (size-alignment 1 :type index :read-only t))
-(defstruct (finite-sb (:copier nil) (:predicate nil) (:conc-name fsb-))
+(defstruct (finite-sb (:copier nil) (:predicate nil) (:conc-name fsb-)
+                      (:constructor make-finite-sb (conflicts always-live live-tns)))
   ;; the number of locations currently allocated in this SB
   (current-size 0 :type index)
   ;; the last location packed in, used by pack to scatter TNs to
@@ -855,18 +870,11 @@
   (wired-map 0 :type sb-vm:finite-sc-offset-map))
 (declaim (freeze-type storage-base finite-sb-template finite-sb))
 
-;;; Give this a toplevel value so that it can be declaimed ALWAYS-BOUND.
-;;; The compiler will never look at the toplevel value though.
-(defvar *finite-sbs*
-  #-sb-xc-host
-  (make-array #.(count :non-packed *backend-sbs* :key #'sb-kind :test #'neq)
-              :initial-element (make-unbound-marker)))
-#-sb-xc-host
-(progn
-  (declaim (type (simple-vector #.(length *finite-sbs*)) *finite-sbs*)
-           (always-bound *finite-sbs*))
-  (eval-when (:compile-toplevel :load-toplevel :execute)
-    (setf (info :variable :wired-tls '*finite-sbs*) :always-thread-local)))
+;;; Give this a per-thread initial value so that it can be declaimed ALWAYS-BOUND.
+;;; The compiler will never see that value. It does not have to be type-correct,
+;;; and in fact unbound-marker works.
+(sb-impl:define-thread-local *finite-sbs* (make-unbound-marker))
+#-sb-xc-host (declaim (type (simple-vector #.(length *finite-sbs*)) *finite-sbs*))
 
 ;;; All these are SETFable
 (defmacro finite-sb-current-size (sb)
@@ -963,7 +971,7 @@
 ;;;; TNs
 
 (defstruct (tn (:include sset-element)
-               (:constructor make-random-tn)
+               (:constructor make-random-tn (sc offset &aux (kind :normal)))
                (:constructor make-tn (number kind primitive-type sc))
                (:copier nil))
   ;; The kind of TN this is:
@@ -1097,6 +1105,8 @@
   ;; environment that the TN is live throughout.
   (environment nil :type (or environment null))
   ;; Used by pack-iterative
+  ;; Aliased TNs have :ALIAS there temporarily, to detected any extra
+  ;; writers.
   (vertex nil))
 
 (declaim (freeze-type tn))
@@ -1119,7 +1129,7 @@
             (:constructor make-global-conflicts (kind tn block number))
             (:copier nil))
   ;; the IR2-BLOCK that this structure represents the conflicts for
-  (block (missing-arg) :type ir2-block)
+  (block (missing-arg) :type ir2-block :read-only t)
   ;; thread running through all the GLOBAL-CONFLICTSs for BLOCK.
   (next-blockwise nil :type (or global-conflicts null))
   ;; the way that TN is used by BLOCK
@@ -1163,6 +1173,7 @@
 
 (defstruct (conditional-flags
             (:constructor make-conditional-flags (flags))
+            (:predicate nil)
             (:copier nil))
   flags)
 

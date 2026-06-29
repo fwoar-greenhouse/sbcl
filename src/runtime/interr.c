@@ -35,7 +35,6 @@
 #include "gc.h"
 
 /* the way that we shut down the system on a fatal error */
-void lisp_backtrace(int frames);
 extern void ldb_monitor(void);
 
 static void
@@ -47,7 +46,7 @@ default_lossage_handler(void)
         // This may not be exactly the right condition for determining
         // whether it might be possible to backtrace, but at least it prevents
         // lose() from itself losing early in startup.
-        if (get_sb_vm_thread()) lisp_backtrace(100);
+        if (get_sb_vm_thread()) print_lisp_backtrace(100, stderr);
     }
     exit(1);
 }
@@ -60,7 +59,7 @@ configurable_lossage_handler()
 
     if (dyndebug_config.dyndebug_backtrace_when_lost) {
         fprintf(stderr, "lose: backtrace follows as requested\n");
-        lisp_backtrace(100);
+        print_lisp_backtrace(100, stderr);
     }
 
     if (dyndebug_config.dyndebug_sleep_when_lost) {
@@ -149,32 +148,6 @@ lose(char *fmt, ...)
 #endif
 }
 
-#if 0
-/// thread printf. This was used to produce the 2-column output
-/// at the bottom of "src/code/final". The main thread'd os_kernel_tid
-/// must be assigned a constant in main_thread_trampoline().
-void tprintf(char *fmt, ...)
-{
-    va_list ap;
-    char buf[200];
-    char *ptr;
-    const char spaces[] = "                                           ";
-    struct thread*th = get_sb_vm_thread();
-    buf[0] = ';'; buf[1] = ' ';
-    ptr = buf+2;
-    if (th->os_kernel_tid == 'A') {
-        strcpy(ptr, spaces);
-        ptr += (sizeof spaces)-1;
-    }
-    va_start(ap, fmt);
-    int n = vsprintf(ptr, fmt, ap);
-    va_end(ap);
-    ptr += n;
-    *ptr++ = '\n';
-    write(2, buf, ptr-buf);
-}
-#endif
-
 int lose_on_corruption_p = 0; // DO NOT CHANGE THIS TO 'bool'. (Naughty users think it's 4 bytes)
 
 void
@@ -223,17 +196,20 @@ corruption_warning_and_maybe_lose(char *fmt, ...)
     maybe_lose();
 }
 
-void print_constant(os_context_t *context, int offset) {
+static void print_constant(os_context_t *context, int offset, FILE* ostream) {
     lispobj code = find_code(context);
     if (code != NIL) {
         struct code *codeptr = (struct code *)native_pointer(code);
-        putchar('\t');
+        putc('\t', ostream);
         if (offset >= code_header_words(codeptr)) {
-            printf("Constant offset %d out of bounds for the code object @ %p\n",
-                   offset, codeptr);
+            fprintf(ostream,
+                    "Constant offset %d out of bounds for the code object @ %p\n",
+                    offset, codeptr);
         } else {
+            struct iochannel io = {ostream, stdin};
             brief_print(codeptr->constants[offset -
-                                           (offsetof(struct code, constants) >> WORD_SHIFT)]);
+                                           (offsetof(struct code, constants) >> WORD_SHIFT)],
+                        &io);
         }
     }
 }
@@ -275,21 +251,18 @@ void skip_internal_error (os_context_t *context) {
 
 }
 
-/* internal error handler for when the Lisp error system doesn't exist
- *
- * FIXME: Shouldn't error output go to stderr instead of stdout? (Alas,
- * this'd require changes in a number of things like brief_print(..),
- * or I'd have changed it immediately.) */
-void describe_error_arg(os_context_t *context, int sc_number, int offset) {
+/* internal error handler for when the Lisp error system doesn't exist */
+void describe_error_arg(os_context_t *context, int sc_number, int offset, FILE* f)
 {
     int ch;
 
-    printf("    SC: %d, Offset: %d", sc_number, offset);
+    fprintf(f, "    SC: %d, Offset: %d", sc_number, offset);
     switch (sc_number) {
     case sc_AnyReg:
     case sc_DescriptorReg:
-        putchar('\t');
-        brief_print(*os_context_register_addr(context, offset));
+        putc('\t', f);
+        struct iochannel io = {f, stdin};
+        brief_print(*os_context_register_addr(context, offset), &io);
         break;
 
     case sc_CharacterReg:
@@ -300,49 +273,46 @@ void describe_error_arg(os_context_t *context, int sc_number, int offset) {
         ch = ch & 0xff;
 #endif
         switch (ch) {
-        case '\n': printf("\t'\\n'\n"); break;
-        case '\b': printf("\t'\\b'\n"); break;
-        case '\t': printf("\t'\\t'\n"); break;
-        case '\r': printf("\t'\\r'\n"); break;
+        case '\n': fprintf(f, "\t'\\n'\n"); break;
+        case '\b': fprintf(f, "\t'\\b'\n"); break;
+        case '\t': fprintf(f, "\t'\\t'\n"); break;
+        case '\r': fprintf(f, "\t'\\r'\n"); break;
         default:
             if (ch < 32 || ch > 127)
-                printf("\\%03o", ch);
+                fprintf(f, "\\%03o", ch);
             else
-                printf("\t'%c'\n", ch);
+                fprintf(f, "\t'%c'\n", ch);
             break;
         }
         break;
     case sc_SapReg:
-#ifdef sc_WordPointerReg
-    case sc_WordPointerReg:
-#endif
-        printf("\t0x%08lx\n", (unsigned long) *os_context_register_addr(context, offset));
+        fprintf(f, "\t0x%08lx\n", (unsigned long) *os_context_register_addr(context, offset));
         break;
     case sc_SignedReg:
-        printf("\t%ld\n", (long) *os_context_register_addr(context, offset));
+        fprintf(f, "\t%ld\n", (long) *os_context_register_addr(context, offset));
         break;
     case sc_UnsignedReg:
-        printf("\t%lu\n", (unsigned long) *os_context_register_addr(context, offset));
+        fprintf(f, "\t%lu\n", (unsigned long) *os_context_register_addr(context, offset));
         break;
 #ifdef sc_SingleFloatReg
     case sc_SingleFloatReg:
-        printf("\t%g\n", *(float *)&context->sc_fpregs[offset]);
+        fprintf(f, "\t%g\n", *(float *)&context->sc_fpregs[offset]);
         break;
 #endif
 #ifdef sc_DoubleFloatReg
     case sc_DoubleFloatReg:
-        printf("\t%g\n", *(double *)&context->sc_fpregs[offset]);
+        fprintf(f, "\t%g\n", *(double *)&context->sc_fpregs[offset]);
         break;
 #endif
     case sc_Constant:
-        print_constant(context, offset);
+        print_constant(context, offset, f);
         break;
     default:
-        printf("\t???\n");
+        fprintf(f, "\t???\n");
         break;
     }
 }
-};
+
 void
 describe_internal_error(os_context_t *context)
 {
@@ -357,7 +327,7 @@ describe_internal_error(os_context_t *context)
     uint32_t trap_instruction = *(uint32_t *)ptr;
     unsigned char trap = trap_instruction >> 5 & 0xFF;
     ptr += 4;
-#elif defined(LISP_FEATURE_PPC64) && defined(LISP_FEATURE_LITTLE_ENDIAN)
+#elif defined(LISP_FEATURE_PPC64) && defined(LISP_FEATURE_LITTLE_ENDIAN) || defined(LISP_FEATURE_LOONGARCH64)
     unsigned char trap = *(ptr-4);
 #else
     unsigned char trap = *(ptr-1);
@@ -370,9 +340,10 @@ describe_internal_error(os_context_t *context)
         ptr++;
     }
     if (code > sizeof(internal_error_nargs)) {
-        printf("Unknown error code %d at %p\n", code, pc);
+        fprintf(stderr, "Unknown error code %d at %p\n", code, pc);
     }
-    printf("Internal error #%d \"%s\" at %p\n", code, internal_error_descriptions[code], pc);
+    fprintf(stderr,
+            "Internal error #%d \"%s\" at %p\n", code, internal_error_descriptions[code], pc);
     count = internal_error_nargs[code];
 
 #ifdef LISP_FEATURE_ARM64
@@ -391,7 +362,7 @@ describe_internal_error(os_context_t *context)
         default:
             sc = sc_DescriptorReg;
         }
-        describe_error_arg(context, sc, first_offset);
+        describe_error_arg(context, sc, first_offset, stderr);
         count--;
     }
 #endif
@@ -399,6 +370,6 @@ describe_internal_error(os_context_t *context)
     for (position = 0; count > 0; --count) {
         int sc_and_offset = read_var_integer(ptr, &position);
         describe_error_arg(context, sc_and_offset_sc_number(sc_and_offset),
-                           sc_and_offset_offset(sc_and_offset));
+                           sc_and_offset_offset(sc_and_offset), stderr);
     }
 }

@@ -22,46 +22,51 @@
 
 /* constants derived from the fundamental constants in passed by GENESIS */
 #define READ_ONLY_SPACE_SIZE (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START)
-#define STATIC_SPACE_SIZE (STATIC_SPACE_END - STATIC_SPACE_START)
-#define NIL_SYMBOL_SLOTS_START (STATIC_SPACE_START + NIL_SYMBOL_SLOTS_OFFSET)
-#define NIL_SYMBOL_SLOTS_END (STATIC_SPACE_START + NIL_SYMBOL_SLOTS_END_OFFSET)
+#define NIL_SYMBOL_SLOTS_START ((lispobj*)(STATIC_SPACE_START + NIL_SYMBOL_SLOTS_OFFSET))
+#define NIL_SYMBOL_SLOTS_END (ALIGN_UP(SYMBOL_SIZE,2)+NIL_SYMBOL_SLOTS_START)
 #define STATIC_SPACE_OBJECTS_START (STATIC_SPACE_START + STATIC_SPACE_OBJECTS_OFFSET)
+#define STATIC_SPACE_END (STATIC_SPACE_START + STATIC_SPACE_SIZE)
+
+#ifdef LISP_FEATURE_X86_64
+#define T_SYMBOL_SLOTS_START ((lispobj*)(LISP_T - OTHER_POINTER_LOWTAG))
+#define T_SYMBOL_SLOTS_END (T_SYMBOL_SLOTS_START+SYMBOL_SIZE)
+#endif
 
 #ifdef LISP_FEATURE_DARWIN_JIT
 #define STATIC_CODE_SPACE_SIZE (STATIC_CODE_SPACE_END - STATIC_CODE_SPACE_START)
 #endif
 
-#define ALIEN_LINKAGE_TABLE_SPACE_END \
-    (ALIEN_LINKAGE_TABLE_SPACE_START + ALIEN_LINKAGE_TABLE_SPACE_SIZE)
+#define ALIEN_LINKAGE_SPACE_END (ALIEN_LINKAGE_SPACE_START + ALIEN_LINKAGE_SPACE_SIZE)
+#ifdef LISP_FEATURE_LINKAGE_SPACE
+#define LISP_LINKAGE_SPACE_SIZE (1<<(N_LINKAGE_INDEX_BITS+WORD_SHIFT))
+#endif
 
 #if !defined(__ASSEMBLER__)
 #include <stdbool.h>
 #include "thread.h"
 
-#if defined(LISP_FEATURE_WIN32)
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#define STACK_GUARD_SIZE (win32_page_size + win32_stack_guarantee)
+#else
+#define STACK_GUARD_SIZE os_vm_page_size
+#endif
+
+#ifdef LISP_FEATURE_STACK_GROWS_DOWNWARD_NOT_UPWARD
 
 #define CONTROL_STACK_HARD_GUARD_PAGE(th) \
     ((os_vm_address_t)(th->control_stack_start))
 #define CONTROL_STACK_GUARD_PAGE(th) \
-    (CONTROL_STACK_HARD_GUARD_PAGE(th) + win32_page_size + win32_stack_guarantee)
-
-#elif defined(LISP_FEATURE_STACK_GROWS_DOWNWARD_NOT_UPWARD)
-
-#define CONTROL_STACK_HARD_GUARD_PAGE(th) \
-    ((os_vm_address_t)(th->control_stack_start))
-#define CONTROL_STACK_GUARD_PAGE(th) \
-    (CONTROL_STACK_HARD_GUARD_PAGE(th) + os_vm_page_size)
+    (CONTROL_STACK_HARD_GUARD_PAGE(th) + STACK_GUARD_SIZE)
 #define CONTROL_STACK_RETURN_GUARD_PAGE(th) \
-    (CONTROL_STACK_GUARD_PAGE(th) + os_vm_page_size)
-
+    (CONTROL_STACK_GUARD_PAGE(th) + STACK_GUARD_SIZE)
 #else
 
 #define CONTROL_STACK_HARD_GUARD_PAGE(th) \
-    (((os_vm_address_t)(th->control_stack_end)) - os_vm_page_size)
+    (((os_vm_address_t)(th->control_stack_end)) - STACK_GUARD_SIZE)
 #define CONTROL_STACK_GUARD_PAGE(th) \
-    (CONTROL_STACK_HARD_GUARD_PAGE(th) - os_vm_page_size)
+    (CONTROL_STACK_HARD_GUARD_PAGE(th) - STACK_GUARD_SIZE)
 #define CONTROL_STACK_RETURN_GUARD_PAGE(th) \
-    (CONTROL_STACK_GUARD_PAGE(th) - os_vm_page_size)
+    (CONTROL_STACK_GUARD_PAGE(th) - STACK_GUARD_SIZE)
 
 #endif
 
@@ -94,7 +99,11 @@
 #define BINDING_STACK_RETURN_GUARD_PAGE(th) \
     (BINDING_STACK_GUARD_PAGE(th) - os_vm_page_size)
 
-extern void allocate_lisp_dynamic_space(bool);
+#ifdef LISP_FEATURE_OS_PROVIDES_DLOPEN
+extern void ensure_undefined_alien(void);
+#else
+#define ensure_undefined_alien() {}
+#endif
 extern bool allocate_hardwired_spaces(bool);
 
 extern void

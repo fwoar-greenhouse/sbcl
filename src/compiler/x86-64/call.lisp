@@ -20,6 +20,44 @@
 (defconstant old-fp-passing-offset
   (make-sc+offset control-stack-sc-number ocfp-save-offset))
 
+(defun linkage-cell-fixup (name node)
+  ;; The distinction between the two linkage-cell fixups is that :linkage-cell
+  ;; never warns about undefined linkage but the "-ud" one may, after resolving
+  ;; separately-compiled fasls much the same as a standard linker, thereby liberating
+  ;; SBCL from the restriction that WITH-COMPILATION-UNIT is the only way to avoid
+  ;; style-warnings about defined-elsewhere functions. Needless to say, we must avoid
+  ;; emitting any such warnings at compile-time. Two tests are done to decide whether
+  ;; to emit the load-time warning:
+  ;; - did the compiler style-warn?  If not then don't. This covers the case
+  ;;   of (FUNCALL 'name)
+  ;; - was it lexically notinline? Even if the compiler style-warned, there should
+  ;;   not be a load-time warning if the user wanted an out-of-line call.
+  (let* ((explicit-notinline
+          (sb-c::fun-lexically-notinline-p name (sb-c::node-lexenv node)))
+         (lt-warn ; (possible) load-time warning for unresolved linkage
+          (and (not explicit-notinline)
+               ;; Optimize the predicate to FIND-IF. We can usually
+               ;; compare names by EQ except when NAME is a list.
+               (find-if (if (symbolp name)
+                            (lambda (x)
+                              (and (eq (sb-c::undefined-warning-kind x) :function)
+                                   (eq (sb-c::undefined-warning-name x) name)))
+                            (lambda (x)
+                              (and (eq (sb-c::undefined-warning-kind x) :function)
+                                   (equal (sb-c::undefined-warning-name x) name))))
+                        sb-c::*undefined-warnings*))))
+    ;; The "addend" field of the fixup is used as a boolean flag.
+    (make-fixup name :linkage-cell (if lt-warn 1 0))))
+
+(defun compute-linkage-cell (node name res)
+  #-immobile-space (inst lea res (ea (linkage-cell-fixup name node) null-tn))
+  #+immobile-space ; this is ironically worse than #-immobile-space
+  (cond ((code-immobile-p node)
+         (inst lea res (rip-relative-ea (linkage-cell-fixup name node))))
+        (t
+         (inst mov res (static-constant-ea lisp-linkage-table))
+         (inst lea res (ea (linkage-cell-fixup name node) res)))))
+
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
 ;;; them at a known location.
@@ -259,25 +297,25 @@
                       (not verify))))
      (flet ((check-nargs ()
               (assemble ()
-                (let* ((*location-context* (list* name
-                                                  (type-specifier type)
-                                                  (make-restart-location SKIP)))
+                (let* ((*location-context* (list* (make-restart-location SKIP)
+                                                  name
+                                                  (type-specifier type)))
                        (err-lab (generate-error-code vop 'invalid-arg-count-error))
-                       (min (and (> min-values 0)
-                                 min-values))
+                       (min min-values)
                        (max (and (< max-values call-arguments-limit)
                                  max-values)))
-                  (cond ((not min)
+                  (cond ((eql min max)
                          (if (zerop max)
                              (inst test :dword rcx-tn rcx-tn)
                              (inst cmp :dword rcx-tn (fixnumize max)))
                          (inst jmp :ne err-lab))
                         (max
-                         (if (zerop min)
-                             (setf move-temp rcx-tn)
-                             (inst lea :dword move-temp (ea (fixnumize (- min)) rcx-tn)))
-                         (inst cmp :dword move-temp (fixnumize (- max min)))
-                         (inst jmp :a err-lab))
+                         (let ((nargs move-temp))
+                          (if (zerop min)
+                              (setf nargs rcx-tn)
+                              (inst lea :dword move-temp (ea (fixnumize (- min)) rcx-tn)))
+                          (inst cmp :dword nargs (fixnumize (- max min)))
+                          (inst jmp :a err-lab)))
                         (t
                          (cond ((= min 1)
                                 (inst test :dword rcx-tn rcx-tn)
@@ -313,16 +351,18 @@
                      (2nd-tn (tn-ref-tn 2nd-tn-ref))
                      (2nd-tn-live (neq (tn-kind 2nd-tn) :unused)))
                 (when 2nd-tn-live
-                  (inst mov 2nd-tn nil-value))
+                  (inst mov 2nd-tn null-tn))
                 (when (> nvals 2)
+                  ;; FIXME: simplify this logic- don't use 2nd-tn as a proxy
+                  ;; for NIL now that NULL-TN is a thing.
                   (loop
                     for tn-ref = (tn-ref-across 2nd-tn-ref)
                     then (tn-ref-across tn-ref)
                     for count from 2 below register-arg-count
                     unless (eq (tn-kind (tn-ref-tn tn-ref)) :unused)
                     do
-                    (inst mov :dword (tn-ref-tn tn-ref)
-                          (if 2nd-tn-live 2nd-tn nil-value)))))
+                    (inst mov (tn-ref-tn tn-ref)
+                          (if 2nd-tn-live 2nd-tn null-tn)))))
               (inst mov rbx rsp-tn)
               regs-defaulted))
 
@@ -360,9 +400,8 @@
                        (inst jmp :nc default-stack-slots))
                       (t
                        (inst jmp :c regs-defaulted)
-                       (loop for null = nil-value then (car used-registers)
-                             for reg in used-registers
-                             do (inst mov :dword reg null))
+                       (loop for reg in used-registers
+                             do (inst mov reg null-tn))
                        (inst jmp done)))
                 REGS-DEFAULTED
                 (do ((i register-arg-count (1+ i))
@@ -395,13 +434,12 @@
                       (when (or (not trust)
                                 (<= min-values 1))
                         (emit-label default-stack-slots)
-                        (loop for null = nil-value then (car used-registers)
-                              for reg in used-registers
-                              do (inst mov :dword reg null))
+                        (loop for reg in used-registers
+                              do (inst mov reg null-tn))
                         (move rbx rsp-tn))
                       (dolist (default defaults)
                         (emit-label (car default))
-                        (inst mov (cdr default) nil-value))
+                        (inst mov (cdr default) null-tn))
                       (inst jmp defaulting-done)))))))))))))
 
 ;;;; unknown values receiving
@@ -447,7 +485,7 @@
     ;; stack values. In this case quickly reallocate sufficient space.
     (when (<= (sb-kernel:values-type-min-value-count type)
               register-arg-count)
-      (inst cmp nargs (fixnumize register-arg-count))
+      (inst cmp :dword nargs (fixnumize register-arg-count))
       (inst jmp :g stack-values)
       #+#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
       (inst sub rsp-tn nargs)
@@ -655,144 +693,121 @@
 ;;; In tail call with fixed arguments, the passing locations are
 ;;; passed as a more arg, but there is no new-FP, since the arguments
 ;;; have been set up in the current frame.
-(macrolet ((define-full-call (vop-name named return variable &optional args)
-            (aver (not (and variable (eq return :tail))))
-            #+immobile-code (when named (setq named :direct))
-            `(define-vop (,vop-name ,@(when (eq return :unknown)
-                                        '(unknown-values-receiver)))
-               (:args
-               ,@(unless (eq return :tail)
-                   '((new-fp :scs (any-reg) :to (:argument 1))))
+(defmacro define-full-call (vop-name named return variable &optional args)
+  (aver (not (and variable (eq return :tail))))
+  `(define-vop (,vop-name ,@(when (eq return :unknown) '(unknown-values-receiver)))
+     (:args ,@(unless (eq return :tail)
+                '((new-fp :scs (any-reg) :to (:argument 1))))
 
-               ;; If immobile-space is in use, then named call does not require
-               ;; a register unless the caller is NOT in immobile space,
-               ;; in which case the register is needed because there is no
-               ;; absolute addressing mode for jmp/call.
-               ,@(unless (eq named :direct)
-                   '((fun :scs (descriptor-reg control-stack)
-                          :target rax :to (:argument 0))))
+            ,@(unless named   ; FUN is an info argument for named call
+                '((fun :scs (descriptor-reg control-stack)
+                       :target rax :to (:argument 0))))
 
-               ,@(when (eq return :tail)
-                   '((old-fp)
-                     (return-pc)))
+            ,@(when (eq return :tail)
+                '((old-fp)
+                  (return-pc)))
 
-               ,@(unless variable
-                   `((args :more t ,@(unless (eq args :fixed)
-                                       '(:scs (descriptor-reg control-stack)))))))
+            ,@(unless variable
+                `((args :more t ,@(unless (eq args :fixed)
+                                    '(:scs (descriptor-reg control-stack)))))))
+     (:arg-refs
+      ,@(unless (eq return :tail)
+          '(nil))
+      ,@(unless named
+          '(fun-ref)))
 
-               ,@(when (memq return '(:fixed :unboxed))
-                   '((:results (values :more t))))
+     ,@(when (memq return '(:fixed :unboxed)) '((:results (values :more t))))
 
-               (:save-p ,(if (eq return :tail) :compute-only t))
+     (:save-p ,(if (eq return :tail) :compute-only t))
 
-               ,@(unless (or (eq return :tail) variable)
-                   `((:move-args ,(if (eq args :fixed)
-                                      :fixed
-                                      :full-call))))
+     ,@(unless (or (eq return :tail) variable)
+         `((:move-args ,(if (eq args :fixed) :fixed :full-call))))
 
-               (:vop-var vop)
-               (:node-var node)
-               (:info
-               ,@(unless (or variable (eq return :tail)) '(arg-locs))
+     (:vop-var vop)
+     (:node-var node)
+     (:info    ,@(unless (or variable (eq return :tail)) '(arg-locs))
                ,@(unless variable '(nargs))
                ;; Intuitively you might want FUN to be the first codegen arg,
                ;; but that won't work, because EMIT-ARG-MOVES wants the
                ;; passing locs in (FIRST (vop-codegen-info vop)).
-               ,@(when (eq named :direct) '(fun))
+               ,@(when named '(fun))
                ,@(when (eq return :fixed) '(nvals))
-               step-instrumenting
-               ,@(unless named
-                   '(fun-type)))
+               step-instrumenting)
 
-               (:ignore
-                ,@(unless (or variable (eq return :tail)) '(arg-locs))
+     (:ignore   ,@(unless (or variable (eq return :tail)) '(arg-locs))
                 ,@(unless variable '(args))
-                ,@(when (eq return :unboxed)
-                    '(values)))
+                ,@(when (eq return :unboxed) '(values))
+                ,@(when (eq args :fixed) '(nargs)))
 
-               ;; We pass either the fdefn object (for named call) or
-               ;; the actual function object (for unnamed call) in
-               ;; RAX. With named call, closure-tramp will replace it
-               ;; with the real function and invoke the real function
-               ;; for closures. Non-closures do not need this value,
-               ;; so don't care what shows up in it.
-               ,@(unless (eq named :direct)
-                   '((:temporary (:sc descriptor-reg :offset rax-offset
-                                  :from (:argument 0) :to :eval) rax)))
+     ;; For anonymous call, RAX is the function. For named call, RAX will be the linkage
+     ;; table base if not stepping, or the linkage cell itself if stepping.
+     ;; Calls from immobile-space without stepping avoid using RAX, and instead
+     ;; access the linkage table relative to RIP.
+     (:temporary (:sc descriptor-reg :offset rax-offset :from (:argument 0) :to :eval) rax)
 
-               ;; We pass the number of arguments in RCX.
-               (:temporary (:sc unsigned-reg :offset rcx-offset
-                            :to ,(if (eq return :fixed)
-                                     :save
-                                     :eval)) rcx)
+     ;; We pass the number of arguments in RCX.
+     ,@(unless (eq args :fixed)
+         `((:temporary
+            (:sc unsigned-reg :offset rcx-offset
+             :to ,(if (eq return :fixed) :save :eval))
+            rcx)))
 
-               ,@(when (eq return :fixed)
+     ,@(when (eq return :fixed)
                    ;; Save it for DEFAULT-UNKNOWN-VALUES to work
-                   `((:temporary (:sc unsigned-reg :offset rbx-offset
-                                  :from :result) rbx)
-                     (:temporary (:sc any-reg) move-temp)))
+         `((:temporary (:sc unsigned-reg :offset rbx-offset :from :result) rbx)
+           (:temporary (:sc any-reg) move-temp)))
 
                ;; With variable call, we have to load the
                ;; register-args out of the (new) stack frame before
                ;; doing the call. Therefore, we have to tell the
                ;; lifetime stuff that we need to use them.
-               ,@(when variable
-                   (mapcar (lambda (name offset)
-                             `(:temporary (:sc descriptor-reg
-                                               :offset ,offset
-                                               :from (:argument 0)
-                                               :to :eval)
-                                          ,name))
-                           *register-arg-names* *register-arg-offsets*))
+     ,@(when variable
+         (mapcar (lambda (name offset)
+                   `(:temporary (:sc descriptor-reg
+                                 :offset ,offset
+                                 :from (:argument 0)
+                                 :to :eval)
+                                ,name))
+                 register-arg-names *register-arg-offsets*))
 
-               ,@(when (eq return :tail)
-                   '((:temporary (:sc unsigned-reg
-                                      :from (:argument 1)
-                                      :to (:argument 2))
-                                 old-fp-tmp)))
-               ,@(unless (eq return :tail)
-                   '((:node-var node)))
+     ,@(when (eq return :tail)
+         '((:temporary (:sc unsigned-reg :from (:argument 1) :to (:argument 2))
+            old-fp-tmp)))
+     ,@(unless (eq return :tail) '((:node-var node)))
 
-               (:generator ,(+ (if named 5 0)
-                               (if variable 19 1)
-                               (if (eq return :tail) 0 10)
-                               15
-                               (if (eq return :unknown) 25 0))
+     (:generator ,(+ (if named 5 0)
+                     (if variable 19 1)
+                     (if (eq return :tail) 0 10)
+                     15
+                     (if (eq return :unknown) 25 0))
 
-               (progn node) ; always "use" it
+       (progn node) ; always "use" it
 
                ;; This has to be done before the frame pointer is
                ;; changed! RAX stores the 'lexical environment' needed
                ;; for closures.
-               ,@(unless (eq named :direct)
-                   '((move rax fun)))
-
-               ,@(if variable
-                     ;; For variable call, compute the number of
-                     ;; arguments and move some of the arguments to
-                     ;; registers.
-                     (collect ((noise))
-                              ;; Compute the number of arguments.
-                              (noise '(inst mov rcx new-fp))
-                              (noise '(inst sub rcx rsp-tn))
-                              #.(unless (= word-shift n-fixnum-tag-bits)
-                                  '(noise '(inst shr rcx
-                                            (- word-shift n-fixnum-tag-bits))))
-                              ;; Move the necessary args to registers,
-                              ;; this moves them all even if they are
-                              ;; not all needed.
-                              (loop
-                               for name in *register-arg-names*
-                               for index downfrom -1
-                               do (noise `(loadw ,name new-fp ,index)))
-                              (noise))
-                     '((cond ((listp nargs)) ;; no-verify-arg-count
-                             ((zerop nargs)
-                              (zeroize rcx))
-                             (t
-                              (inst mov rcx (fixnumize nargs))))))
-               ,@(cond ((eq return :tail)
-                        '(;; Python has figured out what frame we should
+       ,@(unless named '((move rax fun)))
+       ,@(unless (eq args :fixed)
+           (if variable
+               ;; For variable call, compute the number of
+               ;; arguments and move some of the arguments to
+               ;; registers.
+               `((inst mov rcx new-fp)
+                 (inst sub rcx rsp-tn)
+                 (inst shr rcx ,(- word-shift n-fixnum-tag-bits))
+                 ;; Move the necessary args to registers,
+                 ;; this moves them all even if they are
+                 ;; not all needed.
+                 ,@(loop for name in register-arg-names
+                         for index downfrom -1
+                         collect `(loadw ,name new-fp ,index)))
+               '((cond ((listp nargs)) ;; no-verify-arg-count
+                       ((zerop nargs)
+                        (zeroize rcx))
+                       (t
+                        (inst mov rcx (fixnumize nargs)))))))
+       ,@(cond ((eq return :tail)
+                '(        ;; Python has figured out what frame we should
                           ;; return to so might as well use that clue.
                           ;; This seems really important to the
                           ;; implementation of things like
@@ -805,35 +820,29 @@
                           ;; wired to the stack in standard locations
                           ;; then these moves will be un-necessary;
                           ;; this is probably best for the x86.
-                          (sc-case old-fp
-                                   ((control-stack)
-                                    (unless (= ocfp-save-offset
-                                               (tn-offset old-fp))
+                  (sc-case old-fp
+                   ((control-stack)
+                    (unless (= ocfp-save-offset (tn-offset old-fp))
                                       ;; FIXME: FORMAT T for stale
                                       ;; diagnostic output (several of
                                       ;; them around here), ick
-                                      (error "** tail-call old-fp not S0~%")
-                                      (move old-fp-tmp old-fp)
-                                      (storew old-fp-tmp
-                                              rbp-tn
-                                              (frame-word-offset ocfp-save-offset))))
-                                   ((any-reg descriptor-reg)
-                                    (error "** tail-call old-fp in reg not S0~%")
-                                    (storew old-fp
-                                            rbp-tn
-                                            (frame-word-offset ocfp-save-offset))))
+                      (error "** tail-call old-fp not S0~%")
+                      (move old-fp-tmp old-fp)
+                      (storew old-fp-tmp rbp-tn (frame-word-offset ocfp-save-offset))))
+                   ((any-reg descriptor-reg)
+                    (error "** tail-call old-fp in reg not S0~%")
+                    (storew old-fp rbp-tn (frame-word-offset ocfp-save-offset))))
 
                           ;; For tail call, we have to push the
                           ;; return-pc so that it looks like we CALLed
                           ;; despite the fact that we are going to JMP.
-                          (inst push return-pc)
-                          ))
-                       (t
+                  (inst push return-pc)))
+               (t
                         ;; For non-tail call, we have to save our
                         ;; frame pointer and install the new frame
                         ;; pointer. We can't load stack tns after this
                         ;; point.
-                        `(;; Python doesn't seem to allocate a frame
+                `(        ;; Python doesn't seem to allocate a frame
                           ;; here which doesn't leave room for the
                           ;; ofp/ret stuff.
 
@@ -843,136 +852,110 @@
                           ;; allocate on the call. So need to ensure
                           ;; there are at least 3 slots. This hack
                           ;; just adds 3 more.
-                          ,(if variable
-                               '(inst sub rsp-tn (* 3 n-word-bytes)))
+                  ,(if variable
+                       '(inst sub rsp-tn (* 3 n-word-bytes)))
 
                           ;; Bias the new-fp for use as an fp
-                          ,(if variable
-                               '(inst sub new-fp (* sp->fp-offset n-word-bytes)))
+                   ,(if variable
+                        '(inst sub new-fp (* sp->fp-offset n-word-bytes)))
 
                           ;; Save the fp
-                          (storew rbp-tn new-fp
-                                  (frame-word-offset ocfp-save-offset))
+                   (storew rbp-tn new-fp (frame-word-offset ocfp-save-offset))
+                   (move rbp-tn new-fp))))  ; NB - now on new stack frame.
 
-                          (move rbp-tn new-fp))))  ; NB - now on new stack frame.
+       (when step-instrumenting
+         ,@(when named '((compute-linkage-cell node fun rax)))
+         (emit-single-step-test)
+         (inst jmp :e DONE)
+         (inst break single-step-around-trap))
+       DONE
+       (note-this-location vop :call-site)
+       ,(cond (named
+               `(emit-direct-call fun ',(if (eq return :tail) 'jmp 'call)
+                                  node step-instrumenting))
+              ((eq return :tail)
+               `(tail-call-unnamed rax fun-ref vop))
+              (t
+               `(call-unnamed rax fun-ref vop)))
+       ,@(ecase return
+           (:fixed '((default-unknown-values vop values nvals node rbx move-temp)))
+           (:unknown
+            '((note-this-location vop :unknown-return)
+              (receive-unknown-values values-start nvals start count node)))
+           ((:tail :unboxed))))))
 
-               (when (and step-instrumenting
-                          ,@(and (eq named :direct)
-                                 `((not (and #+immobile-code
-                                             ;; handle-single-step-around-trap can't handle it
-                                             (static-fdefn-offset fun))))))
-                 (emit-single-step-test)
-                 (inst jmp :eq DONE)
-                 (inst break single-step-around-trap))
-               DONE
-               (note-this-location vop :call-site)
-               ,(cond ((eq named :direct)
-                       #+immobile-code `(emit-direct-call fun ',(if (eq return :tail) 'jmp 'call)
-                                                          node step-instrumenting)
-                       #-immobile-code `(inst ,(if (eq return :tail) 'jmp 'call)
-                                              (ea (+ nil-value (static-fun-offset fun)))))
-                      #-immobile-code
-                      (named
-                       `(inst ,(if (eq return :tail) 'jmp 'call)
-                              (object-slot-ea rax fdefn-raw-addr-slot other-pointer-lowtag)))
-                      ((eq return :tail)
-                       `(tail-call-unnamed rax fun-type vop))
-                      (t
-                       `(call-unnamed rax fun-type vop)))
-               ,@(ecase return
-                   (:fixed
-                    '((default-unknown-values vop values nvals node rbx move-temp)))
-                   (:unknown
-                    '((note-this-location vop :unknown-return)
-                      (receive-unknown-values values-start nvals start count
-                                              node)))
-                   ((:tail :unboxed)))))))
+(define-full-call call nil :fixed nil)
+(define-full-call call-named t :fixed nil)
+(define-full-call multiple-call nil :unknown nil)
+(define-full-call multiple-call-named t :unknown nil)
+(define-full-call tail-call nil :tail nil)
+(define-full-call tail-call-named t :tail nil)
 
-  (define-full-call call nil :fixed nil)
-  (define-full-call call-named t :fixed nil)
-  #-immobile-code
-  (define-full-call static-call-named :direct :fixed nil)
-  (define-full-call multiple-call nil :unknown nil)
-  (define-full-call multiple-call-named t :unknown nil)
-  #-immobile-code
-  (define-full-call static-multiple-call-named :direct :unknown nil)
-  (define-full-call tail-call nil :tail nil)
-  (define-full-call tail-call-named t :tail nil)
-  #-immobile-code
-  (define-full-call static-tail-call-named :direct :tail nil)
+(define-full-call call-variable nil :fixed t)
+(define-full-call multiple-call-variable nil :unknown t)
+(define-full-call fixed-call-named t :fixed nil :fixed)
+(define-full-call fixed-tail-call-named t :tail nil :fixed)
 
-  (define-full-call call-variable nil :fixed t)
-  (define-full-call multiple-call-variable nil :unknown t)
-  (define-full-call fixed-call-named t :fixed nil :fixed)
-  (define-full-call fixed-tail-call-named t :tail nil :fixed)
-
-  (define-full-call unboxed-call-named t :unboxed nil)
-  (define-full-call fixed-unboxed-call-named t :unboxed nil :fixed))
+(define-full-call unboxed-call-named t :unboxed nil)
+(define-full-call fixed-unboxed-call-named t :unboxed nil :fixed)
+(define-full-call fixed-multiple-call-named t :unknown nil :fixed)
 
 ;;; Call NAME "directly" meaning in a single JMP or CALL instruction,
 ;;; if possible (without loading RAX)
 (defun emit-direct-call (name instruction node step-instrumenting)
-      ;; a :STATIC-CALL fixup is the address of the entry point of
-      ;; the function itself, and a :FDEFN-CALL fixup is the address
-      ;; of the JMP instruction embedded in the header for the named FDEFN.
-  (when (static-fdefn-offset name)
-    (let ((fixup (make-fixup name :static-call)))
-      (return-from emit-direct-call
-        (inst* instruction (if (sb-c::code-immobile-p node) fixup (ea fixup))))))
-  (let* ((fixup (make-fixup name :fdefn-call))
-         (target
-              (if (and (sb-c::code-immobile-p node)
-                       (not step-instrumenting))
-                  fixup
-                  (progn
-                    ;; RAX-TN was not declared as a temp var,
-                    ;; however it's sole purpose at this point is
-                    ;; for function call, so even if it was used
-                    ;; to compute a stack argument, it's free now.
-                    ;; If the call hits the undefined fun trap,
-                    ;; RAX will get loaded regardless.
-                    (inst mov rax-tn fixup)
-                    rax-tn))))
-    (inst* instruction target)))
+  (cond (step-instrumenting
+         ;; If step-instrumenting, then RAX points to the linkage table cell
+         (inst* instruction (ea rax-tn)))
+        ((code-immobile-p node)
+         (inst* instruction (rip-relative-ea (linkage-cell-fixup name node))))
+        #-immobile-space
+        (t (inst* instruction (ea (linkage-cell-fixup name node) null-tn)))
+        #+immobile-space ; again, this should not be worse than #-immobile-space, but it is
+        (t
+         ;; get the linkage table base into RAX
+         (inst mov rax-tn (static-constant-ea lisp-linkage-table))
+         (inst* instruction (ea (linkage-cell-fixup name node) rax-tn)))))
 
 ;;; Invoke the function-designator FUN.
-(defun tail-call-unnamed (fun type vop)
-  (let ((relative-call (sb-c::code-immobile-p vop))
-        (fun-ea (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
-                    fun)))
-    (case type
+(defun tail-call-unnamed (fun fun-ref vop)
+  (let ((relative-call (code-immobile-p vop))
+        (fun-ea (object-slot-ea fun closure-fun-slot fun-pointer-lowtag)))
+    (case (fun-tn-type fun-ref)
       (:designator
        (assemble ()
-         (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
-         (inst test :byte rbx-tn lowtag-mask)
-         (inst jmp :nz (if relative-call
-                           (make-fixup 'call-symbol :assembly-routine)
-                           not-fun))
+         (%test-lowtag fun rbx-tn (if relative-call
+                                      (make-fixup 'call-symbol :assembly-routine)
+                                      not-fun)
+                       t fun-pointer-lowtag
+                       :value-tn-ref fun-ref)
          (inst jmp fun-ea)
          not-fun
          (unless relative-call
-           (invoke-asm-routine 'jmp 'call-symbol vop))))
+           (if (csubtypep (tn-ref-type fun-ref) (specifier-type '(or null function)))
+               (emit-error-break vop error-trap (error-number-or-lose 'undefined-fun-error) (list fun))
+               (invoke-asm-routine 'jmp 'call-symbol vop)))))
       (:symbol
        (invoke-asm-routine 'jmp 'call-symbol vop))
       (t
        (inst jmp fun-ea)))))
 
-(defun call-unnamed (fun type vop)
-  (case type
-    (:symbol
-     (invoke-asm-routine 'call 'call-symbol vop))
-    (t
-     (assemble ()
-       (when (eq type :designator)
-         (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
-         (inst test :byte rbx-tn lowtag-mask)
-         (inst jmp :z call)
-         (invoke-asm-routine 'call 'call-symbol vop)
-         (inst jmp ret))
-       call
-       (inst call (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
-                      fun))
-       ret))))
+(defun call-unnamed (fun fun-ref vop)
+  (let ((type (fun-tn-type fun-ref)))
+    (case type
+      (:symbol
+       (invoke-asm-routine 'call 'call-symbol vop))
+      (t
+       (assemble ()
+         (when (eq type :designator)
+           (%test-lowtag fun rbx-tn call nil fun-pointer-lowtag :value-tn-ref fun-ref)
+           (cond ((csubtypep (tn-ref-type fun-ref) (specifier-type '(or null function)))
+                  (emit-error-break vop error-trap (error-number-or-lose 'undefined-fun-error) (list fun)))
+                 (t
+                  (invoke-asm-routine 'call 'call-symbol vop)
+                  (inst jmp ret))))
+         call
+         (inst call (object-slot-ea fun closure-fun-slot fun-pointer-lowtag))
+         ret)))))
 
 ;;; This is defined separately, since it needs special code that BLT's
 ;;; the arguments down. All the real work is done in the assembly
@@ -982,7 +965,6 @@
          (function :scs (descriptor-reg control-stack) :target rax)
          (old-fp)
          (return-pc))
-  (:info fun-type)
   (:temporary (:sc unsigned-reg :offset rsi-offset :from (:argument 0)) rsi)
   (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 1)) rax)
   (:vop-var vop)
@@ -992,9 +974,9 @@
     (move rsi args)
     (move rax function)
     ;; And jump to the assembly routine.
-    (invoke-asm-routine 'jmp (if (eq fun-type :function)
-                                 'tail-call-variable
-                                 'tail-call-callable-variable)
+    (invoke-asm-routine 'jmp (if (eq (sb-c::tn-primitive-type function) *backend-t-primitive-type*)
+                                 'tail-call-callable-variable
+                                 'tail-call-variable)
                         vop)))
 
 ;;;; unknown values return
@@ -1063,14 +1045,14 @@
     (when (< nvals register-arg-count)
       (let* ((arg-tns (nthcdr nvals (list a0 a1 a2)))
              (first (first arg-tns)))
-        (inst mov first nil-value)
+        (inst mov first null-tn)
         (dolist (tn (cdr arg-tns))
           (inst mov tn first))))
     ;; Set the multiple value return flag.
     (inst stc)
     ;; And away we go. Except that return-pc is still on the
-    ;; stack and we've changed the stack pointer. So we have to
-    ;; tell it to index off of RBX instead of RBP.
+    ;; stack and we've changed the stack pointer. So we might have to
+    ;; tell it to index off of RBX instead of RBP, depending on nvals.
     (cond ((<= nvals register-arg-count)
            (inst leave)
            (inst ret))
@@ -1084,10 +1066,8 @@
            (inst lea rsp-tn
                  (ea (frame-byte-offset (1- nvals)) rbp-tn))
            (move rbp-tn old-fp)
-           (inst push (ea (frame-byte-offset
-                           (+ sp->fp-offset (tn-offset return-pc)))
-                          rbx))
-           (inst ret)))))
+           (emit-mv-return
+            (ea (frame-byte-offset (+ sp->fp-offset (tn-offset return-pc))) rbx))))))
 
 ;;; Do unknown-values return of an arbitrary number of values (passed
 ;;; on the stack.) We check for the common case of a single return
@@ -1114,7 +1094,7 @@
     (unless (policy node (> space speed))
       ;; Check for the single case.
       (let ((not-single (gen-label)))
-        (inst cmp nvals (fixnumize 1))
+        (inst cmp :dword nvals (fixnumize 1))
         (inst jmp :ne not-single)
         ;; Return with one value.
         (loadw a0 vals -1)
@@ -1256,13 +1236,13 @@
         #.(assert (= register-arg-count 3))
         (cond ((> fixed 0)
                (inst cmp :dword rcx-tn (fixnumize i))
-               (inst jmp :eq DONE))
+               (inst jmp :e DONE))
               ;; Use a single comparison for 1 and 2
               ((= i 1)
                (inst cmp :dword rcx-tn (fixnumize 2))
                (inst jmp :l DONE))
               (t
-               (inst jmp :eq DONE)))))
+               (inst jmp :e DONE)))))
 
     (inst jmp DONE)
 
@@ -1322,25 +1302,16 @@
   (:results (value :scs (descriptor-reg any-reg)))
   (:result-types *)
   (:generator 3
-    (inst mov value nil-value)
+    (inst mov value null-tn)
     (inst cmp count (fixnumize index))
     (inst jmp :be done)
     (inst mov value (ea (- (* index n-word-bytes)) object))
     done))
 
 ;;; Turn more arg (context, count) into a list.
-;;; Cons cells will be filled in right-to-left.
-;;; This has a slight advantage in code size, and eliminates an initial
-;;; forward jump into the loop. it also admits an interesting possibility
-;;; to reduce the scope of the pseudo-atomic section so as not to
-;;; encompass construction of the list. To do that, we will need to invent
-;;; a new widetag for "contiguous CONS block" which has a header conveying
-;;; the total payload length. Initially we would store that into the CAR of the
-;;; first cons cell. Upon seeing such header, GC shall treat that entire object
-;;; as a boxed payload of specified length. It will be implicitly pinned
-;;; (if conservative) or transported as a whole (if precise). Then when the CAR
-;;; of the first cons is overwritten, the object changes to a linked list.
-(define-vop ()
+;;; Cons cells will be filled in right-to-left which has a minor advantage
+;;; in code size.
+(define-allocator (%listify-rest-args)
   (:translate %listify-rest-args)
   (:policy :safe)
   ;; CONTEXT is used throughout the copying loop
@@ -1354,44 +1325,60 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) rcx)
   ;; Note that DST conflicts with RESULT because we use both as temps
   (:temporary (:sc unsigned-reg) value dst)
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
   (:results (result :scs (descriptor-reg)))
-  (:node-var node)
   (:generator 20
+#|
+    ;; TODO: if instrumenting, just revert to the older way of precomputing
+    ;; a size rather than scaling by 8 in ALLOCATION so that we don't have
+    ;; to scale and unscale.
     ;; Compute the number of bytes to allocate
     (let ((shift (- (1+ word-shift) n-fixnum-tag-bits)))
       (if (location= count rcx)
           (inst shl :dword rcx shift)
           (inst lea :dword rcx (ea nil count (ash 1 shift)))))
+|#
+    (move rcx count :dword)
     ;; Setup for the CDR of the last cons (or the entire result) being NIL.
-    (inst mov result nil-value)
+    (inst mov result null-tn)
     (cond ((not (member :allocation-size-histogram sb-xc:*features*))
            (inst jrcxz DONE))
           (t ; jumps too far for JRCXZ sometimes
            (inst test rcx rcx)
            (inst jmp :z done)))
-    (unless (node-stack-allocate-p node)
-      (instrument-alloc +cons-primtype+ rcx node (list value dst) thread-tn))
-    (pseudo-atomic (:elide-if (node-stack-allocate-p node) :thread-tn thread-tn)
+    (when (and (not (node-stack-allocate-p node)) (instrument-alloc-policy-p node))
+      (inst shl :dword rcx word-shift) ; compute byte count
+      (instrument-alloc +cons-primtype+ rcx (list value dst))
+      (inst shr :dword rcx word-shift)) ; undo the computation
+    (allocating (:elide-if (node-stack-allocate-p node))
        ;; Produce an untagged pointer into DST
-       (if (node-stack-allocate-p node)
-           (stack-allocation rcx 0 dst)
-           (allocation +cons-primtype+ rcx 0 dst node value thread-tn
+      (let ((scale
+             (cond ((node-stack-allocate-p node)
+                    ;; LEA on RSP would be ok but we'd need to negate RCX first, then un-negate
+                    ;; to compute the final cons, then negate again. So use SHL and SUB instead.
+                    (inst shl :dword rcx word-shift)
+                    (stack-allocation rcx 0 dst)
+                    1)
+                   (t
+                    (allocation +cons-primtype+ rcx 0 dst value
+                       :scale 8
                        :overflow
                        (lambda ()
-                         (inst push rcx)
                          (inst push context)
+                         (inst push rcx)
                          (invoke-asm-routine
                           'call (if (system-tlab-p 0 node) 'sys-listify-&rest 'listify-&rest)
                           node)
                          (inst pop result)
-                         (inst jmp leave-pa))))
+                         (inst jmp alloc-done)))
+                    8))))
        ;; Recalculate DST as a tagged pointer to the last cons
-       (inst lea dst (ea (- list-pointer-lowtag (* cons-size n-word-bytes)) dst rcx))
-       (inst shr :dword rcx (1+ word-shift)) ; convert bytes to number of cells
+       (inst lea dst (ea (- list-pointer-lowtag (* cons-size n-word-bytes)) dst rcx scale))
+       ;; scale=8 implies RCX counts ncells (as a fixnum) therefore just untag it.
+       ;; scale=1 implies RCX counts nbytes therefore ncells = RCX/16
+       (inst shr :dword rcx (if (= scale 8) n-fixnum-tag-bits (1+ word-shift))))
        ;; The rightmost arguments are at lower addresses.
        ;; Start by indexing the last argument
-       (inst neg rcx) ; :QWORD because it's a signed number
+       (inst neg rcx) ; :QWORD because it's negative
        LOOP
        ;; Grab one value and store into this cons. Use RCX as an index into the
        ;; vector of values in CONTEXT, but add 8 because CONTEXT points exactly at
@@ -1405,9 +1392,9 @@
        (storew value dst cons-car-slot list-pointer-lowtag)
        (inst mov result dst) ; preserve the value to put in the CDR of the preceding cons
        (inst sub dst (* cons-size n-word-bytes)) ; get the preceding cons
-       (inst inc rcx) ; :QWORD because it's a signed number
+       (inst inc rcx) ; :QWORD because it's negative
        (inst jmp :nz loop)
-       LEAVE-PA)
+       ALLOC-DONE)
     DONE))
 
 ;;; Return the location and size of the &MORE arg glob created by
@@ -1447,11 +1434,16 @@
   (:temporary (:sc unsigned-reg :offset rbx-offset) temp)
   (:info min max)
   (:vop-var vop)
+  (:node-var node)
   (:save-p :compute-only)
   (:generator 3
+    RESTART
     ;; NOTE: copy-more-arg expects this to issue a CMP for min > 1
-    (let ((err-lab
-            (generate-error-code vop 'invalid-arg-count-error nargs)))
+    (let* ((*location-context* (and max
+                                    (policy node (> debug 1))
+                                    (cons (make-restart-location RESTART) max)))
+           (err-lab
+             (generate-error-code vop 'invalid-arg-count-error nargs)))
       (cond ((not min)
              (if (zerop max)
                  (inst test :dword nargs nargs)
@@ -1489,7 +1481,7 @@
   (:vop-var vop)
   (:generator 3
      (emit-single-step-test)
-     (inst jmp :eq DONE)
+     (inst jmp :e DONE)
      (inst break single-step-before-trap)
      DONE
      (note-this-location vop :internal-error)))

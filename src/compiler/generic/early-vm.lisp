@@ -71,7 +71,7 @@
 (defconstant most-positive-word (1- (expt 2 n-word-bits))
   "The most positive integer that is of type SB-EXT:WORD.")
 
-(defconstant maximum-bignum-length
+(defconstant sb-bignum:maximum-bignum-length
   ;; 32-bit: leave one bit for a GC mark bit
   #-64-bit (ldb (byte (- n-word-bits n-widetag-bits 1) 0) -1)
   ;; 64-bit: restrict to a reasonably large theoretical size of 32GiB per bignum.
@@ -141,19 +141,6 @@
 (defconstant most-negative-exactly-double-float-integer
   (- (expt 2 double-float-digits)))
 
-;;;; Point where continuous area starting at dynamic-space-start bumps into
-;;;; next space. Computed for genesis/constants.h, not used in Lisp.
-#+(and generational sb-xc-host)
-(defconstant max-dynamic-space-end
-    (let ((stop (1- (ash 1 n-word-bits)))
-          (start dynamic-space-start))
-      (dolist (other-start (list read-only-space-start static-space-start
-                                 alien-linkage-table-space-start))
-        (declare (notinline <)) ; avoid dead code note
-        (when (< start other-start)
-          (setf stop (min stop other-start))))
-      stop))
-
 ;; The lowest index that you can pass to %INSTANCE-REF accessing
 ;; a slot of data that is not the instance-layout.
 ;; To get a layout, you must call %INSTANCE-LAYOUT - don't assume index 0.
@@ -202,3 +189,13 @@
   ;; %char-code seems to belong in 'cross-char' but our CHAR-CODE-LIMIT
   ;; is not defined by then.
   (deftype %char-code () `(integer 0 (,sb-xc:char-code-limit))))
+
+(declaim (inline sb-vm:is-lisp-pointer))
+(defun sb-vm:is-lisp-pointer (addr) ; Same as is_lisp_pointer() in C
+  #-64-bit (oddp addr)
+  #+ppc64 (= (logand addr #b101) #b100)
+  #+(and 64-bit (not ppc64)) (not (logtest (logxor addr 3) 3)))
+
+;;; Convince some usage sites to perform fixnum arithmetic
+(declaim (ftype (sfunction (t) (or (mod #.(length +static-symbols+)) boolean))
+                static-symbol-p))

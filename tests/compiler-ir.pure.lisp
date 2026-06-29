@@ -11,8 +11,6 @@
 
 (enable-test-parallelism)
 
-#-sb-devel
-(invoke-restart 'run-tests::skip-file)
 
 (import '(sb-c::combination-fun-debug-name
           sb-c::combination-fun-source-name
@@ -21,8 +19,6 @@
           sb-c::combination-p
           sb-c::basic-combination-info
           sb-c::node-tail-p
-          sb-c::do-blocks
-          sb-c::do-nodes
           sb-c::%check-bound
           sb-kernel:%bit-pos-fwd/1))
 
@@ -33,8 +29,8 @@
     (inspect-ir
      form
      (lambda (component)
-       (do-blocks (block component)
-         (do-nodes (node nil block)
+       (ctu:do-blocks (block component)
+         (ctu:do-nodes (node nil block)
            (when (and (basic-combination-p node)
                       (eq (basic-combination-info node) :full))
              (push node calls))))))
@@ -45,8 +41,8 @@
     (inspect-ir
      form
      (lambda (component)
-       (do-blocks (block component)
-         (do-nodes (node nil block)
+       (ctu:do-blocks (block component)
+         (ctu:do-nodes (node nil block)
            (when (basic-combination-p node)
              (push node calls))))))
     calls))
@@ -56,7 +52,7 @@
     (inspect-ir
      form
      (lambda (component)
-       (sb-c::do-ir2-blocks (block component)
+       (ctu:do-ir2-blocks (block component)
          (do ((vop (sb-c::ir2-block-start-vop block)
                    (sb-c:vop-next vop)))
              ((null vop))
@@ -166,6 +162,7 @@
       (assert (= (funcall fun 9) 362880))
       (assert converted))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :iterative-non-tail))
   (let ((converted nil))
     (let ((fun (inspect-ir
@@ -183,6 +180,7 @@
       (assert (= (funcall fun 9) 362881))
       (assert converted))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :multiple-use))
   (let ((converted nil))
     (let ((fun (inspect-ir
@@ -203,6 +201,7 @@
       (assert (= (funcall fun 6 3 4) 12))
       (assert converted))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :optional-dispatch))
   (let ((converted 0))
     (let ((fun (inspect-ir
@@ -230,6 +229,7 @@
       ;; converted into the entry point for (BASE DISP).
       (assert (= converted 2)))))
 
+#+sb-devel
 (with-test (:name (:assignment-convert :no-self-tr))
   (let ((converted nil))
     (let ((fun (inspect-ir
@@ -257,6 +257,7 @@
       (assert converted))))
 
 ;;; Check that we are able to promote assignment lambdas into LETs.
+#+sb-devel
 (with-test (:name (:assignment-convert :can-become-let))
   (let ((assignment nil)
         (let nil))
@@ -278,6 +279,7 @@
     (assert let)))
 
 ;;; Check assignment conversion of functions which don't return.
+#+sb-devel
 (with-test (:name (:assignment-convert :non-local-exit))
   (let ((assignment nil))
     (let* ((*standard-output* (make-broadcast-stream))
@@ -329,29 +331,30 @@
                             (f)))))
                      :key (lambda (x) (combination-fun-source-name x nil))))))
 
+(defun count-type-checks (lambda)
+  (count-if (lambda (name)
+              (member name '(sb-c::%type-check-error/c sb-c::%type-check-error)))
+         (ir-calls lambda)
+         :key (lambda (x) (combination-fun-source-name x nil))))
+
 (with-test (:name :instance-constraint-intersection)
-  (assert (not (find 'sb-c::%type-check-error/c
-                     (ir-calls
-                      `(lambda (x)
-                         (typecase x
-                           (stream 2)
-                           (hash-table 1))))
-                     :key (lambda (x) (combination-fun-source-name x nil))))))
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (typecase x
+                       (stream 2)
+                       (hash-table 1)))))))
 
 (with-test (:name :aref-full-call-no-type-check)
-  (assert (not (find 'sb-c::%type-check-error/c
-                     (ir-calls
-                      `(lambda (x)
-                         (aref x 0)))
-                     :key (lambda (x) (combination-fun-source-name x nil))))))
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (aref x 0))))))
 
 (with-test (:name :call-full-like-p-constants)
-  (assert (not (find 'sb-c::%type-check-error/c
-                     (ir-calls
-                      `(lambda (a b)
-                         (< (truly-the double-float a) b)))
-                     :key (lambda (x) (combination-fun-source-name x nil))))))
+  (assert (zerop (count-type-checks
+                  `(lambda (a b)
+                     (< (truly-the double-float a) b))))))
 
+#+sb-devel
 (with-test (:name :constant-substitution)
   (let ((calls (ir-calls
                 `(lambda (a b)
@@ -421,19 +424,240 @@
       0)))
 
 (with-test (:name :let-no-typecheck)
-  (assert (not (find 'sb-c::%type-check-error/c
-                     (ir-calls
-                      `(lambda (x)
-                         (let ((m (the sequence x)))
-                           (values (length m)
-                                   m))))
-                     :key (lambda (x) (combination-fun-source-name x nil)))))
-  (assert (eql (count 'sb-c::%type-check-error/c
-                      (ir-calls
-                       `(lambda (x l)
-                          (let ((m (the sequence x))
-                                (l (the integer l)))
-                            (values (length m)
-                                    l))))
-                      :key (lambda (x) (combination-fun-source-name x nil)))
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (let ((m (the sequence x)))
+                       (values (length m)
+                               m))))))
+  (assert (eql (count-type-checks
+                `(lambda (x l)
+                   (let ((m (the sequence x))
+                         (l (the integer l)))
+                     (values (length m)
+                             l))))
                1)))
+
+(with-test (:name :pop-special-once)
+  (assert
+   (= (count 'symbol-value
+             (ir2-vops '(lambda (s)
+                         (declare (special s))
+                         (pop s))))
+      1)))
+
+#+(or x86-64 arm64)
+(with-test (:name :overflow+make-array)
+  (assert
+   (= (count 'sb-vm::overflow+t
+             (ir2-vops '(lambda (y)
+                         (make-array (1+ y)))))
+      1)))
+
+(with-test (:name :other-pointer-p)
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (when (and (stringp (truly-the (or simple-string (member #\a)) x))
+                                (zerop (length x)))
+                       x))))))
+
+(with-test (:name :external-type-checks-across-functions)
+  (assert (zerop (count-type-checks
+                  `(lambda (a b)
+                     (declare (number a b)
+                              (optimize speed))
+                     (+ a b))))))
+
+(with-test (:name :consecutive-casts)
+  (assert (= (count-type-checks
+              `(lambda (x)
+                 (the fixnum (the integer x))))
+             1))
+  #+(or arm64 x86-64)
+  (assert (= (count-type-checks
+              `(lambda (x)
+                 (logand (the number x) 2)))
+             0))
+  (assert (= (count-type-checks
+              `(lambda (x)
+                 (the integer (the (real 5) x))))
+             1)))
+
+(with-test (:name :sign-extend
+            :fails-on (or :ppc :riscv :loongarch64 :sparc :mips))
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 32) a))
+                        (logior a (- (mask-field (byte 1 31) a)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1))
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 32) a))
+                        (logior (- (mask-field (byte 1 31) a)) a)))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1))
+  #+64-bit
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 64) a))
+                        (logior a (- (mask-field (byte 1 63) a)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1)))
+
+(with-test (:name :optional-type-checks)
+  (assert (= (count-type-checks
+              `(lambda (&optional x y)
+                 (declare (list x))
+                 (values x y)))
+             1)))
+
+(with-test (:name :flush-multiple-callables)
+  (assert (not (ir-full-calls
+                `(lambda (a b c)
+                   (declare (vector b))
+                   (find a b :test (if c #'eq #'eql))
+                   10)))))
+
+(with-test (:name :stack-allocate-make-array-reverse)
+  (let ((vops (ir2-vops `(lambda (l)
+                           (let ((j (make-array 5 :initial-contents (nreverse l))))
+                             (declare (dynamic-extent j))
+                             (opaque-identity j)
+                             10)))))
+    (assert (= (count 'sb-vm::allocate-vector-on-stack vops) 1))
+    (assert (= (count 'sb-vm::allocate-vector-on-heap vops) 0))))
+
+
+(with-test (:name :no-type-check-tail-call)
+  (destructuring-bind (combination)
+      (ir-full-calls `(lambda (x)
+                        (truly-the fixnum (funcall (the function x)))))
+    (assert (node-tail-p combination))))
+
+(with-test (:name :evenp+arithmetic
+            :fails-on (or :arm :riscv :loongarch64 :ppc64 :ppc :sparc :mips))
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (evenp (+ x 3))))))
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (logbitp 0 (+ x 3)))))))
+
+(with-test (:name :modarith-unknown-types
+            :fails-on (or :arm :ppc :sparc :mips))
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (logand (+ x 10) 20)))))
+  (assert (not (ir-full-calls `(lambda (m x)
+                                 (logand (if m (+ x 3) (- x 2)) 20))))))
+
+(with-test (:name :reoptimize-complement)
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (declare ((simple-array fixnum (*)) x)
+                                          (optimize speed))
+                                 (position 1 x :test-not #'=))))))
+
+(with-test (:name :complement-multiple-calls)
+  (assert (= (count 'complement
+                    (ir-calls
+                     `(lambda (m n)
+                        (let ((c (complement #'=)))
+                          (values (funcall c 1 m)
+                                  (funcall c 3 n)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             0))
+  (assert (= (count 'complement
+                    (ir-calls
+                     `(lambda (l)
+                        (declare (list l)
+                                 (optimize speed))
+                        (position 10 l :test (complement #'=))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             0)))
+
+(with-test (:name :local-calls-to-&rest)
+  (assert (not (ir-full-calls
+                `(lambda (a)
+                   (flet ((a (&rest args)
+                            (apply #'eql args)))
+                     (list (a a 1)
+                           (a a 2))))))))
+
+(with-test (:name :inline-local-call-with-casts)
+  (assert (not (ir-full-calls
+                `(lambda (n)
+                   (funcall (the (function (fixnum) fixnum)
+                                 (lambda (x) (1+ x)))
+                            n))))))
+
+(with-test (:name :truncate-signed-word-error
+            :fails-on (or :ppc64 :riscv :loongarch64))
+  (assert (not (find 'sb-vm::move-from-signed
+                     (ir2-vops '(lambda (x d)
+                                 (declare ((signed-byte 64) x d))
+                                 (values (the fixnum (truncate x d)))))))))
+
+(with-test (:name :cast-movement)
+  (assert (not (find 'sb-vm::move-from-unsigned
+                     (ir2-vops '(lambda (d x c)
+                                 (declare ((simple-array word (4)) x))
+                                 (let* ((b (aref x 1))
+                                        (a (if d c b)))
+                                   (> (the word a) 10)))))))
+  (assert (find 'sb-vm::move-from-unsigned
+                (ir2-vops '(lambda (d x c)
+                            (declare ((simple-array word (4)) x))
+                            (let* ((b (aref x 1))
+                                   (a (if d c b)))
+                              (print 1)
+                              (> (the word a) 10)))))))
+
+(with-test (:name :overflow-svref
+            :skipped-on (not (or :arm64 :x86-64)))
+  (assert (not (ir-full-calls
+                `(lambda (x n)
+                   (svref x (+ n 1)))))))
+
+(with-test (:name :setf-aref-type-checks)
+  (assert (= (count-type-checks
+              `(lambda (a n)
+                 (setf (aref (the (OR (ARRAY SINGLE-FLOAT) (ARRAY DOUBLE-FLOAT)) a) 0)
+                       n)))
+             1)))
+
+(with-test (:name :constant-fold-multiple-value-uses)
+  (assert (not (ir-full-calls
+                `(lambda (a)
+                   (1+ (if a
+                           1
+                           2d0))))))
+  (assert (not (ir-full-calls
+                `(lambda (b)
+                   (truncate (if b
+                                 10 20d0)
+                             2)))))
+  (assert (not
+           (ir-full-calls
+            `(lambda (d)
+               (multiple-value-bind (v w) (if d
+                                              (values 1 6)
+                                              (values 2 5))
+                 (values v
+                         (+ w 1/2)))))))
+  (assert (not
+           (ir-full-calls
+            `(lambda (d)
+               (let ((x (if d
+                            20
+                            40)))
+                 (setf * 20)
+                 (values (truncate x 1/3))))))))
+
+(with-test (:name :make-array-et-list)
+  (assert (= (count 'list
+                    (ir-calls
+                     `(lambda (n x)
+                        (make-array n :element-type `(unsigned-byte ,x))))
+                    :key (lambda (x) (and (combination-p x)
+                                          (combination-fun-source-name x nil))))
+             0)))

@@ -76,14 +76,21 @@
         (handler-bind ((,condition-type ,handle)) ,form))
       ',condition-type)))
 
-(defmacro assert-type (lambda type)
-  `(assert
-    (test-util:type-specifiers-equal
-     (caddr
-      (sb-kernel:%simple-fun-type
-       (test-util:checked-compile
-        ',lambda)))
-     '(values ,type &optional))))
+(defmacro assert-type (lambda type &rest compile-args)
+  (if (typep type '(cons (eql function)))
+      `(assert
+        (test-util:type-specifiers-equal
+         (sb-kernel:%simple-fun-type
+          (test-util:checked-compile ',lambda ,@compile-args))
+         ',type))
+      `(assert
+        (test-util:type-specifiers-equal
+         (caddr
+          (sb-kernel:%simple-fun-type
+           (test-util:checked-compile ',lambda ,@compile-args)))
+         ',(if (typep type '(cons (eql values)))
+               type
+               `(values ,type &optional))))))
 
 ;;; EXPR is an expression to evaluate (both with EVAL and with
 ;;; COMPILE/FUNCALL). EXTRA-OPTIMIZATIONS is a list of lists of

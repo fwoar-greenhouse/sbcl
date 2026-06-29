@@ -22,11 +22,6 @@
 #include "interr.h"
 #include "breakpoint.h"
 
-os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
-{
-    return (os_vm_address_t)code->si_addr;
-}
-
 void arch_skip_instruction(os_context_t *context)
 {
     /* KLUDGE: Other platforms check for trap codes and skip inlined
@@ -108,7 +103,7 @@ void arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
   // allocate successive entries downward
   char *reloc_addr =
-      (char*)ALIEN_LINKAGE_TABLE_SPACE_END - (index + 1) * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+      (char*)ALIEN_LINKAGE_SPACE_END - (index + 1) * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;

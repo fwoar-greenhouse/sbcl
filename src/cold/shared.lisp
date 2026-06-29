@@ -19,7 +19,9 @@
 ;;; (including not only the final construction of the core file, but
 ;;; also the preliminary steps like e.g. building the cross-compiler
 ;;; and running the cross-compiler to produce target FASL files).
-(defpackage "SB-COLD" (:use "CL"))
+(defpackage "SB-COLD"
+  (:use "CL")
+  (:export genesis))
 
 #+nil ; change to #+sbcl if desired, but at your own risk!
 (when (sb-sys:find-dynamic-foreign-symbol-address "show_gc_generation_throughput")
@@ -111,6 +113,9 @@
 ;;;
 ;;; The cross-compilation process will force the creation of these directories
 ;;; by executing CL:ENSURE-DIRECTORIES-EXIST (on the xc host Common Lisp).
+;;;
+;;; With suitable settings of these prefixes it is possible to run simultaneous
+;;; builds from one source tree.
 (defvar *host-obj-prefix*)
 (defvar *target-obj-prefix*)
 
@@ -135,16 +140,6 @@
 ;;; when it reads #- and #+ syntax)
 (declaim (type function *in-target-compilation-mode-fn*))
 (defvar *in-target-compilation-mode-fn*)
-
-;;; a function with the same calling convention as CL:COMPILE-FILE, to be
-;;; used to translate ordinary Lisp source files into target object files
-(declaim (type function *target-compile-file*))
-(defvar *target-compile-file*)
-
-;;; designator for a function with the same calling convention as
-;;; SB-C:ASSEMBLE-FILE, to be used to translate assembly files into target
-;;; object files
-(defvar *target-assemble-file*)
 
 ;;;; some tools
 
@@ -251,13 +246,18 @@
 
 (load (find-bootstrap-file "^shebang"))
 
+(defun custom-or-default (var default)
+  (if (boundp var) (symbol-value var) default))
+
 ;;; Subfeatures could be assigned as late as the beginning of make-host-2,
 ;;; but I don't want to introduce another mechanism for delaying reading
 ;;; of the customizer just because we can.
 ;;; But it's not well-advertised; does it really merit a customization file?
 (export 'backend-subfeatures)
 (defvar backend-subfeatures
-  (let ((customizer-file-name "customize-backend-subfeatures.lisp"))
+  (let* ((customizer-file-name
+          (custom-or-default 'cl-user::*sbcl-backend-subfeatures-file*
+                             "customize-backend-subfeatures.lisp")))
     (when (probe-file customizer-file-name)
       (copy-list (funcall (compile nil (read-from-file customizer-file-name)) nil)))))
 
@@ -275,14 +275,14 @@
 ;;; The compromise is to examine a variable specifying a path
 ;;; (and it can't go in SB-COLD because the package is not made soon enough)
 (setf sb-xc:*features*
-      (let* ((pathname (let ((var 'cl-user::*sbcl-local-target-features-file*))
-                         (if (boundp var)
-                             (symbol-value var)
-                             "local-target-features.lisp-expr")))
+      (let* ((pathname (custom-or-default 'cl-user::*sbcl-local-target-features-file*
+                                          "local-target-features.lisp-expr"))
              (default-features
                (funcall (compile nil (read-from-file pathname))
                         (read-from-file "^base-target-features.lisp-expr")))
-             (customizer-file-name "customize-target-features.lisp")
+             (customizer-file-name
+              (custom-or-default 'cl-user::*sbcl-customize-target-features-file*
+                                 "customize-target-features.lisp"))
              (customizer (if (probe-file customizer-file-name)
                              (compile nil
                                       (read-from-file customizer-file-name))
@@ -309,24 +309,21 @@
         ;; all versions that support arm, so always enable them there
         (when (target-featurep '(:and :sb-thread (:or :linux :freebsd :openbsd (:and :darwin :arm64))))
           (pushnew :sb-futex sb-xc:*features*))
-        (when (target-featurep '(:and :sb-thread :x86-64))
+        (when (target-featurep '(:and :sb-thread (:or :arm64 :x86-64)))
           (pushnew :system-tlabs sb-xc:*features*))
-        (when (target-featurep '(:and :mark-region-gc :permgen :x86-64))
+        (when (target-featurep '(:and (:or :permgen :immobile-space) :x86-64))
           (pushnew :compact-instance-header sb-xc:*features*))
+        (when (target-featurep :sb-cover-for-internals)
+          ;; coverage of internals currently works substantially
+          ;; better if we preserve more information, and don't do
+          ;; various link-time optimizations.
+          (pushnew :sb-devel sb-xc:*features*))
         (when (target-featurep :immobile-space)
-          (when (target-featurep :x86-64)
-            (pushnew :compact-instance-header sb-xc:*features*))
           (pushnew :immobile-code sb-xc:*features*))
-        (when (target-featurep :64-bit)
-          (push :compact-symbol sb-xc:*features*))
-        (when (target-featurep :64-bit)
-          ;; Considering that a single config file governs rv32 and rv64, I don't
-          ;; know how to make this properly configurable. In theory, 32-bit builds could
-          ;; have a salted hash (gaining 3 bits by making the hash slot raw), but
-          ;; they don't, so in light of things, this is a valid criterion.
-          (push :salted-symbol-hash sb-xc:*features*))
         (when (target-featurep '(:and :sb-thread (:or (:and :darwin (:not (:or :ppc :x86))) :openbsd)))
           (push :os-thread-stack sb-xc:*features*))
+        (when (target-featurep '(:and :sb-thread :x86-64))
+          (push :tls-load-indirect sb-xc:*features*))
         (when (target-featurep '(:and :x86 :int4-breakpoints))
           ;; 0xCE is a perfectly good 32-bit instruction,
           ;; unlike on x86-64 where it is illegal. It's therefore
@@ -353,6 +350,8 @@
           (push :round-float sb-xc:*features*))
         (when (target-featurep '(:and :arm64 :darwin))
           (push :arm-v8.1 backend-subfeatures))
+        (when (target-featurep '(:and :ppc64 :little-endian))
+          (push :fsqrt backend-subfeatures))
 
         ;; Putting arch and gc choice first is visually convenient, versus
         ;; having to parse a random place in the line to figure out the value
@@ -377,10 +376,11 @@
 ;;; failure is (not always obvious from when the build fails).
 (let ((feature-compatibility-tests
        '(("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
-         ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
+         ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64 loongarch64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and mark-region-gc (not (or x86-64 arm64)))"
           "mark-region is not supported on selected architecture")
+         ("(and mark-region-gc (not sb-thread))" "mark-region requires threads")
          ("(and (not sb-thread) (or arm64 ppc64))"
           "The selected architecture requires :SB-THREAD")
          ("(and gencgc cheneygc)"
@@ -398,6 +398,8 @@
           ;; It sorta kinda works to have both, but there should be no need,
           ;; and it's not really supported.
           "At most one interpreter can be selected")
+         ("(and immobile-space permgen)"
+          ":IMMOBILE-SPACE and :PERMGEN are mutually exclusive options")
          ("(and compact-instance-header (not (or permgen immobile-space)))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
          ("(and immobile-code (not immobile-space))"
@@ -408,9 +410,15 @@
           ":SYSTEM-TLABS requires SB-THREAD")
          ("(and sb-futex (not sb-thread))"
           "Can't enable SB-FUTEX on platforms lacking thread support")
+         ("(and relocatable-static-space (not (or arm64 x86-64)))"
+          "Relocatable-static-space not supported for chosen architecture")
+         ("(and relocatable-static-space arm64 (not immobile-space))"
+          "Relocatable-static-space requires immobile-space")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
-          ":SB-THREAD not supported on selected architecture")))
+          ":SB-THREAD not supported on selected architecture")
+         ("(and nonstop-foreign-call (not (and (or arm64 x86-64) sb-thread (not sb-safepoint))))"
+          ":NONSTOP-FOREIGN-CALL not supported with this combination of features")))
       (failed-test-descriptions nil))
   (dolist (test feature-compatibility-tests)
     (let ((*readtable* *xc-readtable*))
@@ -510,12 +518,16 @@
 ;;; Determine the source path for a stem by remapping from the abstract name
 ;;; if it contains "/{arch}/" and appending a ".lisp" suffix.
 ;;; Assume that STEM is source-tree-relative unless it starts with "output/"
-;;; in which case it could be elsewhere, if you prefer to keep the sources
-;;; devoid of compilation artifacts. (The production of out-of-tree artifacts
-;;; is not actually implemented in the generic build, however if your build
-;;; system does that by itself, then hooray for you)
+;;; in which case the file is not under source control, but has a generator script.
 (defun stem-source-path (stem)
-  (concatenate 'string (find-bootstrap-file (stem-remap-target stem)) ".lisp"))
+  ;; Tell FIND-BOOTSTRAP-FILE that the stem is BUILD-DEPENDENT for generated files,
+  ;; because "output/stuff-groveled-from-headers" can be sensitive to the
+  ;; architecture even for a single OS - e.g.
+  ;;  (define-alien-type wst-blksize-t (signed 32)) ; arm64 Linux
+  ;;  (define-alien-type wst-blksize-t (signed 64)) ; x86-64 Linux
+  ;; If running multiarchitecture builds at the same time out of one tree,
+  ;; it is essential that we look in *BUILD-DEPENDENT-GENERATED-SOURCES-ROOT*.
+  (concatenate 'string (find-bootstrap-file (stem-remap-target stem) t) ".lisp"))
 (compile 'stem-source-path)
 
 ;;; Determine the object path for a stem/flags/mode combination.
@@ -626,12 +638,12 @@
                                                  (muffle-warning c)))))
                               (apply #'compile-file args)))
                           #-(or abcl ccl) #'compile-file)
-                         (:target-compile (if (find :assem flags)
-                                              *target-assemble-file*
-                                              *target-compile-file*))))
+                         (:target-compile
+                          (intern (if (find :assem flags) "ASSEMBLE-FILE" "COMPILE-FILE")
+                                  "SB-C"))))
          (trace-file (if (find :trace-file flags) t nil))
          (block-compile (if (find :block-compile flags) t :specified)))
-    (declare (type function compilation-fn))
+    (declare (type (or function symbol) compilation-fn))
 
     (ensure-directories-exist obj :verbose cl:*compile-print*) ; host's value
 
@@ -818,77 +830,8 @@
 (defun target-compile-file (filename)
   (funcall *in-target-compilation-mode-fn*
            (lambda ()
-             (funcall *target-compile-file* filename))))
+             (funcall (intern "COMPILE-FILE" "SB-XC") filename))))
 (compile 'target-compile-file)
-
-;;;; Floating-point number reader interceptor
-
-(defvar *choke-on-host-irrationals* t)
-;;; FIXME: this gets stuck on forms which contain literal CTYPE objects
-;;; because of infinite recursion.
-(defun install-read-interceptor ()
-  ;; Intercept READ to catch inadvertent use of host floating-point literals.
-  ;; This prevents regressions in the portable float logic and allows passing
-  ;; characters to a floating-point library if we so choose.
-  ;; Only do this for new enough SBCL.
-  ;; DO-INSTANCE-TAGGED-SLOT was defined circa Nov 2014 and VERSION>= was defined
-  ;; ca. Nov 2013, but got moved from SB-IMPL or SB-C (inadvertently perhaps).
-  ;; It is not critical that this be enabled on all possible build hosts.
-  #+#.(cl:if (cl:and (cl:find-package "SB-C")
-                     (cl:find-symbol "SPLIT-VERSION-STRING" "SB-C")
-                     (cl:funcall (cl:find-symbol "VERSION>=" "SB-C")
-                                 (cl:funcall (cl:find-symbol "SPLIT-VERSION-STRING" "SB-C")
-                                             (cl:lisp-implementation-version))
-                                 '(1 4 6)))
-             '(and)
-             '(or))
-  (labels ((contains-irrational (x)
-             (typecase x
-               (cons
-                ;; Tail-recursion not guaranteed
-                (do ((cons x (cdr cons)))
-                    ((atom cons)
-                     (contains-irrational cons))
-                  (when (contains-irrational (car cons))
-                    (return t))))
-               (simple-vector (some #'contains-irrational x))
-               ;; We use package literals -- see e.g. SANE-PACKAGE - which
-               ;; must be treated as opaque, but COMMAs should not be opaque.
-               ;; There are also a few uses of "#.(find-layout)".
-               ;; However, the target-num objects should also be opaque
-               ;; and, testing for those types before the structure is defined
-               ;; is not fun. Other than moving the definitions into here
-               ;; from cross-early, there's no good way. But 'chill'
-               ;; should not define those structures.
-               ((and structure-object (not package))
-                (let ((type-name (string (type-of x))))
-                  ;; This "LAYOUT" refers to *our* object, not host-sb-kernel:layout.
-                  (unless (member type-name '("LAYOUT" "FLOAT" "COMPLEXNUM")
-                                  :test #'string=)
-                    ;(Format t "visit a ~/host-sb-ext:print-symbol-with-prefix/~%" (type-of x))
-                    ;; This generalizes over any structure. I need it because we
-                    ;; observe instances of SB-IMPL::COMMA and also HOST-SB-IMPL::COMMA.
-                    ;; (primordial-extensions get compiled before 'backq' is installed)
-                    (sb-kernel:do-instance-tagged-slot (i x)
-                      (when (contains-irrational (sb-kernel:%instance-ref x i))
-                        (return-from contains-irrational t))))))
-               ((or cl:complex cl:float)
-                x)))
-           (reader-intercept (f &optional stream (errp t) errval recursive)
-             (let* ((form (funcall f stream errp errval recursive))
-                    (bad-atom (and (not recursive) ; avoid checking inner forms
-                                   (not (eq form errval))
-                                   *choke-on-host-irrationals*
-                                   (contains-irrational form))))
-               (when bad-atom
-                 (setq *choke-on-host-irrationals* nil) ; one shot, otherwise tough to debug
-                 (error "Oops! didn't expect to read ~s containing ~s" form bad-atom))
-               form)))
-    (unless (sb-kernel:closurep (symbol-function 'read))
-      (sb-int:encapsulate 'read-preserving-whitespace 'protect #'reader-intercept)
-      (sb-int:encapsulate 'read 'protect #'reader-intercept)
-      (format t "~&; Installed READ interceptor~%"))))
-(compile 'install-read-interceptor)
 
 (defvar *math-ops-memoization* (make-hash-table :test 'equal))
 (defun math-journal-pathname (direction)
@@ -899,10 +842,11 @@
   ;; on top of the source file. For more than one, we could either merge them
   ;; or just ignore any modifications.
   (let* ((base "xfloat-math.lisp-expr")
+         (final (concatenate 'string "output/" base))
          (local (concatenate 'string *host-obj-prefix* base)))
     (pathname
      (ecase direction
-       (:input (if (probe-file local) local base))
+       (:input (if (probe-file local) local final))
        (:output local)))))
 
 (defun count-lines-of (pathname &aux (n 0))
@@ -914,9 +858,6 @@
   `(let* ((table *math-ops-memoization*)
           (memo (cons table (hash-table-count table))))
      (assert (atom table)) ; prevent nested use of this macro
-     ;; Don't intercept READ until just-in-time, so that "chill" doesn't
-     ;; annoyingly get the interceptor installed.
-     (install-read-interceptor)
      (let ((*math-ops-memoization* memo))
        ,@body)
      (when nil ; *compile-verbose*
@@ -963,10 +904,10 @@
   #+unix "tools-for-build/perfecthash"
   #+win32 "tools-for-build/perfecthash.exe")
 
-#+sbcl (when (and (probe-file (perfect-hash-generator-program))
-                  (find-symbol "RUN-PROGRAM" "SB-EXT"))
-         (pushnew :use-host-hash-generator cl:*features*)
-         (setq *perfect-hash-generator-mode* :RECORD))
+#+(or sbcl ecl ccl clisp cmucl)
+(when (probe-file (perfect-hash-generator-program))
+  (pushnew :use-host-hash-generator cl:*features*)
+  (setq *perfect-hash-generator-mode* :RECORD))
 
 ;;; I want this to work using the host-native readtable if sb-cold:*xc-readtable*
 ;;; isn't established. The caller should bind *READTABLE* to ours if reading
@@ -1008,58 +949,121 @@
           (error "hash generator duplicates: ~D" errors))))))
 (compile 'preload-perfect-hash-generator)
 
+#+use-host-hash-generator
+(defun run-perfecthash (input)
+  (with-output-to-string (result)
+    (flet (#+sbcl
+           (launch ()
+             (let ((process (sb-ext:run-program (perfect-hash-generator-program)
+                                                '()
+                                                :input :stream :output :stream
+                                                :wait nil
+                                                :allow-other-keys t
+                                                :use-posix-spawn t)))
+               (values (sb-ext:process-output process)
+                       (sb-ext:process-input process)
+                       process)))
+           #+sbcl
+           (wait (process)
+             (sb-ext:process-wait process)
+             (sb-ext:process-close process)
+             (unless (zerop (sb-ext:process-exit-code process))
+               (error "Error running perfecthash: exit code ~D"
+                      (sb-ext:process-exit-code process))))
+           #+cmu
+           (launch ()
+             (let ((process (ext:run-program (perfect-hash-generator-program)
+                                             '()
+                                             :input :stream :output :stream
+                                             :wait nil)))
+               (values (ext:process-output process)
+                       (ext:process-input process)
+                       process)))
+           #+cmu
+           (wait (process)
+             (ext:process-wait process)
+             (ext:process-close process)
+             (unless (zerop (ext:process-exit-code process))
+               (error "Error running perfecthash: exit code ~D"
+                      (ext:process-exit-code process))))
+           #+clisp
+           (launch ()
+             (multiple-value-bind (io-stream input-stream output-stream)
+                 (ext:run-program (perfect-hash-generator-program)
+                                  :input :stream :output :stream)
+               (declare (ignore io-stream))
+               (values input-stream output-stream nil)))
+           #+(or clisp ccl)
+           (wait (process)
+             process)
+           #+ecl
+           (launch ()
+             (let ((process
+                     (nth-value 2 (ext:run-program (perfect-hash-generator-program)
+                                                   ()
+                                                   :input :stream :output :stream
+                                                   :wait nil))))
+               (values (ext:external-process-output process)
+                       (ext:external-process-input process)
+                       process)))
+           #+ecl
+           (wait (process)
+             (multiple-value-bind (status code) (ext:external-process-wait process t)
+               (unless (and (eq status :exited)
+                            (zerop code))
+                 (error "Error running perfecthash: exit code ~D" code))))
+           #+ccl
+           (launch ()
+             (let ((process
+                     (ccl:run-program (perfect-hash-generator-program)
+                                      ()
+                                      :wait nil
+                                      :input :stream :output :stream)))
+               (values (ccl:external-process-output-stream process)
+                       (ccl:external-process-input-stream process)
+                       process))))
+      (multiple-value-bind (input-stream output-stream process) (launch)
+        (format output-stream "~{~X~%~}" (coerce input 'list))
+        (close output-stream)
+        (loop for char = (read-char input-stream nil)
+              while char
+              do (write-char char result))
+        (close input-stream)
+        (wait process)))))
+
+
 (defun emulate-generate-perfect-hash-sexpr (array identifier digest)
   (declare #-use-host-hash-generator (ignore identifier))
-  (let (computed)
-    (declare (ignorable computed))
-    ;; Entries are written to disk with hashes sorted in ascending order so that
-    ;; comparing as sets can be done using EQUALP.
-    ;; Sort nondestructively in case something else looks at the value as supplied.
-    (let* ((canonical-array (sort (copy-seq array) #'<))
-           (match (assoc (cons digest canonical-array) *perfect-hash-generator-memo*
-                         :test #'equalp)))
-      (when match
-        (return-from emulate-generate-perfect-hash-sexpr (cddr match)))
-      (ecase *perfect-hash-generator-mode*
-        (:playback
-         (error "perfect hash file is missing a needed entry for ~x" array))
-        (:record
-         ;; This will only display anything when we didn't have the data,
-         ;; so it's actually not too "noisy" in a normal build.
-         #+use-host-hash-generator
-         (let ((output (make-string-output-stream))
-               (process
-                (sb-ext:run-program (perfect-hash-generator-program)
-                                    '("perfecthash")
-                                    ;; win32 misbehaves with :input string-stream
-                                    :input :stream :output :stream
-                                    :wait nil
-                                    :allow-other-keys t
-                                    :use-posix-spawn t)))
-           (format (sb-ext:process-input process) "~{~X~%~}" (coerce array 'list))
-           (close (sb-ext:process-input process))
-           (loop for char = (read-char (sb-ext:process-output process) nil)
-                 while char
-                 do (write-char char output))
-           (sb-ext:process-wait process)
-           (sb-ext:process-close process)
-           (unless (zerop (sb-ext:process-exit-code process))
-             (error "Error running perfecthash: exit code ~D"
-                    (sb-ext:process-exit-code process)))
-           (let* ((string (get-output-stream-string output))
-                  ;; don't need the final newline, it looks un-lispy in the file
-                  (l (length string)))
-             (assert (char= (char string (1- l)) #\newline))
-             (setq computed (subseq string 0 (1- l))))
-           (let ((*print-right-margin* 200) (*print-level* nil) (*print-length* nil))
-             (format t "~&Recording perfect hash:~%~S~%~X~%"
-                     identifier array))
-           (setf *perfect-hash-generator-memo*
-                 (nconc *perfect-hash-generator-memo*
-                        (list (list* (cons digest canonical-array)
-                                     identifier
-                                     computed))))
-           computed))))))
+  ;; Entries are written to disk with hashes sorted in ascending order so that
+  ;; comparing as sets can be done using EQUALP.
+  ;; Sort nondestructively in case something else looks at the value as supplied.
+  (let* ((canonical-array (sort (copy-seq array) #'<))
+         (match (assoc (cons digest canonical-array) *perfect-hash-generator-memo*
+                       :test #'equalp)))
+    (when match
+      (return-from emulate-generate-perfect-hash-sexpr (cddr match)))
+    (ecase *perfect-hash-generator-mode*
+      (:playback
+       (error "perfect hash file is missing a needed entry for ~x" array))
+      #+use-host-hash-generator
+      (:record
+       ;; This will only display anything when we didn't have the data,
+       ;; so it's actually not too "noisy" in a normal build.
+       (let ((string (run-perfecthash array))
+             computed)
+         (let* (;; don't need the final newline, it looks un-lispy in the file
+                (l (length string)))
+           (assert (char= (char string (1- l)) #\newline))
+           (setq computed (subseq string 0 (1- l))))
+         (let ((*print-right-margin* 200) (*print-level* nil) (*print-length* nil))
+           (format t "~&Recording perfect hash:~%~S~%~X~%"
+                   identifier array))
+         (setf *perfect-hash-generator-memo*
+               (nconc *perfect-hash-generator-memo*
+                      (list (list* (cons digest canonical-array)
+                                   identifier
+                                   computed))))
+         computed)))))
 
 ;;; Unlike xfloat-math which expresses universal truths, the perfect-hash file
 ;;; expresses facts about the behavior of a _particular_ SBCL revision.
@@ -1128,13 +1132,21 @@
                        (assert (equalp array (sort (copy-seq array) #'<)))
                        (let ((digest (reduce #'logxor array)))
                          (list* (cons digest array) identifier expression))))
-                   (with-open-file (stream pathname)
-                     (let ((*read-base* 16)) (read stream))))))
+                   (with-open-file (stream pathname :if-does-not-exist nil)
+                     (when stream
+                       (let ((*read-base* 16)) (read stream))))))
+         (compare (a1 a2)
+           (do ((i 0 (1+ i)))
+               ((or (= i (length a1)) (= i (length a2)))
+                (= i (length a1)))
+             (unless (= (aref a1 i) (aref a2 i))
+               (return (< (aref a1 i) (aref a2 i)))))))
     (let ((entries (load-file destination)))
       (dolist (source sources)
         (dolist (entry (load-file source))
           (unless (assoc (car entry) entries :test #'equalp)
-            (nconc entries (list entry)))))
+            (push entry entries))))
+      (setq entries (sort entries #'compare :key #'cdar))
       (save-perfect-hashfuns destination entries))))
 
 (defun maybe-save-perfect-hashfuns-for-playback ()
@@ -1144,7 +1156,7 @@
       (let ((array (cdar entry)))
         (assert (not (gethash array uniqueness-checker)))
         (setf (gethash array uniqueness-checker) t))))
-  #+use-host-hash-generator
+  #+(and use-host-hash-generator sbcl)
   (when (eq *perfect-hash-generator-mode* :record)
     (save-perfect-hashfuns (perfect-hash-generator-journal :output)
                            *perfect-hash-generator-memo*))

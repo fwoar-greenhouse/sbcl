@@ -250,11 +250,9 @@
 ;;; and all system functions are safe when invoked through their public API.
 ;;; Whether maximally strict checking of types is performed in user code
 ;;; has nothing to do with how the interpreter is compiled.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; Of course, errors are possible in the interpreter itself,
-  ;; so in that case it helps to define this as '() for debugging.
-  #+nil(defparameter +handler-optimize+ '(optimize))
-  (defparameter +handler-optimize+ '(optimize (speed 2) (debug 2) (safety 0))))
+;;; Of course, errors are possible in the interpreter itself,
+;;; so in that case it helps to define this as '() for debugging.
+(defglobal +handler-optimize+ '(optimize (speed 2) (debug 2) (safety 0)))
 
 ;;; We represent a pointer to a symbol in an environment by a FRAME-PTR
 ;;; which is a packed integer containing the "up" and "across" indices.
@@ -914,8 +912,9 @@
         :compile
         (let*
             ((disabled-package-locks
-              `((declare (disabled-package-locks
-                          ,@(sb-c::lexenv-disabled-package-locks lexenv)))))
+              (when (sb-c::lexenv-disabled-package-locks lexenv)
+                `((declare (disable-package-locks
+                            ,@(sb-c::lexenv-disabled-package-locks lexenv))))))
              (macro-env
               ;; Macros in an interpreter environment must look like interpreted
               ;; functions due to use of FUN-NAME to extract their name as a key
@@ -1072,9 +1071,7 @@
         (payload (env-payload env)))
     (flet ((specialize (binding) ; = make a global var, not make less general
              (let ((sym (binding-symbol binding)))
-               (cons sym (make-global-var :%source-name sym
-                                          :kind :special
-                                          :where-from :declared))))
+               (cons sym (sb-c::make-global-var :special sym :declared))))
            (macroize (name thing) (list* name 'sb-sys:macro thing))
            (fname (f) (second (fun-name f))))
       (multiple-value-bind (vars funs)
@@ -1092,10 +1089,10 @@
                          ;; access interpreter's lexical vars
                          ;; Prevent SETF on the variable from getting
                          ;; "Destructive function (SETF SVREF) called on constant data"
-                         (macroize sym `(svref (load-time-value ,payload) ,i)))
+                         (macroize sym `(svref (load-time-value ,payload modifiable-constant) ,i)))
                         (t
-                         (let ((leaf (make-lambda-var
-                                      :%source-name sym
+                         (let ((leaf (sb-c::make-lambda-var
+                                      sym
                                       :type (or (cdr binding) *universal-type*))))
                            (setf (gethash binding var-map) leaf)
                            (cons sym leaf)))))))
@@ -1148,8 +1145,8 @@
                      (null
                       (let ((defined-fun
                              (sb-c::make-defined-fun
-                              :%source-name fname
-                              :type (sb-int:global-ftype fname))))
+                              fname
+                              (sb-int:global-ftype fname))))
                         (setf (sb-c::defined-fun-inlinep defined-fun) inlinep)
                         (push (cons fname defined-fun) funs))))))))
             (ftype
@@ -1176,9 +1173,8 @@
                              (typecase thing
                                (cons x) ; symbol-macro
                                (sb-c::lambda-var thing)
-                               (sb-c::global-var (make-lambda-var
-                                                  :specvar thing
-                                                  :%source-name (car x))))))
+                               (sb-c::global-var (sb-c::make-lambda-var (car x)
+                                                                        :specvar thing)))))
                          vars)
                         ;; And surely this is wrong...
                         funs)))))))

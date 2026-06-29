@@ -539,6 +539,27 @@
                      (atomic-pop (symbol-value 'x))))))
       1)))
 
+(defclass cas-fsc (generic-function)
+  ((a :initform 2))
+  (:metaclass sb-mop:funcallable-standard-class))
+
+(with-test (:name :cas-funcallable-instance)
+  (let ((x (make-instance 'cas-fsc)))
+    (assert
+     (= (funcall (compile nil
+                          `(lambda (x)
+                             (cas (slot-value x 'a) 0 1)))
+                 x)
+        2))
+    (assert (eql (slot-value x 'a) 2))
+    (assert
+     (= (funcall (compile nil
+                          `(lambda (x)
+                             (cas (slot-value x 'a) 2 3)))
+                 x)
+        2))
+    (assert (eql (slot-value x 'a) 3))))
+
 (in-package "SB-VM")
 
 ;;; This file defines a structure, so is an 'impure' test
@@ -558,6 +579,7 @@
     (%instance-cas-pair inst ind old1 old2 new1 new2))
 
   (defun test-wide-cmpxchg ()
+    #-arm64
     (let ((x (cons 'a 'b)))
       (multiple-value-bind (old1 old2) (test-a-cons x 'a 'b 'foo 'bar)
         (assert (and (eq old1 'a) (eq old2 'b) (equal x '(foo . bar)))))
@@ -570,6 +592,7 @@
       (multiple-value-bind (old1 old2) (test-a-vect x 2 nil nil 'foo 'bar)
         (assert (and (null old1) (null old2) (equalp x #(nil nil foo bar nil nil))))))
 
+    #-arm64
     ;; Same remark applies - just check that the offset to the slot is right.
     (let ((s (make-my-struct :three 'the :four 'floor)))
       ;; in slots 3 and 4 put your bootee (a baby shoe, i.e.) on the floor
@@ -579,22 +602,34 @@
                      (eq (my-struct-four s) 'bootee)))))
     t))
 
-(test-util:with-test (:name :wide-compare-and-exchange
-                      :skipped-on (not (or :x86 :x86-64)))
+(defun should-test-dblcas ()
+  #+arm64
+  (or (member :arm-v8.1 sb-c:*backend-subfeatures*)
+      (with-open-file (f "/proc/cpuinfo" :if-does-not-exist nil)
+        (and f
+             (loop repeat 4
+                   thereis (let ((line (read-line f)))
+                             (and (search "Features" line) (search " atomics " line)))))))
+  #+(or x86 x86-64)
   (multiple-value-bind (a b c d) (%cpu-identification 0 0)
     (declare (ignore b c d))
     ;; paranoidly check for whether we can execute function ID 1
-    (or (and (>= a 1) ; the highest function ID
-             (multiple-value-bind (a b c d) (%cpu-identification 1 0)
-               (declare (ignore a b) (ignorable c d))
-               ;; paranoidly check for CMPXCHGxB presence
-               ;; constants from Table 3-20 and 3-21 of Intel manual
-               (and #+x86(logbitp 8 d) #+x86-64(logbitp 13 c)
-                    (test-wide-cmpxchg))))
-        (format t "Double-width compare-and-swap NOT TESTED~%"))))
+    (and (>= a 1) ; the highest function ID
+         (multiple-value-bind (a b c d) (%cpu-identification 1 0)
+           (declare (ignore a b) (ignorable c d))
+           ;; paranoidly check for CMPXCHGxB presence
+           ;; constants from Table 3-20 and 3-21 of Intel manual
+           (and #+x86 (logbitp 8 d) #+x86-64 (logbitp 13 c))))))
+
+(test-util:with-test (:name :wide-compare-and-exchange
+                      :skipped-on (not (or :arm64 :x86 :x86-64)))
+  (if (should-test-dblcas)
+      (test-wide-cmpxchg)
+      (format t "Double-width compare-and-swap NOT TESTED~%")))
 
 (test-util:with-test (:name :cas-sap-ref-smoke-test
-                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+                      :skipped-on (not :sb-thread)
+                      :broken-on :ppc)
   (let ((data (make-array 1 :element-type 'sb-vm:word)))
     (sb-sys:with-pinned-objects (data)
       (let ((sap (sb-sys:vector-sap data)))
@@ -616,11 +651,13 @@
                         (let ((old (cas (,ref sap 0) ,init ,newval)))
                           (assert (eql old ,init)) ; actual old
                           (assert (eql (,ref sap 0) ,newval)))))) ; should have changed
-          (test nil 64 #xdeadc0fefe00)
-          (test t   64 most-negative-fixnum)
+          #+64-bit (test nil 64 #xdeadc0fefe00)
+          #+64-bit (test t   64 most-negative-fixnum)
           (test nil 32 #xbabab00e)
-          #-ppc64 (test nil 16 #xfafa) ; gets "illegal instruction" if unimplemented
-          #-ppc64 (test nil 8 #xbb)
+          ;; on riscv I did not implement these sizes, and
+          ;; ppc64 might get "illegal instruction" depending on the particular CPU
+          #-(or riscv ppc64 loongarch64) (test nil 16 #xfafa)
+          #-(or riscv ppc64 loongarch64) (test nil 8 #xbb)
           )
         ;; SAP-REF-SAP
         (setf (aref data 0) 0)
@@ -639,8 +676,21 @@
           (assert (eq old nil))
           (assert (eq (sap-ref-lispobj sap 0) t)))))))
 
+(test-util:with-test (:name :cas-sb16
+                      :skipped-on (or :interpreter
+                                      (not (or :arm64 :x86-64))))
+ (let ((a (make-array 1 :element-type '(signed-byte 16))))
+   (flet ((cas-sb16 (sap old new)
+           (cas (sb-sys:signed-sap-ref-16 sap 0) old new)))
+     (setf (aref a 0) -1000)
+     (loop for old from -1000 to 1000 do
+        (sb-sys:with-pinned-objects (a)
+          (let ((actual (cas-sb16 (sb-sys:vector-sap a) old (1+ old))))
+            (assert (= actual old))
+            (assert (= (aref a 0) (1+ old)))))))))
+
 (test-util:with-test (:name :cas-sap-ref-stress-test
-                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+                            :skipped-on (not :sb-thread))
   (let ((data (make-array 1 :element-type 'sb-vm:word
                              :initial-element 0)))
     (sb-sys:with-pinned-objects (data)
@@ -677,3 +727,32 @@
   (assert (= (cas-an-alien-byte 1 6) 1))
   (assert (= small-generation-limit 6))
   (setf small-generation-limit 1)))
+
+(test-util:with-test (:name :cas-aref
+                      :skipped-on (not (or :arm64 :x86-64)))
+  (dolist (bits '(8 16 32 #+64-bit 64))
+    (let ((unsigned (make-array '(3 3) :element-type `(unsigned-byte ,bits)
+                                :initial-element 0))
+          (signed (make-array '(3 3) :element-type `(signed-byte ,bits)
+                              :initial-element 0))
+          (uint 0)
+          (sint -5))
+      (dotimes (i 3)
+        (dotimes (j 3)
+          (cas (aref unsigned i j) 0 (incf uint))
+          (cas (aref signed i j) 0 (incf sint))))
+      (assert (equalp unsigned #2A((1 2 3) (4 5 6) (7 8 9))))
+      (assert (equalp signed #2A((-4 -3 -2) (-1 0 1) (2 3 4)))))))
+
+(test-util:with-test (:name :cas-aref-float :skipped-on (not :x86-64))
+  (dolist (et '(single-float double-float))
+    (let ((a (make-array 4 :element-type et)))
+      (dotimes (i 4)
+        (cas (aref a i) (coerce 0 et) (coerce (1+ i) et)))
+      (assert (equalp a #(1d0 2d0 3d0 4d0))))))
+
+(declaim (global *not-ab-global*))
+(defun cas-not-ab-global (old new) (cas *not-ab-global* old new))
+(compile 'cas-not-ab-global)
+(test-util:with-test (:name :cas-not-always-bound-global)
+  (assertoid:assert-error (cas-not-ab-global 1 2) cell-error))

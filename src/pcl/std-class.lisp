@@ -234,25 +234,52 @@
     (call-next-method)))
 
 (defmethod add-direct-method ((specializer specializer) (method method))
-  (let ((cell (specializer-method-holder specializer)))
+  ;; Method "list" storage is a simple-vector. A hashset would probably be best,
+  ;; or a list that upgrades to a hashset. But a vector is already an improvement
+  ;; over a list because it can be examined faster. Quite often GFs gain
+  ;; thousands of methods, especially PRINT-OBJECT, where the vector eliminates
+  ;; all the CDR pointers thus having a better memory access pattern.
+  (flet ((adjoin-to (collection)
+           (let ((collection (the simple-vector (or collection (vector 0 0 0 0))))
+                 (hole))
+             (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+             (loop for i downfrom (1- (length collection)) to 0
+                   do (let ((elt (svref collection i)))
+                        (cond ((eq elt method) (return-from adjoin-to collection))
+                              ((eql elt 0) (setq hole i)))))
+             (when hole
+               (setf (svref collection hole) method)
+               (return-from adjoin-to collection))
+             (let* ((old-size (length collection))
+                    (new-size (ash (* old-size 3) -1)) ; scale up by 3/2
+                    (new (replace (make-array new-size) collection)))
+               (setf (aref new old-size) method)
+               new))))
+    (let ((cell (specializer-method-holder specializer)))
     ;; We need to first smash the CDR, because a parallel read may
     ;; be in progress, and because if an interrupt catches us we
     ;; need to have a consistent state.
-    (setf (cdr cell) ()
-          (car cell) (adjoin method (car cell) :test #'eq)))
-  method)
+      (setf (cdr cell) ()
+            (car cell) (adjoin-to (car cell)))))
+    method)
 
 (defmethod remove-direct-method ((specializer specializer) (method method))
-  (let ((cell (specializer-method-holder specializer)))
+  (flet ((remove-from (collection)
+           (when collection
+             (awhen (position method (the simple-vector collection) :test #'eq)
+               (setf (svref collection it) 0)))
+           collection))
+    (let ((cell (specializer-method-holder specializer)))
     ;; We need to first smash the CDR, because a parallel read may
     ;; be in progress, and because if an interrupt catches us we
     ;; need to have a consistent state.
-    (setf (cdr cell) ()
-          (car cell) (remove method (car cell))))
+      (setf (cdr cell) ()
+            (car cell) (remove-from (car cell)))))
   method)
 
 (defmethod specializer-direct-methods ((specializer specializer))
-  (car (specializer-method-holder specializer nil)))
+  (let ((collection (car (specializer-method-holder specializer nil))))
+    (coerce (remove 0 collection) 'list)))
 
 (defmethod specializer-direct-generic-functions ((specializer specializer))
   (let ((cell (specializer-method-holder specializer nil)))
@@ -264,11 +291,12 @@
           (setf (cdr cell)
                 (with-system-mutex (*specializer-lock*)
                   (let (collect)
-                    (dolist (m (car cell) (nreverse collect))
+                    (dovector (m (or (car cell) #()) (nreverse collect))
                 ;; the old PCL code used COLLECTING-ONCE which used
                 ;; #'EQ to check for newness
-                      (pushnew (method-generic-function m) collect
-                               :test #'eq)))))))))
+                      (unless (eql m 0)
+                        (pushnew (method-generic-function m) collect
+                                 :test #'eq))))))))))
 
 (defmethod specializer-method-holder ((self specializer) &optional create)
   ;; CREATE can be ignored, because instances of SPECIALIZER
@@ -469,6 +497,7 @@
          (dolist (superclass direct-superclasses)
            (unless (validate-superclass class superclass)
              (invalid-superclass class superclass)))
+         (check-superclass-cycle class direct-superclasses)
          (setf (slot-value class 'direct-superclasses) direct-superclasses))
         (t
          (setq direct-superclasses (slot-value class 'direct-superclasses))))
@@ -536,8 +565,6 @@
   (declare (ignore slot-names))
   (make-preliminary-layout class))
 
-(defvar *allow-forward-referenced-classes-in-cpl-p* nil)
-
 ;;; Give CLASS a preliminary layout if it doesn't have one already, to
 ;;; make it known to the type system.
 (defun make-preliminary-layout (class)
@@ -576,6 +603,7 @@
         (make-instance 'class-eq-specializer :class class)))
 
 (defmethod reinitialize-instance :before ((class slot-class) &key direct-superclasses)
+  (check-superclass-cycle class direct-superclasses)
   (dolist (old-super (set-difference (class-direct-superclasses class) direct-superclasses))
     (remove-direct-subclass old-super class))
   (remove-slot-accessors class (class-direct-slots class)))
@@ -854,8 +882,7 @@
              (layout (classoid-layout lclass)))
         (setf (classoid-pcl-class lclass) class)
         (setf (slot-value class 'wrapper) layout)
-        (setf (sb-kernel::layout-slot-mapper layout)
-              (sb-kernel::make-struct-slot-map (layout-dd layout)))
+        (sb-kernel::install-struct-slot-mapper layout)
         (setf (layout-slot-table layout) (make-slot-table class slots))))
     (setf (slot-value class 'finalized-p) t)
     (add-slot-accessors class direct-slots)))
@@ -925,6 +952,14 @@
       (some #'class-has-a-forward-referenced-superclass-p
             (class-direct-superclasses class))))
 
+(defun check-superclass-cycle (class new-superclasses)
+  (loop for superclass in new-superclasses
+        do (when (eq class superclass)
+             (error "~@<Specified class ~S as a superclass of ~
+                       itself.~@:>"
+                    class))
+           (check-superclass-cycle class (class-direct-superclasses superclass))))
+
 ;;; This is called by :after shared-initialize whenever a class is initialized
 ;;; or reinitialized. The class may or may not be finalized.
 (defun update-class (class finalizep)
@@ -933,19 +968,24 @@
                (error "~@<Specified class ~S as a superclass of ~
                        itself.~@:>"
                       class))
-             (without-package-locks
-               (with-world-lock ()
-                 (when (or finalizep (class-finalized-p class))
-                   (%update-cpl class (compute-class-precedence-list class))
-                   ;; This invocation of UPDATE-SLOTS, in practice, finalizes the
-                   ;; class
-                   (%update-slots class (compute-slots class))
-                   (update-gfs-of-class class)
-                   (setf (plist-value class 'default-initargs) (compute-default-initargs class))
-                   (update-ctors 'finalize-inheritance :class class))
-                 (let ((seen (list* class seen)))
-                   (dolist (sub (class-direct-subclasses class))
-                     (rec sub nil seen)))))))
+             (when (without-package-locks
+                     (with-world-lock ()
+                       (prog1
+                           (when (or finalizep (class-finalized-p class))
+                             (%update-cpl class (compute-class-precedence-list class))
+                             ;; This invocation of UPDATE-SLOTS, in practice, finalizes the
+                             ;; class
+                             (%update-slots class (compute-slots class))
+                             (update-gfs-of-class class)
+                             (setf (plist-value class 'default-initargs) (compute-default-initargs class))
+                             (update-ctors 'finalize-inheritance :class class)
+                             t)
+                         (let ((seen (list* class seen)))
+                           (dolist (sub (class-direct-subclasses class))
+                             (rec sub nil seen))))))
+               ;; Warning at run-time is not nice, can it be done at compile-time?
+               #+nil
+               (style-warn-about-duplicate-slots class))))
     (rec class finalizep)))
 
 (define-condition cpl-protocol-violation (reference-condition error)
@@ -1005,7 +1045,11 @@
   (when cpl
     (let ((first (car cpl)))
       (dolist (c (cdr cpl))
-        (pushnew c (slot-value first 'can-precede-list) :test #'eq)))
+        ;; This is (PUSHNEW c (SLOT-VALUE FIRST 'can-precede-list) :TEST #'EQ)))
+        ;; but avoids consing in an arena. Perhaps the ADJOIN transform could sense
+        ;; whether to change %ADJOIN-EQ to SYS-TLAB-ADJOIN-EQ ?
+        (with-slots (can-precede-list) first
+          (setf can-precede-list (sys-tlab-adjoin-eq c can-precede-list)))))
     (update-class-can-precede-p (cdr cpl))))
 
 (defun class-can-precede-p (class1 class2)
@@ -1109,7 +1153,6 @@
             (layout-slot-table nwrapper) (make-slot-table class eslotds)
             (layout-length nwrapper) nslots
             (slot-value class 'wrapper) nwrapper)
-      (style-warn-about-duplicate-slots class)
       (setf (slot-value class 'finalized-p) t))))
 
 (defun update-gf-dfun (class gf)
@@ -1539,8 +1582,6 @@
                    value)))
     (setf (clos-slots-ref slots (slot-definition-location slot)) value)))
 
-(defvar *in-obsolete-instance-trap* nil)
-
 (define-condition obsolete-structure (error)
   ((datum :reader obsolete-structure-datum :initarg :datum))
   (:report
@@ -1707,9 +1748,6 @@
 
     ;; Make the copy point to the old instance's storage, and make the
     ;; old instance point to the new storage.
-    ;; All uses of %CHANGE-CLASS are under the world lock, but that doesn't
-    ;; preclude user code operating on the old slots + new layout or v.v.
-    ;; Users need to synchronize their own access when changing class.
     (replace-wrapper-and-slots copy old-wrapper old-slots)
     (replace-wrapper-and-slots instance new-wrapper new-slots)
 
@@ -1755,10 +1793,9 @@
                 ,@body)))
 (defmethod change-class ((instance standard-object) (new-class standard-class)
                          &rest initargs)
-  (with-world-lock ()
-    (check-new-class-not-metaobject new-class)
-    (with-temporary-instance (temp)
-      (%change-class temp instance new-class initargs))))
+  (check-new-class-not-metaobject new-class)
+  (with-temporary-instance (temp)
+    (%change-class temp instance new-class initargs)))
 
 (defmethod change-class ((instance forward-referenced-class)
                          (new-class standard-class) &rest initargs)
@@ -1793,10 +1830,9 @@
 (defmethod change-class ((instance funcallable-standard-object)
                          (new-class funcallable-standard-class)
                          &rest initargs)
-  (with-world-lock ()
-    (check-new-class-not-metaobject new-class)
-    (with-temporary-funinstance (temp)
-      (%change-class temp instance new-class initargs)))))
+  (check-new-class-not-metaobject new-class)
+  (with-temporary-funinstance (temp)
+    (%change-class temp instance new-class initargs))))
 
 (defmethod change-class ((instance standard-object)
                          (new-class funcallable-standard-class)

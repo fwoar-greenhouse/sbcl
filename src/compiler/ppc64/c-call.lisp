@@ -192,8 +192,9 @@
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
       (inst lr temp (make-fixup "call_into_c" :foreign))
-      (inst mtctr temp)
       (move cfunc function)
+      (emit-alignment 3 :long-nop)
+      (inst mtctr temp)
       (inst bctrl)
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
@@ -256,11 +257,9 @@
   ;;; callback wrapper.
   (defun alien-callback-assembler-wrapper (index result-type argument-types)
     (flet ((make-gpr (n)
-             (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset n))
+             (make-random-tn (sc-or-lose 'any-reg) n))
            (make-fpr (n)
-             (make-random-tn :kind :normal :sc (sc-or-lose
-                                                'double-reg) :offset
-                                                n)))
+             (make-random-tn (sc-or-lose 'double-reg) n)))
       (let* ((segment (make-segment))
              #+big-endian
              (function-descriptor-size 24))
@@ -397,17 +396,13 @@
                               (ceiling (alien-type-bits arg) n-word-bits))
                             argument-types))
 
-              ;; Arranged the args, allocated the return area.  Now
-              ;; actuall call funcall3:  funcall3 (call-alien-function,
-              ;; index, args, return-area)
+              ;; Arranged the args, allocated the return area.
 
-              (destructuring-bind (arg1 arg2 arg3 arg4)
-                  (mapcar #'make-gpr '(3 4 5 6))
-                (load-address-into arg1 (static-fdefn-fun-addr 'enter-alien-callback))
-                (loadw arg1 arg1)
-                (inst li arg2 (fixnumize index))
-                (inst addi arg3 stack-pointer (- arg-store-pos))
-                (inst addi arg4 stack-pointer (- return-area-pos)))
+              (destructuring-bind (arg1 arg2 arg3)
+                  (mapcar #'make-gpr '(3 4 5))
+                (inst li arg1 (fixnumize index))
+                (inst addi arg2 stack-pointer (- arg-store-pos))
+                (inst addi arg3 stack-pointer (- return-area-pos)))
 
               ;; Setup everything.  Now save sp, setup the frame.
               (inst mflr r0)
@@ -417,14 +412,10 @@
 
               ;; And make the call.
               #+little-endian
-              (load-address-into
-               r0
-               (foreign-symbol-address "callback_wrapper_trampoline"))
+              (load-address-into r0 (callback_wrapper_trampoline))
               #+big-endian
               (destructuring-bind (r2 r12) (mapcar #'make-gpr '(2 12))
-                (load-address-into
-                 r12
-                 (foreign-symbol-address "callback_wrapper_trampoline"))
+                (load-address-into r12 (callback_wrapper_trampoline))
                 (inst ld r0 r12 0)
                 (inst ld r2 r12 8))
               (inst mtlr r0)

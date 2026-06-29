@@ -22,20 +22,14 @@
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
                   (defconstant ,offset-sym ,offset)
-                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
-                  (list ,@(mapcar #'(lambda (name)
-                                      (symbolicate name "-OFFSET")) regs))))))
+                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg r0 0)
   (defreg r1 1)
   (defreg r2 2)
   (defreg lexenv 3)
   (defreg nl2 4)
-  (defreg code 5)
+  (defreg csp 5)
   (defreg nl3 6)
   (defreg ocfp 7)
   (defreg r8 8)
@@ -48,7 +42,7 @@
   (defreg pc 15) ;; Yes, the program counter.
 
   (defregset system-regs
-      null cfp nsp lr pc code)
+      null cfp nsp lr pc)
 
   (defregset descriptor-regs
       r0 r1 r2 lexenv r8)
@@ -57,7 +51,7 @@
       ocfp nfp nargs nl2 nl3)
 
   (defregset boxed-regs
-      r0 r1 r2 lexenv r8 code)
+      r0 r1 r2 lexenv r8)
 
   ;; registers used to pass arguments
   ;;
@@ -65,7 +59,7 @@
   (defconstant register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2)
-  (defparameter *register-arg-names* '(r0 r1 r2)))
+  (defconstant-eqx register-arg-names '(r0 r1 r2) #'equal))
 
 
 ;;;; SB and SC definition:
@@ -166,10 +160,6 @@
   (non-descriptor-reg registers
                       :locations #.non-descriptor-regs)
 
-  ;; Pointers to the interior of objects.  Used only as a temporary.
-  (interior-reg registers
-                :locations (#.lr-offset))
-
   ;; **** Things that can go in the floating point registers.
 
   ;; Non-Descriptor single-floats.
@@ -210,18 +200,16 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn null descriptor-reg)
-  (defregtn code descriptor-reg)
 
   (defregtn nargs any-reg)
   (defregtn ocfp any-reg)
   (defregtn nsp any-reg)
+  (defregtn csp any-reg)
   (defregtn cfp any-reg)
-  (defregtn lr interior-reg)
+  (defregtn lr any-reg)
   (defregtn pc any-reg))
 
 ;;; If VALUE can be represented as an immediate constant, then return the
@@ -247,10 +235,6 @@
 
 ;;;; function call parameters
 
-;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn any-reg-sc-number)
-(defconstant control-stack-arg-scn control-stack-sc-number)
-
 ;;; offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)
 (defconstant lra-save-offset 1)
@@ -263,11 +247,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This function is called by debug output routines that want a pretty name

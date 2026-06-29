@@ -154,7 +154,7 @@
     (:no . 1)
     (:b . 2) (:nae . 2) (:c . 2)
     (:nb . 3) (:ae . 3) (:nc . 3)
-    (:eq . 4) (:e . 4) (:z . 4)
+    (:e . 4) (:z . 4)
     (:ne . 5) (:nz . 5)
     (:be . 6) (:na . 6)
     (:nbe . 7) (:a . 7)
@@ -2435,7 +2435,11 @@
          (setf (sap-ref-32 sap offset) rel-val)))))
   nil)
 
-(defun sb-fasl::pack-fixups-for-reapplication (fixup-notes)
+;;; There are 3 data streams in the FIXUPS slot:
+;;; 1. absolute fixups
+;;; 2. relative fixups
+;;; 3. card table mask fixups
+(defun sb-c::pack-fixups-for-reapplication (fixup-notes)
   (let (abs-fixups rel-fixups imm-fixups)
     (dolist (note fixup-notes)
       (let* ((fixup (fixup-note-fixup note))

@@ -124,10 +124,9 @@
                 type-error))
 
 (with-test (:name (:default :element-type read-byte error))
- (assert-error (with-open-file (s "/dev/zero")
-                 (read-byte s))
-               #-win32 type-error
-               #+win32 sb-int:simple-file-error))
+  (assert-error (with-open-file (s #-win32 "/dev/zero" #+win32 "nul")
+                  (read-byte s))
+      type-error))
 
 ;;; bidirectional streams getting confused about their position
 (with-test (:name (:direction :io))
@@ -476,32 +475,25 @@
 
     (delete-file pathname)))
 
-;;; writing looong lines. takes way too long and way too much space
-;;; to test on 64 bit platforms
-(with-test (:name (:write-char :long-lines :stream-ouput-column)
-            :skipped-on :64-bit)
-  (let ((test (scratch-file-name)))
-    (unwind-protect
-         (with-open-file (f test
-                            :direction :output
-                            :external-format :ascii
-                            :element-type 'character
-                            :if-does-not-exist :create
-                            :if-exists :supersede)
-           (let* ((n (truncate most-positive-fixnum 16))
-                  (m 18)
-                  (p (* n m))
-                  (buffer (make-string n)))
-             (dotimes (i m)
-               (write-char #\.)
-               (finish-output)
-               (write-sequence buffer f))
-             (assert (= p (sb-impl::fd-stream-output-column f)))
-             (write-char #\! f)
-             (assert (= (+ 1 p) (sb-impl::fd-stream-output-column f)))
-             (assert (typep p 'bignum))))
-      (when (probe-file test)
-        (delete-file test)))))
+(with-test (:name (:write-char :long-lines :stream-ouput-column))
+  (with-open-file (f (or #+win32 "nul" "/dev/null")
+                     :direction :output
+                     :external-format :ascii
+                     :element-type 'character
+                     :if-exists :append)
+    (let* ((n 33554431)
+           (m 17)
+           (p (* n m))
+           (buffer (make-string n :element-type 'base-char)))
+      (dotimes (i m)
+        (write-char #\.)
+        (finish-output)
+        (write-sequence buffer f))
+      (assert (= p (sb-impl::fd-stream-output-column f)))
+      (write-char #\! f)
+      (assert (= (+ 1 p) (sb-impl::fd-stream-output-column f)))
+      #-64-bit
+      (assert (typep p 'bignum)))))
 
 ;;; read-sequence misreported the amount read and lost position
 (with-test (:name (read-sequence :read-elements))
@@ -654,9 +646,14 @@
 ;;; READ-CHAR-NO-HANG on bivalent streams (as returned by RUN-PROGRAM)
 ;;; was wrong.  CSR managed to promote the wrongness to all streams in
 ;;; the 1.0.32.x series, breaking slime instantly.
-(with-test (:name (read-char :no-hang-after unread-char) :skipped-on :win32)
-  (let* ((process (run-program "/bin/sh" '("-c" "echo a && sleep 10")
-                               :output :stream :wait nil))
+(with-test (:name (read-char :no-hang-after unread-char))
+  (let* ((process #-win32 (run-program "/bin/sh" '("-c" "echo a && sleep 10")
+                                       :output :stream :wait nil)
+                  #+win32 (run-program
+                           "cmd.exe" '("/c" "(echo a) && (%SystemRoot%\\System32\\timeout 10 > nul )")
+                           :external-format '(:default :newline :crlf)
+                           :search t
+                           :input t :output :stream :wait nil))
          (stream (process-output process))
          (char (read-char stream)))
     (assert (char= char #\a))
@@ -669,38 +666,14 @@
       (read-char-no-hang stream)
       (assert (< (- (get-universal-time) time) 2)))))
 
-#-win32
-(with-test (:name (open :interrupt)
-                  :skipped-on (or :win32 (:and :darwin :sb-safepoint)))
-  (let ((to 0))
-    (with-scratch-file (fifo)
-           ;; Make a FIFO
-           (sb-posix:mkfifo fifo (logior sb-posix:s-iwusr sb-posix:s-irusr))
-           ;; Try to open it (which hangs), and interrupt ourselves with a timer,
-           ;; continue (this used to result in an error due to open(2) returning with
-           ;; EINTR, then interupt again and unwind.
-           (handler-case
-               (with-timeout 2
-                 (handler-bind ((timeout (lambda (c)
-                                           (when (eql 1 (incf to))
-                                             (continue c)))))
-                   (with-timeout 1
-                     (with-open-file (f fifo :direction :input)
-                       :open))))
-             (timeout ()
-               (if (eql 2 to)
-                   :timeout
-                   :wtf))
-             (error (e)
-               e)))))
-
 ;; We used to not return from read on a named pipe unless the external-format
 ;; routine had filled an input buffer. Now we'll return as soon as a request
 ;; is satisfied, or on EOF. (https://bugs.launchpad.net/sbcl/+bug/643686)
 #-win32
 (with-test (:name :overeager-character-buffering :skipped-on :win32)
   (let ((use-threads #+sb-thread t)
-        (proc nil))
+        (proc nil)
+        (sem (sb-thread:make-semaphore)))
     (sb-int:dovector (entry sb-impl::*external-formats*)
       (unless entry (return))
       (with-scratch-file (fifo)
@@ -721,6 +694,7 @@
                               (with-open-file (f fifo :direction :output
                                                       :if-exists :overwrite
                                                       :external-format format)
+                                (sb-thread:wait-on-semaphore sem)
                                 (write-line "foobar" f)
                                 (finish-output f)
                                 (sleep most-positive-fixnum))))))
@@ -737,6 +711,8 @@
               ;; Whether we're using threads or processes, the writer isn't
               ;; injecting any more input, but isn't indicating EOF either.
               (with-open-file (f fifo :direction :input :external-format format)
+                #+sb-thread
+                (sb-thread:signal-semaphore sem)
                 (assert (equal "foobar" (read-line f)))))
           (when proc
             (cond (use-threads (sb-thread:terminate-thread proc))
@@ -825,17 +801,17 @@
   (%make-mock-fd-stream
    (mapcar (lambda (x) (substitute #\Newline #\| x)) buffer-chain)))
 
-(defun mock-fd-stream-n-bin-fun (stream char-buf size-buf start count eof-err-p)
+(defun mock-fd-stream-n-bin-fun (stream char-buf size-buf start end &optional eof-err-p)
   (cond ((mock-fd-stream-buffer-chain stream)
          (let* ((chars (pop (mock-fd-stream-buffer-chain stream)))
                 (n-chars (length chars)))
            ;; make sure the mock object is being used as expected.
-           (assert (>= count (length chars)))
+           (assert (>= end (length chars)))
            (replace char-buf chars :start1 start)
            (fill size-buf 1 :start start :end (+ start n-chars))
-           n-chars))
+           (+ start n-chars)))
         (t
-         (sb-impl::eof-or-lose stream eof-err-p 0))))
+         (sb-impl::eof-or-lose stream eof-err-p start))))
 
 (with-test (:name :read-chunk-from-frc-buffer)
   (let ((s (make-mock-fd-stream '("zabc" "d" "efgh" "foo|bar" "hi"))))
@@ -851,11 +827,11 @@
   (let ((s (make-mock-fd-stream '("zabc" "d" "efgh" "foo*bar" "hi")))
         (string (make-string 100)))
     (let ((endpos
-           (sb-impl::ansi-stream-read-string-from-frc-buffer string s 10 nil)))
+           (read-sequence string s :start 10)))
       (assert (and (= endpos 28)
                    (string= (subseq string 10 endpos) "zabcdefghfoo*barhi"))))
     (let ((endpos
-           (sb-impl::ansi-stream-read-string-from-frc-buffer string s 0 nil)))
+           (read-sequence string s)))
       (assert (= endpos 0)))))
 
 (with-test (:name :named-pipe-wait-eof)
@@ -875,3 +851,208 @@
         (read-char-no-hang cs)
         (assert (listen cs))))
     (delete-file file)))
+
+(with-test (:name :read-sequence-end)
+  (assert (=  (with-open-file (s (or #+win32 "zero" "/dev/zero"))
+                (read-sequence (make-string 4096) s :start 9))
+              4096)))
+
+(with-test (:name :io-buffer-sync-basic)
+  (let ((file (scratch-file-name)))
+    (unwind-protect
+         (with-open-file (stream file
+                                 :direction :io
+                                 :if-exists :overwrite
+                                 :if-does-not-exist :create)
+           (write-string "abc" stream)
+           (file-position stream 0)
+           (write-char #\x stream)
+           ;; This should read the character after the 'x' we just wrote,
+           ;; which should be 'b', not 'a' (the original first character)
+           (assert (char= (read-char stream) #\b)))
+      (ignore-errors (delete-file file)))))
+
+(with-test (:name :io-buffer-sync-multiple-ops)
+  (let ((file (scratch-file-name)))
+    (unwind-protect
+         (with-open-file (stream file
+                                 :direction :io
+                                 :if-exists :overwrite
+                                 :if-does-not-exist :create)
+           (write-string "hello world" stream)
+           (file-position stream 6)  ; position after "hello "
+           (write-string "SBCL" stream)
+           (file-position stream 9)  ; position at last character of "SBCL"
+           ;; Should read the 'L' from "SBCL", not 'r' from original "world"
+           (assert (char= (read-char stream) #\L)))
+      (ignore-errors (delete-file file)))))
+
+#+unix
+(with-test (:name :unbuffered-nonblocking-write-sequence)
+  (flet ((make-non-blocking-pipe ()
+           (multiple-value-bind (i o) (sb-posix:pipe)
+             (sb-posix:fcntl i sb-posix:f-setfl sb-posix:o-nonblock)
+             (sb-posix:fcntl o sb-posix:f-setfl sb-posix:o-nonblock)
+             (make-two-way-stream (sb-sys:make-fd-stream i :input t :buffering :none :element-type '(unsigned-byte 8))
+                                  (sb-sys:make-fd-stream o :output t :buffering :none :element-type '(unsigned-byte 8))))))
+    (let ((pipe (make-non-blocking-pipe))
+          (buf (make-array 1 :element-type '(unsigned-byte 8)))
+          (pipe-buffer-length 0))
+      (unwind-protect
+           (progn
+             ;; Fill the pipe buffer
+             (loop while (sb-unix:unix-write (sb-sys:fd-stream-fd (two-way-stream-output-stream pipe)) buf 0 1)
+                   do
+                   (incf pipe-buffer-length))
+             (write-sequence (coerce #(1 2 3 4) '(vector (unsigned-byte 8))) pipe)
+             (let ((in (make-array pipe-buffer-length :element-type '(unsigned-byte 8)
+                                                      :initial-element 255)))
+               (read-sequence in pipe)
+               (assert (every #'zerop in)))
+             (write-sequence (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0) pipe)
+             (let ((in (make-array 4 :element-type '(unsigned-byte 8)
+                                     :initial-element 255)))
+               (read-sequence in pipe)
+               (assert (equalp in #(1 2 3 4)))))
+        (close (two-way-stream-output-stream pipe))
+        (close (two-way-stream-input-stream pipe))))))
+
+;;; Two-way and echo streams have historically forwarded the both
+;;; :FRESH-LINE and :CHARPOS operations to their input stream
+;;; components, and echo streams forwarded the 4 buffer operations to
+;;; both components.
+;; We need an output stream class that can do WRITE-CHAR in order to
+;; exercise FRESH-LINE.
+(defclass null-character-input-stream (fundamental-character-input-stream) ())
+
+(defclass null-character-output-stream (fundamental-character-output-stream) ())
+(defmethod stream-write-char ((s null-character-output-stream) character))
+
+(with-test (:name :two-way-and-echo-ansi-misc-op-forwarding)
+  ;; We can verify that misc ops don't forward to the
+  ;; wrong-directional component by using Gray Streams that /don't/
+  ;; add methods the to the relevant generic function. First some test
+  ;; invariants, to future-proof that testing (in case people change
+  ;; which Gray Streams classes get default methods).
+  (assert (null (find-method #'stream-clear-input ()
+                             '(fundamental-character-output-stream) nil)))
+  (dolist (fun '(stream-line-column     ; :CHARPOS
+                 stream-line-length     ; :LINE-LENGTH
+                 stream-clear-output
+                 stream-finish-output stream-force-output))
+    ;; Note: omitting STREAM-START-LINE-P and
+    ;; STREAM-ADVANCE-TO-COLUMN, because it seems nothing in SBCL
+    ;; calls these.
+    (assert (null (find-method (coerce fun 'function) ()
+                               '(fundamental-character-input-stream) nil))))
+  ;; Here's the actual test.
+  (flet ((try-misc-ops (composite)
+           (clear-input composite)
+           ;; FRESH-LINE calls :CHARPOS calls STREAM-LINE-COLUMN
+           (fresh-line composite)
+           (clear-output composite)
+           (finish-output composite)
+           (force-output composite)
+           ;; When *PRINT-RIGHT-MARGIN* is false, the pretty printer
+           ;; (probably always?) calls :LINE-LENGTH, which calls
+           ;; STREAM-LINE-LENGTH.
+           (let ((*print-pretty* t) (*print-right-margin* nil))
+             (format composite "~<~@{~A~^ ~:_~}~:>"
+                     (loop repeat 32 collect "1111")))))
+    (with-open-stream (input (make-instance 'null-character-input-stream))
+      (with-open-stream (output (make-instance 'null-character-output-stream))
+        (with-open-stream (composite (make-two-way-stream input output))
+          (try-misc-ops composite))))
+    (with-open-stream (input (make-instance 'null-character-input-stream))
+      (with-open-stream (output (make-instance 'null-character-output-stream))
+        (with-open-stream (composite (make-echo-stream input output))
+          (try-misc-ops composite))))))
+
+;;; Or, if you like to test interesting behavior rather than how
+;;; two-way, echo, and Gray Streams get implemented...
+;; Make this substantially smaller than any default line width the
+;; printer uses for any stream.
+(defparameter *short-line-length* 13)
+(defclass short-output-stream
+     (fundamental-character-output-stream)
+     ((charpos :initform 0 :reader stream-line-column)
+      (line-length :initform *short-line-length* :reader stream-line-length)))
+
+;; I don't believe FORMAT deduces output columns from a control string
+;; (e.g., "abc~&def" could be statically converted to "abc~%def", I
+;; guess). In case it might ever, try to confuse it by pulling out
+;; certain parameters so the format controls will be more opaque.
+(defvar *prefix* "abc")
+(defvar *suffix* "def")
+;; This list needs to be long enough that line wrapping will be
+;; likely, and each element must be shorter than *SHORT-LINE-LENGTH*.
+(defvar *long-list* (loop repeat 32 collect "1111"))
+
+(with-test (:name :two-way-and-echo-charpos-and-line-length)
+  (macrolet
+      ((with-stream-for-output ((var ctor) &body body)
+         `(with-open-stream (%in (make-concatenated-stream))
+            (with-open-stream (%out (make-instance 'short-output-stream))
+              (with-open-stream (%input-component (make-two-way-stream %in %out))
+                (with-output-to-string (%output-component)
+                  (with-open-stream
+                      (,var (funcall ,ctor %input-component %output-component))
+                    ,@body)))))))
+    (labels ((test-fresh-line (constructor)
+               ;; Test invariants
+               (assert (not (find #\newline (princ-to-string *prefix*))))
+               (assert (not (find #\newline (princ-to-string *suffix*))))
+               (let ((string (with-stream-for-output (stream constructor)
+                               (format stream "~A~&~A" *prefix* *suffix*))))
+                 (assert (find #\newline string))))
+             (test-tabulation (constructor)
+               (let* ((string (with-stream-for-output (stream constructor)
+                                (format stream "~A~7,1T~A" *prefix* *suffix*)))
+                      (position (search (princ-to-string *suffix*) string
+                                        :from-end t))
+                      (prefix-length (length (princ-to-string *prefix*))))
+                 (flet ((valid-tabulation-position (position colnum colinc startcol)
+                          (or
+                           ;; POSITION should be at colnum*k or colnum*k+colinc
+                           (member (mod position colnum) (list 0 colinc))
+                           ;; "at worst the '~T' operation will simply
+                           ;; output two spaces." (Do we do this?)
+                           (and (= position (+ startcol 2))
+                                (string= "  " string :start2 startcol
+                                         :end2 position)))))
+                   (assert (valid-tabulation-position position 7 1 prefix-length)))))
+             (lines-wrapped-okay-p (string)
+               (assert (find #\newline string))
+               (with-input-from-string (in string)
+                 (loop
+                   (multiple-value-bind (line eof-missing-p)
+                       (read-line in nil)
+                     (if (or (null line) eof-missing-p)
+                         (return t) ; don't worry about the last line
+                         ;; The line wrapping should not use the
+                         ;; input component's line width
+                         (assert (> (length line) *short-line-length*)))))))
+             (test-justification (constructor)
+               (let ((string (with-stream-for-output (stream constructor)
+                               (format stream "~{~<~%~:;~A~>~^ ~}" *long-list*))))
+                 (assert (lines-wrapped-okay-p string))))
+             (test-pretty-printing (constructor)
+               (let ((string (with-stream-for-output (stream constructor)
+                               (let ((*print-pretty* t) (*print-right-margin* nil))
+                                 (format stream "~<~@{~A~^ ~:_~}~:>"
+                                         *long-list*)))))
+                 (assert (lines-wrapped-okay-p string)))))
+      (dolist (ctor '(make-two-way-stream make-echo-stream))
+        (test-fresh-line ctor)
+        (test-tabulation ctor)
+        (test-justification ctor)
+        (test-pretty-printing ctor)))))
+
+(with-test (:name :form-tracking-set-file-position)
+  (with-open-file (s (or #+win32 "zero" "/dev/zero") :class 'sb-int:form-tracking-stream)
+    (assert (eql (read-char s) (code-char 0)))
+    (assert (equal (sb-impl::line/col-from-charpos
+                    s (sb-impl::form-tracking-stream-current-char-pos s))
+                   '(1 . 1)))
+    (file-position s 0); no error
+    (assert (null (sb-impl::form-tracking-stream-current-char-pos s)))))

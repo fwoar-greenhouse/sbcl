@@ -1449,7 +1449,7 @@ redefinition."
 (with-test (:name :specialized-equalp)
   ;; make sure we didn't mess up PATHNAME and HASH-TABLE
   (let ((f (sb-kernel:layout-equalp-impl (sb-kernel:find-layout 'pathname))))
-    (assert (eq f #'sb-int:pathname=)))
+    (assert (eq f #'sb-impl::pathname-equalp)))
   (let ((f (sb-kernel:layout-equalp-impl (sb-kernel:find-layout 'hash-table))))
     (assert (eq f #'sb-int:hash-table-equalp))))
 
@@ -1470,3 +1470,41 @@ redefinition."
                                      (:copier nil))
                            (a 0 :type sb-vm:word :read-only t)))))
     (typep (funcall name :a 3) name)))
+
+(defstruct type-mismatch
+  (v (make-array 10) :type fixnum))
+(compile 'make-type-mismatch)
+
+(with-test (:name :default-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (make-type-mismatch))
+                      :allow-warnings t)))
+  (checked-compile
+   `(lambda (m)
+      (make-type-mismatch :v m))))
+
+(defstruct (boa-constructor-&rest-nil-t
+             (:constructor make-bcrnt (&rest rest))
+             (:conc-name bcrnt-))
+  rest (nil 4) (t 5))
+(with-test (:name (:boa-constructor &rest nil t))
+  (let ((struct (make-bcrnt 1 2 3)))
+    (assert (equal (bcrnt-rest struct) '(1 2 3)))
+    (assert (eql (bcrnt-nil struct) 4))
+    (assert (eql (bcrnt-t struct) 5))))
+
+(let ((a 0))
+  (defstruct (out-of-line-boa-constructor
+               (:constructor make-oolbc (&aux x))
+               (:conc-name oolbc-))
+    x
+    (y (incf a))
+    (z 104 :type sb-vm:word)))
+(with-test (:name (:boa-constructor :out-of-line :uninitialized))
+  (let ((struct (make-oolbc)))
+    (assert (eql (oolbc-y struct) 1))
+    (setf (oolbc-x struct) 2)
+    (assert (eql (oolbc-x struct) 2))
+    (assert (eql (oolbc-z struct) 104))))

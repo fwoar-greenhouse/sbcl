@@ -18,10 +18,6 @@
 #include "globals.h" // for FIXEDOBJ_SPACE_START and TEXT_SPACE_START
 #include "gc-assert.h"
 
-// 1 page is reserved for some constant arrays.
-// Right now it is just the array that maps widetag to layout
-#define FIXEDOBJ_RESERVED_PAGES 1
-
 extern void prepare_immobile_space_for_final_gc(void);
 extern void prepare_immobile_space_for_save(bool verbose);
 extern bool immobile_space_preserve_pointer(void*);
@@ -47,7 +43,7 @@ text_page_address(low_page_index_t page_num)
 }
 
 extern unsigned char* text_page_genmask;
-extern unsigned short int* tlsf_page_sso;
+extern unsigned int* tlsf_page_sso;
 
 static inline low_page_index_t find_fixedobj_page_index(void *addr)
 {
@@ -74,6 +70,10 @@ static inline low_page_index_t find_text_page_index(void *addr)
   return -1;
 }
 
+/* The benefit if this approach to testing for two ranges is questionable,
+ * especially as text space is now _higher_ than dynamic space.
+ * Maybe reconsider just using the obvious two discrete range tests,
+ * or else rearrange the spaces again to where this makes sense */
 static inline bool immobile_space_p(lispobj obj)
 {
 /* To test the two immobile ranges, we first check that a pointer is within
@@ -98,12 +98,6 @@ extern void enliven_immobile_obj(lispobj*,int);
 //                                   v    v
 //                       0xzzzzzzzz GGzzzzww
 //         arbitrary data  --------   ---- length in words
-//
-// An an exception to the above, FDEFNs omit the length:
-//                       0xzzzzzzzz zzzzGGww
-//         arbitrary data  -------- ----
-// so that there are 6 consecutive bytes of arbitrary data.
-// The length of an FDEFN is implicitly fixed at 4 words.
 
 // There is a hard constraint on NUM_GENERATIONS, which is currently 8.
 // (0..5=normal, 6=pseudostatic, 7=scratch)
@@ -121,32 +115,7 @@ static inline int immobile_obj_gen_bits(lispobj* obj) // native pointer
     // When debugging, assert that we're called only on a headered object
     // whose header contains a generation byte.
     gc_dcheck(!embedded_obj_p(widetag_of(obj)));
-    char gen;
-    switch (widetag_of(obj)) {
-    default:
-        gen = ((generation_index_t*)obj)[3]; break;
-    case FDEFN_WIDETAG:
-        gen = ((generation_index_t*)obj)[1]; break;
-    }
-    return gen & 0x1F;
-}
-// Turn a grey node black.
-static inline void set_visited(lispobj* obj)
-{
-    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
-    gc_dcheck(immobile_obj_gen_bits(obj) == new_space);
-    int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
-    ((generation_index_t*)obj)[byte] |= IMMOBILE_OBJ_VISITED_FLAG;
-}
-static inline void assign_generation(lispobj* obj, generation_index_t gen)
-{
-    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
-    int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
-    generation_index_t* ptr = (generation_index_t*)obj + byte;
-    // Clear the VISITED flag, assign a new generation, preserving the three
-    // high bits which include the OBJ_WRITTEN flag as well as two
-    // opaque flag bits for use by Lisp.
-    *ptr = (*ptr & 0xE0) | gen;
+    return ((generation_index_t*)obj)[3] & 0x1F;
 }
 #else
 #error "Need to define immobile_obj_gen_bits() for big-endian"

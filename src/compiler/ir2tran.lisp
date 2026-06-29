@@ -35,7 +35,7 @@
 (defevent make-value-cell-event "Allocate heap value cell for lexical var.")
 (defun emit-make-value-cell (node block value res)
   (event make-value-cell-event node)
-  (vop make-value-cell node block value nil res))
+  (vop make-value-cell node block value res))
 
 ;;;; leaf reference
 
@@ -130,13 +130,13 @@
       ((:special :unknown)
        (aver (symbolp name))
        (let ((name-tn (emit-constant name)))
-         (if (or unsafe (always-boundp name))
+         (if (or unsafe (always-boundp name node))
              (vop fast-symbol-value node block name-tn res)
              (vop symbol-value node block name-tn res))))
       (:global
        (aver (symbolp name))
        (let ((name-tn (emit-constant name)))
-         (if (or unsafe (always-boundp name))
+         (if (or unsafe (always-boundp name node))
              (vop fast-symbol-global-value node block name-tn res)
              (vop symbol-global-value node block name-tn res))))
       (:global-function
@@ -152,17 +152,23 @@
        ;; might try to redefine it and get the old definition. And
        ;; they shouldn't be expected to understand the failure mode
        ;; and the remedy.
-       (cond ((and (labels ((internal-name-p (what)
-                              (typecase what
-                                (list
-                                 (every #'internal-name-p what))
-                                (symbol
-                                 (let ((pkg (sb-xc:symbol-package what)))
-                                   (or (and pkg (system-package-p pkg))
-                                       (eq pkg *cl-package*))))
-                                (t t))))
-                     (internal-name-p name))
-                   (info :function :info name)
+       (let* ((internal (internal-name-p name))
+              (info (info :function :info name))
+              (could-early-bind
+                ;; Existence of globaldb info is a certificate that the function definition
+                ;; will not change. Though functions named (CAS CAR) and (SETF SVREF) lack
+                ;; globaldb info they won't be undefined, nor are they redefinable.
+                ;; And note that this is "could" and not "should", since we're also
+                ;; going to check for NOTINLINE.
+                (or info
+                    (and (typep name '(cons (member setf cas) (cons symbol null)))
+                         (eq (sb-xc:symbol-package (cadr name)) *cl-package*)))))
+         #+()
+         (when (and info
+                    (ir1-attributep (fun-info-attributes info) unboxed-return fixed-args))
+           (cerror "Continue" "Can't use #' on a function with unboxed-return or fixed-args"))
+         (if (and internal
+                  could-early-bind
                    ;; Known functions can be dumped without going through fdefns.
                    ;; But if NOTINLINEd, don't early-bind to the functional value
                    ;; because that disallows redefinition, including but not limited
@@ -174,16 +180,15 @@
                    ;; If to a file, then it better exist at some point, but its existence
                    ;; in the compilation lisp doesn't really imply that it will.
                    #-sb-xc-host (if (producing-fasl-file) t (fboundp name)))
-              (emit-move node block (make-load-time-constant-tn :known-fun name)
-                         res))
-             (t
-              (let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
-                #+untagged-fdefns
-                (if unsafe
-                    (vop sb-vm::untagged-fdefn-fun node block fdefn-tn res)
-                    (vop sb-vm::safe-untagged-fdefn-fun node block fdefn-tn res))
-                #-untagged-fdefns
-                (if unsafe
+             (emit-move node block (make-load-time-constant-tn :known-fun name) res)
+             (let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
+               ;; There is no case in which an internal function will lack a definition
+               ;; when referenced as #' - if it lacked such then you'd likely have just
+               ;; as bad a time with or without safety. One way or another you're landing
+               ;; in the ldb monitor if it occurs during cold-init.
+                (if (or unsafe internal)
+                    #+linkage-space (vop fdefn-fun node block fdefn-tn res)
+                    #-linkage-space
                     (vop slot node block fdefn-tn 'fdefn-fun sb-vm:fdefn-fun-slot
                          sb-vm:other-pointer-lowtag res)
                     (vop safe-fdefn-fun node block fdefn-tn res)))))))))
@@ -299,28 +304,28 @@
                      #-(or x86-64 arm64)
                      (entry (make-load-time-constant-tn :entry xep))
                      (env (node-environment node))
-                     (leaf-dx-p (leaf-dynamic-extent fun)))
+                     (stack-allocate-p (leaf-dynamic-extent fun)))
                 (aver (entry-info-offset entry-info))
                 (vop make-closure node ir2-block #-(or x86-64 arm64) entry
                      (entry-info-offset entry-info) (length closure)
-                     leaf-dx-p tn)
+                     stack-allocate-p tn)
                 (loop for what in closure and n from 0 do
                   (if (lambda-p what)
                       (unless (functional-kind-eq what deleted)
                         (delayed (list tn (find-in-environment what env) n
-                                       leaf-dx-p)))
+                                       stack-allocate-p)))
                       (unless (and (lambda-var-p what)
                                    (null (leaf-refs what)))
                         (let ((initial-value (closure-initial-value what env nil)))
                           (if initial-value
                               (vop closure-init node ir2-block tn initial-value n
-                                   leaf-dx-p)
+                                   stack-allocate-p)
                               ;; An initial-value of NIL means to
                               ;; stash the frame pointer... which
                               ;; requires a different VOP.
                               (vop closure-init-from-fp node ir2-block tn n))))))))))))
-    (loop for (tn what n leaf-dx-p) in (delayed)
-          do (vop closure-init node ir2-block tn what n leaf-dx-p)))
+    (loop for (tn what n stack-allocate-p) in (delayed)
+          do (vop closure-init node ir2-block tn what n stack-allocate-p)))
   (values))
 
 ;;; Convert a SET node. If the NODE's LVAR is annotated, then we also
@@ -447,38 +452,40 @@
            (type list primitive-types types))
   (let ((primitive-types (or primitive-types
                              (mapcar #'primitive-type types))))
-    (if lvar
-        (let ((2lvar (lvar-info lvar)))
-          (ecase (ir2-lvar-kind 2lvar)
-            (:fixed
-             (let* ((locs (ir2-lvar-locs 2lvar))
-                    (nlocs (length locs))
-                    (ntypes (length primitive-types)))
-               (if (and (= nlocs ntypes)
-                        (loop for loc in locs
-                              for prim-type in primitive-types
-                              always (eq (tn-primitive-type loc) prim-type)))
-                   locs
-                   (loop with optional = (and call
-                                              (vop-info-p (combination-info call))
-                                              (vop-info-optional-results (combination-info call)))
-                         for prim-type in primitive-types
-                         for type in types
-                         for i from 0
-                         for loc = (pop locs)
-                         collect (cond ((and loc
-                                             (if (eq (tn-kind loc) :unused)
-                                                 (member i optional)
-                                                 (eq (tn-primitive-type loc) prim-type)))
-                                        loc)
-                                       ((and (not loc)
-                                             (member i optional))
-                                        (make-unused-tn))
-                                       (t
-                                        (make-normal-tn prim-type type)))))))
-            (:unknown
-             (mapcar #'make-normal-tn primitive-types types))))
-        (mapcar #'make-normal-tn primitive-types types))))
+    (flet ((make-tns (locs)
+             (loop with optional = (and call
+                                        (vop-info-p (combination-info call))
+                                        (vop-info-optional-results (combination-info call)))
+                   for prim-type in primitive-types
+                   for type in types
+                   for i from 0
+                   for loc = (pop locs)
+                   collect (cond ((and loc
+                                       (if (eq (tn-kind loc) :unused)
+                                           (member i optional)
+                                           (eq (tn-primitive-type loc) prim-type)))
+                                  loc)
+                                 ((and (not loc)
+                                       (member i optional))
+                                  (make-unused-tn))
+                                 (t
+                                  (make-normal-tn prim-type type))))))
+      (if lvar
+          (let ((2lvar (lvar-info lvar)))
+            (ecase (ir2-lvar-kind 2lvar)
+              (:fixed
+               (let* ((locs (ir2-lvar-locs 2lvar))
+                      (nlocs (length locs))
+                      (ntypes (length primitive-types)))
+                 (if (and (= nlocs ntypes)
+                          (loop for loc in locs
+                                for prim-type in primitive-types
+                                always (eq (tn-primitive-type loc) prim-type)))
+                     locs
+                     (make-tns locs))))
+              (:unknown
+               (mapcar #'make-normal-tn primitive-types types))))
+          (make-tns nil)))))
 
 ;;; Make the first N standard value TNs, returning them in a list.
 (defun make-standard-value-tns (n)
@@ -698,11 +705,39 @@
     (ir2-convert-conditional node block (template-or-lose 'if-eq)
                              test-ref () node t)))
 
-(defun prepare-jump-table-targets (index targets)
-  (let* ((otherwise (assoc 'otherwise targets))
+(defun prepare-jump-table-targets (index node)
+  (let* ((int (type-approximate-interval (lvar-type index)))
+         (targets (jump-table-targets node))
+         (otherwise (assoc 'otherwise targets))
          (targets (sort (remove otherwise targets) #'< :key #'car))
          (min (caar targets))
          (max (caar (last targets)))
+         (sparse (and (policy node (= jump-table 3))
+                      int
+                      (>= (interval-low int) 0)
+                      (interval-high int)
+                      (< (- (interval-high int) (interval-low int)
+                            (length targets))
+                         1000)))
+         (min (cond (sparse
+                     0)
+                    ((and int
+                          (eql (interval-high int) max)
+                          (eql (interval-low int) (1- min)))
+                     ;; If there's only one item not in range avoid checking for
+                     ;; the OTHERWISE case.
+
+                     (1- min))
+                    (t
+                     min)))
+         (max (cond (sparse
+                     (interval-high int))
+                    ((and int
+                          (eql (interval-low int) min)
+                          (eql (interval-high int) (1+ max)))
+                     (1+ max))
+                    (t
+                     max)))
          (otherwise (and otherwise
                          (block-label (cdr otherwise))))
          (vector (make-array (1+ (- max min)) :initial-element (or otherwise 0))))
@@ -720,7 +755,7 @@
   (let ((index (jump-table-index node)))
     (emit-template node block (template-or-lose 'jump-table)
                    (reference-tn (lvar-tn node block index) nil)
-                   nil (prepare-jump-table-targets index (jump-table-targets node)))))
+                   nil (prepare-jump-table-targets index node))))
 
 ;;; Return a list of types that we can pass to LVAR-RESULT-TNS
 ;;; describing the result types we want for a template call. We are really
@@ -805,23 +840,28 @@
 (defoptimizer (%%primitive ir2-convert) ((template &rest args) call block)
   (let* ((template (lvar-value template))
          (lvar (node-lvar call))
-         (rtypes (template-result-types template))
-         (results (make-template-result-tns call lvar rtypes))
-         (r-refs (reference-tn-list results t)))
+         (rtypes (template-result-types template)))
     (multiple-value-bind (args info-args)
         (reference-args call block (cdr (combination-args call)) template)
       (aver (not (template-more-results-type template)))
-      (aver (not (template-conditional-p template)))
-      (if info-args
-          (emit-template call block template args r-refs info-args)
-          (emit-template call block template args r-refs))
-      (move-lvar-result call block results lvar)))
+      (cond ((template-conditional-p template)
+             (ir2-convert-conditional call block template args info-args
+                                      (lvar-dest lvar) nil))
+            (t
+             (let* ((results (make-template-result-tns call lvar rtypes))
+                    (r-refs (reference-tn-list results t)))
+               (if info-args
+                   (emit-template call block template args r-refs info-args)
+                   (emit-template call block template args r-refs))
+               (move-lvar-result call block results lvar))))))
   (values))
 
 (defoptimizer (%%primitive derive-type) ((template info &rest args))
   (let* ((template (lvar-value template))
          (type (template-type template)))
-    (cond ((zerop (vop-info-num-results template))
+    (cond ((template-conditional-p template)
+           (specifier-type 'boolean))
+          ((zerop (vop-info-num-results template))
            (values-specifier-type '(values &optional)))
           ((fun-type-p type)
            (fun-type-returns type))
@@ -1049,7 +1089,7 @@
                         :unknown)
                (:unknown
                 (ir2-convert-local-unknown-call node block fun lvar start))
-               (:fixed
+               ((:fixed :unboxed)
                 (ir2-convert-local-known-call node block fun returns
                                               lvar start)))))))
   (values))
@@ -1077,10 +1117,9 @@
            ;; Uncross so that we don't create a constant for SB-XC:GENSYM
            ;; and CL:GENSYM, in case a piece of code mentions both.
            (let ((name (uncross (lvar-fun-name lvar t))))
-             ;; Static fdefns never need a code header constant.
-             ;; Calls to immobile space fdefns won't use the constant,
-             ;; but it needs to exist for GC's pointer tracing.
-             (values (if (sb-vm::static-fdefn-offset name)
+             ;; Always pass name as a literal symbol or list if #+linkage-space,
+             ;; otherwise do so only if the fdefn is static.
+             (values (if (or #+linkage-space t (static-fdefn-p name))
                          name
                          (make-load-time-constant-tn :fdefinition name))
                      name)))
@@ -1109,30 +1148,25 @@
             (setq last ref))))
       (values first fixed-args-state))))
 
-#+call-symbol
-(defun fun-tn-type (lvar tn)
-  (cond ((neq (tn-primitive-type tn) *backend-t-primitive-type*)
-         :function)
-        ((types-equal-or-intersect (lvar-type lvar)
-                                   (specifier-type 'function))
-         :designator)
-        (t
-         :symbol)))
-
 (defun pass-nargs-p (combination)
-  (let ((fun-info (combination-fun-info combination)))
-    (declare (ignorable fun-info))
+  (let ((fun-info (combination-fun-info combination))
+        (name (combination-fun-source-name combination nil)))
+    (declare (ignorable fun-info name))
     (and #+(or arm64 x86-64)
          (or (policy combination (= insert-step-conditions 3))
              (and
               (combination-pass-nargs combination)
-              (not (and (eq (combination-kind combination) :known)
-                        fun-info
-                        (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count)
-                        (let ((type (info :function :type (combination-fun-source-name combination))))
-                          (and (not (fun-type-keyp type))
-                               (not (fun-type-rest type))
-                               (not (fun-type-optional type)))))))))))
+              (not (and
+                    (or (and (eq (combination-kind combination) :known)
+                             fun-info
+                             (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count))
+                        (and (typep name
+                                    '(cons (eql sb-impl::specialized-xep)))
+                             (setf name (second name))))
+                    (let ((type (info :function :type name)))
+                      (and (not (fun-type-keyp type))
+                           (not (fun-type-rest type))
+                           (not (fun-type-optional type)))))))))))
 
 ;;; Move the arguments into the passing locations and do a (possibly
 ;;; named) tail call.
@@ -1155,10 +1189,8 @@
                  (vop* tail-call node block
                        (fun-tn old-fp return-pc pass-refs)
                        (nil)
-                       nargs (emit-step-p node)
-                       #+call-symbol
-                       (fun-tn-type fun-lvar fun-tn)))
-                #-(and x86-64 immobile-code)
+                       nargs (emit-step-p node)))
+                #-linkage-space
                 ((eq fun-tn named)
                  (vop* static-tail-call-named node block
                        (old-fp return-pc pass-refs) ; args
@@ -1167,22 +1199,26 @@
                 (fixed-args-p
                  (when-vop-existsp (:named sb-vm::fixed-tail-call-named)
                   (vop* sb-vm::fixed-tail-call-named node block
-                        (#-(and x86-64 immobile-code) fun-tn old-fp return-pc pass-refs) ; args
+                        (#-linkage-space fun-tn old-fp return-pc pass-refs) ; args
                         (nil)           ; results
-                        nargs #+(and x86-64 immobile-code) named (emit-step-p node))))
+                        nargs #+linkage-space named (emit-step-p node))))
                 (t
                  (vop* tail-call-named node block
-                       (#-(and x86-64 immobile-code) fun-tn old-fp return-pc pass-refs) ; args
+                       (#-linkage-space fun-tn old-fp return-pc pass-refs) ; args
                        (nil)            ; results
-                       nargs #+(and x86-64 immobile-code) named (emit-step-p node))))))) ; info
+                       nargs #+linkage-space named (emit-step-p node))))))) ; info
   (values))
 
 (defun fixed-args-state (node)
-  (let ((info (combination-fun-info node)))
-    (when (and info
-               (ir1-attributep (fun-info-attributes info) fixed-args))
-      (values (sb-vm::make-fixed-call-args-state)
-              (fun-type-required (info :function :type (combination-fun-source-name node)))))))
+  (let ((info (combination-fun-info node))
+        (name (combination-fun-source-name node nil)))
+    (cond ((and info
+                (ir1-attributep (fun-info-attributes info) fixed-args))
+           (values (sb-vm::make-fixed-call-args-state)
+                   (fun-type-required (info :function :type name))))
+          ((typep name '(cons (eql sb-impl::specialized-xep)))
+           (values (sb-vm::make-fixed-call-args-state)
+                   (fun-type-required (info :function :type (second name))))))))
 
 ;;; like IR2-CONVERT-LOCAL-CALL-ARGS, only different
 (defun ir2-convert-full-call-args (node block)
@@ -1220,15 +1256,11 @@
   (multiple-value-bind (fp args arg-locs nargs fixed-args-p)
       (ir2-convert-full-call-args node block)
     (let* ((lvar (node-lvar node))
-           (unboxed-return (let ((info (combination-fun-info node)))
-                             (and info
-                                  (ir1-attributep (fun-info-attributes info) unboxed-return))))
+           (unboxed-return (unboxed-return-p node))
            (locs (and lvar
                       (if unboxed-return
-                          (let ((state (sb-vm::make-fixed-call-args-state))
-                                (returns (fun-type-returns (info :function :type
-                                                                 (combination-fun-source-name node)))))
-                            (loop for type in (values-type-required returns)
+                          (let ((state (sb-vm::make-fixed-call-args-state)))
+                            (loop for type in (values-type-required unboxed-return)
                                   collect (sb-vm::fixed-call-arg-location type state)))
                           (loop for loc in (ir2-lvar-locs (lvar-info lvar))
                                 for i from 0
@@ -1251,21 +1283,19 @@
                (when-vop-existsp (:named sb-vm::unboxed-call-named)
                  (if fixed-args-p
                      (vop* sb-vm::fixed-unboxed-call-named node block
-                           (fp #-(and x86-64 immobile-code) fun-tn args) ; args
+                           (fp #-linkage-space fun-tn args) ; args
                            (loc-refs)
-                           arg-locs nargs #+(and x86-64 immobile-code) named ; info
+                           arg-locs nargs #+linkage-space named ; info
                            (emit-step-p node))
                      (vop* sb-vm::unboxed-call-named node block
-                           (fp #-(and x86-64 immobile-code) fun-tn args) ; args
+                           (fp #-linkage-space fun-tn args) ; args
                            (loc-refs)
-                           arg-locs nargs #+(and x86-64 immobile-code) named ; info
+                           arg-locs nargs #+linkage-space named ; info
                            (emit-step-p node)))))
               ((not named)
                (vop* call node block (fp fun-tn args) (loc-refs)
-                     arg-locs nargs nvals (emit-step-p node)
-                     #+call-symbol
-                     (fun-tn-type fun-lvar fun-tn)))
-              #-(and x86-64 immobile-code)
+                     arg-locs nargs nvals (emit-step-p node)))
+              #-linkage-space
               ((eq fun-tn named)
                (vop* static-call-named node block
                      (fp args)
@@ -1275,15 +1305,15 @@
               (fixed-args-p
                (when-vop-existsp (:named sb-vm::fixed-call-named)
                  (vop* sb-vm::fixed-call-named node block
-                       (fp #-(and x86-64 immobile-code) fun-tn args) ; args
+                       (fp #-linkage-space fun-tn args) ; args
                        (loc-refs)                       ; results
-                       arg-locs nargs #+(and x86-64 immobile-code) named nvals ; info
+                       arg-locs nargs #+linkage-space named nvals ; info
                        (emit-step-p node))))
               (t
                (vop* call-named node block
-                     (fp #-(and x86-64 immobile-code) fun-tn args) ; args
+                     (fp #-linkage-space fun-tn args) ; args
                      (loc-refs)                       ; results
-                     arg-locs nargs #+(and x86-64 immobile-code) named nvals ; info
+                     arg-locs nargs #+linkage-space named nvals ; info
                      (emit-step-p node))))
         (move-lvar-result node block locs lvar))))
   (values))
@@ -1291,11 +1321,10 @@
 ;;; Do full call when unknown values are desired.
 (defun ir2-convert-multiple-full-call (node block)
   (declare (type combination node) (type ir2-block block))
-  (let ((info (combination-fun-info node)))
-    (if (and info
-             (ir1-attributep (fun-info-attributes info) unboxed-return fixed-args))
+  (let ((unboxed-return (unboxed-return-p node)))
+    (if unboxed-return
         (ir2-convert-fixed-full-call node block)
-        (multiple-value-bind (fp args arg-locs nargs)
+        (multiple-value-bind (fp args arg-locs nargs fixed-args-p)
             (ir2-convert-full-call-args node block)
           (let* ((lvar (node-lvar node))
                  (locs (ir2-lvar-locs (lvar-info lvar)))
@@ -1305,22 +1334,27 @@
                 (fun-lvar-tn node block fun-lvar)
               (cond ((not named)
                      (vop* multiple-call node block (fp fun-tn args) (loc-refs)
-                           arg-locs nargs (emit-step-p node)
-                           #+call-symbol
-                           (fun-tn-type fun-lvar fun-tn)))
-                    #-(and x86-64 immobile-code)
+                           arg-locs nargs (emit-step-p node)))
+                    #-linkage-space
                     ((eq fun-tn named)
                      (vop* static-multiple-call-named node block
                            (fp args)
                            (loc-refs)
                            arg-locs nargs named
                            (emit-step-p node)))
+                    (fixed-args-p
+                     (when-vop-existsp (:named sb-vm::fixed-multiple-call-named)
+                       (vop* sb-vm::fixed-multiple-call-named node block
+                             (fp #-linkage-space fun-tn args) ; args
+                             (loc-refs) ; results
+                             arg-locs nargs #+linkage-space named ; info
+                             (emit-step-p node))))
                     (t
                      (vop* multiple-call-named node block
-                           (fp #-(and x86-64 immobile-code) fun-tn args) ; args
-                           (loc-refs)   ; results
-                           arg-locs nargs #+(and x86-64 immobile-code) named ; info
-                           (emit-step-p node)))))))))
+                           (fp #-linkage-space fun-tn args) ; args
+                           (loc-refs)                       ; results
+                           arg-locs nargs #+linkage-space named ; info
+                                          (emit-step-p node)))))))))
   (values))
 
 ;;; stuff to check in PONDER-FULL-CALL
@@ -1367,14 +1401,15 @@
       (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
                                   (fun-lexically-notinline-p fname))))
              (inlineable-bit (if inlineable-p 1 0))
-             (cell (get-emitted-full-calls fname)))
+             (table (cu-emitted-full-calls *compilation-unit*))
+             (cell (gethash fname table)))
         (if (not cell)
             ;; The low bit indicates whether any not-NOTINLINE call was seen.
             ;; The next-lowest bit is magic. Refer to %COMPILER-DEFMACRO
             ;; and WARN-IF-INLINE-FAILED/CALL for the pertinent logic.
             (setf cell (logior 4 inlineable-bit))
             (incf cell (+ 4 (if (oddp cell) 0 inlineable-bit))))
-        (setf (get-emitted-full-calls fname) cell)
+        (setf (gethash fname table) cell)
         ;; If the full call was wanted, don't record anything.
         ;; (This was originally for debugging SBCL self-compilation)
         (when inlineable-p
@@ -1442,10 +1477,13 @@
                       ((and optional
                             (not (optional-dispatch-more-entry ef)))
                        (optional-dispatch-max-args ef))))
-           (fun-info (info :function :info (functional-%source-name ef))))
+           (name (functional-%source-name ef))
+           (fun-info (info :function :info name)))
       (unless (or (and (eql min 0) (not max))
-                  (and fun-info
-                       (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count)))
+                  (or
+                   (and fun-info
+                        (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count))
+                   (typep name '(cons (eql sb-impl::specialized-xep)))))
         (vop verify-arg-count node block
              arg-count-location
              min
@@ -1511,22 +1549,26 @@
                (fixed-args
                  (and fun-info
                       (ir1-attributep (fun-info-attributes fun-info) fixed-args)))
-               (arg-types (and fixed-args
-                               (fun-type-required (info :function :type name))))
-               (fixed-arg-state (and fixed-args
+               (arg-types (or (and fixed-args
+                                   (fun-type-required (info :function :type name)))
+                              (and (typep name
+                                          '(cons (eql sb-impl::specialized-xep)))
+                                   (fun-type-required (specifier-type `(function ,@(cddr name)))))))
+               (fixed-arg-state (and arg-types
                                      (sb-vm::make-fixed-call-args-state))))
           (when (leaf-refs (first vars))
             (emit-move node block arg-count-tn (leaf-info (first vars))))
           (dolist (arg (rest vars))
-            (when (leaf-refs arg)
-              (let ((pass (if fixed-args
-                              (sb-vm::fixed-call-arg-location (pop arg-types) fixed-arg-state)
-                              (standard-arg-location n)))
-                    (home (leaf-info arg)))
-                (if (and (lambda-var-indirect arg)
-                         (lambda-var-explicit-value-cell arg))
-                    (emit-make-value-cell node block pass home)
-                    (emit-move node block pass home))))
+            (let ((arg-type (pop arg-types)))
+              (when (leaf-refs arg)
+                (let ((pass (if fixed-arg-state
+                                (sb-vm::fixed-call-arg-location arg-type fixed-arg-state)
+                                (standard-arg-location n)))
+                      (home (leaf-info arg)))
+                  (if (and (lambda-var-indirect arg)
+                           (lambda-var-explicit-value-cell arg))
+                      (emit-make-value-cell node block pass home)
+                      (emit-move node block pass home)))))
             (incf n)))))
     #-fp-and-pc-standard-save
     (emit-move node block (make-old-fp-passing-location)
@@ -1749,23 +1791,17 @@
         (let ((env (environment-info (node-environment node))))
           (vop tail-call-variable node block start fun
                (ir2-environment-old-fp env)
-               (ir2-environment-return-pc env)
-               #+call-symbol
-               (fun-tn-type fun-lvar fun))))
+               (ir2-environment-return-pc env))))
        ((and 2lvar
              (eq (ir2-lvar-kind 2lvar) :unknown))
         (vop* multiple-call-variable node block (start fun nil)
               ((reference-tn-list (ir2-lvar-locs 2lvar) t))
-              (emit-step-p node)
-               #+call-symbol
-               (fun-tn-type fun-lvar fun)))
+              (emit-step-p node)))
        (t
         (let ((locs (standard-result-tns lvar)))
           (vop* call-variable node block (start fun nil)
                 ((reference-tn-list locs t)) (length locs)
-                (emit-step-p node)
-                #+call-symbol
-                (fun-tn-type fun-lvar fun))
+                (emit-step-p node))
           (move-lvar-result node block locs lvar)))))))
 
 ;;; Reset the stack pointer to the start of the specified
@@ -1788,19 +1824,29 @@
          (first (lvar-value last-preserved))
          (2first (lvar-info first))
 
-         (moved-tns '()))
+         (moved-tns '())
+         (movep t))
+    (aver (memq (ir2-lvar-kind 2after) '(:unknown :stack)))
     (dolist (moved-lvar moved)
       (let ((2lvar (lvar-info (lvar-value moved-lvar))))
-        ;; we cannot move stack-allocated DX objects
-        (aver (eq (ir2-lvar-kind 2lvar) :unknown))
-        (push (first (ir2-lvar-locs 2lvar)) moved-tns)))
-    (aver (memq (ir2-lvar-kind 2after) '(:unknown :stack)))
-    (aver (eq (ir2-lvar-kind 2first) :unknown))
-    (vop* %%nip-values node block
-          ((first (ir2-lvar-locs 2after))
-           (first (ir2-lvar-locs 2first))
-           (reference-tn-list moved-tns nil))
-          ((reference-tn-list moved-tns t)))))
+        (ecase (ir2-lvar-kind 2lvar)
+          (:unknown
+           (push (first (ir2-lvar-locs 2lvar)) moved-tns))
+          (:stack
+           ;; Stack objects can't move, so instead, set the stack lvar
+           ;; so that resetting it cleans the nipped values as well.
+           (emit-move node block
+                      (first (ir2-lvar-locs 2lvar))
+                      (first (ir2-lvar-locs 2after)))
+           (setq movep nil)
+           (return)))))
+    (when movep
+      (aver (eq (ir2-lvar-kind 2first) :unknown))
+      (vop* %%nip-values node block
+            ((first (ir2-lvar-locs 2after))
+             (first (ir2-lvar-locs 2first))
+             (reference-tn-list moved-tns nil))
+            ((reference-tn-list moved-tns t))))))
 
 ;;; Deliver the values TNs to LVAR using MOVE-LVAR-RESULT.
 (defoptimizer (values ir2-convert) ((&rest values) node block)
@@ -1845,9 +1891,6 @@
                (ir2-convert-full-call node block))))))
 
 (defoptimizer (%more-arg-values ir2-convert) ((context start count) node block)
-  ;; Slime is still using that argument
-  (aver (and (constant-lvar-p start)
-             (eql (lvar-value start) 0)))
   (binding* ((lvar (node-lvar node) :exit-if-null)
              (2lvar (lvar-info lvar)))
     (ecase (ir2-lvar-kind 2lvar)
@@ -1862,16 +1905,31 @@
                      loc)))
       (:unknown
        (let ((locs (ir2-lvar-locs 2lvar)))
-         (vop* %more-arg-values node block
-               ((lvar-tn node block context)
-                (lvar-tn node block count)
-                nil)
-               ((reference-tn-list locs t))))))))
+         (if (and (constant-lvar-p start)
+                  (eql (lvar-value start) 0))
+             (vop* %more-arg-values node block
+                   ((lvar-tn node block context)
+                    (lvar-tn node block count)
+                    nil)
+                   ((reference-tn-list locs t)))
+             (if-vop-existsp (:named sb-vm::%more-arg-values-skip)
+               (vop* sb-vm::%more-arg-values-skip node block
+                     ((lvar-tn node block context)
+                      (lvar-tn node block start)
+                      (lvar-tn node block count)
+                      nil)
+                     ((reference-tn-list locs t)))
+               (bug "Implement"))))))))
 
 #+call-symbol
 (defoptimizer (%coerce-callable-for-call ir2-convert) ((fun) node block)
   (when fun
     (ir2-convert-full-call node block)))
+
+;; Has an ir2-converter but needs to behave like a full call.
+#+call-symbol
+(setf (fun-info-externally-checkable-type (fun-info-or-lose '%coerce-callable-for-call))
+      :full)
 
 ;;;; DYNAMIC-EXTENT
 
@@ -1879,10 +1937,11 @@
 (defoptimizer (%dynamic-extent-start ir2-convert) (() node block)
   (let* ((lvar (node-lvar node))
          (2lvar (lvar-info lvar)))
-    (aver (eq (ir2-lvar-kind 2lvar) :stack))
-    (when (leaf-refs (find-constant lvar))
-      (vop current-stack-pointer node block
-           (first (ir2-lvar-locs 2lvar))))))
+    (unless (eq (ir2-lvar-kind 2lvar) :unused)
+      (aver (eq (ir2-lvar-kind 2lvar) :stack))
+      (when (leaf-refs (find-constant lvar))
+        (vop current-stack-pointer node block
+             (first (ir2-lvar-locs 2lvar)))))))
 
 ;;;; special binding
 
@@ -2208,7 +2267,7 @@
   (block nil
     (when (constant-lvar-p width)
       (case (lvar-value width)
-        (#.(- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)
+        (#.sb-vm:n-fixnum-bits
          (when (or (csubtypep (lvar-type x)
                               (specifier-type 'word))
                    (csubtypep (lvar-type x)
@@ -2350,8 +2409,7 @@
                              (policy first-node (/= insert-safepoints 0)))
                     (vop sb-vm::insert-safepoint first-node 2block))))
             (ir2-convert-block block)
-            (incf num))))
-      (setf (component-max-block-number component) num)))
+            (incf num))))))
   (values))
 
 ;;; If necessary, emit a terminal unconditional branch to go to the
@@ -2379,7 +2437,8 @@
                              (name (and (ref-p use)
                                         (leaf-has-source-name-p (ref-leaf use))
                                         (leaf-source-name (ref-leaf use))))
-                             (ftype (and (info :function :info name) ; only use the ftype if
+                             (ftype (and #-sb-xc-host
+                                         (info :function :info name) ; only use the ftype if
                                          (global-ftype name)))) ; name was defknown
                         (unless (or (node-tail-p last)
                                     (policy last (zerop safety))
@@ -2435,10 +2494,7 @@
               (ir2-convert-full-call node 2block))
              (:known
               (let* ((info (basic-combination-fun-info node))
-                     (fun (fun-info-ir2-convert info))
-                     (hook (fun-info-ir2-hook info)))
-                (when hook
-                  (funcall hook node 2block))
+                     (fun (fun-info-ir2-convert info)))
                 (cond (fun
                        (funcall fun node 2block))
                       ((eq (basic-combination-info node) :full)

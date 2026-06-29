@@ -13,6 +13,17 @@
 
 ;;;; type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:temporary (:scs (non-descriptor-reg)) tmp)
+  (:generator 1
+    (inst li tmp #x7FFFFFFC)
+    (inst and res arg tmp)))
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -122,18 +133,6 @@
                 (inst or t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
-
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    ;; FIXME: It would be better if this would mask the lowtag,
-    ;; and shift the result into a positive fixnum like on x86.
-    (inst sll res ptr 3)
-    (inst srl res res 1)))
 
 
 ;;;; allocation

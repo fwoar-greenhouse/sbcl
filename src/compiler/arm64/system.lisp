@@ -13,6 +13,16 @@
 
 ;;;; Type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:generator 1
+    ;; result is a fixnum with 32 significant bits
+    (inst and res arg #x1FFFFFFFE)))
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -55,6 +65,22 @@
     ;; And, finally, pick out the widetag from the header.
     (inst neg result result)
     (inst ldrb result (@ object result))
+    done))
+
+;;; Return an index suitable for **PRIMITIVE-OBJECT-LAYOUTS**, with
+;;; instance and funcallable-instance already handled.
+(define-vop (widetag-of-for-layout)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:arg-refs object-ref)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (inst and result object widetag-mask)
+    (inst and tmp-tn object lowtag-mask)
+    (inst cmp tmp-tn other-pointer-lowtag)
+    (inst b :ne done)
+    (inst ldrb result (@ object (- other-pointer-lowtag)))
     done))
 
 (define-vop (layout-depthoid)
@@ -133,14 +159,6 @@
               byte 2))
       (inst ldrb tmp-tn (@ array (- byte other-pointer-lowtag)))
       (inst tst tmp-tn mask))))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst and res ptr (lognot fixnum-tag-mask))))
 
 ;;;; Allocation
 
@@ -170,8 +188,7 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 10
-    ;; 4 byte load, ignoring serial# in the high bits
-    (inst ldr (32-bit-reg ndescr) (@ code (- 8 other-pointer-lowtag)))
+    (loadw (32-bit-reg ndescr) code code-boxed-size-slot other-pointer-lowtag)
     (inst add sap code ndescr)
     (inst sub sap sap other-pointer-lowtag)))
 
@@ -196,7 +213,7 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (inst ldr (32-bit-reg ndescr) (@ code (- 8 other-pointer-lowtag)))
+    (loadw (32-bit-reg ndescr) code code-boxed-size-slot other-pointer-lowtag)
     (inst add ndescr offset ndescr)
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
@@ -309,3 +326,13 @@
       (loadw next-bits node (+ instance-slots-offset instance-data-start)
              instance-pointer-lowtag)
       (inst orr next-tagged next-bits instance-pointer-lowtag))))
+
+
+(define-vop (switch-to-arena)
+  (:args (x :scs (descriptor-reg immediate)))
+  (:temporary (:sc unsigned-reg :offset nl0-offset :from (:argument 0)) arg0)
+  (:temporary (:sc unsigned-reg :offset nl1-offset) arg1)
+  (:vop-var vop)
+  (:generator 1
+    (inst mov arg0 (if (sc-is x immediate) (tn-value x) x))
+    (invoke-asm-routine 'switch-to-arena arg1)))

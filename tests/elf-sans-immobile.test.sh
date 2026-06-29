@@ -16,10 +16,10 @@
 . ./subr.sh
 
 run_sbcl <<EOF
-  #+(and linux x86-64 sb-thread)
-  (unless (member :immobile-space sb-impl:+internal-features+)
-    (exit :code 0)) ; proceed with test
- (exit :code 2) ; otherwise skip the test
+#+(and linux x86-64 sb-thread)
+(unless (member :immobile-space sb-impl:+internal-features+)
+  (exit :code 0)) ; proceed with test
+(exit :code 2) ; otherwise skip the test
 EOF
 status=$?
 if [ $status != 0 ]; then # test can't be executed
@@ -33,9 +33,7 @@ create_test_subdirectory
 temp=$TEST_DIRECTORY/$TEST_FILESTEM
 
 run_sbcl --load ../tools-for-build/elftool \
-  --eval '(sb-editcore:move-dynamic-code-to-text-space "../output/sbcl.core" "'${temp}'-patched.core")' \
-  --eval '(sb-editcore:redirect-text-space-calls "'${temp}'-patched.core")' \
-  --eval '(sb-editcore:split-core "'${temp}'-patched.core" "'${temp}'-src.s")' --quit
+  --eval '(sb-editcore:split-core "../output/sbcl.core" "'${temp}'-src.s")' --quit
 
 m_arg=`run_sbcl --eval '(progn #+sb-core-compression (princ " -lzstd") #+x86 (princ " -m32"))' --quit`
 
@@ -44,7 +42,9 @@ exefile=$TEST_DIRECTORY/sbcl-new-elf
 cc -no-pie -o ${exefile} -Wl,--export-dynamic -Wl,-no-as-needed \
    ${temp}-src.s ${temp}-src-core.o ../src/runtime/libsbcl.a -lm -ldl ${m_arg}
 
-result=`${exefile} --eval '(princ "Success")' --quit`
+result=`${exefile} --eval \
+   '(if (alien-funcall (extern-alien "gc_managed_heap_space_p" (function (boolean 8) unsigned))
+                       sb-vm:text-space-start) (princ "Success"))' --quit`
 echo $result
 if [ "$result" = Success ]
 then
@@ -65,18 +65,19 @@ fi
 set +e # no exit on error
 ${exefile} --noprint n<<EOF
 (in-package sb-impl)
-(defun disassembly-contains-query-read-char ()
-  (search "FDEFN QUERY-READ-CHAR"
-          (with-output-to-string (ss) (disassemble 'y-or-n-p :stream ss))))
-(assert (not (disassembly-contains-query-read-char)))
+(defun expand-pkg-iterator (&rest whatever) whatever :bork-bork-bork)
+;; the macro-function contains a JMP to expand-pkg-iterator
+(assert (equal (macroexpand-1 '(do-all-symbols (s) (print :hi)))
+               :bork-bork-bork))
+(defun asm-string () (with-output-to-string (ss) (disassemble 'y-or-n-p :stream ss)))
+(assert (search "#'QUERY-READ-CHAR" (asm-string)))
 (defun query-read-char () #\y) ; will undo static linkage
-(assert (disassembly-contains-query-read-char))
+(assert (search "; QUERY-READ-CHAR" (asm-string)))
 (if (let ((*query-io* (make-broadcast-stream))) (y-or-n-p)) (exit :code 42))
 EOF
 status=$?
 if [ $status -eq 42 ]
 then
-  echo
   echo "Undo static linkage: PASS"
 else
   exit 1

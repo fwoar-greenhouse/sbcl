@@ -21,7 +21,7 @@
 
 #+permgen
 (progn
-(define-alien-variable ("PERMGEN_SPACE_START" sb-vm:permgen-space-start) sb-kernel::os-vm-size-t)
+(define-alien-variable ("permgen_bounds" sb-vm:permgen-space-start) sb-kernel::os-vm-size-t)
 (define-alien-variable ("permgen_space_free_pointer" sb-vm:*permgen-space-free-pointer*)
     system-area-pointer))
 
@@ -36,9 +36,8 @@
 (declaim (inline dynamic-space-free-pointer))
 (defun dynamic-space-free-pointer ()
   (sap+ (int-sap sb-vm:dynamic-space-start)
-        ;; not sure why next_free_page is 'sword_t' instead of 'uword_t' !
         (truly-the (signed-byte 64)
-                   (* (extern-alien "next_free_page" signed) sb-vm:gencgc-page-bytes))))
+                   (* (extern-alien "next_free_page" sb-kernel::page-index-t) sb-vm:gencgc-page-bytes))))
 
 (declaim (inline read-only-space-obj-p dynamic-space-obj-p))
 (defun read-only-space-obj-p (x)
@@ -55,11 +54,11 @@
     (let ((addr (get-lisp-obj-address x)))
       (< sb-vm:dynamic-space-start addr (sap-int (dynamic-space-free-pointer))))))
 
-(define-alien-variable ("TEXT_SPACE_START" sb-vm:text-space-start) unsigned-long)
+(define-alien-variable ("TEXT_SPACE_START" sb-vm:text-space-start) sb-kernel::os-vm-size-t)
 
-#+immobile-space
-(define-symbol-macro sb-vm:alien-linkage-table-space-start
-    (extern-alien "ALIEN_LINKAGE_TABLE_SPACE_START" unsigned))
+#+(or x86-64 immobile-space)
+(define-symbol-macro sb-vm:alien-linkage-space-start
+    (extern-alien "ALIEN_LINKAGE_SPACE_START" unsigned))
 
 #+darwin-jit
 (define-alien-variable ("static_code_space_free_pointer" sb-vm:*static-code-space-free-pointer*)
@@ -67,8 +66,16 @@
 
 (declaim (inline memmove))
 (define-alien-routine ("memmove" memmove) void ; BUG: technically returns void*
-  (dest (* char))
-  (src (* char))
+  (dest system-area-pointer)
+  (src system-area-pointer)
+  (n sb-unix::size-t))
+;;; The overhead of Lisp may make the distinction between memmove() and memcpy()
+;;; irrelevant, but we may as well promise that the ranges don't overlap when one
+;;; of them is a freshly consed string, for example.
+(declaim (inline memcpy))
+(define-alien-routine ("memcpy" memcpy) system-area-pointer
+  (dest system-area-pointer)
+  (src system-area-pointer)
   (n sb-unix::size-t))
 
 (defun copy-ub8-to-system-area (src src-offset dst dst-offset length)
@@ -85,6 +92,7 @@
   (memmove (sap+ dst dst-offset) (sap+ src src-offset) length)
   (values))
 
+(declaim (maybe-inline get-errno))
 (define-alien-routine ("os_get_errno" get-errno) int)
 (setf (documentation 'get-errno 'function)
       "Return the value of the C library pseudo-variable named \"errno\".")

@@ -124,7 +124,10 @@
              ((nil) 'unsigned-byte)
              ((t) 'signed-byte))
           ,width)
-         (foldable flushable movable always-translatable)
+         (foldable flushable movable always-translatable
+                   ,@(and (ir1-attributep (fun-info-attributes (fun-info-or-lose prototype))
+                                          commutative)
+                          '(commutative)))
        :derive-type (make-modular-fun-type-deriver ',prototype ,width ',signedp))))
 
 (defun %define-good-modular-fun (name kind signedp)
@@ -136,19 +139,29 @@
   `(%define-good-modular-fun ',name ',kind ',signedp))
 
 (defmacro define-modular-fun-optimizer
-    (name ((&rest lambda-list) kind signedp &key (width (gensym "WIDTH")))
+    (name ((&rest lambda-list) kind signedp &key (width (gensym "WIDTH"))
+                                                 result-width
+                                                 (node (gensym "NODE")))
      &body body)
   (%check-modular-fun-macro-arguments name kind lambda-list)
-  (with-unique-names (call args)
-    `(setf (gethash ',name (modular-class-funs (find-modular-class ',kind ',signedp)))
-           (lambda (,call ,width)
-             (declare (type basic-combination ,call)
-                      (type (integer 0) ,width))
-             (let ((,args (basic-combination-args ,call)))
-               (when (= (length ,args) ,(length lambda-list))
-                 (destructuring-bind ,lambda-list ,args
-                   (declare (type lvar ,@lambda-list))
-                   ,@body)))))))
+  (multiple-value-bind (forms decls) (parse-body body nil)
+    (multiple-value-bind (a-declarations b-declarations)
+        (extract-var-decls decls (and result-width (list result-width)))
+      (with-unique-names (args result-width-name)
+        `(setf (gethash ',name (modular-class-funs (find-modular-class ',kind ',signedp)))
+               (lambda (,node ,width ,(or result-width
+                                       result-width-name))
+                 (declare (type basic-combination ,node)
+                          (type (integer 0) ,width)
+                          ,@(unless result-width
+                              `((ignore ,result-width-name))))
+                 ,a-declarations
+                 (let ((,args (basic-combination-args ,node)))
+                   (when (= (length ,args) ,(length lambda-list))
+                     (destructuring-bind ,lambda-list ,args
+                       (declare (type lvar ,@lambda-list))
+                       ,@b-declarations
+                       ,@forms)))))))))
 
 ;;; (ldb (byte s 0) (foo                 x  y ...)) =
 ;;; (ldb (byte s 0) (foo (ldb (byte s 0) x) y ...))
@@ -167,7 +180,7 @@
 ;;; modular version, if it exists, or NIL. If we have changed
 ;;; anything, we need to flush old derived types, because they have
 ;;; nothing in common with the new code.
-(defun cut-to-width (lvar kind width signedp)
+(defun cut-to-width (lvar kind width signedp &optional (result-width width))
   (declare (type lvar lvar) (type (integer 0) width))
   (let ((type (specifier-type (if (zerop width)
                                   '(eql 0)
@@ -188,26 +201,25 @@
                           (args (combination-args dest)))
                  (case name
                    (logand
-                    (when (= 2 (length args))
-                      (let ((other (if (eql (first args) lvar)
-                                       (second args)
-                                       (first args))))
+                    (when (and (= (length args) 2)
+                               (eq (first args) lvar))
+                      (let ((other (second args)))
                         (when (and (constant-lvar-p other)
-                                   (ctypep (lvar-value other) type)
-                                   (not signedp))
+                                   (typep (lvar-value other) 'unsigned-byte)
+                                   (ctypep (lvar-value other) type))
                           (return-from insert-lvar-cut)))))
                    (mask-signed-field
                     (when (and signedp
-                               (eql lvar (second args))
+                               (eq lvar (second args))
                                (constant-lvar-p (first args))
                                (<= (lvar-value (first args)) width))
                       (return-from insert-lvar-cut)))))
                (filter-lvar lvar
                             (if signedp
                                 (lambda (dummy)
-                                  `(mask-signed-field ,width ,dummy))
+                                  `(truly-the (signed-byte ,width) (mask-signed-field ,width ,dummy)))
                                 (lambda (dummy)
-                                  `(logand ,dummy ,(ldb (byte width 0) -1)))))
+                                  `(truly-the (unsigned-byte ,width) (logand ,dummy ,(ldb (byte width 0) -1))))))
                (do-uses (node lvar)
                  (setf (block-reoptimize (node-block node)) t)
                  (reoptimize-component (node-component node) :maybe))
@@ -236,10 +248,7 @@
                              (t
                               (change-ref-leaf node (find-constant new-value)
                                                :recklessly t)
-                              (let ((lvar (node-lvar node)))
-                                (setf (lvar-%derived-type lvar)
-                                      (and (lvar-has-single-use-p lvar)
-                                           (make-values-type (list (ctype-of new-value))))))
+                              (replace-node-type node (make-values-type (list (ctype-of new-value))))
                               (setf (block-reoptimize (node-block node)) t)
                               (reoptimize-component (node-component node) :maybe)
                               (values t t)))))))
@@ -274,17 +283,18 @@
                                                 (modular-fun-info
                                                  (modular-fun-info-name modular-fun))
                                                 (function
-                                                 (funcall modular-fun node width)))
+                                                 (funcall modular-fun node width result-width)))
                                               :exit-if-null)
                                         (did-something nil)
                                         (over-wide nil))
                                (unless (eql modular-fun :good)
                                  (setq did-something t
                                        over-wide t)
-                                 (change-ref-leaf
-                                  fun-ref
-                                  (find-free-fun name "in a strange place"))
-                                 (setf (combination-kind node) :full))
+                                 (unless (eq name t)
+                                   (change-ref-leaf
+                                    fun-ref
+                                    (find-free-fun name "CUT-TO-WIDTH"))
+                                   (setf (combination-kind node) :full)))
                                (unless (functionp modular-fun)
                                  (dolist (arg (basic-combination-args node))
                                    (multiple-value-bind (change wide)
@@ -295,11 +305,36 @@
                                  ;; Can't rely on REOPTIMIZE-NODE, as it may neve get reoptimized.
                                  ;; But the outer functions don't want the type to get
                                  ;; widened and their VOPs may never be applied.
-                                 (setf (node-derived-type node)
-                                       (fun-type-returns (global-ftype name)))
-                                 (setf (lvar-%derived-type (node-lvar node)) nil)
+                                 (replace-node-type node
+                                                    (fun-type-returns (global-ftype (if (eq name t)
+                                                                                        fun-name
+                                                                                        name))))
                                  (ir1-optimize-combination node))
-                               (values t did-something over-wide)))))))))
+                               (values t did-something over-wide)))))))
+                 (cast
+                  ;; Cut (logand (+ x 1) m), which is (logand (the integer (+ x 1)) m),
+                  ;; and X can only be an integer for that to be true.
+                  (when (eq (cast-type-to-check node)
+                            (specifier-type 'integer))
+                    (let (did-something)
+                      (do-uses (combination (cast-value node))
+                        (when (and (or (combination-matches* '(+ -) '(* *) combination)
+                                       (combination-matches* '(%negate) '(*) combination))
+                                   (almost-immediately-used-p (node-lvar combination) combination
+                                                              :flushable t))
+                          (destructuring-bind (a &optional b) (combination-args combination)
+                            (when (or (not (types-equal-or-intersect (lvar-type a)
+                                                                     #1=(specifier-type '(or ratio (complex rational)))))
+                                      (not (and b
+                                                (types-equal-or-intersect (lvar-type b) #1#))))
+                              (when (cut-node combination)
+                                (setf did-something t))))))
+                      (when did-something
+                        (replace-node-type node
+                                           (if (type-single-value-p (node-derived-type node))
+                                               (values-specifier-type '(values integer &optional))
+                                               (values-specifier-type '(values integer)))))
+                      nil)))))
              (cut-lvar (lvar &key head
                         &aux did-something must-insert over-wide)
                "Cut all the LVAR's use nodes. If any of them wasn't handled
@@ -352,7 +387,6 @@
              (cond
                ((eq signedp (cdr w)) (<= width (car w)))
                ((eq signedp nil) (< width (car w))))))
-      (declare (dynamic-extent #'inexact-match))
       (let ((tgt (find-if #'inexact-match twidths)))
         (when tgt
           (return-from best-modular-version
@@ -362,8 +396,9 @@
           (return-from best-modular-version
             (values (car ugt) :untagged (cdr ugt))))))))
 
-(defoptimizer (logand optimizer) ((x y) node)
-  (let ((result-type (single-value-type (node-derived-type node))))
+(defoptimizer (logand optimizer) ((x y) node &optional result-type)
+  (let ((result-type (or result-type
+                         (single-value-type (node-derived-type node)))))
     (multiple-value-bind (low high)
         (integer-type-numeric-bounds result-type)
       (when (and (numberp low)
@@ -386,14 +421,19 @@
               ;; We cut to W not WIDTH if SIGNEDP is true, because
               ;; signed constant replacement needs to know which bit
               ;; in the field is the signed bit.
-              (let ((xact (cut-to-width x kind (if signedp w width) signedp))
-                    (yact (cut-to-width y kind (if signedp w width) signedp)))
+              (let ((xact (cut-to-width x kind (if signedp w width) signedp width))
+                    (yact (cut-to-width y kind (if signedp w width) signedp width)))
                 (declare (ignore xact yact))
                 nil) ; After fixing above, replace with T, meaning
                                         ; "don't reoptimize this (LOGAND) node any more".
               )))))))
 
 (setf (fun-info-optimizer (fun-info-or-lose 'logandc2)) #'logand-optimizer-optimizer)
+(setf (fun-info-optimizer (fun-info-or-lose 'logtest))
+      (lambda (node)
+        (let ((type (logand-derive-type-optimizer node)))
+          (when type
+           (logand-optimizer-optimizer node type)))))
 
 (defoptimizer (mask-signed-field optimizer) ((width x) node)
   (let ((result-type (single-value-type (node-derived-type node))))
@@ -410,49 +450,321 @@
               nil                ; After fixing above, replace with T.
               )))))))
 
-(defoptimizer (logior optimizer) ((x y) node)
-  (let ((result-type (single-value-type (node-derived-type node))))
-    (multiple-value-bind (low high)
-        (integer-type-numeric-bounds result-type)
-      (when (and (numberp low)
-                 (numberp high)
-                 (<= high 0))
-        (let ((width (integer-length low)))
-          (multiple-value-bind (w kind)
-              (best-modular-version (1+ width) t)
-            (when w
-              ;; FIXME: see comment in LOGAND optimizer
-              (let ((xact (cut-to-width x kind w t))
-                    (yact (cut-to-width y kind w t)))
-                (declare (ignore xact yact))
-                nil) ; After fixing above, replace with T
-              )))))))
+(defun logior-cut-width (node)
+  (multiple-value-bind (low high)
+      (integer-type-numeric-bounds (single-value-result-type node))
+    (when (and (numberp low)
+               (numberp high)
+               (<= high 0))
+      (let ((width (integer-length low)))
+        (best-modular-version (1+ width) t)))))
 
+(defoptimizer (logior optimizer) ((x y) node)
+  (multiple-value-bind (w kind)
+      (logior-cut-width node)
+    (when w
+      ;; FIXME: see comment in LOGAND optimizer
+      (let ((xact (cut-to-width x kind w t))
+            (yact (cut-to-width y kind w t)))
+        (declare (ignore xact yact))
+        nil) ; After fixing above, replace with T
+      )))
+
+
+(defun unsigned-mask-width (type)
+  (let* ((int (type-approximate-interval type))
+         (high (interval-high int)))
+    (when high
+      (integer-length high))))
+
+(deftransform logand ((x y) (t (constant-arg integer)) word
+                      :node node :important nil)
+  ;; Reduce constant width
+  (let* ((mask (lvar-value y))
+         (cut (ldb (byte (unsigned-mask-width (single-value-result-type node t)) 0)
+                   mask)))
+    (if (= cut mask)
+        (give-up-ir1-transform)
+        `(logand x ,cut))))
+
+;;; Remove the second logand or reduce its constant in
+;;; (logand m (logand n #xFFFF))
+(deftransform logand ((a b) (t t) * :important nil :node node)
+  (or (combination-match (:node node)
+          (logand (:type unsigned-byte a) (logand x (:constant b)))
+        (block nil
+          (let* ((width (or (unsigned-mask-width (lvar-type a))
+                            (return)))
+                 (full-mask (if (constant-lvar-p a)
+                                (lvar-value a)
+                                (ldb (byte width 0) -1)))
+                 (cut (logand b
+                              full-mask)))
+            (cond ((and
+                    ;; unsigned cut-to-width always recuts to the minimum width
+                    (vop-existsp :translate sb-vm::*-modfx)
+                    ;; cut-to-width will insert these again
+                    (/= cut most-positive-word
+                        (ash most-positive-word -1))
+                    (= cut full-mask))
+                   (extract-lvar-n x 1 node)
+                   t)
+                  ((= cut b)
+                   nil)
+                  (t
+                   (erase-node-type combination *wild-type* nil node)
+                   (transform-call combination
+                                   `(lambda (x y)
+                                      (declare (ignore y))
+                                      (logand x ,cut))
+                                   'logand)
+                   t)))))
+      ;; Reduce the constant in logior
+      (combination-match (:node node)
+          (logand (:type unsigned-byte a) (logior * (:constant b)))
+        (block nil
+          (let* ((width (or (unsigned-mask-width (lvar-type a))
+                            (return)))
+                 (full-mask (ldb (byte width 0) -1))
+                 (mask (if (constant-lvar-p a)
+                           (lvar-value a)
+                           full-mask))
+                 (cut (logand b mask)))
+            (cond ((= cut full-mask)
+                   ;; (logand #xFF (logior n #xFF)) => #xFF
+                   (erase-node-type combination *wild-type* nil node)
+                   (transform-call combination
+                                   `(lambda (x y)
+                                      (declare (ignore x y))
+                                      ,cut)
+                                   'logand)
+                   t)
+                  ((or (>= (integer-length cut)
+                           (integer-length b)))
+                   nil)
+                  (t
+                   (erase-node-type combination *wild-type* nil node)
+                   (transform-call combination
+                                   `(lambda (x y)
+                                      (declare (ignore y))
+                                      (logior x ,cut))
+                                   'logand)
+                   t)))))
+      (combination-match (:node node)
+          (logand (:type unsigned-byte a) (logxor * (:constant b)))
+        (block nil
+          (let* ((width (or (unsigned-mask-width (lvar-type a))
+                            (return)))
+                 (full-mask (ldb (byte width 0) -1))
+                 (mask (if (constant-lvar-p a)
+                           (lvar-value a)
+                           full-mask))
+                 (cut (logand b
+                              mask)))
+            (cond ((= cut b)
+                   nil)
+                  (t
+                   (erase-node-type combination *wild-type* nil node)
+                   (transform-call combination
+                                   `(lambda (x y)
+                                      (declare (ignore y))
+                                      (logxor x ,cut))
+                                   'logand)
+                   t)))))
+      ;; Remove mask-signed-field
+      (combination-match (:node node)
+          (logand (:type unsigned-byte a) (mask-signed-field (:constant sign) b))
+        (block nil
+          (let ((width (or (unsigned-mask-width (lvar-type a))
+                           (return))))
+            (when (> sign width)
+              (extract-lvar-n b 1 node))))))
+  (give-up-ir1-transform))
+
+;;; Combine (ash (ash x 1) 1) into (ash x 2)
 (deftransform ash ((value amount))
   (let ((value-node (lvar-uses value)))
     (unless (combination-p value-node)
       (give-up-ir1-transform))
     (let ((inside-fun-name (lvar-fun-name (combination-fun value-node))))
-      (multiple-value-bind (prototype width)
-          (modular-version-info inside-fun-name :untagged nil)
-        (unless (eq (or prototype inside-fun-name) 'ash)
-          (give-up-ir1-transform))
-        (when (and width (not (constant-lvar-p amount)))
-          (give-up-ir1-transform))
-        (let ((inside-args (combination-args value-node)))
-          (unless (= (length inside-args) 2)
-            (give-up-ir1-transform))
-          (let ((inside-amount (second inside-args)))
-            (unless (and (constant-lvar-p inside-amount)
-                         (not (minusp (lvar-value inside-amount))))
-              (give-up-ir1-transform)))
-          (splice-fun-args value inside-fun-name 2)
-          (if width
+      (if (eq inside-fun-name 'ash)
+          (let* ((inside-args (combination-args value-node))
+                 (inside-amount (second inside-args))
+                 ;; Can't do anything if it shifts right erasing bits.
+                 (in-range (or (type-approximate-interval (lvar-type inside-amount))
+                               (give-up-ir1-transform)))
+                 (in-range (if (eq (interval-range-info in-range) '+)
+                               in-range
+                               (give-up-ir1-transform)))
+                 (out-range (type-approximate-interval (lvar-type amount)))
+                 (new-range (when out-range
+                              (interval-add in-range out-range))))
+
+            (when (and (or ;; Don't do it if the new amount won't shift in one direction
+                        (and new-range
+                             (not (interval-range-info new-range))
+                             (interval-range-info out-range))
+                        ;; Do not disturb the conversion to a right shift
+                        (combination-is (lvar-uses amount) '(%negate -)))
+                       ;; but not if it won't be inlined anyway
+                       (or (csubtypep (lvar-type value) (specifier-type 'word))
+                           (csubtypep (lvar-type value) (specifier-type 'sb-vm:signed-word))))
+              (give-up-ir1-transform))
+            (splice-fun-args value inside-fun-name 2)
+            `(lambda (value amount1 amount2)
+               (ash value (+ amount1 amount2))))
+          (multiple-value-bind (prototype width)
+              (modular-version-info inside-fun-name :untagged nil)
+            (unless (eq prototype 'ash)
+              (give-up-ir1-transform))
+            (when (not (constant-lvar-p amount))
+              (give-up-ir1-transform))
+            (let ((inside-args (combination-args value-node)))
+              (unless (= (length inside-args) 2)
+                (give-up-ir1-transform))
+              (let ((inside-amount (second inside-args)))
+                (unless (and (constant-lvar-p inside-amount)
+                             (not (minusp (lvar-value inside-amount))))
+                  (give-up-ir1-transform)))
+              (splice-fun-args value inside-fun-name 2)
               `(lambda (value amount1 amount2)
                  (logand (ash value (+ amount1 amount2))
-                         ,(1- (ash 1 (+ width (lvar-value amount))))))
-              `(lambda (value amount1 amount2)
-                 (ash value (+ amount1 amount2)))))))))
+                         ,(1- (ash 1 (+ width (lvar-value amount))))))))))))
+
+(deftransform ash-into-word-mod ((x count) (t (constant-arg (integer #.(- sb-vm:n-word-bits) 0))))
+  `(typecase x
+     (fixnum
+      (logand most-positive-word (ash (truly-the fixnum x) count)))
+     (sb-vm:signed-word
+      (logand most-positive-word (ash (truly-the sb-vm:signed-word x) count)))
+     (t
+      (ash-right-two-words (sb-bignum:%bignum-ref (truly-the bignum x) 1)
+                           (sb-bignum:%bignum-ref (truly-the bignum x) 0)
+                           (- count)))))
+
+(deftransform ash-into-word-mod ((x count) * * :important nil :priority :last)
+  (let* ((minusp (csubtypep (lvar-type count) (specifier-type '(integer * 0))))
+         (right
+           `(typecase x
+              (fixnum
+               (logand most-positive-word (ash (truly-the fixnum x) ,(if minusp
+                                                                         `(- count)
+                                                                         `count))))
+              (t
+               (multiple-value-bind (words bits) (truncate ,(if minusp
+                                                                `count
+                                                                `(- count))
+                                                           sb-vm:n-word-bits)
+                 (let ((length (%bignum-length (truly-the bignum x))))
+                   (flet ((extend-ref (index)
+                            (if (< index length)
+                                (sb-bignum:%bignum-ref (truly-the bignum x) (truly-the bignum-index index))
+                                (sb-bignum::%sign-digit (truly-the bignum x) length))))
+                     (declare (inline extend-ref))
+                     (ash-right-two-words (extend-ref (1+ words))
+                                          (extend-ref words)
+                                          (truly-the (mod ,sb-vm:n-word-bits) bits)))))))))
+    (if minusp
+        `(let ((count (- count)))
+           ,right)
+        `(if (minusp count)
+             ,right
+             (logand most-positive-word (ash x (truly-the unsigned-byte count)))))))
+
+(defun ash-into-word-mod (x count)
+  (logand (ash x count) most-positive-word))
+
+(defun ash-into-word-modfx (x count)
+  (mask-signed-field sb-vm:n-fixnum-bits (ash x count)))
+
+(deftransform ash-into-word-mod ((x count) (t (constant-arg (integer * (#.(- sb-vm:n-word-bits))))))
+  (let ((count (- (lvar-value count))))
+    (multiple-value-bind (words bits) (truncate count sb-vm:n-word-bits)
+      `(typecase x
+         (sb-vm:signed-word
+          (logand most-positive-word (ash (truly-the sb-vm:signed-word x) count)))
+         (t
+          (let ((length (%bignum-length (truly-the bignum x))))
+            (flet ((extend-ref (index)
+                     (if (< index length)
+                         (sb-bignum:%bignum-ref (truly-the bignum x) index)
+                         (sb-bignum::%sign-digit (truly-the bignum x) length))))
+              (declare (inline extend-ref))
+              ,(if (zerop bits)
+                   `(extend-ref ,words)
+                   `(ash-right-two-words (extend-ref ,(1+ words))
+                                         (extend-ref ,words)
+                                         ,bits)))))))))
+
+(deftransform ash-into-word-modfx ((x count) (t (constant-arg (integer #.(- sb-vm:n-word-bits) 0))))
+  `(typecase x
+     (fixnum
+      (mask-signed-field sb-vm:n-fixnum-bits
+                         (ash (truly-the fixnum x) count)))
+     (sb-vm:signed-word
+      (mask-signed-field sb-vm:n-fixnum-bits
+                         (ash (truly-the sb-vm:signed-word x) count)))
+     (t
+      (mask-signed-field sb-vm:n-fixnum-bits
+                         (ash-right-two-words (sb-bignum:%bignum-ref (truly-the bignum x) 1)
+                                              (sb-bignum:%bignum-ref (truly-the bignum x) 0)
+                                              (- count))))))
+
+(deftransform ash-into-word-modfx ((x count) * * :important nil :priority :last)
+  (let* ((minusp (csubtypep (lvar-type count) (specifier-type '(integer * 0))))
+         (right
+           `(typecase x
+              (fixnum
+               (mask-signed-field sb-vm:n-fixnum-bits
+                                  (ash (truly-the fixnum x) ,(if minusp
+                                                                 `(- count)
+                                                                 `count))))
+              (t
+               (multiple-value-bind (words bits) (truncate ,(if minusp
+                                                                `count
+                                                                `(- count))
+                                                           sb-vm:n-word-bits)
+                 (let ((length (%bignum-length (truly-the bignum x))))
+                   (flet ((extend-ref (index)
+                            (if (< index length)
+                                (sb-bignum:%bignum-ref (truly-the bignum x) (truly-the bignum-index index))
+                                (sb-bignum::%sign-digit (truly-the bignum x) length))))
+                     (declare (inline extend-ref))
+                     (mask-signed-field sb-vm:n-fixnum-bits
+                                        (ash-right-two-words (extend-ref (1+ words))
+                                                             (extend-ref words)
+                                                             bits)))))))))
+    (if minusp
+        `(let ((count (- count)))
+           ,right)
+        `(if (minusp count)
+             ,right
+             (mask-signed-field sb-vm:n-fixnum-bits (ash x (truly-the unsigned-byte count)))))))
+
+(deftransform ash-into-word-modfx ((x count) (t (constant-arg (integer * (#.(- sb-vm:n-word-bits))))))
+  (let ((count (- (lvar-value count))))
+    (multiple-value-bind (words bits) (truncate count sb-vm:n-word-bits)
+      `(typecase x
+         (sb-vm:signed-word
+          (mask-signed-field sb-vm:n-fixnum-bits
+                             (ash (truly-the sb-vm:signed-word x) count)))
+         (t
+          (let ((length (%bignum-length (truly-the bignum x))))
+            (flet ((extend-ref (index)
+                     (if (< index length)
+                         (sb-bignum:%bignum-ref (truly-the bignum x) index)
+                         (sb-bignum::%sign-digit x length))))
+              (declare (inline extend-ref))
+              (mask-signed-field sb-vm:n-fixnum-bits
+                                 ,(if (zerop bits)
+                                      `(extend-ref ,words)
+                                      `(ash-right-two-words (extend-ref ,(1+ words))
+                                                            (extend-ref ,words)
+                                                            ,bits))))))))))
+
+(deftransform ash-right-two-words ((w2 w1 count) (t t (eql #.sb-vm:n-word-bits)) * :important nil)
+  'w2)
+
 (macrolet
     ((def (left-name name kind width signedp)
        (declare (ignorable name))
@@ -463,7 +775,9 @@
             (defknown ,left-name (integer (integer 0)) (,type ,width)
                 (foldable flushable movable)
               :derive-type (make-modular-fun-type-deriver 'ash ',width ',signedp))
-            (define-modular-fun-optimizer ash ((integer count) ,kind ,signedp :width width)
+            (define-modular-fun-optimizer ash ((integer count) ,kind ,signedp :width width
+                                               :result-width result-width)
+              (declare (ignorable result-width))
               (let ((integer-type (lvar-type integer))
                     (count-type (lvar-type count)))
                 (declare (ignorable integer-type))
@@ -479,9 +793,19 @@
                               ;; Unknown sign
                               (not (csubtypep count-type (specifier-type '(integer * 0))))
                               (not (csubtypep count-type (specifier-type '(integer 0 *))))
-                              (or (csubtypep integer-type (specifier-type `(unsigned-byte ,sb-vm:n-word-bits)))
-                                  (csubtypep integer-type (specifier-type `(signed-byte ,sb-vm:n-word-bits)))))
-                         ',name)))))
+                              (word-sized-type-p integer-type))
+                         ',name)
+                        #+(or arm64 x86-64)
+                        ((not (word-sized-type-p integer-type))
+                         (cond ((csubtypep count-type (specifier-type `(integer ,(- result-width width) ,most-positive-fixnum)))
+                                ;; Uses the bits from the first word when shifting right
+                                (cut-to-width integer ,kind width ,signedp)
+                                ',name)
+                               ((and (csubtypep count-type (specifier-type 'fixnum))
+                                     (not (csubtypep count-type (specifier-type 'unsigned-byte))))
+                                ',(if signedp
+                                      'ash-into-word-modfx
+                                      'ash-into-word-mod))))))))
             (setf (gethash ',left-name (modular-class-versions (find-modular-class ',kind ',signedp)))
                   `(ash ,',width))
             (deftransform ,left-name ((integer count) (t (constant-arg (eql 0))))
@@ -697,3 +1021,39 @@
             `(sb-vm::calc-phash val ,n-temps ,steps)
             form)))))
 )
+
+#+(or arm64 x86-64)
+(progn
+  (defknown sb-vm::truncate-mod64 (sb-vm:signed-word sb-vm:signed-word)
+      (values word sb-vm:signed-word)
+      (foldable flushable movable))
+
+  (defoptimizer (sb-vm::truncate-mod64 derive-type) ((n d) node)
+    (let ((res (truncate-derive-type-optimizer node)))
+      (when res
+        (destructuring-bind (q r) (values-type-required res)
+          (make-values-type  (list (%two-arg-derive-type q
+                                                         (specifier-type `(eql ,(ldb (byte sb-vm:n-word-bits 0) -1)))
+                                                         #'logand-derive-type-aux)
+                                   r))))))
+
+  (deftransform sb-vm::truncate-mod64 ((n d) * * :node node)
+    (let ((truncate-type (truncate-derive-type-optimizer node)))
+      (if (and truncate-type
+               (values-subtypep truncate-type
+                                (values-specifier-type `(values sb-vm:signed-word t &optional))))
+          `(multiple-value-bind (q r) (truncate n d)
+             (values (logand q ,most-positive-word)
+                     r))
+          (give-up-ir1-transform))))
+
+  (define-modular-fun-optimizer truncate
+      ((n d) :untagged nil :width width :node node)
+    (when (and (= width sb-vm:n-word-bits)
+               (not (values-subtypep (node-derived-type node)
+                                     (values-specifier-type `(values sb-vm:signed-word t &optional))))
+               (csubtypep (lvar-type n) (specifier-type 'sb-vm:signed-word))
+               (csubtypep (lvar-type d) (specifier-type 'sb-vm:signed-word)))
+      'sb-vm::truncate-mod64))
+  (setf (gethash 'sb-vm::truncate-mod64 (modular-class-versions (find-modular-class ':untagged 'nil)))
+        `(truncate ,sb-vm:n-word-bits)))

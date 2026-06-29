@@ -112,13 +112,18 @@ src/runtime/sbcl --core output/sbcl.core --lose-on-corruption --noinform \
                  (push obj l2)))
              :all)
             (when l1 (format t "Found ~D:~%~S~%" (length l1) l1))
+            ;; Assert that a chosen few symbols not named using the ! convention are removed
+            ;; by tree-shaking. This list was made by hand-checking various macros that seemed
+            ;; not to be needed after the build. I would have thought
+            ;; (EVAL-WHEN (:COMPILE-TOPLEVEL)) to be preferable, but revision fb1ba6de5e makes
+            ;; a case for not doing that. Either way is less than fabulous.
             (sb-int:awhen
                 (mapcan (quote apropos-list)
                         (quote ("DEFINE-INFO-TYPE" "LVAR-TYPE-USING"
                                                    "TWO-ARG-+/-"
                                                    "PPRINT-TAGBODY-GUTS" "WITH-DESCRIPTOR-HANDLERS"
                                                    "SUBTRACT-BIGNUM-LOOP" "BIGNUM-REPLACE" "WITH-BIGNUM-BUFFERS"
-                                                   "GCD-ASSERT" "MODULARLY" "BIGNUM-NEGATE-LOOP"
+                                                   "GCD-ASSERT" "BIGNUM-NEGATE-LOOP"
                                                    "SHIFT-RIGHT-UNALIGNED"
                                                    "STRING-LESS-GREATER-EQUAL-TESTS")))
               (format t "~&Leftover from [disabled?] tree-shaker:~%~S~%" sb-int:it))
@@ -131,10 +136,9 @@ src/runtime/sbcl --core output/sbcl.core --lose-on-corruption --noinform \
 # contrib/Makefile shouldn't be counted in NCONTRIBS nor should asdf and uiop.
 # The asdf directory produces 2 fasls, so is unlike all our other contribs
 # and would therefore mess up the accounting here if included.
-NCONTRIBS=`ls -1 contrib/sb-*/Makefile | wc -l`
 NPASSED=`ls obj/sbcl-home/contrib/sb-*.fasl | wc -l`
 echo
-echo "The build seems to have finished successfully, including $NPASSED (out of $NCONTRIBS)"
+echo "The build seems to have finished successfully, including $NPASSED"
 echo "contributed modules. If you would like to run more extensive tests on"
 echo "the new SBCL, you can try:"
 echo

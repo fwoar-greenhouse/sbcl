@@ -114,7 +114,7 @@
 (eval-when (:compile-toplevel :load-toplevel)
   (setf *c-functions-in-runtime*
         (append #+netbsd '("stat" "lstat" "fstat" "readdir" "opendir")
-                #+(and (or arm64 riscv ppc ppc64) linux) '("stat" "lstat" "fstat"))))
+                #+(and (or arm64 riscv ppc ppc64 loongarch64) linux) '("stat" "lstat" "fstat"))))
 
 
 ;;; filesystem access
@@ -356,16 +356,13 @@
 
   ;; FIXME this is a lie, of course this can fail, but there's no
   ;; error handling here yet!
-  #+darwin
-  (define-call "darwin_reinit" void never-fails)
-  (define-call ("posix_fork" :c-name "fork") pid-t minusp)
+  (define-call-internally posix-fork "fork" pid-t minusp)
   (defun fork ()
     "Forks the current process, returning 0 in the new process and the PID of
 the child process in the parent. Forking while multiple threads are running is
 not supported."
-    ;; It would be easy enough to to allow fork in multithreaded code - we'd need the new
-    ;; process to set *ALL-THREADS* to contain only one thread, and unmap other threads'
-    ;; stack to avoid a memory leak. The tricky part would be adhering the the POSIX caveats.
+    ;; Supporting fork in multithreaded code is not worth the hassle, as users would
+    ;; be prone to violating the constraints of the various operating systems:
     ;; Linux:
     ;;   After a fork() in a multithreaded program, the child can safely call only async-signal-safe
     ;;   functions (see signal-safety(7)) until such time as it calls execve(2).
@@ -377,24 +374,24 @@ not supported."
     ;;   To be totally safe you should restrict yourself to only executing async-signal safe
     ;;   operations until such time as one of the exec functions is called.
     #+sb-thread
-    (when (cdr (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
-                 (sb-impl::finalizer-thread-stop)
-                 ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
-                 ;; Do that now so that the forked process has only the main thread
-                 ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
-                 (sb-thread::%dispose-thread-structs)
-                 ;; Threads are added to ALL-THREADS before they have an OS thread,
-                 ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
-                 ;; So we need to go lower-level to sense whether any exist.
-                 (sb-thread:avltree-list sb-thread::*all-threads*)))
+    (when (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
+            (sb-impl::finalizer-thread-stop)
+            ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
+            ;; Do that now so that the forked process has only the main thread
+            ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
+            (sb-thread::%dispose-thread-structs)
+            ;; Threads are added to ALL-THREADS before they have an OS thread,
+            ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
+            ;; So we need to go lower-level to sense whether any exist.
+            (> (sb-thread::avl-count sb-thread::*all-threads*) 1))
       (sb-impl::finalizer-thread-start)
       (error "Cannot fork with multiple threads running."))
-    (let ((pid (posix-fork)))
-      (when (= pid 0) ; child
-        #+darwin (darwin-reinit)
-        #+mark-region-gc (alien-funcall (extern-alien "thread_pool_init" (function void))))
-      #+sb-thread (sb-impl::finalizer-thread-start)
-      pid))
+    (sb-sys:without-interrupts
+      (let ((pid (posix-fork)))
+        (when (= pid 0)                 ; child
+          (alien-funcall (extern-alien "sb_posix_after_fork" (function void))))
+        #+sb-thread (sb-impl::finalizer-thread-start)
+        pid)))
   (export 'fork :sb-posix)
 
   (define-call "getpgid" pid-t minusp (pid pid-t))
@@ -449,17 +446,21 @@ not supported."
   (export 'getcwd :sb-posix)
   (defun getcwd ()
     "Returns the process's current working directory as a string."
+    #+(or android linux openbsd freebsd netbsd sunos darwin dragonfly haiku)
+    (sb-unix:posix-getcwd)
+    #-(or android linux openbsd freebsd netbsd sunos darwin dragonfly haiku)
     (flet ((%getcwd (buffer size)
              (alien-funcall
               (extern-alien #-win32 "getcwd"
                             #+win32 "_getcwd" (function c-string (* t) int))
               buffer size)))
+     (sb-int:possibly-base-stringize
       (with-growing-c-string (buf size)
         (let ((result (%getcwd buf size)))
           (cond (result
                  (buf))
                 ((/= (get-errno) sb-posix:erange)
-                 (syscall-error 'getcwd))))))))
+                 (syscall-error 'getcwd)))))))))
 
 #-win32
 (progn
@@ -641,8 +642,10 @@ not supported."
                       ,name (function ,result-type ,@(when arg-type `(,arg-type))))
                    ,@(when arg `(,arg))))))
           (if (null-alien r)
-              (when (plusp (get-errno))
-                (syscall-error ',lisp-name))
+              (let ((errno (get-errno)))
+                (when (and (plusp errno)
+                           (/= errno ENOENT))
+                  (syscall-error ',lisp-name)))
               (,conv r)))))))
   (define-enumerator-call (name assertion)
       (let ((lisp-name (intern (string-upcase name) :sb-posix)))
@@ -747,11 +750,13 @@ not supported."
 (defmacro define-stat-call (name arg designator-fun type)
   ;; FIXME: this isn't the documented way of doing this, surely?
   (let ((lisp-name (lisp-for-c-symbol name))
-        (real-name #+inode64 (format nil "~A$INODE64" name)
-                   #-inode64 name))
+        (real-name (or #+inode64
+                       (format nil "~A$INODE64" name)
+                       #+(and ucrt 64-bit)
+                       (format nil "~A64" name)
+                       name)))
     `(progn
       (export ',lisp-name :sb-posix)
-      (declaim (inline ,lisp-name))
       (defun ,lisp-name (,arg &optional stat)
         (declare (type (or null stat) stat))
         (with-alien-stat a-stat ()
@@ -808,16 +813,20 @@ not supported."
 
 #-win32
 (define-protocol-class termios alien-termios ()
-  ((iflag :initarg :iflag :accessor sb-posix:termios-iflag
+  ((iflag :initarg :iflag :accessor termios-iflag
           :documentation "Input modes.")
-   (oflag :initarg :oflag :accessor sb-posix:termios-oflag
+   (oflag :initarg :oflag :accessor termios-oflag
           :documentation "Output modes.")
-   (cflag :initarg :cflag :accessor sb-posix:termios-cflag
+   (cflag :initarg :cflag :accessor termios-cflag
           :documentation "Control modes.")
-   (lflag :initarg :lflag :accessor sb-posix:termios-lflag
+   (lflag :initarg :lflag :accessor termios-lflag
           :documentation "Local modes.")
-   (cc :initarg :cc :accessor sb-posix:termios-cc :array-length nccs
-       :documentation "Control characters."))
+   (cc :initarg :cc :accessor termios-cc :array-length nccs
+       :documentation "Control characters.")
+   (ispeed :initarg :ispeed :accessor termios-ispeed
+           :documentation "Input speed.")
+   (ospeed :initarg :ospeed :accessor termios-ospeed
+           :documentation "Output speed."))
   (:documentation
    "Instances of this class represent I/O characteristics of the terminal."))
 
@@ -911,7 +920,8 @@ not supported."
 (progn
   (export 'time :sb-posix)
   (defun time ()
-    (let ((result (alien-funcall (extern-alien "time"
+    (let ((result (alien-funcall (extern-alien #-64-bit-time "time"
+                                               #+64-bit-time "__time64"
                                                (function time-t (* time-t)))
                                  nil)))
       (if (minusp result)
@@ -919,19 +929,19 @@ not supported."
           result)))
   (export 'utime :sb-posix)
   (defun utime (filename &optional access-time modification-time)
-    (let ((fun (extern-alien #-netbsd "utime" #+netbsd "_utime"
-                             (function int (c-string :not-null t)
-                                       (* alien-utimbuf))))
-          (name (filename filename)))
-      (if (not (and access-time modification-time))
-          (alien-funcall fun name nil)
-          (with-alien ((utimbuf (struct alien-utimbuf)))
-            (setf (slot utimbuf 'actime) (or access-time 0)
-                  (slot utimbuf 'modtime) (or modification-time 0))
-            (let ((result (alien-funcall fun name (alien-sap utimbuf))))
-              (if (minusp result)
-                  (syscall-error 'utime)
-                  result))))))
+    (with-alien ((fun (function int (c-string :not-null t) (* alien-utimbuf))
+                      :extern #-(or 64-bit-time netbsd) "utime" #+netbsd "_utime"
+                      #+64-bit-time "__utime64"))
+      (let ((name (filename filename)))
+        (if (not (and access-time modification-time))
+            (alien-funcall fun name nil)
+            (with-alien ((utimbuf (struct alien-utimbuf)))
+              (setf (slot utimbuf 'actime) (or access-time 0)
+                    (slot utimbuf 'modtime) (or modification-time 0))
+              (let ((result (alien-funcall fun name (alien-sap utimbuf))))
+                (if (minusp result)
+                    (syscall-error 'utime)
+                    result)))))))
   (export 'utimes :sb-posix)
   (defun utimes (filename &optional access-time modification-time)
     (flet ((seconds-and-useconds (time)
@@ -942,38 +952,29 @@ not supported."
              (if (minusp value)
                  (syscall-error 'utimes)
                  value)))
-      (let ((fun (extern-alien #-netbsd "utimes" #+netbsd "sb_utimes"
-                               (function int (c-string :not-null t)
-                                                  (* (array alien-timeval 2)))))
-            (name (filename filename)))
-        (if (not (and access-time modification-time))
-            (maybe-syscall-error (alien-funcall fun name nil))
-            (with-alien ((buf (array alien-timeval 2)))
-              (let ((actime (deref buf 0))
-                    (modtime (deref buf 1)))
-                (setf (values (slot actime 'sec)
-                              (slot actime 'usec))
-                      (seconds-and-useconds (or access-time 0))
-                      (values (slot modtime 'sec)
-                              (slot modtime 'usec))
-                      (seconds-and-useconds (or modification-time 0)))
-                (maybe-syscall-error (alien-funcall fun name
-                                                    (alien-sap buf))))))))))
+      (with-alien ((fun (function int (c-string :not-null t) (* (array alien-timeval 2)))
+                        :extern #-(or netbsd 64-bit-time) "utimes" #+(or netbsd 64-bit-time) "sb_utimes"))
+        (let ((name (filename filename)))
+          (if (not (and access-time modification-time))
+              (maybe-syscall-error (alien-funcall fun name nil))
+              (with-alien ((buf (array alien-timeval 2)))
+                (let ((actime (deref buf 0))
+                      (modtime (deref buf 1)))
+                  (setf (values (slot actime 'sec)
+                                (slot actime 'usec))
+                        (seconds-and-useconds (or access-time 0))
+                        (values (slot modtime 'sec)
+                                (slot modtime 'usec))
+                        (seconds-and-useconds (or modification-time 0)))
+                  (maybe-syscall-error (alien-funcall fun name
+                                                      (alien-sap buf)))))))))))
 
 
 ;;; environment
 
-(defun getenv (name)
-  ;; SUSv4 doesn't define any errors for getenv, but some systems do.
-  (set-errno 0)
-  (let ((r (alien-funcall
-            (extern-alien "getenv" (function (* char) (c-string :not-null t)))
-            name)))
-    (declare (type (alien (* char)) r))
-    (if (null-alien r)
-        (when (plusp (get-errno))
-          (syscall-error 'getenv))
-        (cast r c-string))))
+(declaim (ftype (function (t) (values (or simple-string null) &optional)) getenv))
+(setf (fdefinition 'getenv) #'sb-ext:posix-getenv)
+
 #-win32
 (progn
   (define-call "setenv" int minusp
@@ -987,7 +988,7 @@ not supported."
     ;; We don't want to call actual putenv: the string passed to putenv ends
     ;; up in environ, and we any string we allocate GC might move.
     ;;
-    ;; This makes our wrapper nonconformant if you squit hard enough, but
+    ;; This makes our wrapper nonconformant if you squint hard enough, but
     ;; users who care about that should really be calling putenv() directly in
     ;; order to be able to manage memory sanely.
     (let ((p (position #\= string))

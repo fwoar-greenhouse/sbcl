@@ -117,15 +117,15 @@
       (truly-the
        (values t &optional)
        (catch 'up-and-out
-         (let* ((string (etypecase string-or-fun
+         (let* ((string (typecase string-or-fun
                           (simple-string
                            string-or-fun)
                           (string
                            (coerce string-or-fun 'simple-string))
-                          ;; Not just more compact than testing for fmt-control
-                          ;; but also produces a better error message.
                           (function
-                           (fmt-control-string string-or-fun))))
+                           (fmt-control-string string-or-fun))
+                          (t
+                           #.(sb-c::internal-type-error-call 'string-or-fun '(or string function)))))
                 (*default-format-error-control-string* string)
                 (*logical-block-popper* nil)
                 (tokens
@@ -185,8 +185,7 @@
 
 (defmacro def-complex-format-interpreter (char lambda-list &body body)
   (aver (not (lower-case-p char)))
-  (let ((defun-name
-            (intern (format nil "~:C-INTERPRETER" char)))
+  (let ((defun-name (directive-handler-name char "-INTERPRETER"))
         (directive '.directive) ; expose this var to the lambda. it's easiest
         (directives (if lambda-list (car (last lambda-list)) (gensym "DIRECTIVES"))))
     `(progn
@@ -344,6 +343,12 @@
           ;; colinc = 1, minpad = 0, padleft = t
           (format-write-field stream signed mincol 1 0 padchar t))
         (princ number stream))))
+
+;;; Interpreter stub
+(defun format-integer (object base stream)
+  (let ((*print-base* base)
+        (*print-radix* nil))
+    (princ object stream)))
 
 (defun format-add-commas (string commachar commainterval)
   (let ((length (length string)))
@@ -635,18 +640,15 @@
     (format-exponential stream (next-arg) w d e k ovf pad mark atsignp)))
 
 (defun format-exponential (stream number w d e k ovf pad marker atsign)
-  (if (numberp number)
-      (if (floatp number)
-          (format-exp-aux stream number w d e k ovf pad marker atsign)
-          (if (rationalp number)
-              (format-exp-aux stream
-                              (coerce number 'single-float)
-                              w d e k ovf pad marker atsign)
-              (format-write-field stream
-                                  (decimal-string number)
-                                  w 1 0 #\space t)))
-      (let ((*print-base* 10))
-        (format-princ stream number nil nil w 1 0 pad))))
+  (cond ((floatp number)
+         (format-exp-aux stream number w d e k ovf pad marker atsign))
+        ((rationalp number)
+         (format-exp-aux stream
+                         (coerce number 'single-float)
+                         w d e k ovf pad marker atsign))
+        (t
+         (let ((*print-base* 10))
+           (format-princ stream number nil nil w 1 0 pad)))))
 
 (defun format-exponent-marker (number)
   (if (case *read-default-float-format*
@@ -681,54 +683,54 @@
   (if (or (float-infinity-p number)
           (float-nan-p number))
       (prin1 number stream)
-      (multiple-value-bind (num expt) (sb-impl::scale-exponent (abs number))
-        (let* ((k (if (= num $1.0) (1- k) k))
-               (expt (- expt k))
-               (estr (decimal-string (abs expt)))
-               (elen (if e (max (length estr) e) (length estr)))
-               spaceleft)
-          (when w
-            (setf spaceleft (- w 2 elen))
-            (when (or atsign (float-sign-bit-set-p number))
-              (decf spaceleft)))
-          (if (and w ovf e (> elen e))  ;exponent overflow
-              (dotimes (i w) (write-char ovf stream))
-              (let* ((fdig (if d (if (plusp k) (1+ (- d k)) d) nil))
-                     (fmin (if (minusp k) 1 fdig)))
-                (multiple-value-bind (fstr flen lpoint tpoint)
-                    (sb-impl::flonum-to-string num spaceleft fdig k fmin)
-                  (when (eql fdig 0) (setq tpoint nil))
-                  (when w
-                    (decf spaceleft flen)
-                    (when lpoint
-                      (if (or (> spaceleft 0) tpoint)
-                          (decf spaceleft)
-                          (setq lpoint nil)))
-                    (when tpoint
-                      (if (<= spaceleft 0)
-                          (setq tpoint nil)
-                          (decf spaceleft))))
-                  (cond ((and w (< spaceleft 0) ovf)
-                         ;;significand overflow
-                         (dotimes (i w) (write-char ovf stream)))
-                        (t (when w
-                             (dotimes (i spaceleft) (write-char pad stream)))
-                           (if (float-sign-bit-set-p number)
-                               (write-char #\- stream)
-                               (if atsign (write-char #\+ stream)))
-                           (when lpoint (write-char #\0 stream))
-                           (write-string fstr stream)
-                           (when tpoint (write-char #\0 stream))
-                           (write-char (if marker
-                                           marker
-                                           (format-exponent-marker number))
-                                       stream)
-                           (write-char (if (minusp expt) #\- #\+) stream)
-                           (when e
-                             ;;zero-fill before exponent if necessary
-                             (dotimes (i (- e (length estr)))
-                               (write-char #\0 stream)))
-                           (write-string estr stream))))))))))
+      (let* ((num (abs number))
+             (num-expt (sb-impl::flonum-exponent num))
+             (expt (- num-expt k))
+             (estr (decimal-string (abs expt)))
+             (elen (if e (max (length estr) e) (length estr)))
+             spaceleft)
+        (when w
+          (setf spaceleft (- w 2 elen))
+          (when (or atsign (float-sign-bit-set-p number))
+            (decf spaceleft)))
+        (if (and w ovf e (> elen e))  ;exponent overflow
+            (dotimes (i w) (write-char ovf stream))
+            (let* ((fdig (if d (if (plusp k) (1+ (- d k)) d) nil))
+                   (fmin (if (minusp k) 1 fdig)))
+              (multiple-value-bind (fstr flen lpoint tpoint)
+                  (sb-impl::flonum-to-string num spaceleft fdig k fmin num-expt)
+                (when (eql fdig 0) (setq tpoint nil))
+                (when w
+                  (decf spaceleft flen)
+                  (when lpoint
+                    (if (or (> spaceleft 0) tpoint)
+                        (decf spaceleft)
+                        (setq lpoint nil)))
+                  (when tpoint
+                    (if (<= spaceleft 0)
+                        (setq tpoint nil)
+                        (decf spaceleft))))
+                (cond ((and w (< spaceleft 0) ovf)
+                       ;;significand overflow
+                       (dotimes (i w) (write-char ovf stream)))
+                      (t (when w
+                           (dotimes (i spaceleft) (write-char pad stream)))
+                         (if (float-sign-bit-set-p number)
+                             (write-char #\- stream)
+                             (if atsign (write-char #\+ stream)))
+                         (when lpoint (write-char #\0 stream))
+                         (write-string fstr stream)
+                         (when tpoint (write-char #\0 stream))
+                         (write-char (if marker
+                                         marker
+                                         (format-exponent-marker number))
+                                     stream)
+                         (write-char (if (minusp expt) #\- #\+) stream)
+                         (when e
+                           ;;zero-fill before exponent if necessary
+                           (dotimes (i (- e (length estr)))
+                             (write-char #\0 stream)))
+                         (write-string estr stream)))))))))
 
 (def-format-interpreter #\G (colonp atsignp params)
   (check-modifier "colon" colonp)
@@ -757,15 +759,15 @@
   (if (or (float-infinity-p number)
           (float-nan-p number))
       (prin1 number stream)
-      (multiple-value-bind (ignore n) (sb-impl::scale-exponent (abs number))
-        (declare (ignore ignore))
+      (let* ((abs (abs number))
+             (n (sb-impl::flonum-exponent abs)))
         ;; KLUDGE: Default d if omitted. The procedure is taken directly from
         ;; the definition given in the manual, and is not very efficient, since
         ;; we generate the digits twice. Future maintainers are encouraged to
         ;; improve on this. -- rtoy?? 1998??
         (unless d
           (multiple-value-bind (str len)
-              (sb-impl::flonum-to-string (abs number))
+              (sb-impl::flonum-to-string abs)
             (declare (ignore str))
             (let ((q (if (= len 1) 1 (1- len))))
               (setq d (max q (min n 7))))))
@@ -1229,6 +1231,19 @@
                                         (if atsignp orig-args arg)
                                         arg))))))
   (if atsignp nil args))
+
+(defun princ-multiple-to-string (&rest args)
+  (%with-output-to-string (str)
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (do-rest-arg ((arg) args)
+        (typecase arg
+          (string
+           (write-string arg str))
+          (character
+           (write-char arg str))
+          (t
+           (output-object arg str)))))))
 
 ;;;; format interpreter and support functions for user-defined method
 
@@ -1246,14 +1261,9 @@
 
 (!defun-from-collected-cold-init-forms !format-directives-init)
 
-(defvar sb-int::**tokenize-control-string-cache-vector**-stats) ; might not be DEFVARed
 (defun sb-impl::!format-cold-init ()
   (!late-format-init)
-  (!format-directives-init)
-  ;; cold-init requires these assignments if hash-cache profiling is enabled
-  (setq **tokenize-control-string-cache-vector** (make-array 128 :initial-element 0))
-  (setq sb-int::**tokenize-control-string-cache-vector**-stats
-        (make-array 3 :initial-element 0 :element-type 'fixnum)))
+  (!format-directives-init))
 
 (push '("SB-FORMAT"
         def-format-directive def-complex-format-directive

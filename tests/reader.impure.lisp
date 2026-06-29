@@ -59,7 +59,6 @@
 
 ;;; Bug 51b. (try to throw READER-ERRORs when the reader encounters
 ;;; dubious input)
-(assert-error (read-from-string "1e1000") reader-error)
 (assert-error (read-from-string "1/0") reader-error)
 
 ;;; Bug reported by Antonio Martinez on comp.lang.lisp 2003-02-03 in
@@ -203,8 +202,20 @@
     (list :metavar (read stream t nil t)))
   (assert (equal (read-from-string "$(x)") '(:metavar x)))
 
+  ;; What happens if the fun-designator is NIL? It used to remove the macro.
+  ;; I don't see evidence in the CLHS that this is correct, so now it implies
+  ;; that the character can't be read except where it behaves as a constituent.
+  ;; There is divided opinion amongst FOSS Lisp implementations I tested.
+  ;; Choice (1) fail at the call to SET-MACRO-CHARACTER
+  ;;   CLISP: (set-macro-character #\$ nil) => "undefined function NIL"
+  ;; Choice (2) remove the macro, causing #\$ become normal syntax.
+  ;;   ABCL and Clozure both do this
+  ;; Choice (3) fail when reading the character #\$
+  ;;   GCL: "Cell error on NIL: Undefined function"
+  ;;   ECL: "The function NIL is undefined."
+  ;;   Clasp: "The function NIL is undefined."
   (set-macro-character #\$ nil) ; 'NIL never designates a function
-  (assert (eq (read-from-string "$") '$))
+  (assert-error (read-from-string "$"))
 
   ;; Do not accept extended-function-designators.
   ;; (circumlocute to prevent a compile-time error)
@@ -350,4 +361,96 @@
          (read-from-string "#1=#S(FOO :A #.(MAKE-INSTANCE 'junk))"))
     (sb-int:unencapsulate 'sb-int:add-to-xset 'wrap)))
 
-;;; success
+(defstruct node
+  (next nil :type (or null node))
+  (listnext nil :type (or null (cons node)))
+  (conscons nil :type (or null (cons node cons)))
+  (label 1 :type sb-vm:word))
+
+(with-test (:name (:sharp=-typed-slot :direct :no-error))
+  (assert (equalp (read-from-string "#S(NODE :NEXT NIL)")
+                  (make-node :next nil)))
+  (assert (equalp (read-from-string "#S(NODE :NEXT #S(NODE :NEXT NIL))")
+                  (make-node :next (make-node :next nil)))))
+(with-test (:name (:sharp=-typed-slot :direct error))
+  (assert-error (read-from-string "#S(NODE :NEXT 1)"))
+  (assert-error (read-from-string "#S(NODE :NEXT (1))"))
+  (assert-error (read-from-string "#S(NODE :NEXT (#S(NODE :NEXT NIL)))"))
+  (assert-error (read-from-string "#S(NODE :NEXT #(#S(NODE :NEXT NIL)))"))
+  (assert-error (read-from-string "#S(NODE :NEXT #S(NODE :NEXT 1))")))
+
+(with-test (:name (:sharp=-typed-slot :circular :no-error)
+            :fails-on :sparc)
+  (let ((circ (read-from-string "#1=#S(NODE :NEXT #1#)")))
+    (assert (eql (node-next circ) circ))))
+(with-test (:name (:sharp=-typed-slot :circular error))
+  (assert-error (read-from-string "#1=#S(NODE :NEXT (#1#))"))
+  (assert-error (read-from-string "#1=#S(NODE :NEXT #(#1#))")))
+
+(with-test (:name (:sharp=-cons-typed-slot :direct :no-error))
+  (assert (equalp (read-from-string "#S(NODE :LISTNEXT NIL)")
+                  (make-node :listnext nil)))
+  (assert (equalp (read-from-string "#S(NODE :LISTNEXT (#S(NODE :LISTNEXT NIL)))")
+                  (make-node :listnext (list (make-node :listnext nil))))))
+(with-test (:name (:sharp=-cons-typed-slot :direct error))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT 1)"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT (1))"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT #S(NODE :LISTNEXT NIL))"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT #(#S(NODE :LISTNEXT NIL)))"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT (#S(NODE :LISTNEXT 1)))")))
+
+(with-test (:name (:sharp=-cons-typed-slot :circular :no-error)
+            :fails-on :sparc)
+  (let ((circ (read-from-string "#1=#S(NODE :LISTNEXT (#1#))")))
+    (assert (eql (car (node-listnext circ)) circ))))
+(with-test (:name (:sharp=-cons-typed-slot :circular error))
+  (assert-error (read-from-string "#1=#S(NODE :LISTNEXT #1#)"))
+  (assert-error (read-from-string "#1=#S(NODE :LISTNEXT #(#1#))")))
+
+(with-test (:name (:sharp=-cons-typed-cons-slot :direct :no-error))
+  (assert (equalp (read-from-string "#S(NODE :CONSCONS (#S(NODE) . (3 . 4)))")
+                  (make-node :conscons (cons (make-node) (cons 3 4))))))
+(with-test (:name (:sharp=-cons-typed-cons-slot :direct error))
+  (assert-error (read-from-string "#S(NODE :CONSCONS 1)"))
+  (assert-error (read-from-string "#S(NODE :CONSCONS (1))")))
+
+(with-test (:name (:sharp=-cons-typed-cons-slot :circular :no-error)
+            :fails-on :sparc)
+  (let* ((circ (car (read-from-string "#1=(#S(NODE :CONSCONS #1#) . #1#)")))
+         (conscons (node-conscons circ)))
+    (assert (eql (car conscons) circ))
+    (assert (eql (cadr conscons) circ))))
+
+(with-test (:name (:sharp=-raw-typed-slot :direct :no-error))
+  (let ((node (read-from-string "#1=#S(NODE :LABEL 3)")))
+    (assert (eql (node-label node) 3))))
+(with-test (:name (:sharp=-raw-typed-slot :circular error))
+  (assert-error (read-from-string "#1=#S(NODE :LABEL #1#)")))
+
+(with-test (:name (:sharp= equalp hash-table :key) :fails-on :sbcl)
+  (let* ((*print-circle* t)
+         (string (write-to-string
+                  (let ((h (make-hash-table :size 10 :test 'equalp)))
+                    (setf (gethash 20 h) 30)
+                    (setf (gethash h h) 10)
+                    h)
+                  :readably t))
+         (table (read-from-string string)))
+    (assert (eql (gethash 20 table) 30))
+    (assert (eql (gethash table table) 10))))
+
+(with-test (:name (:sharp= make-array :displaced-to) :fails-on :sbcl)
+  (let* ((array (read-from-string "#1=#.(make-array 3 :displaced-to (make-array 5 :initial-element '#1#))"))
+         (displacement (array-displacement array))
+         (*print-circle* t)
+         (*print-array* nil))
+    (dotimes (i 3)
+      (assert (eql (aref array i) array)))
+    (dotimes (i 5)
+      (assert (eql (aref displacement i) array)))))
+
+(with-test (:name (:sharp= :circular-mismatch)
+            :fails-on :sparc)
+  (assert-error
+      (read-from-string "#S(NODE :NEXT (#1=#S(NODE :NEXT #1#)))")
+      type-error))

@@ -58,10 +58,11 @@
       (symbol
        (symbol-value form))
       (list
-       (multiple-value-bind (specialp value)
+       (multiple-value-bind (specialp values)
            (constant-special-form-value form environment envp)
-         (if specialp value (constant-function-call-value
-                             form environment envp))))
+         (if specialp
+             (values-list values)
+             (constant-function-call-value form environment envp))))
       (t
        form))))
 
@@ -78,7 +79,14 @@
                (and info (ir1-attributep (fun-info-attributes info)
                                          foldable)))
              (and (every (lambda (arg)
-                           (%constantp arg environment envp))
+                           ;; filter-lvar inserts dummy constants,
+                           ;; while the forms are clearly not
+                           ;; constant. Most functions fail on them.
+                           ;; But there's a problem with error
+                           ;; signaling during cold init.
+                           ;; And some functions might not signal errors at all.
+                           (unless (constant-p arg)
+                             (%constantp arg environment envp)))
                          (cdr form))))
         ;; Even though the function may be marked as foldable
         ;; the call may still signal an error -- eg: (CAR 1).
@@ -250,7 +258,7 @@
        `(flet ((constantp* (x) (%constantp x environment envp))
                (constant-form-value* (x) (%constant-form-value x environment envp)))
           (declare (optimize speed) (ignorable #'constantp*)
-                   (ftype (sfunction (t) t) constantp* constant-form-value*))
+                   (ftype (sfunction (t) t) constantp*))
           (let ((args (cdr (truly-the list form))))
             (case (car form)
               ,@(map 'list
@@ -271,8 +279,9 @@
   (defun constant-special-form-value (form environment envp)
     (let ((result))
       (tagbody
-         (setq result (expand-cases 2 (return-from constant-special-form-value
-                                        (values nil nil))))
+         (setq result (multiple-value-list
+                       (expand-cases 2 (return-from constant-special-form-value
+                                         (values nil nil)))))
          (return-from constant-special-form-value (values t result))
        fail))
     ;; Mutatation of FORM could cause failure. It's user error, not a bug.

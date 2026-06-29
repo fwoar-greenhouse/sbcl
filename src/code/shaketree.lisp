@@ -16,7 +16,7 @@
                        (push x result) ; keep a strong reference to this symbol
                        (push (cons (string x) (make-weak-pointer x)) result))))
                (fill cells 0)
-               (resize-symbol-table table 0 t)
+               (resize-symbol-table table 0 'intern)
                result)))
       (dolist (package (list-all-packages))
         ;; Never discard standard symbols
@@ -25,7 +25,22 @@
                        (weaken (package-external-symbols package) :external)
                        package)
                 list))))
-    (gc :gen 7)
+
+    (flet ((visit-ctors (xform)
+             (maphash (lambda (classoid layout)
+                        (declare (ignore classoid))
+                        (binding* ((dd (layout-info layout) :exit-if-null))
+                          (setf (dd-constructors dd) (mapcan xform (dd-constructors dd)))))
+                      (classoid-subclasses (find-classoid t)))))
+      ;; Weaken references from a defstruct-descriptions to its constructors.
+      ;; No global def needed if every call site was inlined
+      (visit-ctors (lambda (x) `((,(make-weak-pointer (car x)) ,(string (car x)) . ,(cdr x)))))
+      (gc :gen 7)
+      ;; Unweaken dd constructor references ASAP because the compiler is in a fragile state.
+      ;; If FUN-NAME-INLINE-EXPANSION were to be called, it might fail an AVER.
+      (visit-ctors (lambda (x &aux (wpv (weak-pointer-value (car x))))
+                     (if wpv `((,wpv . ,(cddr x)))))))
+
     (when query
       (sb-ext:search-roots query :criterion :static))
     (let ((n-dropped 0))
@@ -33,10 +48,10 @@
                (declare (ignore package))
                (dolist (item symbols)
                  (if (symbolp item)
-                     (add-symbol table item)
+                     (add-symbol table item 'intern)
                      (let ((symbol (weak-pointer-value (cdr item))))
                        (cond (symbol
-                              (add-symbol table symbol))
+                              (add-symbol table symbol 'intern))
                              (t
                               (when print
                                 (format t "  (~a)~A~%" access (car item)))

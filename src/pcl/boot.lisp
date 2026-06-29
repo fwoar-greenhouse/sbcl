@@ -72,7 +72,7 @@ bootstrapping.
                     ensure-generic-function-using-class
                     add-method remove-method))
 
-(defvar *!early-functions*
+(define-load-time-global *!early-functions*
   '((make-a-method !early-make-a-method real-make-a-method)
     (add-named-method !early-add-named-method real-add-named-method)))
 
@@ -101,7 +101,7 @@ bootstrapping.
 ;;;   (LAMBDA-LIST SPECIALIZERS QUALIFIERS METHOD-BODY-FUNCTION-NAME)
 ;;;
 ;;;,where SPECIALIZERS is a list of class names.
-(defvar *!generic-function-fixups*
+(define-load-time-global *!generic-function-fixups*
   '((add-method
      standard
      ((generic-function method)
@@ -516,11 +516,6 @@ bootstrapping.
             (class-prototype (or (generic-function-method-class gf?)
                                  (find-class 'standard-method)))))))
 
-;;; These are used to communicate the method name and lambda-list to
-;;; MAKE-METHOD-LAMBDA-INTERNAL.
-(defvar *method-name* nil)
-(defvar *method-lambda-list* nil)
-
 (defun expand-defmethod (name proto-gf proto-method qualifiers lambda-list
                          body env)
   (binding* (;; ENV could be of type SB-INTERPRETER:BASIC-ENV but I
@@ -1272,7 +1267,9 @@ bootstrapping.
                                           rest-arg
                                           &rest lmf-options)
                                          &body body)
-  `(bind-fast-lexical-method-functions (,args ,rest-arg ,next-method-call ,lmf-options)
+  `(bind-fast-lexical-method-functions (,args ,rest-arg ,next-method-call
+                                        (,@lmf-options
+                                         :no-optionals ,(= (length args) (length lambda-list))))
      (bind-args (,(nthcdr (length args) lambda-list) ,rest-arg)
        ,@body)))
 
@@ -1311,7 +1308,12 @@ bootstrapping.
                                   (or cnm-args ,method-args))))))
                 (next-method-p () (not (null .next-method.))))
            (declare (ignorable #'next-method-p))
-           ,@body))))
+           ;; Compatibility with fast-lexical-method-functions
+           (macrolet ((call-next-method-n (&rest args)
+                        `(call-next-method ,@args))
+                      (call-next-method-0 ()
+                        `(call-next-method)))
+             ,@body)))))
 
 (defun call-no-next-method (method-cell &rest args)
   (let ((method (car method-cell)))
@@ -1377,8 +1379,7 @@ bootstrapping.
                                 ,@required-args+rest-arg))
 
 (defmacro invoke-fast-method-call/more (method-call
-                                        more-context
-                                        more-count
+                                        rest-arg
                                         &rest required-args)
   (macrolet ((generate-call (n)
                ``(funcall (fast-method-call-function ,method-call)
@@ -1386,7 +1387,7 @@ bootstrapping.
                           (fast-method-call-next-method-call ,method-call)
                           ,@required-args
                           ,@(loop for x below ,n
-                                  collect `(sb-c::%more-arg ,more-context ,x)))))
+                                  collect `(fast-&rest-nth ,x ,rest-arg)))))
     ;; The cases with only small amounts of required arguments passed
     ;; are probably very common, and special-casing speeds them up by
     ;; a factor of 2 with very little effect on the other
@@ -1395,7 +1396,7 @@ bootstrapping.
     ;; This is enough hardwired cases to handle the 0, 1, or 2 optional
     ;; arguments to STREAM-WRITE-STRING. If you change anything about this,
     ;; make sure to benchmark it.
-    `(case ,more-count
+    `(case (length ,rest-arg)
        (0 ,(generate-call 0))
        (1 ,(generate-call 1))
        (2 ,(generate-call 2))
@@ -1403,7 +1404,7 @@ bootstrapping.
             (values (fast-method-call-pv ,method-call))
             (values (fast-method-call-next-method-call ,method-call))
             ,@required-args
-            (sb-c:%more-arg-values ,more-context 0 ,more-count))))))
+            (values-list ,rest-arg))))))
 
 (defstruct (fast-instance-boundp (:copier nil))
   (index 0 :type fixnum))
@@ -1598,26 +1599,16 @@ bootstrapping.
      (apply emf args))))
 
 
-(defmacro fast-call-next-method-body ((args next-method-call rest-arg)
-                                      method-cell
-                                      cnm-args)
+(defmacro fast-call-next-method-body ((args next-method-call rest-arg) method-cell)
   `(if ,next-method-call
-       ,(let ((call `(invoke-narrow-effective-method-function
-                      ,next-method-call
-                      ,(not (null rest-arg))
-                      :required-args ,args
-                      :rest-arg ,(when rest-arg (list rest-arg)))))
-             `(if ,cnm-args
-                  (bind-args ((,@args
-                               ,@(when rest-arg
-                                       `(&rest ,rest-arg)))
-                              ,cnm-args)
-                    ,call)
-                  ,call))
-       (call-no-next-method ',method-cell
-                            ,@args
-                            ,@(when rest-arg
-                                    `(,rest-arg)))))
+       (invoke-narrow-effective-method-function
+        ,next-method-call
+        ,(not (null rest-arg))
+        :required-args ,args
+        :rest-arg ,(when rest-arg (list rest-arg)))
+       ,(if rest-arg
+            `(apply #'call-no-next-method ',method-cell ,@args ,rest-arg)
+            `(call-no-next-method ',method-cell ,@args))))
 
 (defmacro bind-fast-lexical-method-functions
     ((args rest-arg next-method-call (&key
@@ -1625,7 +1616,8 @@ bootstrapping.
                                       setq-p
                                       parameters-setqd
                                       method-cell
-                                      applyp))
+                                      applyp
+                                      no-optionals))
      &body body
      &environment env)
   (let* ((next-method-p-def
@@ -1638,20 +1630,35 @@ bootstrapping.
         `(flet ,next-method-p-def
            (declare (ignorable #'next-method-p))
            ,@body)
-        `(flet (,@(when call-next-method-p
-                    `((call-next-method (&rest cnm-args)
-                        (declare (dynamic-extent cnm-args)
-                                 (muffle-conditions code-deletion-note)
-                                 (optimize (sb-c:insert-step-conditions 0)))
-                        ,@(if (safe-code-p env)
-                              `((%check-cnm-args cnm-args (list ,@args)
-                                                 ',method-cell))
-                              nil)
-                        (fast-call-next-method-body (,args
-                                                     ,next-method-call
-                                                     ,rest-arg)
-                            ,method-cell
-                            cnm-args))))
+        `(labels (,@(when call-next-method-p
+                      (let ((cnm-req-args (make-gensym-list (length args))))
+                       `((call-next-method (&rest cnm-args)
+                           (declare (dynamic-extent cnm-args)
+                                    (muffle-conditions code-deletion-note)
+                                    (optimize (sb-c:insert-step-conditions 0)))
+                           (if cnm-args
+                               (apply #'call-next-method-n cnm-args)
+                               (call-next-method-0)))
+                         (call-next-method-0 ()
+                           (declare (muffle-conditions code-deletion-note)
+                                    (optimize (sb-c:insert-step-conditions 0)))
+                           (fast-call-next-method-body (,args
+                                                        ,next-method-call
+                                                        ,rest-arg)
+                                                       ,method-cell))
+                         (call-next-method-n (,@cnm-req-args ,@(unless no-optionals
+                                                                 `(&rest cnm-args)))
+                            (declare ,@(unless no-optionals
+                                         `((dynamic-extent cnm-args)))
+                                     (muffle-conditions code-deletion-note)
+                                     (optimize (sb-c:insert-step-conditions 0)))
+                            ,@(when (safe-code-p env)
+                                `((%check-cnm-args (list ,@cnm-req-args) (list ,@args) ',method-cell)))
+                            (fast-call-next-method-body (,cnm-req-args
+                                                         ,next-method-call
+                                                         ,(unless no-optionals
+                                                            'cnm-args))
+                                                        ,method-cell)))))
                 ,@next-method-p-def)
            (declare (ignorable #'next-method-p))
            (let ,rebindings
@@ -1776,7 +1783,9 @@ bootstrapping.
                     ;; hierarchy: nil -> :simple -> T.
                     (unless (eq call-next-method-p t)
                       (setq call-next-method-p (if (cdr form) t :simple)))
-                    form)
+                (if (cdr form)
+                    `(call-next-method-n ,@(cdr form))
+                    `(call-next-method-0)))
                (function
                 (when (equal (cdr form) '(call-next-method))
                   (setq call-next-method-p t))
@@ -1793,13 +1802,7 @@ bootstrapping.
                (t form))))
       (let* ((sb-walker::*walk-form-preserve-source* t)
              (walked-lambda (walk-form method-lambda env #'walk-function)))
-        ;;; FIXME: the walker's rewriting of the source code causes
-        ;;; trouble when doing code coverage. The rewrites should be
-        ;;; removed, and the same operations done using
-        ;;; compiler-macros or tranforms.
-        (values (if (sb-c:policy env (= sb-c:store-coverage-data 0))
-                    walked-lambda
-                    method-lambda)
+        (values walked-lambda
                 call-next-method-p
                 (not (null parameters-setqd))
                 parameters-setqd)))))
@@ -1902,12 +1905,9 @@ bootstrapping.
       (when (and mff (consp name) (eq (car name) 'slow-method))
         (let ((fast-name `(fast-method ,@(cdr name))))
           (set-fun-name mff fast-name))))
-    (when plist
-      (let ((plist plist))
-        (let ((snl (getf plist :slot-name-lists)))
-          (when snl
-            (setf (method-plist-value method :pv-table)
-                  (intern-pv-table :slot-name-lists snl))))))))
+    (binding* ((snl (getf plist :slot-name-lists) :exit-if-null))
+      (setf (method-plist-value method :pv-table)
+            (intern-pv-table :slot-name-lists snl)))))
 
 (defun analyze-lambda-list (lambda-list)
   (multiple-value-bind (llks required optional rest keywords)
@@ -1958,7 +1958,7 @@ bootstrapping.
 
 ;;;; early generic function support
 
-(defvar *!early-generic-functions* ())
+(define-load-time-global *!early-generic-functions* ())
 
 ;; CLHS doesn't specify &allow-other-keys here but I guess the supposition
 ;; is that they'll be checked by ENSURE-GENERIC-FUNCTION-USING-CLASS.
@@ -1974,8 +1974,9 @@ bootstrapping.
            (fmakunbound fun-name)
            (apply #'ensure-generic-function fun-name all-keys))
           (t
-           (apply #'ensure-generic-function-using-class
-                  existing fun-name all-keys)))))
+           (sb-vm::without-arena
+             (apply #'ensure-generic-function-using-class
+                    existing fun-name all-keys))))))
 
 (defun generic-clobbers-function (fun-name)
   (cerror "Replace the function binding"
@@ -2034,9 +2035,9 @@ bootstrapping.
   arg-info-metatypes
   arg-info-number-optional
   arg-info-key/rest-p
-  arg-info-keys   ;nil        no &KEY or &REST allowed
-                  ;(k1 k2 ..) Each method must accept these &KEY arguments.
-                  ;T          must have &KEY or &REST
+  arg-info-keys   ;nil                   no &KEY or &REST allowed
+                  ;(k1 k2 ..)            Each method must accept these &KEY arguments.
+                  ;T/:allow-other-keys   must have &KEY or &REST
 
   gf-info-simple-accessor-type ; nil, reader, writer, boundp, makunbound
   (gf-precompute-dfun-and-emf-p nil) ; set by set-arg-info
@@ -2121,7 +2122,7 @@ bootstrapping.
         (setf (arg-info-key/rest-p arg-info) (ll-keyp-or-restp llks))
         (setf (arg-info-keys arg-info)
               (if lambda-list-p
-                  (if (ll-kwds-allowp llks) t keywords)
+                  (if (ll-kwds-allowp llks) :allow-other-keys keywords)
                   (arg-info-key/rest-p arg-info)))))
     (when new-method
       (check-method-arg-info gf arg-info new-method))
@@ -2812,8 +2813,9 @@ bootstrapping.
                                   (apply #'real-make-a-method args)))
                               (early-gf-methods gf))))
         (setf (generic-function-method-class gf) *the-class-standard-method*)
-        (setf (generic-function-method-combination gf)
-              *standard-method-combination*)
+        (let ((mc *standard-method-combination*))
+          (setf (generic-function-method-combination gf) mc)
+          (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
         (set-methods gf methods)))
 
     (dolist (fn *!early-functions*)
@@ -2852,12 +2854,12 @@ bootstrapping.
                           'standard-method
                           qualifiers lambda-list specializers initargs nil
                           'source (translate-source-location fun))))))
-            (setf (generic-function-method-class gf)
-                  *the-class-standard-method*
-                  (generic-function-method-combination gf)
-                  (ecase method-combination
-                    (standard *standard-method-combination*)
-                    (or *or-method-combination*)))
+            (let ((mc (ecase method-combination
+                        (standard *standard-method-combination*)
+                        (or *or-method-combination*))))
+              (setf (generic-function-method-class gf) *the-class-standard-method*
+                    (generic-function-method-combination gf) mc)
+              (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
             (set-methods gf (mapcar #'make-method methods)))))
 
   (/show "leaving !FIX-EARLY-GENERIC-FUNCTIONS"))

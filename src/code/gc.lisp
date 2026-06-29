@@ -65,12 +65,12 @@ and submit it as a patch."
   (+ (dynamic-usage)
      *n-bytes-freed-or-purified*))
 
+(declaim (ftype (sfunction (t) sb-vm:word) primitive-object-size))
 (defun primitive-object-size (object)
   "Return number of bytes of heap or stack directly consumed by OBJECT"
   (cond ((not (sb-vm:is-lisp-pointer (get-lisp-obj-address object))) 0)
         ((eq object nil) (ash sb-vm::sizeof-nil-in-words sb-vm:word-shift))
         ((simple-fun-p object) (code-object-size (fun-code-header object)))
-        #-(or x86 x86-64 arm64 riscv) ((lra-p object) 1)
         (t
          (with-alien ((sizer (function unsigned unsigned) :extern "primitive_object_size"))
            (with-pinned-objects (object)
@@ -78,6 +78,8 @@ and submit it as a patch."
 
 ;;;; GC hooks
 
+;;; N.B.: hooks need to be sufficiently uncomplicated as to be harmless,
+;;; and should not expect any particular thread context.
 (define-load-time-global *after-gc-hooks* nil
   "Called after each garbage collection, except for garbage collections
 triggered during thread exits. In a multithreaded environment these hooks may
@@ -86,7 +88,7 @@ run in any thread.")
 
 ;;;; internal GC
 
-(define-alien-routine collect-garbage int (last-gen int))
+(define-alien-routine collect-garbage void (last-gen int))
 
 (define-alien-routine gc-stop-the-world void)
 (define-alien-routine gc-start-the-world void)
@@ -129,6 +131,8 @@ run in any thread.")
   #-64-bit 0)
 
 (defun sub-gc (gen)
+  ;; Can't instrument GC-EPOCH cons in a foreign thead with no *CURRENT-THREAD* yet
+  (declare (optimize (sb-c::instrument-consing 0)))
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
          nil)
@@ -222,14 +226,9 @@ run in any thread.")
 
 #+sb-thread
 (defun post-gc ()
-  (sb-impl::finalizer-thread-notify)
+  (sb-impl::finalizer-thread-notify 1) ; Tell it to perform post-GC hooks
   (alien-funcall (extern-alien "empty_thread_recyclebin" (function void)))
-  ;; Post-GC actions are invoked synchronously by the GCing thread,
-  ;; which is an arbitrary one. If those actions aquire any locks, or are sensitive
-  ;; to the state of *ALLOW-WITH-INTERRUPTS*, any deadlocks of what-have-you
-  ;; are user error. Hooks need to be sufficiently uncomplicated as to be harmless.
-  (sb-vm:without-arena "post-gc"
-    (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))
+  nil)
 
 #-sb-thread
 (defun post-gc ()
@@ -283,7 +282,8 @@ run in any thread.")
       (sb-thread::without-thread-waiting-for ()
         (with-interrupts
           (run-pending-finalizers)
-          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))
+          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))
+  nil)
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
@@ -299,7 +299,7 @@ used to specify the oldest generation guaranteed to be collected."
 
 (define-alien-routine scrub-control-stack void)
 
-(defglobal sb-unicode::*name->char-buffers* nil)
+(define-load-time-global sb-unicode::*name->char-buffers* nil)
 (defun unsafe-clear-roots (gen)
   (declare (ignorable gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
@@ -311,14 +311,17 @@ used to specify the oldest generation guaranteed to be collected."
   (scrub-power-cache)
   (setf sb-unicode::*name->char-buffers* nil)
   (setf sb-c::*phash-lambda-cache* nil)
+  (setf sb-impl::*available-ub8-buffers* nil sb-impl::*available-char-buffers* nil)
+  (setf sb-impl::*read-line-buffers* nil)
   ;; Clear caches depending on the generation being collected.
   (cond ((eql 0 gen)
-         ;; Drop strings because the hash is pointer-hash
-         ;; but there is no automatic cache rehashing after GC.
+         ;; Drop strings because the hash is address-based, but there
+         ;; is no automatic cache rehashing after GC.
          (sb-format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
          (sb-format::tokenize-control-string-cache-clear))
         (t
+         (setq sb-di::*uncompacted-fun-maps* nil sb-di::*compiled-debug-funs* nil)
          (drop-all-hash-caches))))
 
 ;;;; auxiliary functions
@@ -340,13 +343,6 @@ Note: currently changes to this value are lost when saving core."
     (when (< val current)
       (decf (extern-alien "auto_gc_trigger" os-vm-size-t) (- current val))))
   (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t) val))
-
-(declaim (inline maybe-handle-pending-gc))
-(defun maybe-handle-pending-gc ()
-  (when (and (not *gc-inhibit*)
-             (or #+sb-thread *stop-for-gc-pending*
-                 *gc-pending*))
-    (sb-unix::receive-pending-interrupt)))
 
 ;;;; GENCGC specifics
 ;;;;
@@ -414,7 +410,7 @@ statistics are appended to it."
                (alien-funcall find-page-index address))))
 
 (defun pages-allocated ()
-  (loop for n below (extern-alien "next_free_page" signed)
+  (loop for n below (extern-alien "next_free_page" page-index-t)
         count (not (zerop (slot (deref sb-vm:page-table n) 'sb-vm::flags)))))
 
 #-mark-region-gc
@@ -429,8 +425,7 @@ statistics are appended to it."
              (when (simple-fun-p object)
                (setq addr (get-lisp-obj-address (fun-code-header object))))
              (let ((sap (int-sap (logandc2 addr sb-vm:lowtag-mask))))
-               (logand (if (fdefn-p object) (sap-ref-8 sap 1) (sap-ref-8 sap 3))
-                       #xF)))))))
+               (logand (sap-ref-8 sap 3) #xF)))))))
 
 #+mark-region-gc
 (defun generation-of (object)
@@ -532,14 +527,20 @@ Experimental: interface subject to change."
                     ((< sb-vm:read-only-space-start addr
                         (sap-int sb-vm:*read-only-space-free-pointer*))
                      :read-only)
+                    #+permgen
+                    ((< sb-vm:permgen-space-start addr
+                        (sap-int sb-vm:*permgen-space-free-pointer*))
+                     :permgen)
                     ;; Without immobile-space, the text range is
                     ;; more-or-less an extension of static space.
                     #-immobile-space
                     ((< sb-vm:text-space-start addr
                         (sap-int sb-vm:*text-space-free-pointer*))
                      :static)
-                    ((< sb-vm:static-space-start addr
-                        (sap-int sb-vm:*static-space-free-pointer*))
+                    ((or #+x86-64 (< (extern-alien "static_space_trailer_start" unsigned)
+                                     addr sb-vm::static-space-end)
+                         (< sb-vm:static-space-start addr
+                            (sap-int sb-vm:*static-space-free-pointer*)))
                      :static))))
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)
@@ -551,10 +552,6 @@ Experimental: interface subject to change."
     (let ((addr (get-lisp-obj-address x)))
       (and (sb-vm:is-lisp-pointer addr)
            (cases)))))
-
-;;; Internal use only. FIXME: I think this duplicates code that exists
-;;; somewhere else which I could not find.
-(defun lisp-space-p (sap &aux (addr (sap-int sap))) (cases))
 ) ; end MACROLET
 
 (define-condition memory-fault-error (system-condition error) ()

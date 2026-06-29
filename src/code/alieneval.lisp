@@ -12,7 +12,7 @@
 
 (in-package "SB-ALIEN")
 
-#-sb-xc-host (sb-impl::define-thread-local *saved-fp* nil)
+#-sb-xc-host (sb-impl:define-thread-local *saved-fp* nil)
 
 (defvar *default-c-string-external-format* nil)
 
@@ -181,7 +181,7 @@
                                      (ldb (byte type-hash-nbits 0) (symbol-name-hash name)))))
                   (,allocator hash ,@allocator-args)))))))))
 
-(defmacro define-alien-type-method ((class method) lambda-list &rest body)
+(defmacro define-alien-type-method ((class method) lambda-list &body body)
   (let ((defun-name (symbolicate class "-" method "-METHOD")))
     `(progn
        (defun ,defun-name ,lambda-list
@@ -520,18 +520,24 @@
   ;; of return values and override the naturalize method to perform
   ;; the sign extension (in compiler/{arch}/c-call.lisp).
   (ecase context
-    ((:normal #-(or x86 x86-64) :result)
+    ((:normal #-(or x86 x86-64 loongarch64 riscv) :result)
      (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
            (alien-integer-type-bits type)))
     #+(or x86 x86-64)
     (:result
      (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
            (max (alien-integer-type-bits type)
-                sb-vm:n-machine-word-bits)))))
+                sb-vm:n-machine-word-bits)))
+    #+(or loongarch64 riscv)
+    (:result
+     (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
+           (if (>= (alien-integer-type-bits type) 32)
+               sb-vm:n-machine-word-bits
+               (alien-integer-type-bits type))))))
 
 ;;; As per the comment in the :ALIEN-REP method above, this is defined
-;;; elsewhere for x86oids.
-#-(or x86 x86-64)
+;;; elsewhere
+#-(or x86 x86-64 riscv loongarch64)
 (define-alien-type-method (integer :naturalize-gen) (type alien)
   (declare (ignore type))
   alien)
@@ -1149,7 +1155,13 @@
               (setf (auxiliary-alien-type kind name env)
                     (!make-alien-record-type :name name :kind kind))))
          (t
-          (!make-alien-record-type :kind kind)))))
+          (ecase kind
+            (:union
+             (load-time-value
+              (!make-alien-record-type :kind :union)))
+            (:struct
+             (load-time-value
+              (!make-alien-record-type :kind :struct))))))))
   (define-alien-type-translator union (name &rest fields &environment env)
     (parse-alien-record-type :union name fields env))
   (define-alien-type-translator struct (name &rest fields &environment env)
@@ -1267,6 +1279,7 @@
   ;; as indicative of "..." in the C prototype. We can record that too.
   (varargs nil :type (or boolean fixnum (eql :unspecified)) :read-only t)
   (stub nil :type (or null function))
+  (into-stub nil :type (or null function)) ; for alien-funcall-into
   (convention nil :type calling-convention :read-only t))
 ;;; The safe default is to assume that everything is varargs.
 ;;; On x86-64 we have to emit a spurious instruction because of it.

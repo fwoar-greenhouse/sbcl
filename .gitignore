@@ -32,7 +32,7 @@ src/runtime/target-arch-os.h
 src/runtime/target-arch.h
 src/runtime/target-lispregs.h
 src/runtime/target-os.h
-src/runtime/ppc-linux-mcontext.h
+src/runtime/embedcore-sbcl
 tests/test-status.lisp-expr
 tests/test.log
 tests/*.so
@@ -46,7 +46,7 @@ tools-for-build/grovel-headers
 tools-for-build/grovel-headers.exe
 tools-for-build/mmap-rwx
 tools-for-build/where-is-mcontext
-tools-for-build/perfecthash
+tools-for-build/perfecthash*
 contrib/asdf/asdf-upstream
 doc/manual/*.html
 version.lisp-expr

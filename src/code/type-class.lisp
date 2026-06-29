@@ -217,12 +217,11 @@
 (declaim (inline address-based-counter-val quasi-random-address-based-hash))
 (defun address-based-counter-val ()
   (let ((word
-         ;; threads imply gencgc. use the per-thread alloc region pointer
-         #+sb-thread
+         ;; Use the per-thread alloc region pointer when possible
+         #+(or x86-64 sb-thread)
          (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-mixed-tlab-slot))
-         ;; dynamic-space-free-pointer increments only when a page is full.
-         ;; Using mixed_region directly is finer-grained.
-         #+(and (not sb-thread) gencgc)
+         ;; Otherwise mixed_region in static space
+         #-(or x86-64 sb-thread)
          (sb-sys:sap-ref-word (sb-sys:int-sap (+ sb-vm::static-space-start
                                                  sb-vm::mixed-region-offset))
                               0)))
@@ -259,14 +258,15 @@
 ;;; You could always make it SB-XC:FIXNUM at the risk of forcing the host to
 ;;; deal in bignums. Why cause it undue slowness when we don't need so many bits?
 ;;; NOTE: we _do_ use the sign bit, leaving us 25 pseudorandom bits, but
-;;; the 2 bits of least significance are NOT pseudorandom, so it's best
+;;; the 3 bits of least significance are NOT pseudorandom, so it's best
 ;;; not to use them directly in the hash index.
 (defconstant ctype-hash-size  30)  ; all significant bits, for the slot type specifier
 (defconstant ctype-PRNG-nbits 25)  ; from pseudorandom number generator
-(defconstant ctype-contains-unknown #b01)
-(defconstant ctype-contains-hairy   #b10) ; any hairy type, including UNKNOWN
-(defconstant +ctype-flag-mask+ #b11)
-(defconstant +ctype-hash-mask+ (logandc2 (1- (ash 1 ctype-PRNG-nbits)) #b11))
+(defconstant ctype-contains-unknown #b001)
+(defconstant ctype-contains-hairy   #b010) ; any hairy type, including UNKNOWN
+(defconstant ctype-contains-class   #b100) ; standard-class
+(defconstant +ctype-flag-mask+ #b111)
+(defconstant +ctype-hash-mask+ (logandc2 (1- (ash 1 ctype-PRNG-nbits)) #b111))
 
 (defstruct (ctype (:conc-name type-)
                    (:constructor nil)
@@ -278,17 +278,23 @@
 
 ;;; Apparently the old CONTAINS-UNKNOWN-TYPE-P function could accept NIL
 ;;; and return NIL. This seems kinda sloppy. Can we get rid of that "feature"?
-(declaim (inline contains-unknown-type-p contains-hairy-type-p))
+(declaim (inline contains-unknown-type-p contains-hairy-type-p opaque-type-p))
 (defun contains-unknown-type-p (ctype)
-  (if ctype (oddp (type-%bits ctype)) nil))
+  (and ctype
+       (logtest (type-%bits ctype) ctype-contains-unknown)))
 (defun contains-hairy-type-p (ctype)
-  (logbitp 1 (type-%bits ctype)))
+  (logtest (type-%bits ctype) ctype-contains-hairy))
+
+;;; Can't do optimizations for satisfies, unknown types or standard-class.
+(defun opaque-type-p (ctype)
+  (logtest (type-%bits ctype) +ctype-flag-mask+))
 
 (defun ok-to-memoize-p (arg)
   (etypecase arg
-    (ctype (evenp (type-%bits arg))) ; i.e. not CTYPE-CONTAINS-UNKNOWN
+    (ctype (not (logtest (type-%bits arg) ctype-contains-unknown)))
     (list  (dolist (elt arg t)
-             (when (oddp (type-%bits elt)) (return nil))))))
+             (when (logtest (type-%bits elt) ctype-contains-unknown)
+               (return nil))))))
 
 (defmacro type-class-id (ctype) `(ldb (byte 5 ,ctype-PRNG-nbits) (type-%bits ,ctype)))
 (defmacro type-id->type-class (id) `(truly-the type-class (aref *type-classes* ,id)))
@@ -332,7 +338,7 @@
       (intersection  intersection-type)
       (union         union-type)
       (negation      negation-type)
-      (number        numeric-type)
+      (numeric-union numeric-union-type)
       (array         array-type)
       (character-set character-set-type)
       (member        member-type)
@@ -651,7 +657,7 @@
 ;;;  2. it inserts (:COPIER NIL)
 ;;;  3. it adds :READ-ONLY T to all slots
 ;;;  4. it has slot options to help with hash-consing
-(defmacro def-type-model ((name &rest options) &rest direct-slots)
+(defmacro def-type-model ((name &rest options) &body direct-slots)
   ;; :CONSTRUCTOR* reminds you that it's not a direct translation to defstruct.
   (aver (<= (count :constructor* options :key #'car) 1))
   ;; The private constructor is always positional.
@@ -781,10 +787,6 @@
 (define-load-time-global *eql-type-cache* ; like EQL-SPECIALIZER-TABLE in PCL
     (sb-impl::make-system-hash-table :test 'eql :weakness :value :synchronized nil))
 
-(defmacro safe-member-type-elt-p (obj)
-  `(or (not (sb-vm:is-lisp-pointer (get-lisp-obj-address ,obj)))
-       (heap-allocated-p ,obj)))
-
 #-sb-xc-host
 (defun ctype-hashset-insert-if-absent (hashset key function)
   (or (hashset-find hashset key)
@@ -870,19 +872,11 @@
   ;;  :single-warning-for-single-undefined-type
   (specifier nil :type t :test equal :hasher sb-c::fallback-hash))
 
-(macrolet ((hash-fp-zeros (x) ; order-insensitive
-             `(let ((h 0))
-                (dolist (x ,x h) (setq h (logxor (sb-xc:sxhash x) h)))))
-           (fp-zeros= (a b)
-             `(let ((a ,a) (b ,b))
-                (and (= (length a) (length b))
-                     (every (lambda (x) (member x b)) a)))))
 ;;; A MEMBER-TYPE represent a use of the MEMBER type specifier. We
 ;;; bother with this at this level because MEMBER types are fairly
 ;;; important and union and intersection are well defined.
-(def-type-model (member-type (:constructor* nil (xset fp-zeroes)))
-  (xset nil :type xset :hasher xset-elts-hash :test xset=)
-  (fp-zeroes nil :type list :hasher hash-fp-zeros :test fp-zeros=)))
+(def-type-model (member-type (:constructor* nil (xset)))
+  (xset nil :type xset :hasher xset-elts-hash :test xset=))
 (define-load-time-global *xset-mutex* (or #-sb-xc-host (sb-thread:make-mutex :name "xset")))
 ;;; This hashset is guarded by *XSET-MUTEX*. It is _not_ declared as synchronized
 ;;; so that HASHSET-INSERT-IF-ABSENT should not acquire a mutex inside a mutex
@@ -1066,9 +1060,9 @@
              (setf (aref *numeric-aspects-v* index)
                    (!make-numeric-aspects complexp class precision index)))))
 
-(defmacro get-numtype-aspects (&rest rest)
+(defmacro get-numtype-aspects (complexp class precision)
   `(the (not null)
-        (aref *numeric-aspects-v* (!compute-numtype-aspect-id ,@rest))))
+        (aref *numeric-aspects-v* (!compute-numtype-aspect-id ,complexp ,class ,precision))))
 
 (macrolet ((numbound-hash (b)
              ;; It doesn't matter what the hash of a number is, as long as it's stable.
@@ -1087,21 +1081,64 @@
              `(let ((a ,a) (b ,b))
                 (if (listp a)
                     (and (listp b) (eql (car a) (car b)))
-                    (eql a b)))))
-;;; A NUMERIC-TYPE represents any numeric type, including things
-;;; such as FIXNUM.
-(def-type-model (numeric-type
-                 (:extra-mix-step)
-                 (:constructor* nil (aspects low high)))
-  (aspects (missing-arg) :type numtype-aspects :hasher numtype-aspects-id :test eq)
-  (low nil :type (or real (cons real null) null)
-       :hasher numbound-hash :test numbound-eql)
-  (high nil :type (or real (cons real null) null)
-        :hasher numbound-hash :test numbound-eql)))
+                    (eql a b))))
+           (hash-ranges (a)
+             `(let ((vector ,a)
+                    (h 0))
+                (loop for e across vector
+                      do
+                      (setf h (mix h (numbound-hash e))))
+                h)))
+
+  (def-type-model (numeric-union-type
+                   (:extra-mix-step)
+                   (:constructor* nil (aspects ranges)))
+    (aspects (missing-arg) :type numtype-aspects :hasher numtype-aspects-id :test eq)
+    ;; Ranges are sorted in ascending order by their low bound.
+    ;; Rational ranges are represented by three entries,
+    ;; #(run low high ...) where run is one of range-integer-run,
+    ;; range-ratio-run, range-rational-run.
+    ;; Floats are just #(low high ...)
+    (ranges #() :type simple-vector :hasher hash-ranges :test equalp)))
+
+(declaim (inline numeric-type-aspects))
+(defun numeric-type-aspects (x)
+  (numeric-union-type-aspects x))
+
 (declaim (inline numeric-type-complexp numeric-type-class numeric-type-format))
 (defun numeric-type-complexp (x) (numtype-aspects-complexp (numeric-type-aspects x)))
 (defun numeric-type-class (x) (numtype-aspects-class (numeric-type-aspects x)))
 (defun numeric-type-format (x) (numtype-aspects-precision (numeric-type-aspects x)))
+
+;;; A single-range type. Similar to the old model.
+(deftype numeric-type () `(satisfies numeric-type-p))
+
+(defun numeric-type-p (x)
+  (typecase x
+    (numeric-union-type
+     (<= (length (numeric-union-type-ranges x)) 3))))
+
+(defun numeric-type-low (x)
+  (let ((ranges (numeric-union-type-ranges x)))
+    (ecase (length ranges)
+      (3 (aref ranges 1))
+      (2 (aref ranges 0)))))
+
+(defun numeric-type-high (x)
+  (let ((ranges (numeric-union-type-ranges x)))
+    (ecase (length ranges)
+      (3 (aref ranges 2))
+      (2 (aref ranges 1)))))
+
+(defun numeric-union-type-low (x)
+  (let ((ranges (numeric-union-type-ranges x)))
+    (case (numeric-type-class x)
+      ((integer rational) (aref ranges 1))
+      (t (aref ranges 0)))))
+
+(defun numeric-union-type-high (x)
+  (let ((ranges (numeric-union-type-ranges x)))
+    (aref ranges (1- (length ranges)))))
 
 ;;; A CONS-TYPE is used to represent a CONS type.
 (def-type-model (cons-type (:constructor* nil (car-type cdr-type)))
@@ -1157,7 +1194,7 @@
     ;; Don't need the answer to be positive for key-info-set-hashset,
     ;; but do need it to be positive when hashing ARGS-TYPE which uses MIX.
     (dolist (elt set (logand h sb-xc:most-positive-fixnum))
-      (setf h (plus-mod-fixnum (truly-the fixnum (key-info-hash elt)) h)))))
+      (setf h (plus-mod-fixnum (truly-the sb-xc:fixnum (key-info-hash elt)) h)))))
 
 (defun key-info-list-flags (list)
   (let ((bits 0))

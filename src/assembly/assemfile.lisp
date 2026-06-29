@@ -34,9 +34,11 @@
          (sb-vm::*adjustable-vectors* nil))
     (declare (special sb-vm::*adjustable-vectors*))
     (unwind-protect
-        (let ((sb-xc:*features* (cons :sb-assembling sb-xc:*features*))
-              (*readtable* sb-cold:*xc-readtable*))
-          (load (merge-pathnames name (make-pathname :type "lisp")))
+        (progn
+          (let ((sb-xc:*features* (cons :sb-assembling sb-xc:*features*))
+                (*compilation* (make-compilation))
+                (*readtable* sb-cold:*xc-readtable*))
+            (load (merge-pathnames name (make-pathname :type "lisp"))))
           (resolve-ep-labels (asmstream-code-section asmstream))
           ;; Reserve space for the jump table. The first word of the table
           ;; indicates the total length in words, counting the length word itself
@@ -65,19 +67,17 @@
           ;; alignment is ensured by SIMPLE-FUN-HEADER-WORD.
           (emit (asmstream-data-section asmstream)
                 `(.align ,sb-vm:n-lowtag-bits))
-          (let ((segment (assemble-sections
-                          asmstream nil
-                          (make-segment :run-scheduler nil))))
+          (let ((assembly (assemble-sections asmstream nil (make-segment nil))))
             (unless (= (length (remove-duplicates (mapcar 'car *entry-points*)))
                        (length *entry-points*))
               (error "Duplicate asm routine: ~S"
                      (loop for (this . rest) on *entry-points*
                            when (assoc (car this) rest)
                            collect (car this))))
-            (dump-assembler-routines segment
-                                     (segment-buffer segment)
-                                     (sb-assem::segment-fixup-notes segment)
-                                     (sb-assem::get-allocation-points asmstream)
+            (dump-assembler-routines (asm-segment assembly)
+                                     (segment-buffer (asm-segment assembly))
+                                     (asm-fixup-notes assembly)
+                                     (asm-alloc-sites assembly)
                                      *entry-points*
                                      lap-fasl-output))
           (setq won t))
@@ -137,18 +137,33 @@
     ;; changed to labels. For now, restrict to control transfers.
     (binding* ((patch
                 (when (member (stmt-mnemonic statement)
-                              '("B" "BEQ" "JMP" "CALL") ; KLUDGE
+                              '("B" "BEQ" "JMP" "CALL" "CBZ" "CBNZ" "TBZ" "TBNZ") ; KLUDGE
                               :test 'string=)
                   (member-if (lambda (x)
                                (and (typep x 'fixup)
-                                    (eq (fixup-flavor x) :assembly-routine)
-                                    (eql (fixup-offset x) 0)))
+                                    (eq (fixup-flavor x) :assembly-routine)))
                              (stmt-operands statement)))
                 :exit-if-null)
-               (ep (assoc (fixup-name (car patch)) *entry-points*)))
+               (fixup (car patch))
+               (ep (assoc (fixup-name fixup) *entry-points*)))
       ;; oy. what is (third ep) ? An offset?
       (aver (and ep (= (third ep) 0)))
-      (rplaca patch (second ep)))))
+      (let ((label (second ep)))
+        ;; Make a new label for fixup-offset
+        (unless (eql (fixup-offset fixup) 0)
+          (let* ((target (do ((stmt (stmt-next (section-start section)) (stmt-next stmt)))
+                             ((null stmt)
+                              (error "Label for ~a not found" ep))
+                           (when (eq label (stmt-labels stmt))
+                             (return stmt))))
+                 (new-target
+                   (loop for i from 1
+                         for stmt = (stmt-next target) then (stmt-next stmt)
+                         when (= (fixup-offset fixup) i)
+                         return stmt)))
+            (setf label (gen-label))
+            (add-stmt-labels new-target (list label))))
+        (rplaca patch label)))))
 
 (defun expand-align-option (align)
   (when align
@@ -162,10 +177,7 @@
           (return)))
     `(let ,(mapcar (lambda (reg)
                      `(,(reg-spec-name reg)
-                       (make-random-tn
-                        :kind :normal
-                        :sc (sc-or-lose ',(reg-spec-sc reg))
-                        :offset ,(reg-spec-offset reg))))
+                       (make-random-tn (sc-or-lose ',(reg-spec-sc reg)) ,(reg-spec-offset reg))))
                    regs)
        ,@(decls)
        (assemble (:code 'nil)

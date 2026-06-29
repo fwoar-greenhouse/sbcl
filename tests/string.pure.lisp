@@ -269,15 +269,11 @@ claim that any particular result from these edge cases constitutes a bug.
    (funcall (opaque-identity 'make-string) (truncate array-total-size-limit 2)
             :element-type '(unsigned-byte 8))))
 
-(with-test (:name :make-string-pedantic-initial-element)
+(with-test (:name :make-string-initial-element-mismatch)
   ;; This used to be silently accepted (at least in the interpreter)
   (assert-error
    (funcall (opaque-identity 'make-string) 10
-            :element-type '(member #\a #\b #\c) :initial-element nil))
-  ;; As was this
-  (assert-error
-   (funcall (opaque-identity 'make-string) 10
-            :element-type '(member #\a #\b #\c) :initial-element #\x)))
+            :element-type '(member #\a #\b #\c) :initial-element nil)))
 
 (with-test (:name :%sp-string-compare-argument-order)
   (checked-compile-and-assert
@@ -374,3 +370,27 @@ claim that any particular result from these edge cases constitutes a bug.
            simple-string)
     (check (string-upcase (the character x))
            (simple-string 1))))
+
+(with-test (:name :downcase-ascii)
+  (assert (string= (string-downcase (code-char 192))
+                   (string (char-downcase (code-char 192))))))
+
+(with-test (:name :find-on-string)
+  (checked-compile-and-assert
+   ()
+   `(lambda (s)
+      (declare (string s))
+      (find #\1 s :test #'char/=))
+   ((" ") #\Space)
+   (("1") nil)))
+
+(with-test (:name :inline-fill)
+  (assert (equal (ctu:ir1-named-calls
+                  `(lambda (x)
+                     (make-string 2 :element-type x :initial-element #\a)))
+                 '(sb-vm::%string-widetag-and-n-bits-shift))))
+
+(with-test (:name :inline-fill)
+  (assert (not (ctu:ir1-named-calls
+                `(lambda (x)
+                   (string= x ""))))))

@@ -14,6 +14,16 @@
 ;;; Written by Rob MacLachlan
 (in-package "SB-C")
 
+;;; Return the lowest common ancestor of BLOCK1 and BLOCK2 in the
+;;; dominator tree.
+(defun lowest-common-dominator (block1 block2)
+  (declare (type cblock block1 block2))
+  (cond ((eq block1 block2) block1)
+        ((< (block-number block1) (block-number block2))
+         (lowest-common-dominator (block-dominator block1) block2))
+        (t
+         (lowest-common-dominator block1 (block-dominator block2)))))
+
 ;;; FIND-DOMINATORS  --  Internal
 ;;;
 ;;; Find the immediate dominator of each block in COMPONENT.  If a
@@ -23,34 +33,25 @@
   (let ((head (loop-head (component-outer-loop component)))
         changed)
     (setf (block-dominator head) head)
-    (unless (dfo-as-needed component)
-      (number-blocks component))
-    (labels ((intersect (block1 block2)
-               (cond ((eq block1 block2) block1)
-                     ((< (block-number block1) (block-number block2))
-                      (intersect (block-dominator block1) block2))
-                     (t
-                      (intersect block1 (block-dominator block2))))))
-      (loop
-       (setq changed nil)
-       (do-blocks (block component :tail)
-         (let ((dom))
-           (dolist (pred (block-pred block))
-             (unless (null (block-dominator pred))
-               (setq dom (if dom
-                             (intersect pred dom)
-                             pred))))
-           (unless (eq (block-dominator block) dom)
-             (setf (block-dominator block) dom)
-             (setq changed t))))
-       (unless changed (return))))
-    (setf (block-dominator head) nil)
-    (setf (component-dominators-computed component) t)))
+    (dfo-as-needed component)
+    (loop
+      (setq changed nil)
+      (do-blocks (block component :tail)
+        (let ((dom))
+          (dolist (pred (block-pred block))
+            (unless (null (block-dominator pred))
+              (setq dom (if dom
+                            (lowest-common-dominator pred dom)
+                            pred))))
+          (unless (eq (block-dominator block) dom)
+            (setf (block-dominator block) dom)
+            (setq changed t))))
+      (unless changed (return)))
+    (setf (block-dominator head) nil)))
 
 (defun clear-dominators (component)
   (do-blocks (block component)
-    (setf (block-dominator block) nil))
-  (setf (component-dominators-computed component) nil))
+    (setf (block-dominator block) nil)))
 
 ;;; DOMINATES-P  --  Internal
 ;;;
@@ -188,8 +189,7 @@
 ;;; loop segment.
 (defun note-loop-head (head component)
   (declare (ignore component))
-  (let ((result (make-loop :head head
-                           :kind :natural))
+  (let ((result (make-loop :natural head))
         (number (block-number head)))
     (dolist (pred (block-pred head))
       (when (<= (block-number pred) number)

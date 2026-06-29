@@ -83,7 +83,7 @@
   (process handle)
   (exit-code uint))
 
-(defun zero-alien (alien type)
+(defmacro zero-alien (alien type)
   `(alien-funcall (extern-alien "memset" (function void system-area-pointer int unsigned))
                   (alien-sap ,alien) 0 (alien-size ,type :bytes)))
 
@@ -141,18 +141,17 @@
   (case event-code
     (0
      (flet ((interrupt-it ()
-              (let* ((context
-                       (sb-di::nth-interrupt-context
-                        (1- sb-kernel:*free-interrupt-context-index*)))
-                     (pc (sb-vm:context-pc context)))
-                (with-interrupts
-                  (let ((int (make-condition
-                              'interactive-interrupt
-                              :context context
-                              :address (sb-sys:sap-int pc))))
-                    ;; First SIGNAL, so that handlers can run.
-                    (signal int)
-                    (%break 'sigint int))))))
+              (with-alien ((context (* os-context-t)
+                                    sb-kernel:*current-internal-error-context*))
+                (let ((pc (sb-vm:context-pc context)))
+                  (with-interrupts
+                    (let ((int (make-condition
+                                'interactive-interrupt
+                                :context context
+                                :address (sb-sys:sap-int pc))))
+                      ;; First SIGNAL, so that handlers can run.
+                      (signal int)
+                      (%break 'sigint int)))))))
        (sb-thread:interrupt-thread (sb-thread::foreground-thread)
                                    #'interrupt-it)
        t))))
@@ -281,7 +280,7 @@ true to stop searching)." *console-control-spec*)
                 (event (create-event nil t nil nil)))
            (setf (io-copier-event copier) event
                  (io-copier-overlapped copier) overlapped
-                 (io-copier-buffer copier) (make-alien char +copier-buffer+)
+                 (io-copier-buffer copier) (make-alien unsigned-char +copier-buffer+)
                  (svref result i) copier)
            (zero-alien overlapped overlapped)
            (setf (slot overlapped 'event) event)))
@@ -366,7 +365,7 @@ true to stop searching)." *console-control-spec*)
                                            (t
                                             (let ((last-error (get-last-error)))
                                               (unless (= last-error error-broken-pipe)
-                                                (pending-or-error "ReadFile" last-error)))))))))
+                                                (pending-or-error "GetOverlappedResult" last-error)))))))))
                         (loop for copier across copiers
                            do (try-read copier))
                         (loop for event = (wait-for-multiple-objects-or-signal (cast events

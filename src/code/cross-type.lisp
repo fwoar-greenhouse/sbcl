@@ -57,7 +57,8 @@
   (or (member symbol
               '(closurep simple-fun-p unbound-marker-p
                 sb-impl::vector-with-fill-pointer-p
-                legal-fun-name-p extended-function-designator-p))
+                legal-fun-name-p extended-function-designator-p
+                numeric-type-p proper-list-p))
       (member symbol sb-vm::*backend-cross-foldable-predicates*)
       (and (eq (sb-xc:symbol-package symbol) *cl-package*)
            (or (eq usage 'sb-xc:typep)
@@ -99,8 +100,8 @@
           ((instance) (values (%instancep obj) t))
           ((nil extended-sequence funcallable-instance)
            (values nil t)))) ; nothing could be these
-       (numeric-type
-        (values (number-typep obj type) t))
+       (numeric-union-type
+        (values (numeric-union-typep obj type) t))
        (array-type
         ;; Array types correspond fairly closely between host and target, but
         ;; asking whether an array is definitely non-simple is a nonsensical
@@ -150,7 +151,7 @@
                      ;; probably not a function. What about FMT-CONTROL instances?
                      (values nil t)))
                 ((system-area-pointer stream fdefn weak-pointer file-stream
-                  code-component lra pathname logical-pathname)
+                  code-component pathname logical-pathname)
                  (values nil t)))
               (cond ((eq name 'pathname)
                      (values (pathnamep obj) t))
@@ -333,7 +334,7 @@
      (ctype-of-number x))
     (array
      ;; It is critical not to inquire of the host for the array's element type.
-     (let ((etype (specifier-type (sb-xc:array-element-type x))))
+     (let ((etype (specifier-type (array-element-type x))))
        (make-array-type (array-dimensions x)
                         ;; complexp relies on the host implementation,
                         ;; but in practice any array for which we need to
@@ -377,3 +378,6 @@
 ;; Use of non-ASCII during build occurs no sooner than make-target-2,
 ;; therefore _every_ character satisfies BASE-CHAR-P prior to that.
 #+sb-unicode (defun base-char-p (x) (characterp x))
+
+(defun sb-bignum:%bignum-length (x)
+  (values (ceiling (1+ (integer-length x)) sb-vm:n-word-bits)))

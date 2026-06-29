@@ -308,9 +308,9 @@
       (assert (eq (read-char s nil s) s)))))
 
 ;; Output routines must return the written element
-(with-test (:name :output-routine-retval :skipped-on :win32)
+(with-test (:name :output-routine-retval)
   (dolist (x sb-impl::*output-routines*)
-    (with-open-file (f "/dev/null" :direction :output :if-exists :overwrite)
+    (with-open-file (f #-win32 "/dev/null" #+win32 "nul" :direction :output :if-exists :overwrite)
       (let ((arg (if (eq (car x) 'character) #\z 99))
             (fun (symbol-function (third x))))
         (assert (eql arg (funcall fun f arg)))))))
@@ -363,6 +363,63 @@
             (unless (eql got character)
               (error "wanted ~S, got ~S (~S)" character got n))))
         (assert (eql (read-char s nil s) s))))))
+
+(with-test (:name (read-sequence :utf-8 :decoding-error-restarts))
+  (flet ((test (bytes replacement string-length element-type
+                      expected-string expected-end &optional (start 0))
+           (let ((file *test-path*))
+             (with-open-file (stream file :direction :output
+                                     :if-exists :supersede
+                                     :element-type '(unsigned-byte 8))
+               (dolist (byte bytes) (write-byte byte stream)))
+             (unwind-protect
+                 (with-open-file (stream file :external-format :utf-8
+                                         :element-type element-type)
+                   (handler-bind
+                       ((sb-int:character-decoding-error
+                         (lambda (ignore)
+                           (declare (ignore ignore))
+                           (typecase replacement
+                             ((or string character)
+                              (invoke-restart 'sb-impl::input-replacement replacement))
+                             (null (invoke-restart 'sb-int:attempt-resync))
+                             ((eql :eof) (invoke-restart 'sb-int:force-end-of-file))))))
+                     (let* ((pad #\space)
+                            (string (make-string string-length :initial-element pad)))
+                       (let ((end (read-sequence string stream :start start)))
+                         (assert
+                          (equal (list (string-right-trim (list pad) string) end)
+                                 (list expected-string expected-end)))))))
+               (handler-case (delete-file file)
+                 (file-error ()))))))
+    (let ((bad-bytes '(65 #xE0 66 67)))
+      ;; This doesn't call FD-STREAM-READ-SEQUENCE/UTF-8-TO-STRING because
+      ;; the requested number of characters, 10, is less than half a CIN
+      ;; buffer size. So it gives the right answer.
+      (test bad-bytes #\? 10 'character "A?BC" 4)
+      ;; A bivalent stream has no CIN buffer, so this won't call
+      ;; FD-STREAM-READ-SEQUENCE/UTF-8-TO-STRING.
+      (test bad-bytes #\? 10 :default "A?BC" 4)
+      ;; But when the stream has a CIN buffer and >256 characters are
+      ;; requested, when FD-STREAM-READ-SEQUENCE/UTF-8-TO-STRING
+      ;; encounters a decoding error, it returns NIL, which causes
+      ;; ANSI-STREAM-READ-STRING-FROM-FRC-BUFFER to fall thru to code that
+      ;; clobbers the string from the initial START arg.
+      (test bad-bytes #\? 257 'character "A?BC" 4) ;; comes out as "?BC", 3 in 2.5.9
+      ;; One more for good luck
+      (test bad-bytes "xyz" 259 'character "  AxyzBC" 8 2)
+      ;; Now all 4 again but with ATTEMPT-RESYNC.
+      (test bad-bytes nil 10 'character "ABC" 3)
+      (test bad-bytes nil 10 :default "ABC" 3)
+      (test bad-bytes nil 257 'character "ABC" 3) ;; comes out as "BC", 2 in 2.5.9
+      (test bad-bytes nil 259 'character "  ABC" 5 2) ;; comes out as "BC", 4 in 2.5.9
+      ;; And again with FORCE-END-OF-FILE. (These all worked right in
+      ;; 2.5.9, because after fall-thru there was nothing left in the
+      ;; stream to overwrite the #\A.
+      (test bad-bytes :eof 10 'character "A" 1)
+      (test bad-bytes :eof 10 :default "A" 1)
+      (test bad-bytes :eof 257 'character "A" 1)
+      (test bad-bytes :eof 259 'character "  A" 3 2))))
 
 ;;; Test character decode restarts.
 (with-open-file (s *test-path* :direction :output
@@ -1304,24 +1361,53 @@
                    (read-line f)))))
 
 ;; test for lp#659107
-(with-test (:name :cmdline-setq-external-format
-                  :skipped-on (not :sb-unicode))
+(with-test (:name :cmdline-setq-external-format)
   (with-scratch-file (script "lisp")
     (with-open-file (stream script :direction :output
                                    :if-exists :supersede
                                    :if-does-not-exist :create
-                                   :external-format :utf16le)
-      (format stream "(defvar s \"what? ~A\"~%)" (name-char "GRINNING_FACE"))
+                                   :external-format :latin1)
+      (format stream "(defvar s \"what? ~A\"~%)" (name-char "LATIN_SMALL_LETTER_Y_WITH_DIAERESIS"))
       (format stream "(sb-ext:exit :code
- (if (and (string= (subseq s 0 6) \"what? \") (char= (char s 6) #\\grinning_face)) 0 1))~%"))
+ (if (and (string= (subseq s 0 6) \"what? \") (char= (char s 6) #\\LATIN_SMALL_LETTER_Y_WITH_DIAERESIS)) 0 1))~%"))
     (let ((process (run-program
                     sb-ext:*runtime-pathname*
                     (list "--core" sb-int:*core-string*
                           "--noinform" "--no-sysinit" "--no-userinit" "--noprint"
                           "--disable-debugger"
-                          "--eval" "(setq *default-external-format* :utf16le)"
+                          "--eval" "(setq *default-external-format* :latin1)"
                           "--load" script)
                     :error t)))
         (assert (zerop (process-exit-code process))))))
+
+(with-test (:name (open :default-external-format :newline))
+  (with-open-file (f *test-path*
+                     :direction :output
+                     :element-type '(unsigned-byte 8)
+                     :if-exists :supersede)
+    (let ((string (format nil "Hello~C~CWorld" #\Return #\Linefeed)))
+      (write-sequence (map '(vector (unsigned-byte 8)) 'char-code string) f)))
+  (let ((*default-external-format* '(:ascii :newline :crlf)))
+    (with-open-file (f *test-path*)
+      (let ((string (make-string (length "Hello  World "))))
+        (read-sequence string f)
+        (assert (string= string (format nil "Hello~CWorld" #\Newline) :end1 11))))))
+
+(with-test (:name (compile-file :default-external-format :newline))
+  (let ((path (scratch-file-name "lisp")))
+    (with-open-file (f path
+                       :direction :output
+                       :element-type '(unsigned-byte 8)
+                       :if-exists :supersede)
+      (let ((string (format nil "(defun foo (x) (format nil (formatter \"Hello~~~C~C  ~~A World\") x))" #\Return #\Linefeed)))
+        (write-sequence (map '(vector (unsigned-byte 8)) 'char-code string) f)))
+    (let ((*default-external-format* '(:ascii :newline :crlf))
+          (*error-output* (make-broadcast-stream)))
+      (multiple-value-bind (output failurep warningsp)
+          (compile-file path :verbose nil)
+        (delete-file output)
+        (delete-file path)
+        (assert (null failurep))
+        (assert (null warningsp))))))
 
 (delete-file *test-path*)

@@ -59,7 +59,7 @@
   (:variant array-dimensions-offset other-pointer-lowtag))
 
 (define-vop ()
-  (:translate %array-rank)
+  (:translate array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
@@ -139,7 +139,7 @@
                (t
                 (inst addi ea index (- (ash vector-data-offset word-shift) other-pointer-lowtag))
                 (inst add ea object ea)))
-         (emit-gengc-barrier object ea (list t1) (vop-nth-arg 2 vop) value)
+         (emit-gengc-barrier object ea (list t1) (vop-nth-arg 2 vop))
          (inst std value ea 0)))
     `(define-vop (,(symbolicate "DATA-VECTOR-SET/" (string type))
                   ,(symbolicate (string variant) "-SET"))

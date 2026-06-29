@@ -21,7 +21,8 @@
    grapheme-break-class word-break-class sentence-break-class graphemes
    words sentences lines
    unicode= unicode-equal unicode< unicode<= unicode> unicode>=
-   confusable-p))
+   confusable-p scalar-p
+   utf8-decode-from-sap utf8-decode-from-octets))
 
 (eval-when (:compile-toplevel :execute)
   (defun lisp-expr-file-pathname (namestring)
@@ -44,10 +45,9 @@
 (eval-when (:compile-toplevel)
   (defun plist-to-alist (list)
     (loop for (key value) on list by #'cddr collect (cons key value))))
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *proplist-properties*
+(sb-ext:defglobal *proplist-properties*
     (mapcar (lambda (x) (cons (car x) (coerce (cdr x) '(vector (unsigned-byte 32)))))
-            '#.(plist-to-alist (read-lisp-expr-file "misc-properties")))))
+            '#.(plist-to-alist (read-lisp-expr-file "misc-properties"))))
 
 (eval-when (:compile-toplevel)
   (defvar *phash-cache-file-pathname*
@@ -67,6 +67,8 @@
     (or (gethash keys *phash-cache-file-contents*)
         (let ((start (get-internal-real-time))
               (answer (sb-c:make-perfect-hash-lambda keys)))
+          (declare (ignorable start))
+          #+nil
           (format *debug-io* "~&Computed perfect hash of ~D keys: ~F sec (~S)~%"
                   (length keys)
                   (/ (- (get-internal-real-time) start) internal-time-units-per-second)
@@ -824,6 +826,9 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 (defun char-uppercase (char)
   (if (has-case-p char)
+      #-sb-unicode
+      (list (char-upcase char))
+      #+sb-unicode
       (let ((cp (char-case-info char)))
         (if (consp cp)
             (let ((cp (car cp)))
@@ -835,6 +840,9 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 (defun char-lowercase (char)
   (if (has-case-p char)
+      #-sb-unicode
+      (list (char-downcase char))
+      #+sb-unicode
       (let ((cp (char-case-info char)))
         (if (consp cp)
             (let ((cp (cdr cp)))
@@ -881,11 +889,10 @@ disappears when accents are placed on top of it. and NIL otherwise"
     (setf result (nreverse result))
     (coerce result 'string)))
 
-(declaim (type function sb-unix::posix-getenv))
 (defun get-user-locale ()
   (let ((raw-locale
-         #+(or win32 unix) (or (sb-unix::posix-getenv "LC_ALL")
-                                (sb-unix::posix-getenv "LANG"))
+         #+(or win32 unix) (or (sb-ext:posix-getenv "LC_ALL")
+                               (sb-ext:posix-getenv "LANG"))
          #-(or win32 unix) nil))
     (when raw-locale
       (let ((lang-code (string-upcase
@@ -1080,6 +1087,7 @@ The result is not guaranteed to have the same length as the input."
 
 (macrolet ((def (name extendedp)
              `(defun ,name (function string)
+                (declare (dynamic-extent function))
                 (do* ((length (length string))
                       (start 0)
                       (end 1 (1+ end))
@@ -1092,7 +1100,6 @@ The result is not guaranteed to have the same length as the input."
                      ((>= end length)
                       (if (= end length) (progn (funcall function string start end) nil)))
                   (flet ((brk () (funcall function string start end) (setf start end)))
-                    (declare (dynamic-extent #'brk))
                     (shiftf char1 char2 (char string end))
                     (shiftf c1 c2 (grapheme-break-class char2))
                     (if (eql c2 :regional-indicator) (incf nri) (setf nri 0))
@@ -1998,6 +2005,165 @@ according to the IDNA confusableSummary.txt table"
       (string= skeleton1 skeleton2)))
 
 (clear-info :function :compiler-macro-function 'proplist-p)
+
+;;; Given the surprisingly large number of places the integers #xD800 and #xDFFF
+;;; are expressed as literals I would have thought by now someone would have abstracted
+;;; it out into surrogate-p or similar.  Maybe I'm just blind and we do have it?
+;;; Anyway this is the opposite of a hypothetical surrogate-p predicate.
+;;; Note that scalars -include- the characters which are NONCHARACTER but not surrogates.
+(defun scalar-p (c) (or (< c #xD800) (and (>= c #xE000) (<= c #x10FFFF))))
+
+;;; A branch-free table to decide how long a utf8-encoded codepoint is in octets
+;;; given its first octet. Because the 32-bit codegen requires untagged words here,
+;;; it amusingly produces better assembly code than 64-bit which excessively shifts.
+(declaim (inline utf8-encoded-len-from-leading-byte))
+(defun utf8-encoded-len-from-leading-byte (octet)
+  (declare (type (unsigned-byte 8) octet)
+           (optimize (safety 0)))
+  (macrolet ((magic (&aux (result 0))
+               (dotimes (i 16 result)
+                 (let ((bits (1- (aref #(1 1 1 1 1 1 1 1 1 1 1 1 2 2 3 4) i))))
+                   (setq result (logior result (ash bits (* i 2))))))))
+    (let ((high4 (ash octet -4)))
+      (1+ (logand (ash (magic) (- (ash high4 1))) #b11)))))
+
+;;; To decode a 0-terminated UTF8 array of unknown length returning a Lisp string
+;;; with maximal speed, preferring a result type of BASE-STRING when possible,
+;;; and requiring there to be no decoding errors, this is the the way to do it.
+;;; When processing data from external sources it wouldn't be the worst thing to use
+;;; OCTETS-TO-STRING for its error checking, but when dealing with C APIs within
+;;; your system, checking for decoding errors at each function call can
+;;; cause a lot of unnecessary CPU cycles to be burnt.
+;;; I didn't see an efficient technique to construct anything exactly equivalent
+;;; to this function using other pre-existing functions.
+(labels
+    ((copy-to-char-string (sap length-in-octets nchars)
+       (declare (sb-sys:system-area-pointer sap) (index length-in-octets nchars))
+       ;; It is generally quicker to call a foreign function to decode utf8,
+       ;; with the possible exception of strings shorter than a few characters.
+       (let* ((string (make-array nchars :element-type 'character))
+              (result
+               (sb-sys:with-pinned-objects (string)
+                 (sb-alien:alien-funcall
+                  (sb-alien:extern-alien "utf8_into_simple_character_string"
+                   (function sb-alien:unsigned
+                             sb-sys:system-area-pointer sb-alien:unsigned
+                             sb-alien:system-area-pointer))
+                  sap length-in-octets (sb-sys:vector-sap string)))))
+         (sb-int:aver (= result nchars))
+         string))
+     (copy-to-base-string (sap nchars)
+       (if (= nchars 0)
+           #.(coerce "" 'simple-base-string)
+           (let ((string (make-array nchars :element-type 'base-char)))
+             (sb-sys:with-pinned-objects (string)
+               (sb-impl::memcpy (sb-sys:vector-sap string) sap nchars))
+             string)))
+     (any-extended-char-p (sap limit)
+       ;; TODO: instead of looping over bytes, this should read exactly one word
+       ;; and mask off the irrelevant bytes. Then compare to the mask of high bits.
+       ;; To be pedantic there is the question of whether it is legal to read
+       ;; the entire word preceding SAP and entire word following LIMIT.
+       ;; The way to do it strictly observing the specified bounds is to purposely
+       ;; do an unaligned read so that you gather a word of octets not to exceed
+       ;; the stated bounds, as long as the CPU has no unaligned penalty. e.g.
+       ;;  b | b | b | b | b | b | b | b | b | b
+       ;;        |
+       ;;        ^ aligned word boundary
+       ;;    ^ specified start byte
+       ;; An unaligned load which gathers up a word at the specified start is ok
+       ;; provided that the specified end accomodates the entire word.
+       ;; Looping takes less brain power to get right, so let's just do that.
+       (declare (sb-sys:system-area-pointer sap limit))
+       (loop
+        (when (sb-sys:sap>= sap limit) (return nil))
+        (when (logtest (sb-sys:sap-ref-8 sap 0) #x80) (return t))
+        (setf sap (sb-sys:sap+ sap 1))))
+     (any-extended-char-p/word (sap limit)
+       (declare (sb-sys:system-area-pointer sap limit))
+       (loop
+        (when (sb-sys:sap>= sap limit) (return nil))
+        (when (logtest (sb-sys:sap-ref-word sap 0)
+                       #+64-bit #x8080808080808080 #-64-bit #x80808080)
+          (return t))
+        (setf sap (sb-sys:sap+ sap sb-vm:n-word-bytes))))
+     (scan-between (sap limit &aux (length-in-chars 0) (start sap))
+       (declare (sb-sys:system-area-pointer sap limit) (index length-in-chars))
+       ;; Decode octets starting at SAP up to LIMIT. If an encoding sequence does not end
+       ;; exactly at LIMIT, this is an error on the part of the caller. The returned string
+       ;; will not contain the character involved in the overrun in that case.
+       ;; But first, do a quick pass to test for presence of any non-BASE-CHAR.
+       (flet ((sap-align-down (x)
+                (sb-sys:int-sap (logandc2 (sb-sys:sap-int x) (1- sb-vm:n-word-bytes)))))
+         (declare (inline sap-align-down))
+         ;; When trying to use SB-INT:ALIGN-UP here, the compiler doesn't know that
+         ;; the expression (+ value mask) should be treated modularly, and so it inserts
+         ;; possible bignum arithmetic. Performing SAP+ avoids that.
+         (let ((aligned-start (sap-align-down (sb-sys:sap+ sap (1- sb-vm:n-word-bytes))))
+               (aligned-end (sap-align-down limit)))
+           (unless (or (any-extended-char-p/word aligned-start aligned-end)
+                       (any-extended-char-p sap aligned-start)
+                       (any-extended-char-p aligned-end limit))
+             (return-from scan-between
+               (copy-to-base-string sap (sb-sys:sap- limit sap))))))
+       (loop
+        (let* ((n (utf8-encoded-len-from-leading-byte (sb-sys:sap-ref-8 sap 0)))
+               (next (sb-sys:sap+ sap n)))
+          (when (sb-sys:sap>= next limit)
+            (when (sb-sys:sap= next limit) (incf length-in-chars) (setq sap next))
+            (return))
+          (incf length-in-chars)
+          (setq sap next)))
+       (copy-to-char-string start (sb-sys:sap- sap start) length-in-chars)))
+
+  (defun utf8-decode-from-sap (sap &optional (count nil count-supplied)
+                               &aux (length-in-chars 0) (start sap))
+    (declare (sb-sys:system-area-pointer sap) (index length-in-chars))
+    (if count-supplied
+        ;; The counted mode of operation allows embedded #\nul
+        (if (zerop (the index count))
+            #.(coerce "" 'simple-base-string)
+            (scan-between sap (sb-sys:sap+ sap count)))
+        ;; The uncounted mode of operation decodes until reaching a #\nul
+        (loop
+         (let ((octet (sb-sys:sap-ref-8 sap 0)))
+           (when (= octet 0)
+             (let ((bytes (sb-sys:sap- sap start)))
+               (return (if (> bytes length-in-chars)
+                           (copy-to-char-string start bytes length-in-chars)
+                           (copy-to-base-string start length-in-chars)))))
+           (setq sap (sb-sys:sap+ sap (utf8-encoded-len-from-leading-byte octet)))
+           (incf length-in-chars)))))
+
+  (defun utf8-decode-from-octets (ub8-vector)
+    ;; possibly use with-array-data here to allow non-simple array?
+    (declare ((simple-array (unsigned-byte 8) 1) ub8-vector))
+    (sb-sys:with-pinned-objects (ub8-vector)
+      (let ((sap (sb-sys:vector-sap ub8-vector)))
+        (scan-between sap (sb-sys:sap+ sap (length ub8-vector)))))))
+
+;; Compare UTF8-ENCODED-LEN-FROM-LEADING-BYTE to SB-IMPL::BYTES-FOR-CHAR/UTF-8/LF
+;; the former one getting shaken out of the resulting core file.
+#+sb-unicode
+(let ((s (make-string 1))
+      (replacement #.(coerce '(0) '(simple-array (unsigned-byte 8) (*)))))
+  (dotimes (c char-code-limit)
+    ;; An octet array of just 1 null looks to utf8-decode-from-sap like the empty string,
+    ;; as it should. It would need to be a counted octet string to decode as codepoint 0.
+    (when (and (scalar-p c) (> c 0))
+      (setf (char s 0) (code-char c))
+      (let* ((result (sb-impl::string->utf8 s 0 1 0 replacement))
+             (firstbyte (aref result 0))
+             (octet-len-expected (sb-impl::bytes-for-char/utf-8/lf (code-char c)))
+             (octet-len (utf8-encoded-len-from-leading-byte firstbyte)))
+        (when (or (/= octet-len octet-len-expected) (/= octet-len (length result)))
+          (error "~S is messed up at ~x" 'utf8-encoded-len-from-leading-byte c))
+        (let ((terminated-result (sb-impl::string->utf8 s 0 1 1 replacement)))
+          (aver (= (length terminated-result) (1+ octet-len)))
+          (let ((decoded (sb-sys:with-pinned-objects (terminated-result)
+                           (utf8-decode-from-sap (sb-sys:vector-sap terminated-result)))))
+            (aver (string= decoded s))
+            (when (< c 128) (aver (sb-kernel:simple-base-string-p decoded)))))))))
 
 #|
 ;;; For offline use.

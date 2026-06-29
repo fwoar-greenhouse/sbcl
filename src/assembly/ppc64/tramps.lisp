@@ -9,9 +9,11 @@
     (xundefined-tramp (:return-style :none)
                       (:align n-lowtag-bits)
                       (:export undefined-tramp
-                               (undefined-tramp-tagged
+                               (undefined-tramp-tagged ; can this junk go away?
                                 (+ xundefined-tramp
                                    fun-pointer-lowtag))))
+    ;; I very much suspect this doesn't have to be wired to fdefn-tn any more.
+    ;; (Same goes for funcallable-instance-tramp)
     ((:temp fdefn-tn descriptor-reg fdefn-offset))
   (inst dword simple-fun-widetag) ;; header
   (inst dword (make-fixup 'undefined-tramp-tagged :assembly-routine)) ;; self
@@ -19,8 +21,11 @@
     (inst dword nil-value))
 
   UNDEFINED-TRAMP
-  (inst addi code-tn lip-tn (- fun-pointer-lowtag
-                               (ash simple-fun-insts-offset word-shift)))
+  ;; I see no purpose to computing CODE-TN here. Normally we need it in order
+  ;; to load header constants since there is no PC-relative load form,
+  ;; but there are no constants, and this routine can't be GC'ed so it's
+  ;; not for that either.
+  (inst addi code-tn lip-tn (- (ash simple-fun-insts-offset word-shift)))
 
   (inst cmpwi nargs-tn (fixnumize register-arg-count))
   (inst bgt NO-STACK-ARGS)
@@ -30,45 +35,23 @@
   (inst add csp-tn cfp-tn nargs-tn)
   FINISH-FRAME-SETUP
   (storew ocfp-tn cfp-tn 0)
+  (inst mflr lra-tn)
   (storew lra-tn cfp-tn 1)
   (error-call nil 'undefined-fun-error fdefn-tn))
 
 (define-assembly-routine
-    (closure-tramp (:return-style :none)
-                   (:align n-lowtag-bits))
-    ((:temp fdefn-tn descriptor-reg fdefn-offset))
-  ;; More complicated code allows an fdefn to be either tagged or untagged
-  ;; when referenced from a code header.
-  ;;  (inst andi. temp-reg-tn fdefn-tn 15)
-  ;;  (inst beq untagged)
-  ;;  (loadw lexenv-tn fdefn-tn fdefn-fun-slot other-pointer-lowtag)
-  ;;  (inst b continue)
-  ;;  untagged
-  ;;  (loadw lexenv-tn fdefn-tn fdefn-fun-slot 0)
-  ;;  continue
-  (loadw lexenv-tn fdefn-tn fdefn-fun-slot (+ #-untagged-fdefns other-pointer-lowtag))
-  (loadw code-tn lexenv-tn closure-fun-slot fun-pointer-lowtag)
-  (inst addi lip-tn code-tn (- (ash simple-fun-insts-offset word-shift)
-                               fun-pointer-lowtag))
-  (inst mtctr lip-tn)
-  (inst bctr))
-
-(define-assembly-routine
     (xfuncallable-instance-tramp (:return-style :none)
                       (:align n-lowtag-bits)
-                      (:export (funcallable-instance-tramp
-                                (+ xfuncallable-instance-tramp
-                                   fun-pointer-lowtag))))
-    ((:temp fdefn-tn descriptor-reg fdefn-offset))
+                      (:export funcallable-instance-tramp))
+    ()
   (inst dword simple-fun-widetag)
   (inst dword (make-fixup 'funcallable-instance-tramp :assembly-routine))
   (dotimes (i (- simple-fun-insts-offset 2))
     (inst dword nil-value))
 
+  FUNCALLABLE-INSTANCE-TRAMP
   (loadw lexenv-tn lexenv-tn funcallable-instance-function-slot fun-pointer-lowtag)
-  (loadw fdefn-tn lexenv-tn closure-fun-slot fun-pointer-lowtag)
-  (inst addi lip-tn fdefn-tn (- (ash simple-fun-insts-offset word-shift)
-                                fun-pointer-lowtag))
+  (loadw lip-tn lexenv-tn closure-fun-slot fun-pointer-lowtag) ; RAW ADDR
   (inst mtctr lip-tn)
   (inst bctr))
 
@@ -95,7 +78,7 @@
   ;; and we're not using threads (yet).
   (inst .skip (* 68 n-word-bytes))
   (flet ((reg (offset sc)
-           (make-random-tn :kind :normal :sc (sc-or-lose sc) :offset offset)))
+           (make-random-tn (sc-or-lose sc) offset)))
     ;;  -8 = arg
     ;; -16 = caller's LR spill (for calling into me)
     ;; -24 = my LR spill (for calling out to C)
@@ -124,12 +107,13 @@
                         (inst ld r12 r12 0))
     ;; load the size argument into the first C argument register
     (inst ld r3 lip -8)
+
     (inst mtctr r12)
     (inst bctrl)
     ;; We're back.
     (inst mtctr r3) ; stash the result in a reg that won't be clobbered
     ;; Reload a pointer to this asm routine
-    (inst addi lip null-tn (make-fixup 'alloc-tramp :assembly-routine*))
+    (inst addi lip null-tn (make-fixup 'alloc-tramp :assembly-routine))
     ;; Restore the return address from the caller's frame.
     ;; 'sp' hasn't been restored yet, so add our frame size.
     (inst ld r0 machine-sp (+ 32 16))

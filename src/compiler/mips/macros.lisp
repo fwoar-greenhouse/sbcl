@@ -78,31 +78,19 @@ byte-ordering issues."
 ;;; return instructions.
 
 (defmacro lisp-jump (function lip)
-  "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
+  "Jump to the lisp function FUNCTION.  LIP is lip-tn"
   `(progn
      (inst addu ,lip ,function (- (ash simple-fun-insts-offset word-shift)
                                    fun-pointer-lowtag))
      (inst j ,lip)
      (emit-nop-or-move code-tn ,function)))
 
-(defmacro lisp-return (return-pc lip &key (offset 0) (frob-code t))
-  "Return to RETURN-PC.  LIP is an interior-reg temporary."
+(defmacro lisp-return (return-pc lra &key (offset 0))
+  "Return to RETURN-PC."
   `(progn
-     (inst addu ,lip ,return-pc
-           (- (* (1+ ,offset) n-word-bytes) other-pointer-lowtag))
-     (inst j ,lip)
-     ,(if frob-code
-          `(emit-nop-or-move code-tn ,return-pc)
-          '(inst nop))))
-
-
-(defmacro emit-return-pc (label)
-  "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
-  `(progn
-     (emit-alignment n-lowtag-bits)
-     (emit-label ,label)
-     (inst lra-header-word)))
-
+     (inst addu ,lra ,return-pc (* ,offset n-word-bytes))
+     (inst j ,lra)
+     (inst nop)))
 
 
 ;;;; Stack TN's
@@ -139,7 +127,7 @@ byte-ordering issues."
 
 ;;;; Storage allocation:
 (defmacro with-fixed-allocation ((result-tn flag-tn temp-tn type-code
-                                  size dynamic-extent-p
+                                  size
                                   &key (lowtag other-pointer-lowtag))
                                  &body body)
   "Do stuff to allocate an other-pointer object of fixed Size with a single
@@ -151,22 +139,26 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
     (bug "empty &body in WITH-FIXED-ALLOCATION"))
   (once-only ((result-tn result-tn) (flag-tn flag-tn) (temp-tn temp-tn)
               (type-code type-code) (size size)
-              (dynamic-extent-p dynamic-extent-p)
               (lowtag lowtag))
-    `(if ,dynamic-extent-p
-         (pseudo-atomic (,flag-tn) ; why P-A ???
-           (align-csp ,temp-tn ,flag-tn)
-           (inst or ,result-tn csp-tn ,lowtag)
-           (inst li ,temp-tn (compute-object-header ,size ,type-code))
-           (inst addu csp-tn (pad-data-block ,size))
-           (storew ,temp-tn ,result-tn 0 ,lowtag)
-           ,@body)
-         (pseudo-atomic (,flag-tn)
-           (allocation ,type-code (pad-data-block ,size) ,result-tn ,lowtag
-                       (list ,flag-tn ,temp-tn) :stackp ,dynamic-extent-p)
-           (inst li ,temp-tn (compute-object-header ,size ,type-code))
-           (storew ,temp-tn ,result-tn 0 ,lowtag)
-           ,@body))))
+    `(pseudo-atomic (,flag-tn)
+       (allocation ,type-code (pad-data-block ,size) ,result-tn ,lowtag
+                   (list ,flag-tn ,temp-tn))
+       (inst li ,temp-tn (compute-object-header ,size ,type-code))
+       (storew ,temp-tn ,result-tn 0 ,lowtag)
+       ,@body)))
+
+(defun generate-stack-overflow-check (vop size temp)
+  (let ((overflow (generate-error-code vop
+                                       'stack-allocated-object-overflows-stack-error
+                                       size)))
+    #-sb-thread
+    (load-symbol-value temp *control-stack-end*)
+    #+sb-thread
+    (loadw temp thread-base-tn thread-control-stack-end-slot)
+    (inst sub temp temp csp-tn)
+    (inst sltu temp size temp)
+    (inst beq temp overflow)
+    (inst nop)))
 
 (defun align-csp (temp1 temp2)
   (inst li temp1 (lognot lowtag-mask))
@@ -210,7 +202,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
     (emit-internal-error kind code values
                          :trap-emitter (lambda (tramp-number)
                                          (inst break 0 tramp-number)))
-    (emit-alignment word-shift)))
+    (emit-alignment 2)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
@@ -259,7 +251,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg)))
        (:arg-types ,type tagged-num)
-       (:temporary (:scs (interior-reg)) lip)
+       (:temporary (:scs (non-descriptor-reg)) lip)
        (:results (value :scs ,scs))
        (:result-types ,el-type)
        (:generator 5
@@ -295,7 +287,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
        (:generator 2
          ,@(if (member name '(instance-index-set %closure-index-set))
                `((without-scheduling ()
-                   (emit-gengc-barrier object nil temp (vop-nth-arg 2 vop) value)
+                   (emit-gengc-barrier object nil temp (vop-nth-arg 2 vop))
                    (inst addu temp object index)
                    (storew value temp ,offset ,lowtag)))
                `((inst addu temp object index)
@@ -316,7 +308,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
        (:generator 1
          ,@(if (member name '(instance-index-set %closure-index-set))
                `((without-scheduling ()
-                   (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) value)
+                   (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop))
                    (storew value object (+ ,offset index) ,lowtag)))
                `((storew value object (+ ,offset index) ,lowtag)))))))
 
@@ -333,7 +325,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
          (:arg-types ,type positive-fixnum)
          (:results (value :scs ,scs))
          (:result-types ,el-type)
-         (:temporary (:scs (interior-reg)) lip)
+         (:temporary (:scs (non-descriptor-reg)) lip)
          (:generator 5
            (inst addu lip object index)
            ,@(when (eq size :short)
@@ -375,7 +367,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
                 (index :scs (unsigned-reg))
                 (value :scs ,scs))
          (:arg-types ,type positive-fixnum ,el-type)
-         (:temporary (:scs (interior-reg)) lip)
+         (:temporary (:scs (non-descriptor-reg)) lip)
          (:generator 5
            (inst addu lip object index)
            ,@(when (eq size :short)

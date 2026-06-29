@@ -20,8 +20,6 @@
 ;;; application programmer, and are not.
 
 ;;; TODO
-;;; 1) structs don't have within-file location info.  problem for the
-;;;   structure itself, accessors, the copier and the predicate
 ;;; 3) error handling.  Signal random errors, or handle and resignal 'our'
 ;;;   error, or return NIL?
 ;;; 4) FIXMEs
@@ -128,6 +126,17 @@ constant pool."
      spaces
      (lambda (obj size)
        (declare (ignore size))
+       ;; There are no constants for linkage-space calls. Not only that,
+       ;; but certain linkage entry refs get elided because it is not
+       ;; required for liveness from a GC perspective.
+       #+linkage-space
+       (dolist (index (sb-c:unpack-code-fixup-locs (sb-vm::%code-fixups obj)))
+         (let ((ep (sb-sys:sap-ref-word
+                    (sb-alien:extern-alien "linkage_space" sb-sys:system-area-pointer)
+                    (ash index sb-vm:word-shift))))
+           (when (eq (sb-kernel:%make-lisp-obj (+ ep -16 sb-vm:fun-pointer-lowtag)) function)
+             (funcall fn obj))))
+       #-linkage-space
        (map-code-constants
         obj
         (lambda (constant)
@@ -181,8 +190,10 @@ constant pool."
                               vop
                               (gethash (sb-c::vop-info-name vop)
                                        sb-c::*backend-parsed-vops*))
-          for name = (sb-c::vop-parse-name vop-parse)
-          for loc = (sb-c::vop-parse-source-location vop-parse)
+          for name = (and vop-parse
+                          (sb-c::vop-parse-name vop-parse))
+          for loc = (and vop-parse
+                         (sb-c::vop-parse-source-location vop-parse))
           when loc
           collect (let ((source (translate-source-location loc)))
                     (setf (definition-source-description source)
@@ -192,38 +203,54 @@ constant pool."
                     source))))
 
 (defun find-definition-sources-by-name (name type)
-  "Returns a list of DEFINITION-SOURCEs for the objects of type TYPE
-defined with name NAME. NAME may be a symbol or a extended function
-name. Type can currently be one of the following:
+  "Returns a list of DEFINITION-SOURCEs for definitions of NAME with
+the given definition TYPE. TYPE can currently be one of the following.
 
-   (Public)
-   :CLASS
-   :COMPILER-MACRO
-   :CONDITION
-   :CONSTANT
-   :FUNCTION
-   :GENERIC-FUNCTION
-   :MACRO
-   :METHOD
-   :METHOD-COMBINATION
-   :PACKAGE
-   :SETF-EXPANDER
-   :STRUCTURE
-   :SYMBOL-MACRO
-   :TYPE
-   :ALIEN-TYPE
-   :VARIABLE
-   :DECLARATION
+Public definition TYPEs:
 
-   (Internal)
-   :OPTIMIZER
-   :SOURCE-TRANSFORM
-   :TRANSFORM
-   :VOP
-   :IR1-CONVERT
+    :CLASS
+    :COMPILER-MACRO
+    :CONDITION
+    :CONSTANT
+    :FUNCTION
+    :GENERIC-FUNCTION
+    :MACRO
+    :METHOD
+    :METHOD-COMBINATION
+    :PACKAGE
+    :SETF-EXPANDER
+    :STRUCTURE
+    :SYMBOL-MACRO
+    :TYPE
+    :ALIEN-TYPE
+    :VARIABLE
+    :DECLARATION
 
-If an unsupported TYPE is requested, the function will return NIL.
-"
+Internal definition TYPEs:
+
+    :OPTIMIZER
+    :SOURCE-TRANSFORM
+    :TRANSFORM
+    :VOP
+    :IR1-CONVERT
+
+Definition types are disjoint. For example, :TYPE refers to DEFTYPEs
+but not CLASSes or SB-ALIEN:DEFINE-ALIEN-TYPE, as those are of
+definition type :CLASS and :ALIEN-TYPE, respectively. :FUNCTION does
+not include :GENERIC-FUNCTION, :CLASS does not include :STRUCTURE,
+etc. :VARIABLE refers to non-constant dynamic variables (e.g. those
+defined with DEFVAR, DEFPARAMETER, SB-EXT:DEFGLOBAL or
+SB-ALIEN:DEFINE-ALIEN-VARIABLE but not with DEFCONSTANT).
+
+Valid NAMEs are generally SYMBOLs with the following exceptions:
+
+- For :COMPILER-MACRO, :FUNCTION, :GENERIC-FUNCTION and :METHOD,
+  anything that's VALID-FUNCTION-NAME-P is valid.
+
+- For :PACKAGE, string designators are valid.
+
+If an unsupported TYPE is requested or NAME is invalid, the function
+will return NIL."
   (flet ((get-class (name)
            (and (symbolp name)
                 (find-class name nil)))
@@ -254,22 +281,28 @@ If an unsupported TYPE is requested, the function will return NIL.
                    (macro-function name))
           (find-definition-source (macro-function name))))
        ((:compiler-macro)
-        (when (compiler-macro-function name)
+        (when (and (valid-function-name-p name)
+                   (compiler-macro-function name))
           (find-definition-source (compiler-macro-function name))))
        (:ir1-convert
         (let ((converter (info :function :ir1-convert name)))
           (and converter
-           (find-definition-source converter))))
+               (find-definition-source converter))))
        ((:function :generic-function)
-        (when (and (fboundp name)
-                   (or (consp name)
-                       (and
-                        (not (macro-function name))
-                        (not (special-operator-p name)))))
-          (let ((fun (real-fdefinition name)))
-            (when (eq (not (typep fun 'generic-function))
-                      (not (eq type :generic-function)))
-              (find-definition-source fun)))))
+        (when (valid-function-name-p name)
+          (if (fboundp name)
+              (when (and (or (consp name)
+                             (and
+                              (not (macro-function name))
+                              (not (special-operator-p name)))))
+                (let ((fun (real-fdefinition name)))
+                  (when (eq (not (typep fun 'generic-function))
+                            (not (eq type :generic-function)))
+                    (find-definition-source fun))))
+              (let ((dd (info :function :source-transform name)))
+                (when (typep dd '(cons defstruct-description))
+                  (find-definition-sources-by-name (dd-name (car dd))
+                                                   :structure))))))
        ((:type)
         ;; Source locations for types are saved separately when the expander
         ;; is a closure without a good source-location.
@@ -280,7 +313,7 @@ If an unsupported TYPE is requested, the function will return NIL.
                 (when (functionp expander-fun)
                   (find-definition-source expander-fun))))))
        ((:method)
-        (when (fboundp name)
+        (when (and (valid-function-name-p name) (fboundp name))
           (let ((fun (real-fdefinition name)))
             (when (typep fun 'generic-function)
               (loop for method in (sb-mop::generic-function-methods
@@ -318,10 +351,9 @@ If an unsupported TYPE is requested, the function will return NIL.
             (translate-source-location
              (sb-pcl::method-combination-info-source-location info)))))
        ((:package)
-        (when (symbolp name)
-          (let ((package (find-package name)))
-            (when package
-              (find-definition-source package)))))
+        (let ((package (ignore-errors (find-package name))))
+          (when package
+            (find-definition-source package))))
        ;; TRANSFORM and OPTIMIZER handling from swank-sbcl
        ((:transform)
         (let ((fun-info (info :function :info name)))
@@ -334,7 +366,9 @@ If an unsupported TYPE is requested, the function will return NIL.
                   for note = (sb-c::transform-note xform)
                   do (setf (definition-source-description source)
                            (if (consp typespec)
-                               (list (second typespec) note)
+                               (if (eq (third typespec) '*)
+                                   (list (second typespec) note)
+                                   (list (second typespec) (third typespec) note))
                                (list note)))
                   collect source))))
        ((:optimizer)
@@ -346,21 +380,26 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-c:fun-info-optimizer . sb-c:optimizer)
                             (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
                             (sb-c::fun-info-ir2-hook . sb-c::ir2-hook)
-                            (sb-c::fun-info-stack-allocate-result
-                             . sb-c::stack-allocate-result)
-                            (sb-c::fun-info-constraint-propagate
-                             . sb-c::constraint-propagate)
-                            (sb-c::fun-info-constraint-propagate-if
-                             . sb-c::constraint-propagate-if)
-                            (sb-c::fun-info-call-type-deriver
-                             . sb-c::call-type-deriver))))
+                            (sb-c::fun-info-stack-allocate-result . sb-c::stack-allocate-result)
+                            (sb-c::fun-info-constraint-propagate . sb-c::constraint-propagate)
+                            (sb-c::fun-info-constraint-propagate-if . sb-c::constraint-propagate-if)
+                            (sb-c::fun-info-constraint-propagate-back . sb-c::constraint-propagate-back)
+                            (sb-c::fun-info-constraint-propagate-result . sb-c::constraint-propagate-result)
+                            (sb-c::fun-info-equality-constraint . sb-c::equality-constraint)
+                            (sb-c::fun-info-folder . sb-c::folder)
+                            (sb-c::fun-info-externally-checkable-type . sb-c::externally-checkable-type)
+                            (sb-c::fun-info-constants . sb-c::constants)
+                            (sb-c::fun-info-call-type-deriver . sb-c::call-type-deriver)
+                            (sb-c::fun-info-rewrite-full-call . sb-c::rewrite-full-call)
+                            (sb-c::fun-info-fold-p . sb-c::fold-p)
+                            (sb-c::fun-info-flushable . sb-c::flushable))))
               (loop for (reader . name) in otypes
                     for fn = (funcall reader fun-info)
-                    when fn collect
-                    (let ((source (find-definition-source fn)))
-                      (setf (definition-source-description source)
-                            (list name))
-                      source))))))
+                    when (functionp fn)
+                      collect (let ((source (find-definition-source fn)))
+                                (setf (definition-source-description source)
+                                      (list name))
+                                source))))))
        (:vop
         (find-vop-source name))
        (:alien-type
@@ -369,10 +408,10 @@ If an unsupported TYPE is requested, the function will return NIL.
                (translate-source-location loc))))
        ((:source-transform)
         (let* ((transform-fun
-                (or (info :function :source-transform name)
-                    (and (typep name '(cons (eql setf) (cons symbol null)))
-                         (info :function :source-transform
-                                      (second name)))))
+                 (or (info :function :source-transform name)
+                     (and (typep name '(cons (eql setf) (cons symbol null)))
+                          (info :function :source-transform
+                                (second name)))))
                ;; A cons for the :source-transform is essentially the same
                ;; info that was formerly in :structure-accessor.
                (accessor (and (consp transform-fun) (cdr transform-fun))))
@@ -386,12 +425,12 @@ If an unsupported TYPE is requested, the function will return NIL.
         (let ((locations (info :source-location :declaration name)))
           (loop for (kind loc) on locations by #'cddr
                 when loc
-                collect (let ((loc (translate-source-location loc)))
-                          (setf (definition-source-description loc)
-                                ;; Copy list to ensure that user code
-                                ;; cannot mutate the original.
-                                (copy-list (ensure-list kind)))
-                          loc))))
+                  collect (let ((loc (translate-source-location loc)))
+                            (setf (definition-source-description loc)
+                                  ;; Copy list to ensure that user code
+                                  ;; cannot mutate the original.
+                                  (copy-list (ensure-list kind)))
+                            loc))))
        (t
         nil)))))
 
@@ -455,8 +494,8 @@ If an unsupported TYPE is requested, the function will return NIL.
                (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))))
     (make-definition-source
      :pathname
-     (when (stringp (debug-source-namestring debug-source))
-       (parse-namestring (debug-source-namestring debug-source)))
+     (when (stringp (sb-c::debug-source-namestring debug-source))
+       (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
      (if tlf
          (elt (sb-c::debug-source-start-positions debug-source) tlf))
@@ -467,7 +506,7 @@ If an unsupported TYPE is requested, the function will return NIL.
                       (declare (ignore cond))
                       (sb-c::compiled-debug-fun-blocks
                        (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))))
-     :file-write-date (debug-source-created debug-source)
+     :file-write-date (sb-c::debug-source-created debug-source)
      :plist (sb-c::debug-source-plist debug-source))))
 
 (defun translate-source-location (location)
@@ -522,7 +561,10 @@ value."
                  (info :type :expander typespec-operator)))
          (f (if (listp f) (car f) f)))
     (if (functionp f)
-        (values (%fun-lambda-list f) t)
+        (let ((lambda-list (%fun-lambda-list f)))
+          (if (eq lambda-list :unknown)
+              (values nil nil)
+              (values lambda-list t)))
         (values nil nil))))
 
 (defun method-combination-lambda-list (method-combination)
@@ -573,20 +615,39 @@ or a method combination name."
 ;;; strategy would be to use the disassembler to find actual
 ;;; call-sites.
 
+;; FIXME[1]: this is quite clearly intended to do just about the same thing
+;;           as CTU:FIND-NAMED-CALLEES yet the two are unnecessarily different.
+;; FIXME[2]: for at least #+linkage-space we should disassemble FUNCTION
+;;           because the stored linkage indices underestimate the answer.
+;;           The gain from doing it right is that code constants overestimate
+;;           especially if >1 simple-fun is present in the code.
 (defun find-function-callees (function)
   "Return functions called by FUNCTION."
-  (declare (simple-fun function))
-  (let ((callees '()))
-    (map-code-constants
-     (fun-code-header function)
-     (lambda (obj)
-       (when (fdefn-p obj)
-         (push (fdefn-fun obj) callees))))
-    callees))
+  (if (typep function 'generic-function)
+      (loop for method in (sb-mop:generic-function-methods function)
+            for method-fun = (sb-mop:method-function method)
+            append (find-function-callees
+                    (if (typep (%fun-name method-fun) '(cons (eql sb-pcl::call)))
+                        (sb-kernel:%closure-index-ref  method-fun 0)
+                        method-fun)))
+      (let ((callees '()))
+        #+linkage-space
+        (dolist (index (sb-c:unpack-code-fixup-locs
+                        (sb-vm::%code-fixups (fun-code-header (sb-kernel:%fun-fun function)))))
+          (let ((name (sb-vm::linkage-addr->name index :index)))
+            (when (fboundp name)
+              (push (fdefinition name) callees))))
+        #-linkage-space
+        (map-code-constants
+         (fun-code-header (sb-kernel:%fun-fun function))
+         (lambda (obj)
+           (when (fdefn-p obj)
+             (let ((fun (fdefn-fun obj)))
+               (when fun
+                 (push fun callees))))))
+        callees)))
 
-(defun find-function-callers (function &optional (spaces '(:read-only :static
-                                                           :dynamic
-                                                           #+immobile-code :immobile)))
+(defun find-function-callers (function &optional (spaces '(:all)))
   "Return functions which call FUNCTION, by searching SPACES for code objects"
   (let ((referrers '()))
     (map-caller-code-components
@@ -599,37 +660,161 @@ or a method combination name."
 
 ;;; XREF facility
 
+#-(and system-tlabs (not mark-region-gc))
+(progn
+  (labels ((functoid-simple-fun (functoid)
+             ;; looks like this is supposed to ignore INTERPRETED-FUNCTION ?
+             (typecase functoid
+               (simple-fun functoid)
+               (closure
+                (let ((fun (%closure-fun functoid)))
+                  (if (and (eq (%fun-name fun) 'sb-impl::encapsulation))
+                      (functoid-simple-fun
+                       (sb-impl::encapsulation-info-definition
+                        (sb-impl::encapsulation-info functoid)))
+                      fun))))))
+    (defun map-simple-funs (function)
+      (let ((function (%coerce-callable-to-fun function)))
+        (labels ((process (name value)
+                   (awhen (functoid-simple-fun value)
+                     (funcall function name it))))
+          (call-with-each-globaldb-name
+           (lambda (name)
+             ;; Methods are processed with their generic function
+             (unless (typep name '(cons (member sb-pcl::slow-method sb-pcl::fast-method)))
+               (let ((f (or (and (symbolp name) (macro-function name))
+                            (and (legal-fun-name-p name) (fboundp name)))))
+                 (typecase f
+                   (generic-function
+                    (loop for method in (sb-mop:generic-function-methods f)
+                          for fun = (sb-pcl::safe-method-fast-function method)
+                          when fun do (process (sb-kernel:%fun-name fun) fun)))
+                   (function
+                    (process name f)))))
+             #+sb-xref-for-internals
+             (let ((info (info :function :info name)))
+               (when info
+                 (loop for transform in (sb-c::fun-info-transforms info)
+                       for fun = (sb-c::transform-function transform)
+                       ;; Defined using :defun-only and a later %deftransform.
+                       unless (symbolp fun)
+                       do (process transform fun))))))
+          #+sb-xref-for-internals
+          (sb-int:dohash ((name vop) sb-c::*backend-template-names*)
+            (declare (ignore name))
+            (let ((fun (sb-c::vop-info-generator-function vop)))
+              (when fun
+                (process vop fun))))))))
+  (defun collect-xref (wanted-kind wanted-name)
+    (let ((result '()))
+      (map-simple-funs
+       (lambda (name fun)
+         (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
+           (sb-c:map-packed-xref-data
+            (lambda (xref-kind xref-name xref-form-number)
+              (when (and (eq xref-kind wanted-kind)
+                         (equal xref-name wanted-name))
+                (let ((source-location (find-function-definition-source fun)))
+                  ;; Use the more accurate source path from the xref
+                  ;; entry.
+                  (setf (definition-source-form-number source-location)
+                        xref-form-number)
+                  (let ((name (typecase name
+                                (sb-c::transform
+                                 (let ((fun-name (%fun-name fun)))
+                                   (append (if (consp fun-name)
+                                               fun-name
+                                               (list fun-name))
+                                           (let* ((type (sb-c::transform-type name))
+                                                  (type-spec (type-specifier type)))
+                                             (and (sb-kernel:fun-type-p type)
+                                                  (list (second type-spec)))))))
+                                (sb-c::vop-info
+                                 (list 'sb-c:define-vop
+                                       (sb-c::vop-info-name name)))
+                                (t
+                                 name))))
+                    (push (cons name source-location) result)))))
+            xrefs))))
+      result)))
+
+#+(and system-tlabs (not mark-region-gc))
+(progn
+(sb-ext:defglobal *codeblob-cache* nil)
+(flet ((gather-code (stamp) ; = the value of sb-vm::*code-alloc-count*
+         ;; Remove unreachable functions.
+         (sb-ext:gc :full t)
+         (let ((arena (sb-vm:new-arena (* 2 1024 1024)))
+               (result))
+           ;; Can allocate inside an arena while holding without-gcing in sb-vm:map-code-objects
+           ;; Anyway this approach is silly because Lisp should maintain at all times
+           ;; a binary-searchable tree of all code which would solve all problems
+           ;; related to finding a codeblob from a PC without relying on whatever
+           ;; a particular GC implementation exposes in terms of linearly searchable
+           ;; ranges of memory. immobile-space does maintain such a tree. Of course the tree
+           ;; should also _weakly_ reference all code, and should be usable for xref
+           ;; and other consumers beside the debugger. And it should come with a pony too.
+           (unwind-protect
+                (sb-vm:with-arena (arena)
+                  ;; No filtering since we want this to pertain to all COLLECT-XREFS calls
+                  (sb-vm:map-code-objects (lambda (code) (push code result))))
+             ;; arenas are not suitable for returning memoized data
+             (setq result (coerce result 'vector))
+             (sb-vm:destroy-arena arena))
+           (setf *codeblob-cache* (cons stamp (sb-ext:make-weak-pointer result)))
+           result)))
 (defun collect-xref (wanted-kind wanted-name)
-  (let ((result '()))
-    (sb-c:map-simple-funs
-     (lambda (name fun)
-       (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
-         (sb-c:map-packed-xref-data
-          (lambda (xref-kind xref-name xref-form-number)
-            (when (and (eq xref-kind wanted-kind)
-                       (equal xref-name wanted-name))
-              (let ((source-location (find-function-definition-source fun)))
-                ;; Use the more accurate source path from the xref
-                ;; entry.
-                (setf (definition-source-form-number source-location)
-                      xref-form-number)
-                (let ((name (cond ((sb-c::transform-p name)
-                                   (let ((fun-name (%fun-name fun)))
-                                     (append (if (consp fun-name)
-                                                 fun-name
-                                                 (list fun-name))
-                                             (let* ((type (sb-c::transform-type name))
-                                                    (type-spec (type-specifier type)))
-                                               (and (sb-kernel:fun-type-p type)
-                                                    (list (second type-spec)))))))
-                                  ((sb-c::vop-info-p name)
-                                   (list 'sb-c:define-vop
-                                         (sb-c::vop-info-name name)))
-                                  (t
-                                   name))))
-                  (push (cons name source-location) result)))))
-          xrefs))))
-    result))
+  (let* ((current-stamp sb-vm::*code-alloc-count*)
+         (all-code
+          ;; this is not an attempt to be 100% correct in observing an up-to-date
+          ;; snapshot at a point in time.  It's close enough though.
+          ;; I can't imagine that users are clamoring for a perfect solution to
+          ;; racing threads and XREFing jit-compiled code.
+          (or (let ((cache *codeblob-cache*))
+                (and (eql (car cache) current-stamp)
+                     (sb-ext:weak-pointer-value (cdr cache))))
+              (loop ; expect exactly 1 iteration
+               (let ((vector (gather-code current-stamp))
+                     (new-stamp sb-vm::*code-alloc-count*))
+                 (if (eq new-stamp current-stamp) ; say it's done
+                     (return vector)
+                     (setq current-stamp new-stamp))))))
+         (funs))
+    (dovector (code all-code)
+      (dotimes (i (code-n-entries code))
+        (let ((fun (%code-entry-point code i)))
+          (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
+            (sb-c:map-packed-xref-data
+             (lambda (xref-kind xref-name xref-form-number)
+               (when (and (eq xref-kind wanted-kind)
+                          (equal xref-name wanted-name))
+                 (push (cons fun xref-form-number) funs)))
+             xrefs)))))
+    (let (result)
+      (loop for (fun . xref-form-number) in funs
+            do
+            (let ((source-location (find-function-definition-source fun)))
+              ;; Use the more accurate source path from the xref
+              ;; entry.
+              (setf (definition-source-form-number source-location) xref-form-number)
+              (let* ((name (sb-c::%fun-name fun))
+                     (name (cond ((typep name '(cons (eql sb-c:deftransform)))
+                                  (let* ((fun-name (second name))
+                                         (info (sb-int:info :function :info fun-name))
+                                         (transform (and info
+                                                         (find fun (sb-c::fun-info-transforms info)
+                                                               :key #'sb-c::transform-function))))
+                                    (if transform
+                                        (append name
+                                                (let* ((type (sb-c::transform-type transform))
+                                                       (type-spec (type-specifier type)))
+                                                  (and (sb-kernel:fun-type-p type)
+                                                       (list (second type-spec)))))
+                                        name)))
+                                 (t
+                                  name))))
+                (pushnew (cons name source-location) result :test #'equalp))))
+      result)))))
 
 (defun who-calls (function-name)
   "Use the xref facility to search for source locations where the

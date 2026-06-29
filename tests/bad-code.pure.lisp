@@ -372,10 +372,22 @@
                       '(lambda () (encode-universal-time 0 0 0 1 1 1900 -1))
                       :allow-style-warnings t))))
 
-(with-test (:name :search-transform-bad-index)
-  (checked-compile
-   '(lambda (a)
-     (search '(0 1 0 2) a :start1 4 :end1 5))))
+(with-test (:name :bad-index)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (a)
+                        (search '(0 1 0 2) a :start1 4 :end1 5))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (subseq '(0) 10))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (subseq #(0) 0 10))
+                      :allow-warnings t))))
 
 (with-test (:name :bound-mismatch-union-types)
   (assert (nth-value 1
@@ -389,8 +401,36 @@
   (assert (nth-value 3
                      (checked-compile
                       '(lambda (x)
-                        (the integer (if x 10)))
-                      :allow-style-warnings t))))
+                        (the integer (if x 10 t)))
+                      :allow-style-warnings t)))
+  (assert (nth-value 3
+                     (checked-compile
+                      '(lambda (c)
+                        (the integer
+                         (if c (map nil #'1+ c) 1)))
+                      :allow-style-warnings t)))
+  (checked-compile
+   '(lambda (x)
+     (the integer (if x 10))))
+  (checked-compile
+   '(lambda (c m)
+     (char-code (block nil (labels ((j (c)
+                                      (if c
+                                          #\c
+                                          (return nil))))
+                             (j c)
+                             (j m))))))
+  (checked-compile
+   '(lambda (c)
+     (the integer
+      (or (position c "AB") (position c "CD")))))
+  (checked-compile
+   '(lambda (x)
+     (multiple-value-bind (a b) (if x
+                                    (values nil 2)
+                                    (values 2 3))
+       (declare (integer a))
+       (list a b)))))
 
 (with-test (:name :constant-modification-local-function)
   (assert (= (length (nth-value 2
@@ -697,6 +737,20 @@
                       `(lambda (x)
                          (declare (string x))
                          (replace x '(1 2 3)))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (replace x #(1 2 3)))
+                      :allow-warnings 'warning)))
+  (checked-compile
+   `(lambda (n)
+      (replace (the (simple-array single-float) n) '(1 1.0) :start2 1)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (replace n '(1 1.0) :start2 10))
                       :allow-warnings 'warning))))
 
 (with-test (:name :fill-type-mismatch)
@@ -738,7 +792,15 @@
        :allow-warnings t)
     (declare (ignore failure))
     (assert warning)
-    (assert-error (funcall fun "abcdef") sb-kernel:bounding-indices-bad-error)))
+    (assert-error (funcall fun "abcdef") sb-kernel:bounding-indices-bad-error))
+  (multiple-value-bind (fun failure warning)
+      (checked-compile
+       `(lambda (s)
+          (position #\a (the simple-base-string s) :start 4 :end 2))
+       :allow-warnings t)
+    (declare (ignore failure))
+    (assert warning)
+    (assert-error (funcall fun (string 'list)) sb-kernel:bounding-indices-bad-error)))
 
 (with-test (:name :cast-movement-empty-types)
   (assert (nth-value 2
@@ -772,3 +834,249 @@
                      (checked-compile
                       `(lambda () (declare (sb-ext:muffle-conditions foo)) nil)
                       :allow-style-warnings t))))
+
+(with-test (:name :format-char)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (format t "~c" 1))
+                      :allow-warnings t))))
+
+(with-test (:name :format-r)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (format t "~r" t))
+                      :allow-warnings t))))
+
+(with-test (:name :multiple-uses-funargs)
+  (assert (nth-value 3
+                     (checked-compile
+                      `(lambda (x f)
+                         (sort x
+                               (or f
+                                   (lambda (x)
+                                     (< x 0)))))
+                      :allow-style-warnings t))))
+
+(with-test (:name :see-through-mv-let+values)
+  (assert (nth-value 3
+                     (checked-compile
+                      `(lambda (x f)
+                         (multiple-value-bind (f key)
+                             (if f
+                                 (values f #'car)
+                                 (values #'1+ #'cdr))
+                           (sort x f :key key)))
+                      :allow-style-warnings t))))
+
+(with-test (:name :member-bad-test)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (m y)
+                         (member m y :test #'= :key #'symbol-name))
+                      :allow-warnings t))))
+
+(with-test (:name :constant-modification-functions)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (n)
+                        (setf (car (aref #((1) (2)) n)) 10))
+                      :allow-warnings t))))
+
+(with-test (:name :constant-modification-nil)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (n)
+                        (incf (car (assoc n '((1 . 2) (3 . 4))))))
+                      :allow-warnings t))))
+
+(with-test (:name :make-array-initial-contents-warning)
+  (checked-compile
+   `(lambda (n)
+      (make-array n
+                  :element-type 'single-float
+                  :initial-contents '((1.0)))))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (make-array '(10 10)
+                                     :element-type 'single-float
+                                     :initial-contents '(1.0)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (make-array (list n n)
+                                     :element-type 'single-float
+                                     :initial-contents (list (list 1.0 1.0)
+                                                             (list 1.0 1.0 1.0))))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (make-array (list n n)
+                                     :element-type 'single-float
+                                     :initial-contents (list (list 1.0 1.0)
+                                                             1.0)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (make-array 10 :element-type 'single-float :initial-contents (list 10)))
+                      :allow-warnings t))))
+
+(with-test (:name :fun-type-intersection)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (funcall (the (and x
+                                            (function (&optional t (mod 10)))) #'aref)
+                                  x 30))
+                      :allow-warnings t
+                      :allow-style-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (j)
+                         (funcall (the (and compiled-function
+                                            (function (&optional fixnum))) j)
+                                  'a))
+                      :allow-warnings t
+                      :allow-style-warnings t))))
+
+(with-test (:name :funcall-union)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x a)
+                         (funcall (ecase x
+                                    (0 #'+)
+                                    (1 #'-))
+                                  a 'b))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x a)
+                         (funcall (case x
+                                    (0 #'+)
+                                    (1 #'-))
+                                  a 'b))
+                      :allow-warnings t))))
+
+(with-test (:name :check-type-compile-time)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda ()
+                         (let ((x 10))
+                           (check-type x list)))
+                      :allow-warnings t))))
+
+(with-test (:name :code-deletion-macros)
+  (assert
+   (nth-value 4
+              (checked-compile `(lambda ()
+                                  (when nil
+                                    (setf * 10)))
+                               :allow-notes 'code-deletion-note)))
+  (checked-compile `(lambda (x)
+                      (unless x
+                        (or)))
+                   :allow-notes nil))
+
+
+(with-test (:name :check-type-bad-type)
+  (assert
+   (nth-value 2
+              (checked-compile `(lambda (x)
+                                  (check-type x (values t)))
+                               :allow-warnings t))))
+
+(with-test (:name :constant-modification-functions-debug)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (declare (optimize (debug 2)))
+                        (let ((l '((0) 0 0)))
+                          (incf (car (car l)))
+                          l))
+                      :allow-warnings t)))
+  (checked-compile
+   `(lambda ()
+      (flet ((x (x)
+               (when x
+                 (setf (cadr x) 10))))
+        (x nil)
+        (x (list 1 2))))))
+
+(with-test (:name :the-bad-type-no-runtime-error)
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (the (nil) x))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1))))
+
+(with-test (:name :case-duplicate-t-no-runtime-error)
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (case x
+           (t 1)
+           (t 2)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1)))
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (case x
+           (otherwise 1)
+           (t 2)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1)))
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (typecase x
+           (otherwise 1)
+           (otherwise 2)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1)))
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       '(lambda (x)
+         (case x
+           ()
+           (t 1)))
+       :allow-warnings t)
+    (assert fail)
+    (assert warn)
+    (assert (= (funcall fun 1) 1))))
+
+(with-test (:name :typecase-nonfinal-otherwise-warns)
+  (assert-signal
+      (macroexpand-1 '(typecase x (cons 1) (otherwise 2) (t 3)))
+      warning))
+
+(with-test (:name :important-result-through-casts)
+  (assert
+   (nth-value 3
+              (checked-compile `(lambda (x y)
+                                  (the sequence (delete x y))
+                                  10)
+                               :allow-style-warnings t))))
+
+(with-test (:name :function-err-wording)
+  (flet ((try (sym &aux (*error-output* (make-broadcast-stream)))
+           (princ-to-string
+            (block foo (handler-bind
+                           ((sb-c:compiler-error (lambda (e) (return-from foo e))))
+                         (compile nil `(lambda () #',sym)))))))
+    (assert (search "special operator IF was found" (try 'if)))
+    (assert (search "macro COND was found" (try 'cond)))))

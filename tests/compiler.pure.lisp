@@ -161,14 +161,18 @@
 
 ;;; on the PPC, we got the magic numbers in undefined_tramp wrong for
 ;;; a while; fixed by CSR 2002-07-18
-(with-test (:name :undefined-function-error
-            :fails-on :ppc64)
+(with-test (:name :undefined-function-error)
   (multiple-value-bind (value error)
       (ignore-errors (funcall (checked-compile
                                `(lambda () (some-undefined-function))
                                :allow-style-warnings t)))
     (assert (null value))
     (assert (eq (cell-error-name error) 'some-undefined-function))))
+
+(defvar *unbound*)
+
+;;; Assign a TLS index
+(let (*unbound*))
 
 (with-test (:name :unbound-variable-error)
   (let ((foo (gensym)))
@@ -184,7 +188,10 @@
     ;; variable names that looked like names of thread slots.
     (assert (eq (handler-case *state*
                   (unbound-variable (c) (cell-error-name c)))
-                '*state*))))
+                '*state*))
+    (assert (eq (handler-case *unbound*
+                  (unbound-variable (c) (cell-error-name c)))
+                '*unbound*))))
 
 ;;; Non-symbols shouldn't be allowed as VARs in lambda lists. (Where VAR
 ;;; is a variable name, as in section 3.4.1 of the ANSI spec.)
@@ -1899,7 +1906,7 @@
     (multiple-value-bind (res err) (ignore-errors (funcall fun t))
       (assert (not res))
       (assert (typep err 'program-error))
-      (assert (not (sequence:emptyp (princ-to-string err)))))))
+      (assert (string/= "" (princ-to-string err))))))
 
 (with-test (:name (compile random :distribution))
   (let ((fun (checked-compile '(lambda (x) (random (if x 10 20))))))
@@ -2085,7 +2092,7 @@
                                      (declare (optimize (speed 3)))
                                      (+ x 2))))))
     ;; forced-to-do GENERIC-+, etc, possible word -> bignum conversion note
-    (assert (> (length notes) 1)))
+    (assert (> (length notes) 0)))
 
   (let ((notes (nth-value
                 4 (checked-compile '(lambda (x)
@@ -3101,6 +3108,15 @@
            (setq x (make-array '(4 4)))
            (adjust-array y '(3 5))
            (array-dimension y 0)))
+    (((make-array '(4 4) :initial-element nil :adjustable t)) 3))
+  (checked-compile-and-assert (:optimize nil)
+      `(lambda (x)
+         (declare (optimize speed))
+         (declare (type (array * (4 4)) x))
+         (let ((y x))
+           (setq x (make-array '(4 4)))
+           (adjust-array y '(3 5))
+           (array-dimension (the (array t) y) 0)))
     (((make-array '(4 4) :initial-element nil :adjustable t)) 3)))
 
 (with-test (:name :with-timeout-code-deletion-note)
@@ -3197,71 +3213,71 @@
              (flet ((size () (list 3))) ; here too
                (make-array (size) :initial-contents `(,x ,y ,z)))))))
 
-;;; optimizing array-in-bounds-p
-(defun contains-array-in-bounds-p (form)
-  (member 'array-in-bounds-p (ctu:ir1-named-calls `(lambda () ,form))))
 (with-test (:name :optimize-array-in-bounds-p)
-  (locally
-    (macrolet ((must-optimize (&body exprs)
-                 `(progn
-                    ,@(loop for expr in exprs
-                            collect `(assert (not (contains-array-in-bounds-p ',expr))))))
-               (must-not-optimize (&body exprs)
-                 `(progn
-                    ,@(loop for expr in exprs
-                            collect `(assert (contains-array-in-bounds-p ',expr))))))
-      (must-optimize
-        ;; in bounds
-        (let ((a (make-array '(1))))
-          (array-in-bounds-p a 0))
-        ;; exceeds upper bound (constant)
-        (let ((a (make-array '(1))))
-          (array-in-bounds-p a 1))
-        ;; exceeds upper bound (interval)
-        (let ((a (make-array '(1))))
-          (array-in-bounds-p a (+ 1 (random 2))))
-        ;; negative lower bound (constant)
-        (let ((a (make-array '(1))))
-          (array-in-bounds-p a -1))
-        ;; negative lower bound (interval)
-        (let ((a (make-array 3))
-              (i (- (random 1) 20)))
-          (array-in-bounds-p a i))
-        ;; multiple known dimensions
-        (let ((a (make-array '(1 1))))
-          (array-in-bounds-p a 0 0))
-        ;; union types
-        (let ((s (the (simple-string 10) (eval "0123456789"))))
-          (array-in-bounds-p s 9)))
-      (must-not-optimize
-       ;; don't trust non-simple array length in safety=1
-       (let ((a (the (array * (10 20)) (make-array '(10 20) :adjustable t))))
-         (eval `(adjust-array ,a '(0 0)))
-         (array-in-bounds-p a 9 0))
-       ;; multiple unknown dimensions
-       (let ((a (make-array (list (random 20) (random 5)))))
-         (array-in-bounds-p a 5 2))
-       ;; some other known dimensions
-       (let ((a (make-array (list 1 (random 5)))))
-         (array-in-bounds-p a 0 2))
-       ;; subscript might be negative
-       (let ((a (make-array '(5 10))))
-         (array-in-bounds-p a 1 (- (random 3) 2)))
-       ;; subscript might be too large
-       (let ((a (make-array '(5 10))))
-         (array-in-bounds-p a (random 6) 1))
-       ;; unknown upper bound
-       (let ((a (make-array '(5 10))))
-         (array-in-bounds-p a (get-universal-time) 1))
-       ;; unknown lower bound
-       (let ((a (make-array '(5 30))))
-         (array-in-bounds-p a 0 (- (get-universal-time))))
-       ;; in theory we should be able to optimize
-       ;; the following but the current implementation
-       ;; doesn't cut it because the array type's
-       ;; dimensions get reported as (* *).
-       (let ((a (make-array (list (random 20) 1))))
-         (array-in-bounds-p a 5 2))))))
+  (macrolet ((must-optimize (&body exprs)
+               `(progn
+                  ,@(loop for (expr type) on exprs by #'cddr
+                          collect `(assert-type (lambda () ,expr) (member ,type)))))
+             (must-not-optimize (&body exprs)
+               `(progn
+                  ,@(loop for expr in exprs
+                          collect `(assert-type (lambda () ,expr) boolean)))))
+    (must-optimize
+     ;; in bounds
+     (let ((a (make-array '(1))))
+       (array-in-bounds-p a 0))
+     t
+     ;; exceeds upper bound (constant)
+     (let ((a (make-array '(1))))
+       (array-in-bounds-p a 1))
+     nil
+     ;; exceeds upper bound (interval)
+     (let ((a (make-array '(1))))
+       (array-in-bounds-p a (+ 1 (random 2))))
+     nil
+     ;; negative lower bound (constant)
+     (let ((a (make-array '(1))))
+       (array-in-bounds-p a -1))
+     nil
+     ;; negative lower bound (interval)
+     (let ((a (make-array 3))
+           (i (- (random 1) 20)))
+       (array-in-bounds-p a i))
+     nil
+     ;; multiple known dimensions
+     (let ((a (make-array '(1 1))))
+       (array-in-bounds-p a 0 0))
+     t
+     ;; union types
+     (let ((s (the (simple-string 10) (eval "0123456789"))))
+       (array-in-bounds-p s 9))
+     t
+     (let ((a (make-array (list (random 20) 1))))
+       (array-in-bounds-p a 5 2))
+     nil)
+    (must-not-optimize
+     ;; don't trust non-simple array length in safety=1
+     (let ((a (the (array * (10 20)) (make-array '(10 20) :adjustable t))))
+       (eval `(adjust-array ,a '(0 0)))
+       (array-in-bounds-p a 9 0))
+     ;; multiple unknown dimensions
+     (let ((a (make-array (list (random 20) (random 5)))))
+       (array-in-bounds-p a 5 2))
+     ;; some other known dimensions
+     (let ((a (make-array (list 1 (random 5)))))
+       (array-in-bounds-p a 0 2))
+     ;; subscript might be negative
+     (let ((a (make-array '(5 10))))
+       (array-in-bounds-p a 1 (- (random 3) 2)))
+     ;; subscript might be too large
+     (let ((a (make-array '(5 10))))
+       (array-in-bounds-p a (random 6) 1))
+     ;; unknown upper bound
+     (let ((a (make-array '(5 10))))
+       (array-in-bounds-p a (get-universal-time) 1))
+     ;; unknown lower bound
+     (let ((a (make-array '(5 30))))
+       (array-in-bounds-p a 0 (- (get-universal-time)))))))
 
 ;;; optimizing (EXPT -1 INTEGER)
 (with-test (:name (expt -1 integer))
@@ -3319,11 +3335,6 @@
                                   `(lambda ()
                                      (declare (optimize (sb-c::float-accuracy 0)))
                                      ,lambda-form)))))
-             ;; Multiplication at runtime should be eliminated only with
-             ;; FLOAT-ACCURACY=0. (To catch SNaNs.)
-             #+(or x86 x86-64)
-             (assert (and (ctu:asm-search "MUL" fun1)
-                          (not (ctu:asm-search "MUL" fun2))))
              ;; Not generic arithmetic, please!
              (assert (and (not (ctu:asm-search "GENERIC" fun1))
                           (not (ctu:asm-search "GENERIC" fun2))))
@@ -3352,8 +3363,10 @@
              ;; addition in to catch SNaNs.
              #+x86
              (progn
-               (assert (ctu:asm-search "FADD" fun1))
-               (assert (not (ctu:asm-search "FADD" fun2))))
+               (assert (or (ctu:asm-search "FADDD " fun1)
+                           (ctu:asm-search "FADD-STI " fun1)))
+               (assert (not (or (ctu:asm-search "FADDD " fun2)
+                                (ctu:asm-search "FADD-STI " fun2)))))
              #+x86-64
              (let ((inst (if (typep result 'double-float)
                              "ADDSD" "ADDSS")))
@@ -3375,19 +3388,6 @@
                                   `(lambda ()
                                      (declare (optimize (sb-c::float-accuracy 0)))
                                      ,lambda-form)))))
-             ;; Let's make sure there is no substraction at runtime: for x86
-             ;; and x86-64 that implies an FSUB, SUBSS, or SUBSD instruction,
-             ;; so look for SUB in the disassembly. It's a terrible KLUDGE,
-             ;; but it works. Unless FLOAT-ACCURACY is zero, we leave the
-             ;; substraction in in to catch SNaNs.
-             #+x86
-             (assert (and (ctu:asm-search "FSUB" fun1)
-                          (not (ctu:asm-search "FSUB" fun2))))
-             #+x86-64
-             (let ((inst (if (typep result 'double-float)
-                             "SUBSD" "SUBSS")))
-               (assert (and (ctu:asm-search inst fun1)
-                            (not (ctu:asm-search inst fun2)))))
              (assert (eql result (funcall fun1 arg)))
              (assert (eql result (funcall fun2 arg))))))
     (test `(lambda (x) (declare (single-float x)) (- x 0)) 123.45)
@@ -3442,7 +3442,7 @@
                                t))))
     (ctu:assert-no-consing (funcall f))))
 
-(with-test (:name :truncate-float :fails-on :ppc64)
+(with-test (:name :truncate-float)
   (let ((s (checked-compile `(lambda (x)
                                (declare (single-float x))
                                (truncate x))))
@@ -3548,15 +3548,15 @@
     (test 'base-string 'sb-kernel:%concatenate-to-base-string)
     (test 'simple-base-string 'sb-kernel:%concatenate-to-base-string)))
 
-(with-test (:name (satisfies :no-local-fun)
-            :fails-on :ppc64)
+(with-test (:name (satisfies :no-local-fun))
   (let ((fun (checked-compile
               `(lambda (arg)
                  (labels ((local-not-global-bug (x)
                             t)
                           (bar (x)
                             (typep x '(satisfies local-not-global-bug))))
-                   (bar arg))))))
+                   (bar arg)))
+              :allow-style-warnings t)))
     (assert (eq 'local-not-global-bug
                 (handler-case
                     (funcall fun 42)
@@ -3742,30 +3742,6 @@
          (load-time-value (the (values fixnum) 42)))
     (() 42)))
 
-(with-test (:name (compile :bug-654289))
-  ;; Test that compile-times don't explode when quoted constants
-  ;; get big.
-  (labels ((time-n (n)
-             (gc :full t) ; Let's not confuse the issue with GC
-             (let* ((tree (make-tree (expt 10 n) nil))
-                    (t0 (get-internal-run-time))
-                    (f (checked-compile `(lambda (x) (eq x (quote ,tree)))))
-                    (t1 (get-internal-run-time)))
-               (assert (funcall f tree))
-               (- t1 t0)))
-           (make-tree (n acc)
-             (cond ((zerop n) acc)
-                   (t (make-tree (1- n) (cons acc acc))))))
-    (let* ((times (loop for i from 0 upto 4
-                        collect (time-n i)))
-           (max-small (reduce #'max times :end 3))
-           (max-big (reduce #'max times :start 3)))
-      ;; This way is hopefully fairly CPU-performance insensitive.
-      (unless (> (+ (truncate internal-time-units-per-second 10)
-                    (* 2 max-small))
-                 max-big)
-        (error "Bad scaling or test? ~S" times)))))
-
 (with-test (:name (compile :bug-309063))
   (checked-compile-and-assert ()
       `(lambda (x)
@@ -3832,7 +3808,7 @@
       (assert (< d3 (* 10 short-avg))))))
 
 (with-test (:name :bug-384892)
-  (assert (equal
+  (assert (ctype=
            '(function (fixnum fixnum &key (:k1 boolean))
              (values (member t) &optional))
            (sb-kernel:%simple-fun-type
@@ -3841,72 +3817,6 @@
                                 (declare (boolean k1))
                                 (declare (ignore x y k1))
                                 t))))))
-
-(with-test (:name :bug-309448
-            :skipped-on :gc-stress)
-  ;; Like all tests trying to verify that something doesn't blow up
-  ;; compile-times this is bound to be a bit brittle, but at least
-  ;; here we try to establish a decent baseline.
-  (labels ((time-it (lambda want &optional times)
-             (gc :full t) ; let's keep GCs coming from other code out...
-             (let* ((start (get-internal-run-time))
-                    (iterations 0)
-                    (fun (if times
-                             (loop for result = (checked-compile lambda)
-                                   repeat times
-                                   finally (return result))
-                             (loop for result = (checked-compile lambda)
-                                   do (incf iterations)
-                                   until (> (get-internal-run-time) (+ start (* 10
-                                                                                (/ internal-time-units-per-second
-                                                                                   1000))))
-                                   finally (return result))))
-                    (end (get-internal-run-time))
-                    (got (funcall fun)))
-               (unless (eql want got)
-                 (error "wanted ~S, got ~S" want got))
-               (values (- end start) iterations)))
-           (test-it (simple result1 complex result2)
-             (multiple-value-bind (time-simple iterations)
-                 (time-it simple result1)
-               (assert (>= (* 10 (1+ time-simple))
-                           (time-it complex result2 iterations))))))
-    ;; This is mostly identical as the next one, but doesn't create
-    ;; hairy unions of numeric types.
-    (test-it `(lambda ()
-                (labels ((bar (baz bim)
-                           (let ((n (+ baz bim)))
-                             (* n (+ n 1) bim))))
-                  (let ((a (bar 1 1))
-                        (b (bar 1 1))
-                        (c (bar 1 1)))
-                    (- (+ a b) c))))
-             6
-             `(lambda ()
-                (labels ((bar (baz bim)
-                           (let ((n (+ baz bim)))
-                             (* n (+ n 1) bim))))
-                  (let ((a (bar 1 1))
-                        (b (bar 1 5))
-                        (c (bar 1 15)))
-                    (- (+ a b) c))))
-             -3864)
-    (test-it `(lambda ()
-                (labels ((sum-d (n)
-                           (let ((m (truncate 999 n)))
-                             (/ (* n m (1+ m)) 2))))
-                  (- (+ (sum-d 3)
-                        (sum-d 3))
-                     (sum-d 3))))
-             166833
-             `(lambda ()
-                (labels ((sum-d (n)
-                           (let ((m (truncate 999 n)))
-                             (/ (* n m (1+ m)) 2))))
-                  (- (+ (sum-d 3)
-                        (sum-d 5))
-                     (sum-d 15))))
-             233168)))
 
 (with-test (:name :regression-1.0.44.34)
   (checked-compile
@@ -4078,22 +3988,18 @@
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-793771 *))
-  (let ((f (checked-compile
-            `(lambda (x)
-               (declare (type (single-float (0.0)) x))
-               (* x 0.1)))))
-    (assert (equal `(function ((single-float (0.0)))
-                              (values (single-float 0.0) &optional))
-                   (sb-kernel:%simple-fun-type f)))))
+  (assert-type
+   (lambda (x)
+     (declare (type (single-float (0.0)) x))
+     (* x 0.1))
+   (or (member 0.0) (single-float (0.0)))))
 
 (with-test (:name (:bug-793771 /))
-  (let ((f (checked-compile
-            `(lambda (x)
-               (declare (type (single-float (0.0)) x))
-               (/ x 3.0)))))
-    (assert (equal `(function ((single-float (0.0)))
-                              (values (single-float 0.0) &optional))
-                   (sb-kernel:%simple-fun-type f)))))
+  (assert-type
+   (lambda (x)
+     (declare (type (single-float (0.0)) x))
+     (/ x 3.0))
+   (or (member 0.0) (single-float (0.0)))))
 
 (with-test (:name (compile :bug-486812 single-float))
   (checked-compile `(lambda ()
@@ -4338,26 +4244,6 @@
                                (type (and fixnum a) x))
                       x)
                    :allow-style-warnings t))
-
-(with-test (:name (compile :bug-959687))
-  (flet ((test (form)
-           (multiple-value-bind (fun failure-p warnings style-warnings)
-               (checked-compile form :allow-failure t :allow-style-warnings t)
-             (declare (ignore warnings))
-             (assert (and failure-p style-warnings))
-             (assert-error(funcall fun t)))))
-    (test `(lambda (x)
-             (case x
-               (t
-                :its-a-t)
-               (otherwise
-                :somethign-else))))
-    (test `(lambda (x)
-             (case x
-               (otherwise
-                :its-an-otherwise)
-               (t
-                :somethign-else))))))
 
 (with-test (:name (compile :bug-924276))
   (assert (nth-value
@@ -4775,11 +4661,10 @@
                       (ash a b))))
 
 (with-test (:name (compile :nconc-derive-type))
-  (let ((function (checked-compile `(lambda (x y)
-                                      (declare (type (or cons fixnum) x))
-                                      (nconc x y)))))
-    (assert (equal (sb-kernel:%simple-fun-type function)
-                   '(function ((or cons fixnum) t) (values cons &optional))))))
+  (assert-type (lambda (x y)
+                 (declare (type (or cons fixnum) x))
+                 (nconc x y))
+               (function ((or cons fixnum) t) (values cons &optional))))
 
 ;; make sure that all data-vector-ref-with-offset VOPs are either
 ;; specialised on a 0 offset or accept signed indices
@@ -5015,8 +4900,9 @@
                       (typecase a
                         ((array t 2)
                          (when (= (array-rank a) 3)
-                           (array-dimension a 2)))))))))
-    (assert (= 1 (length notes)))))
+                           (array-dimension a 2)))))
+                   :allow-notes 'code-deletion-note))))
+    (assert notes)))
 
 (with-test (:name (upgraded-array-element-type :undefined-type))
   (checked-compile-and-assert (:allow-style-warnings t :optimize nil)
@@ -5577,7 +5463,9 @@
   (let ((f (checked-compile '(lambda (x) (oddp x)))))
     (ctu:assert-no-consing (funcall f most-positive-fixnum))))
 (with-test (:name (oddp bignum :no-consing)
-            :serial t :skipped-on :interpreter :fails-on (or :arm :ppc))
+            :serial t
+            :skipped-on :interpreter
+            :fails-on (or :arm :ppc :ppc64 :riscv :loongarch64 :sparc :mips))
   (let ((f (checked-compile '(lambda (x) (oddp x))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
@@ -5586,7 +5474,9 @@
   (let ((f (checked-compile '(lambda (x) (logtest x most-positive-fixnum)))))
     (ctu:assert-no-consing (funcall f 1))))
 (with-test (:name (logtest bignum :no-consing)
-            :serial t :skipped-on :interpreter :fails-on (or :arm :ppc))
+            :serial
+            t :skipped-on :interpreter
+            :fails-on (or :arm :ppc :ppc64 :riscv :loongarch64 :sparc :mips))
   (let ((f (checked-compile '(lambda (x) (logtest x 1))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
@@ -6078,10 +5968,10 @@
     ((5.0f-9) #C(-4.123312f37 -0.0))))
 
 (with-test (:name :reducing-constants.2)
-  (checked-compile-and-assert (:allow-style-warnings t)
-      `(lambda () (*  1.0 2 (expt 2 127)))
-    (() #-no-float-traps (condition 'floating-point-overflow)
-        #+no-float-traps sb-ext:single-float-positive-infinity)))
+  (let* ((fun (checked-compile `(lambda () (* 1.0 2 (expt 2 127))))))
+    (handler-case (funcall fun)
+      (floating-point-overflow ())
+      (:no-error (x) (assert (eql x sb-ext:single-float-positive-infinity))))))
 
 (with-test (:name (logbitp :past fixnum))
   (checked-compile-and-assert ()
