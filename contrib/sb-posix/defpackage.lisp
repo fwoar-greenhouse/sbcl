@@ -17,7 +17,7 @@
            #:passwd-gecos #:passwd-dir #:passwd-shell
            #:group-name #:group-gid #:group-passwd #:group-mem
            #:stat-mode #:stat-ino #:stat-dev #:stat-nlink #:stat-uid
-           #:stat-gid #:stat-size #:stat-atime #:stat-mtime #:stat-ctime
+           #:stat-gid #:stat-size #:stat-atime #:stat-mtime #:stat-ctime  #:stat-birth-time
            #:stat-rdev
            #:termios-iflag #:termios-oflag #:termios-cflag
            #:termios-lflag #:termios-cc

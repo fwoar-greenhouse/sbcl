@@ -744,6 +744,8 @@ not supported."
    (mtime :initarg :mtime :reader stat-mtime
           :documentation "Time of last data modification.")
    (ctime :initarg :ctime :reader stat-ctime
+          :documentation "Time of last status change.")
+   (birth-time :initarg :birth-time :reader stat-birth-time
           :documentation "Time of last status change."))
   (:documentation "Instances of this class represent POSIX file metadata."))
 

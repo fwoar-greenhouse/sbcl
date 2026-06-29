@@ -341,7 +341,8 @@
               ((signed 64) size "long long" "st_size")
               (time-t atime "time_t" "st_atime")
               (time-t mtime "time_t" "st_mtime")
-              (time-t ctime "time_t" "st_ctime")))
+              (time-t ctime "time_t" "st_ctime")
+              (time-t birth-time "time_t" "st_birthtimespec")))
  #+(and win32 ucrt)
  (:structure alien-stat
              ("struct __stat64"
