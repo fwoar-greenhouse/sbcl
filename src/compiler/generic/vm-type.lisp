@@ -272,7 +272,9 @@
   (cond ((built-in-classoid-p type)
          (case (classoid-name type)
            (system-area-pointer sb-vm:sap-widetag)
-           (fdefn sb-vm:fdefn-widetag)))
+           (fdefn sb-vm:fdefn-widetag)
+           #+sb-simd-pack-512
+           (simd-pack-512-mask sb-vm:simd-pack-512-mask-widetag)))
         ((numeric-type-p type)
          (cond ((type= type (specifier-type '(complex single-float)))
                 sb-vm:complex-single-float-widetag)
@@ -287,7 +289,11 @@
         #+sb-simd-pack-256
         ((simd-pack-256-type-p type)
          (cond ((type= type (specifier-type 'simd-pack-256))
-                sb-vm:simd-pack-256-widetag)))))
+                sb-vm:simd-pack-256-widetag)))
+        #+sb-simd-pack-512
+        ((simd-pack-512-type-p type)
+         (cond ((type= type (specifier-type 'simd-pack-512))
+                sb-vm:simd-pack-512-widetag)))))
 
 ;; Given TYPES which is a list of types from a union type, decompose into
 ;; two unions, one being an OR over types representable as widetags

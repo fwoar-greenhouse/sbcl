@@ -221,7 +221,7 @@
 (define-assembly-routine (throw
                            (:return-style :full-call-no-return)
                            (:save-p :compute-only))
-                         ((:arg target (descriptor-reg any-reg) edx-offset)
+                         ((:arg target (descriptor-reg any-reg) (:lisp-reg 0))
                           (:arg start any-reg ebx-offset)
                           (:arg count any-reg ecx-offset)
                           (:temp catch any-reg eax-offset))
@@ -253,8 +253,7 @@
 #-win32
 (define-assembly-routine (unwind
                           (:return-style :none)
-                          (:translate %unwind)
-                          (:policy :fast-safe))
+                          (:translate %unwind))
                          ((:arg block (any-reg descriptor-reg) eax-offset)
                           (:arg start (any-reg descriptor-reg) ebx-offset)
                           (:arg count (any-reg descriptor-reg) ecx-offset)
@@ -299,8 +298,7 @@
 
 #+win32
 (define-assembly-routine (unwind
-                          (:return-style :none)
-                          (:policy :fast-safe))
+                          (:return-style :none))
                          ((:arg block (any-reg descriptor-reg) eax-offset)
                           (:arg start (any-reg descriptor-reg) ebx-offset)
                           (:arg count (any-reg descriptor-reg) ecx-offset))
@@ -438,8 +436,7 @@
 #+win32
 (define-assembly-routine (continue-unwind
                           (:return-style :none)
-                          (:translate %unwind)
-                          (:policy :fast-safe))
+                          (:translate %unwind))
                          ((:arg block (any-reg descriptor-reg) eax-offset)
                           (:arg start (any-reg descriptor-reg) ebx-offset)
                           (:arg count (any-reg descriptor-reg) ecx-offset))

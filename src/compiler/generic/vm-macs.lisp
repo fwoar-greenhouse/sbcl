@@ -42,9 +42,7 @@
   ;; In any case, we desire a way to say that certain foreign calls are
   ;; uninterruptible, but this technique has less overhead than WITHOUT-GCING
   ;; which is to be eschewed as no such thing exists in most collectors.
-  ;; If using safepoints, then this reduces to PROGN.
-  `(symbol-macrolet (#-(or sb-safepoint nonstop-foreign-call)
-                     (sb-vm::.pseudo-atomic-call-out. t))
+  `(symbol-macrolet ((sb-vm::.pseudo-atomic-call-out. t))
      ,@body))
 
 ;;;; other miscellaneous stuff
@@ -197,9 +195,10 @@
 ;;; determined) and assign the rest sequentially.
 (defmacro !define-storage-classes (&rest classes)
   (let* ((fixed-numbers '((descriptor-reg . 0)
-                          (any-reg        . 1)
+                          (control-stack  . 1)
                           (signed-reg     . 2)
-                          (constant       . 3)))
+                          (constant       . 3)
+                          (any-reg        . 4))) ;; any-reg will be merged with descriptor-reg by make-sc+offset
          (index (length fixed-numbers)))
     (flet ((process-class (class-spec)
              (destructuring-bind (sc-name sb-name &rest args) class-spec

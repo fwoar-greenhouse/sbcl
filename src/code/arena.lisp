@@ -137,14 +137,7 @@ one or more times, not to exceed MAX-EXTENSIONS times"
 (defun cur-thread-stack-object-p (x)
   (let ((a (get-lisp-obj-address x)))
     (and (< (sap-int (current-sp)) a
-            (sap-int (current-thread-offset-sap thread-control-stack-end-slot))))))
-
-(declaim (inline force-to-heap-p))
-(defun force-to-heap-p (x)
-  (and (not (zerop (sap-int (current-thread-offset-sap thread-arena-slot))))
-       (or (dynamic-space-obj-p x)
-           ;; FIXME: is checking for read-only still correct???
-           (read-only-space-obj-p x)))))
+            (sap-int (current-thread-offset-sap thread-control-stack-end-slot)))))))
 
 (defmacro in-same-arena ((object reason) &rest forms)
   (declare (ignorable object reason))
@@ -277,34 +270,6 @@ one or more times, not to exceed MAX-EXTENSIONS times"
             (arena-index self)
             (arena-length self)
             (arena-bytes-wasted self))))
-
-(defun copy-number-to-heap (n)
-  (declare (sb-c::tlab :system))
-  (named-let copy ((n n))
-    (if (or (typep n '(or fixnum single-float))
-            (and (typep n '(or bignum double-float (complex float)))
-                 (dynamic-space-obj-p n)))
-        n
-        (typecase n
-          ;; can't use copy-bignum because that uses the active tlab
-          ;; nor bignum-replace because it's a not-yet-defined macro.
-          (bignum (let* ((len (sb-bignum:%bignum-length n))
-                         (new (sb-bignum:%allocate-bignum len)))
-                    (dotimes (i len new)
-                      (declare (type sb-bignum:bignum-index i))
-                      (sb-bignum:%bignum-set new i (sb-bignum:%bignum-ref n i)))))
-          (double-float
-           (%make-double-float (double-float-bits n)))
-          ;; ratio is dynspace-p only if both parts are. copy everything to be safe
-          (ratio (%make-ratio (truly-the integer (copy (%numerator n)))
-                              (truly-the integer (copy (%denominator n)))))
-          ;; Handle complex subtypes by hand so that a vop or IR2-converter is used
-          ((complex single-float) (complex (realpart n) (imagpart n)))
-          ((complex double-float) (complex (realpart n) (imagpart n)))
-          (complex ; same as RATIO
-           (%make-complex (truly-the rational (copy (%realpart n)))
-                          (truly-the rational (copy (%imagpart n)))))
-          (t (bug "~S is not a number" n))))))
 
 ;;; This variable is bound to a function of three args: arena, current request,
 ;;; and desired new total space consumption of the arena. It is called prior to

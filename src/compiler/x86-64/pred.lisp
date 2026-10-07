@@ -302,11 +302,10 @@
   (:args (x :scs (any-reg descriptor-reg control-stack))
          (y :scs (any-reg descriptor-reg control-stack immediate constant)))
   (:conditional :e)
-  (:policy :fast-safe)
   (:translate eq)
   (:arg-refs x-tn-ref)
   (:temporary (:sc unsigned-reg) temp) ; TODO: add :unused-if
-  (:generator 6
+  (:generator 1
     (cond
       ((sc-is y constant)
        (inst cmp x (cond ((sc-is x descriptor-reg any-reg) y)
@@ -315,7 +314,7 @@
        (inst cmp x (move-immediate temp (immediate-tn-repr y))))
       ((sc-is y immediate)
        (let* ((value (encode-value-if-immediate y))
-              (immediate (plausible-signed-imm32-operand-p value)))
+              (immediate (imm32-p value)))
          (when (and (null (tn-value y)) (tn-ref-type x-tn-ref))
            ;; if the complement of X's type with respect to type NULL can't
            ;; be a cons, then we don't need a 4-byte comparison against NIL.
@@ -360,12 +359,12 @@
              `(define-vop (,eq-name ,eql-name)
                 (:translate eq)
                 (:variant-cost ,cost))))
-  (def fast-if-eq-character fast-char=/character 3)
-  (def fast-if-eq-character/c fast-char=/character/c 2)
-  (def fast-if-eq-signed fast-if-eql/signed 5)
-  (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
-  (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
-  (def fast-if-eq-unsigned/c fast-if-eql-c/unsigned 4))
+  (def if-eq-character char=/character 3)
+  (def if-eq-character/c char=/character/c 2)
+  (def if-eq-signed if-eql/signed 5)
+  (def if-eq-signed/c if-eql-c/signed 4)
+  (def if-eq-unsigned if-eql/unsigned 5)
+  (def if-eq-unsigned/c if-eql-c/unsigned 4))
 
 (define-vop (%instance-ref-eq)
   (:args (instance :scs (descriptor-reg))
@@ -379,7 +378,6 @@
   (:info slot)
   (:translate %instance-ref-eq)
   (:conditional :e)
-  (:policy :fast-safe)
   (:generator 1
    (inst cmp :qword
          (ea (+ (- instance-pointer-lowtag)
@@ -394,7 +392,6 @@
   (:translate %instance-types=)
   (:temporary (:sc unsigned-reg) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:generator 1
     (let* ((t1 (tn-ref-type args))
            (t2 (tn-ref-type (tn-ref-across args)))
@@ -438,7 +435,6 @@
          (y :scs (any-reg descriptor-reg) :target rsi))
   (:arg-refs x-ref y-ref)
   (:conditional :e)
-  (:policy :fast-safe)
   (:translate eql)
   (:temporary (:sc unsigned-reg :offset rdi-offset :from (:argument 0)) rdi)
   (:temporary (:sc unsigned-reg :offset rsi-offset :from (:argument 1)) rsi)

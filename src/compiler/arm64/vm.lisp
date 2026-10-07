@@ -18,7 +18,7 @@
 
 ;;;; register specs
 
-(defvar *register-names* (make-array 32 :initial-element nil))
+(defglobal *register-names* (make-array 32 :initial-element nil))
 
 (macrolet ((defreg (name offset)
              (let ((offset-sym (symbolicate name "-OFFSET")))
@@ -88,8 +88,16 @@
   (defconstant-eqx register-arg-names '(r0 r1 r2 r3) #'equal)
   (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 #-(or darwin win32) r8 r9 r10)
   (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8)
-  (defglobal *float-regs* (loop for i below 32 collect i)))
 
+  (defconstant float-reg-count 32))
+
+(defglobal *128-regs* (loop with regs = non-descriptor-regs
+                            while regs
+                            when (let ((reg (pop regs)))
+                                   (when (eql (1+ reg) (car regs))
+                                     (pop regs)
+                                     reg))
+                            collect it))
 
 ;;;; SB and SC definition:
 
@@ -106,7 +114,6 @@
   ;; Non-immediate contstants in the constant pool
   (constant constant)
 
-  ;; Anything else that can be an immediate.
   (immediate immediate-constant)
 
   ;; **** The stacks.
@@ -137,16 +144,23 @@
 
   (32-bit-reg registers
               :locations #.(loop for i below 32 collect i))
-
   ;; The non-descriptor stacks.
   (signed-stack non-descriptor-stack)    ; (signed-byte 64)
   (unsigned-stack non-descriptor-stack)  ; (unsigned-byte 64)
+
+  (signed-128-stack non-descriptor-stack :element-size 2)
   (character-stack non-descriptor-stack) ; non-descriptor characters.
   (sap-stack non-descriptor-stack)       ; System area pointers.
   (single-stack non-descriptor-stack)    ; single-floats
   (double-stack non-descriptor-stack) ; double floats.
   (complex-single-stack non-descriptor-stack)
   (complex-double-stack non-descriptor-stack :element-size 2 :alignment 2)
+  #+sb-simd-pack
+  (int-neon-stack non-descriptor-stack :element-size 2 :alignment 2)
+  #+sb-simd-pack
+  (double-neon-stack non-descriptor-stack :element-size 2 :alignment 2)
+  #+sb-simd-pack
+  (single-neon-stack non-descriptor-stack :element-size 2 :alignment 2)
 
   ;; **** Things that can go in the integer registers.
 
@@ -176,40 +190,67 @@
                 :save-p t
                 :alternate-scs (unsigned-stack))
 
+  (signed-128-reg registers
+                  :locations #.*128-regs*
+                  ;; :constant-scs (immediate)
+                  :element-size 2
+                  :save-p t
+                  :alternate-scs (signed-128-stack))
+
   ;; Random objects that must not be seen by GC.  Used only as temporaries.
   (non-descriptor-reg registers
                       :locations #.non-descriptor-regs)
 
   ;; **** Things that can go in the floating point registers.
 
-  (single-immediate immediate-constant)
-  (double-immediate immediate-constant)
+  (fp-immediate immediate-constant)
 
   (single-reg float-registers
               :locations #.(loop for i below 32 collect i)
-              :constant-scs (single-immediate)
+              :constant-scs (fp-immediate)
               :save-p t
               :alternate-scs (single-stack))
   (double-reg float-registers
               :locations #.(loop for i below 32 collect i)
-              :constant-scs (double-immediate)
+              :constant-scs (fp-immediate)
               :save-p t
               :alternate-scs (double-stack))
 
-  (complex-single-immediate immediate-constant)
-  (complex-double-immediate immediate-constant)
-
   (complex-single-reg float-registers
                       :locations #.(loop for i below 32 collect i)
-                      :constant-scs (complex-single-immediate)
+                      :constant-scs (fp-immediate)
                       :save-p t
                       :alternate-scs (complex-single-stack))
 
   (complex-double-reg float-registers
                       :locations #.(loop for i below 32 collect i)
-                      :constant-scs (complex-double-immediate)
+                      :constant-scs (fp-immediate)
                       :save-p t
                       :alternate-scs (complex-double-stack))
+
+  ;; temporary only
+  #+sb-simd-pack
+  (neon-reg float-registers
+           :locations #.(loop for i to 31 collect i))
+  ;; regular values
+  #+sb-simd-pack
+  (int-neon-reg float-registers
+                :locations #.(loop for i to 31 collect i)
+                :constant-scs (fp-immediate)
+                :save-p t
+                :alternate-scs (int-neon-stack))
+  #+sb-simd-pack
+  (double-neon-reg float-registers
+                   :locations #.(loop for i to 31 collect i)
+                   :constant-scs (fp-immediate)
+                   :save-p t
+                   :alternate-scs (double-neon-stack))
+  #+sb-simd-pack
+  (single-neon-reg float-registers
+                   :locations #.(loop for i to 31 collect i)
+                   :constant-scs (fp-immediate)
+                   :save-p t
+                   :alternate-scs (single-neon-stack))
 
   (catch-block control-stack :element-size catch-block-size)
   (unwind-block control-stack :element-size unwind-block-size)
@@ -225,7 +266,7 @@
 
   (defregtn null descriptor-reg)
   (defregtn lexenv descriptor-reg)
-  (defregtn tmp any-reg)
+  (defregtn tmp unsigned-reg)
   (defregtn cardtable any-reg)
 
   (defregtn nargs any-reg)
@@ -254,17 +295,14 @@
      (if (static-symbol-p value)
          immediate-sc-number
          nil))
-    (double-float
-     double-immediate-sc-number)
-    (single-float
-     single-immediate-sc-number)
-    ((complex double-float)
-     complex-double-immediate-sc-number)
-    ((complex single-float)
-     complex-single-immediate-sc-number)
+    ((or float (complex float))
+     fp-immediate-sc-number)
     (structure-object
      (when (eq value sb-lockless:+tail+)
-       immediate-sc-number))))
+       immediate-sc-number))
+    #+(and sb-simd-pack (not sb-xc-host))
+    (simd-pack
+     fp-immediate-sc-number)))
 
 (defun boxed-immediate-sc-p (sc)
   (eql sc immediate-sc-number))
@@ -295,9 +333,16 @@
   (let ((sb (sb-name (sc-sb (tn-sc tn))))
         (offset (tn-offset tn)))
     (ecase sb
-      (registers (format nil "~:[~;W~]~A"
-                         (sc-is tn 32-bit-reg)
-                         (svref *register-names* offset)))
+      (registers
+       (sc-case tn
+         (signed-128-reg
+          (format nil "~a/~a"
+                  (svref *register-names* offset)
+                  (svref *register-names* (1+ offset))))
+         (t
+          (format nil "~:[~;W~]~A"
+                  (sc-is tn 32-bit-reg)
+                  (svref *register-names* offset)))))
       (control-stack (format nil "CS~D" offset))
       (non-descriptor-stack (format nil "NS~D" offset))
       (constant (format nil "Const~D" offset))
@@ -307,7 +352,12 @@
                (sc-case tn
                  (single-reg "S")
                  ((double-reg complex-single-reg) "D")
-                 (complex-double-reg "Q"))
+                 ((#+sb-simd-pack neon-reg
+                   #+sb-simd-pack int-neon-reg
+                   #+sb-simd-pack double-neon-reg
+                   #+sb-simd-pack single-neon-reg
+                   complex-double-reg)
+                  "V"))
                offset)))))
 
 (defun primitive-type-indirect-cell-type (ptype)
@@ -339,4 +389,7 @@
         bic-fixnum-encode-immediate
         logical-immediate-or-word-mask
         sb-arm64-asm::ldr-str-offset-encodable
+        sb-arm64-asm::ldr-str-8-offset-encodable
+        sb-arm64-asm::ldr-str-16-offset-encodable
+        sb-arm64-asm::ldr-str-32-offset-encodable
         power-of-two-p))

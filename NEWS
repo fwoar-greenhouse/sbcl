@@ -1,5 +1,206 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
+changes in sbcl-2.6.9 relative to sbcl-2.6.8:
+  * minor incompatible change: structure slots defined as :READ-ONLY can be
+    written using SLOT-VALUE with the constant slot name, matching the
+    existing behaviour if the slot name is provided as a variable.
+  * enhancement: addition of u8.16-shuffle to SSE3 SB-SIMD support.  (thanks
+    to Qiantan Hong)
+  * enhancement: addition of some AVX512 support to SB-SIMD.  (thanks to Aaron
+    Estrada)
+  * bug fix: address a number of issues in the SB-SIMD contributed module.
+    (thanks to Sylvia Harrington)
+  * bug fix: don't improperly inherit dynamic extent nature of transformations
+    of lists constructed with dynamic extent.
+  * bug fix: don't call SB-GMP exponential function with a non-rational base.
+    (thanks to Ilia Gradina)
+  * bug fix: compiler internal error from stack manipulation in inline- and
+    dynamic-extent-heavy code.  (lp#2156347, reported by Vasily Postnicov)
+  * bug fix: the SB-MANUAL contributed module should build more reliably on
+    Windows.  (lp#2165787)
+  * bug fix: be more conservative when inferring types of components of
+    composite data structures lexically following a declaration in the
+    presence of possible side effects.  (lp#2165835)
+  * bug fix: compiler miscompilation of type checks of unused optional
+    arguments.  (lp#2165974, reported by Vasily Postnicov)
+  * bug fix: test consistency checks of system variables now correctly ignore
+    SB-IMPL::*READ-LINE-BUFFERS*, affecting particularly large heaps.
+    (lp#2167121, reported by 3b)
+  * bug fix: miscompilation through too-optimistic reuse of storage locations.
+    (lp#2167208)
+  * bug fix: compiler error from off-by-one access to internal data
+    structures.  (lp#2167568)
+  * bug fix: compiler error from compilation of nested functions with
+    non-local exits.  (lp#2167725)
+  * bug fix: compiler error after incautious value coalescing.  (lp#2167800)
+  * optimization: microoptimizations to the return sequence to generic
+    arithmetic assembly routines on x86-64.
+  * optimization: checks for whether floats are integral are more compact.
+  * optimization: on arm64, integer-length is more efficient on
+    machine-word-sized integers.
+  * optimization: certain basic operations on numeric RATIO types have a fast
+    path.
+  * optimization: the GMP-INTEXP used in the SB-GMP implementation of EXPT is faster.
+  * optimization: self- and mutually-referential functions can be
+    automatically stack-allocated when the system can prove that no function
+    reference can escape.
+  * optimization: the compiler can propagate equality constraints over local calls.
+  * optimization: the compiler can make use of register pairs for unboxed signed
+    128-bit simple arithmetic on ARM64 and x86-64.
+  * optimization: constraint propagation is somewhat faster.
+  * optimization: provide the compiler with smarts for type inference for
+    SB-SYS:WITH-INTERRUPTS.  (lp#2167153, reported by Vasily Postnicov)
+
+changes in sbcl-2.6.8 relative to sbcl-2.6.7:
+  * minor incompatible change: FILE-POSITION on composite streams returns a
+    more accurate result for CONCATENATED-STREAM, and NULL on TWO-WAY-STREAM
+    and ECHO-STREAM.
+  * platform support:
+    ** improvements to code generation for the ARM64 backend.
+    ** improved support for AVX512 instruction encoding and decoding.  (thanks
+       to Arthur Miller)
+  * various enhancements to the SB-SIMD contributed module.  (thanks to Sylvia
+    Harrington and Arthur Miller)
+  * bug fix: FILE-POSITION on a stream after reading input into a list or
+    generic sequence returns the correct result.
+  * bug fix: allow the manual to build on more platforms.  (lp#2162021)
+  * bug fix: infinite loop in the compiler while attempting to remove data
+    moves.  (lp#2162597)
+  * bug fix: debugger failed to handle (COMPLEX DOUBLE-FLOAT) entities on the
+    stack.  (reported by Clint Seinen)
+  * bug fix: error reporting from STRING-TO-OCTETS reported using the wrong
+    string indices.  (lp#2164924)
+  * optimization: the compiler performs assignment conversion in nearly all
+    possible cases now, along the lines of Fluet and Weeks' "Contification
+    using Dominators" of 2001., which transforms state-machine-like code
+    written in terms of local functions into the equivalent tagbody/go control
+    structures.
+  * optimization: type inference of parameters is now possible for local
+    functions which recursively call themselves.  (lp#486416, reported by
+    Tobias Rittweiler)
+  * optimization: special-case DPB with newbyte of 0 or -1.
+  * optimization: more improvements to UTF8 encoding and decoding.
+  * optimization: multiple structure TYPEP tests in sequence can elide
+    redundant memory loads of layouts.
+  * optimization: transform ZEROP of (LDB ...) to an equivalent zero test with
+    a mask.  (lp#2162824, thanks to Vasily Postnicov)
+
+changes in sbcl-2.6.7 relative to sbcl-2.6.6:
+  * new contrib module: SB-MANUAL contains the SBCL manual in docstrings of
+    section definitions, which tie together the docstrings of normal Lisp
+    definitions. The manual can thus be explored interactively in the usual
+    way (e.g. with Slime's M-.), and it is browsable with the MGL-PAX library
+    (out of tree). Also, https://fixnum.com/ (similarly unrelated to the SBCL
+    project) provides alternative renderings of the SBCL manual as heavily
+    linked PDF and HTML documents as well as Markdown and plain text.
+  * new feature: DOCUMENTATION supports DOC-TYPE DECLARATION.
+  * platform support:
+    ** the SB-SIMD contrib now supports ARM64.  (Thanks to Sylvia Harrington)
+    ** AVX512 instructions are now supported on X86-64.  (Thanks to Robert
+       Smith and Arthur Miller)
+    ** additional support for SIMD instructions on ARM64 and X86-64.  (Thanks
+       to Arthur Miller)
+    ** fix miscompilation of SAP-REF-N on ARM64.  (Thanks to Hayley Patton)
+    ** implement INTEGER-LENGTH on primitive types without a loop on MIPS and
+       LoongArch.
+  * bug fix: READing with *READ-SUPPRESS* T no longer emits warnings like
+    "<internal-feature> no longer present on *FEATURES*".
+  * bug fix: compiler type-error when compiling calls to CONCATENATE with
+    conditional known non-sequence arguments.  (lp#2160747)
+  * bug fix: (EQL <complex>) types were not being treated as numeric by the
+    type system.  (lp#2160429)
+  * bug fix: improve the handling of quiet (non-signalling) NaN inputs to LOG.
+    (lp#2160268, reported by Woodrow Kiang)
+  * bug fix: miscompilation of MULTIPLE-VALUE-CALL.  (lp#2160207, reported by
+    Vasily Postnicov)
+  * optimization: passing constant complex numbers to local functions can be
+    done without consing.
+  * optimization: where available, use enhanced SIMD routines for UTF-8
+    conversions.
+  * optimization: compiler transforms of COUNT are applicable with a wider
+    variety of keyword arguments.
+  * optimization: remove at least one redundant instruction from SB-ALIEN:DEREF.
+  * optimization: the sparse set implementation in the compiler has been tuned
+    to improve performance on real-world workloads.
+  * documentation: many typos and typesetting issues were fixed.
+  * documentation: SB-MANUAL:@FOREIGN-FUNCTION-INTERFACE now correctly states
+    that arrays are row-major (not column-major).  (lp#2158033, thanks to Scott
+    L. Burson)
+  * documentation: internally, docstrings now conform to a subset of Markdown,
+    but DOCUMENTATION (and thus DESCRIBE) strips some of this markup. The
+    official manual is still generated from Texinfo, but the Texinfo files are
+    generated from SB-MANUAL.
+  * documentation: the manual now has a separate index for declarations.
+
+changes in sbcl-2.6.6 relative to sbcl-2.6.5:
+  * minor incompatible change: FDEFINITION now returns the outermost wrapper
+    (added e.g. by TRACE, PROFILE) like SYMBOL-FUNCTION.  (lp#799533)
+  * minor incompatible change: in unsafe code, C strings with :EXTERNAL-FORMAT
+    :ASCII are copied directly as byte-sized quantities without checking
+    whether the top bit of the byte is set.
+  * platform support:
+    ** fix the build on big-endian 64-bit PowerPC with ELFv2.  (thanks to
+       Piotr Kubaj)
+    ** move the static space address for macOS 27 on ARM64.  (lp#2156072,
+       reported by Gary Palter)
+    ** optimizations to SB-THREAD:BARRIER for ARM64.  (thanks to Sahil Kang)
+    ** fix a compiler crash in MULTIPLE-VALUE-LIST in argument forms on ARM64.
+       (lp#2155788, reported by Gary Palter)
+  * bug fix: TRACE no longer fails when trying to print a return value that
+    cannot be printed readably and *PRINT-READABLY* is true.
+  * optimization: the compiler is more precise in its type derivation of
+    COERCE given constraints on its inputs.
+  * optimization: the compiler is better able to derive the return types of
+    AREF and ELT.
+  * optimization: faster encoding and decoding of UTF-8 C strings.
+  * optimization: (length (intersection a b)) doesn't cons an intermediate
+    list.
+  * documentation: the manual now includes a section for SB-INTROSPECT, which
+    has also seen improvement in its documentation strings and comments.
+  * documentation: fixed many typesetting problems and typos in the user
+    manual.
+
+changes in sbcl-2.6.5 relative to sbcl-2.6.4:
+  * minor incompatible change: the condition signalled when an accessed slot
+    is missing from an object is no longer a TYPE-ERROR.
+  * minor incompatible change: the condition signalled when accessing an
+    uninitialized structure slot is no longer a TYPE-ERROR.
+  * minor incompatible change: the implementations of standardized functions
+    treating lists as sets, such as INTERSECTION and UNION, take more
+    advantage of the freedom to return the elements of the result in any
+    order.
+  * platform support:
+    ** add low-level support for floating point state manipulation on
+       PPC64/FreeBSD.  (thanks to Piotr Kubaj)
+    ** improve the software emulation of displaced instructions on ARM64.
+    ** restore building the system using the musl C library.  (lp#2153432,
+       reported by Tom Gillespie)
+    ** fix some SB-SIMD shifting instructions on AVX2.  (lp#2152791, reported
+       by Willem Broekema)
+  * enhancement: definition sources for alien callbacks are now findable by
+    name in SB-INTROSPECT.
+  * bug fix: the SYMBOL restart for finding packages now actually performs a
+    non-local exit.  (lp#2153092, reported by Zach Shaftel)
+  * bug fix: TYPEP on large disjoint numeric union types compiles faster using
+    fewer resources.  (lp#2151818, reported by James McDonald)
+  * bug fix: strings of arbitrary size with fill-pointer set to 1 are
+    character designators.  (reported by _death)
+  * bug fix: the KEEP-OLD restart established by ADD-PACKAGE-LOCAL-NICKNAME
+    keeps the old nickname instead of going ahead with the change (and the
+    restart report function no longer returns from ADD-PACKAGE-LOCAL-NICKNAME).
+  * bug fix: when EXPORT results in a conflict between symbols exported by
+    different used packages, the TAKE-NEW restart now shadowing-imports the
+    new symbol instead of doing nothing and leaving the package in an
+    inconsistent state.
+  * bug fix: the SB-EVAL interpreter checks program syntax more thoroughly.
+  * bug fix: compiler cross-reference data is decoded correctly for a
+    functional with more than one entry for a given name.
+  * bug fix: TYPE-ERRORs signalled by SBCL are more likely to have a DATUM
+    that is not of the condition's EXPECTED-TYPE.
+  * bug fix: the code walker no longer uses the stack to walk PROGN bodies.
+  * optimization: in various situations, INTERSECTION and UNION will use
+    hash-tables to perform the operation more quickly.
+
 changes in sbcl-2.6.4 relative to sbcl-2.6.3:
   * minor incompatible change: when DEFSETF is called on a name that was
     previously used as a (presumed) call to a function, it issues a single

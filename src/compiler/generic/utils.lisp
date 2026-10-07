@@ -12,11 +12,6 @@
 
 (in-package "SB-VM")
 
-;;; Make a fixnum out of NUM. (I.e. shift by two bits if it will fit.)
-(defun fixnumize (num)
-  (if (fixnump num)
-      (ash num n-fixnum-tag-bits)
-      (error "~W is too big for a fixnum." num)))
 
 (declaim (inline tn-byte-offset))
 (defun tn-byte-offset (tn)
@@ -166,7 +161,6 @@
 
 #-(or arm64 x86-64) (defvar *descriptor-args*)
 #-(or arm64 c-stack-is-control-stack) (defvar *non-descriptor-args*)
-#-(or x86 arm64 x86-64) (defvar *float-regs*)
 
 (defun fixed-call-arg-location (type state)
   (let* ((primtype (if (typep type 'primitive-type)
@@ -182,23 +176,20 @@
                                   (elt *descriptor-args* index))
                    (make-wired-tn primtype control-stack-sc-number (+ register-arg-count (- index max-regs)))))))
       (case (primitive-type-name primtype)
+        #+(or arm64 x86-64)
         ((double-float single-float)
          (let ((n (incf (fixed-call-args-state-float state))))
-           (if (< n (length *float-regs*))
-               (make-wired-tn primtype
-                              sc
-                              (elt *float-regs* n))
+           (if (< n float-reg-count)
+               (make-wired-tn primtype sc n)
                (descriptor))))
-        ((unsigned-byte-64 signed-byte-64)
+        ((system-area-pointer unsigned-byte-64 signed-byte-64)
          (let ((n (incf (#-c-stack-is-control-stack fixed-call-args-state-non-descriptors
                          #+c-stack-is-control-stack fixed-call-args-state-descriptors
                          state)))
                (regs #-c-stack-is-control-stack *non-descriptor-args*
                      #+c-stack-is-control-stack *descriptor-args*))
            (if (< n (length regs))
-               (make-wired-tn primtype
-                              sc
-                              (elt regs n))
+               (make-wired-tn primtype sc (elt regs n))
                (descriptor))))
         (t
          (descriptor))))))
@@ -369,12 +360,18 @@
          :symbol)))
 
 (defun remove-moves (tn)
-  (or (let ((write (sb-c::tn-writes tn)))
-        (when (and write (not (tn-ref-next write)))
-          (let ((vop (tn-ref-vop write)))
-            (when (and vop (eq (vop-name vop) 'move))
-              (remove-moves (tn-ref-tn (vop-args vop)))))))
-      tn))
+  (declare (type tn tn))
+  (labels ((remove-move (tn &optional seen)
+             (or
+              (unless (member tn seen)
+                (let ((write (sb-c::tn-writes tn)))
+                  (when (and write (not (tn-ref-next write)))
+                    (let ((vop (tn-ref-vop write)))
+                      (when (and vop (eq (vop-name vop) 'move))
+                        (remove-move (tn-ref-tn (vop-args vop))
+                                     (cons tn seen)))))))
+              tn)))
+    (remove-move tn)))
 
 ;;; Note that this is a allowed to fail by returning NIL.
 ;;; So it's really testing "CERTAINLY-STACK-CONSED-P", which is
@@ -539,6 +536,32 @@
   (let ((slot (get-dsd-index layout sb-kernel::id-word0)))
     (ash (+ sb-vm:instance-slots-offset slot) sb-vm:word-shift)))
 
+(defmacro ensure-layout-id-fixup-or-imm (l)
+  ;; If not compiling to a file, then ensure we have an ID, and use it as an immediate
+  ;; operand. (If the backend can't do that due to encoding limitations, it can choose to
+  ;; use a fixup). Otherwise, if the ID is a small integer for a builtin layout - so it won't
+  ;; change - then wire it in even if compiling to a file. Otherwise, returnd a fixup.
+  `(cond ((not (sb-c::producing-fasl-file)) (ensure-layout-id ,l)) ; assign it now
+         ((typep (layout-id ,l) '(signed-byte 8)) (layout-id ,l)) ; a known small id
+         (t (make-fixup ,l :layout-id))))
+
+(defmacro layout-id-offset (layout)
+  ;; Compute offset at which you can read a layout-id from an unknown layout to see
+  ;; if it matches the ID at the depthoid of LAYOUT.
+  `(+ (id-bits-offset)
+      (ash (- (layout-depthoid ,layout) 2) 2)
+      (- instance-pointer-lowtag))) ; Answer is in bytes relative to tagged ptr
+
+;; It is both an optimization and a necessity that we use a single-bit test
+;; for these three layouts in particular, because no layout-id is stored
+;; for depthoid=1 in the ID array within a layout.
+(defun struct-typep-bit-test-p (layout)
+  (let ((name (if (symbolp layout) layout (layout-classoid-name layout))))
+    (case name
+      (condition +condition-layout-flag+)
+      (pathname  +pathname-layout-flag+)
+      (structure-object +structure-layout-flag+))))
+
 ;;; I'd like the division-by-constant-integer optimization to work
 ;;; during cross-compilation, but the algorithm to compute the magic
 ;;; parameters is expressed in C, not Lisp. I need to translate it.
@@ -620,11 +643,6 @@
 
 (defun call-out-pseudo-atomic-p (vop)
   (declare (ignorable vop))
-  ;; If #+sb-safepoint, the decision to poll for a safepoint
-  ;; occurs at the end. In that case, we can not prevent stop-for-GC
-  ;; from occurring in the C code, because foreign code is allowed
-  ;; to run during GC; it just can't go back into Lisp until GC is over.
-  #-(or sb-safepoint nonstop-foreign-call)
   (loop for e = (sb-c::node-lexenv (sb-c::vop-node vop))
         then (sb-c::lexenv-parent e)
         while e
@@ -674,3 +692,22 @@
 
 (defmacro callback_wrapper_trampoline ()
     '(foreign-symbol-address "callback_wrapper_trampoline"))
+
+#+(or arm64 x86-64)
+(defun 128-reg-parts (x)
+  (sc-case x
+    (signed-128-reg
+     (values
+      (make-random-tn (sc-or-lose 'unsigned-reg) (tn-offset x))
+      (make-random-tn (sc-or-lose 'signed-reg) (1+ (tn-offset x)))))))
+
+#+(or arm64 x86-64)
+(defmacro with-128-parts ((lo hi reg &rest more) &body body)
+  (labels ((expand (regs)
+             (if regs
+                 (destructuring-bind (lo hi reg . more) regs
+                   `(multiple-value-bind (,lo ,hi) (128-reg-parts ,reg)
+                      ,(expand more)))
+                 `(assemble ()
+                    ,@body))))
+    (expand (list* lo hi reg more))))

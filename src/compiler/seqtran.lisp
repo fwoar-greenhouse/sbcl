@@ -403,16 +403,14 @@
 (deftransform elt ((s i) (simple-array t) *)
   '(aref s i))
 
-(deftransform elt ((s i) (list t) * :policy (< safety 3))
-  (when (eql (lvar-type s) (specifier-type 'null))
-    (give-up-ir1-transform))
-  '(nth i s))
+(deftransform elt ((s i) (list t))
+  '(elt-list s i))
 
 (deftransform %setelt ((s i v) ((simple-array * (*)) t t) *)
   '(setf (aref s i) v))
 
-(deftransform %setelt ((s i v) (list t t) * :policy (< safety 3))
-  '(setf (car (nthcdr i s)) v))
+(deftransform %setelt ((s i v) (list t t))
+  '(%setelt-list s i v))
 
 (deftransform %check-vector-sequence-bounds ((vector start end)
                                              (vector t t) *
@@ -703,6 +701,71 @@
                   test)
         test))))
 
+(defun lower-test (test type1 type2)
+  (cond ((and (memq test '(equalp =))
+              (csubtypep type1 (specifier-type 'integer))
+              (csubtypep type2 (specifier-type 'integer)))
+         (setf test (if (or (csubtypep type1 (specifier-type 'fixnum))
+                            (csubtypep type2 (specifier-type 'fixnum)))
+                        'eq
+                        'eql)))
+        ((and (eq test 'char=)
+              (csubtypep type1 (specifier-type 'character))
+              (csubtypep type2 (specifier-type 'character)))
+         (setf test 'eq)))
+  test)
+
+(defun change-test-based-on-item-and-sequence-type (test item sequence key)
+  (let* ((test (if test
+                   (lvar-fun-is test '(eql equal equalp char= char-equal =))
+                   'eql))
+         (test-origin test))
+    (when test
+      (setf test (change-test-based-on-item test (lvar-type item)))
+      (unless (eq test 'eq)
+        (let ((elt (sequence-element-type sequence key)))
+          (setf test (change-test-based-on-item test elt))
+          (setf test (lower-test test (lvar-type item) elt)))))
+    (unless (eq test test-origin)
+      test)))
+
+(defun change-test-based-on-sequence-type (test sequence key)
+  (let* ((test (if test
+                   (lvar-fun-is test '(eql equal equalp char= char-equal =))
+                   'eql))
+         (test-origin test))
+    (when test
+      (unless (eq test 'eq)
+        (let ((elt (sequence-element-type sequence key)))
+          (setf test (change-test-based-on-item test elt))
+          (unless (eq test 'eq)
+            (cond ((and (memq test '(equalp =))
+                        (csubtypep elt (specifier-type 'integer)))
+                   (setf test (if (csubtypep elt (specifier-type 'fixnum))
+                                  'eq
+                                  'eql)))
+                  ((and (eq test 'char=)
+                        (csubtypep elt (specifier-type 'character)))
+                   (setf test 'eq)))))))
+    (unless (eq test test-origin)
+      test)))
+
+(defun change-test-based-on-two-sequences-types (test sequence1 sequence2 key)
+  (let* ((test (if test
+                   (lvar-fun-is test '(eql equal equalp char= char-equal =))
+                   'eql))
+         (test-origin test))
+    (when test
+      (unless (eq test 'eq)
+        (let ((elt1 (sequence-element-type sequence1 key))
+              (elt2 (sequence-element-type sequence2 key)))
+          (setf test (change-test-based-on-item test elt1))
+          (unless (eq test 'eq)
+            (setf test (change-test-based-on-item test elt2))
+            (setf test (lower-test test elt1 elt2))))))
+    (unless (eq test test-origin)
+      test)))
+
 (macrolet ((def (name &optional if/if-not)
              (let ((basic (symbolicate "%" name))
                    (basic-eq (symbolicate "%" name "-EQ"))
@@ -711,8 +774,9 @@
                    (test (symbolicate "%" name "-TEST"))
                    (key-test (symbolicate "%" name "-KEY-TEST")))
                `(progn
-                  (deftransform ,name ((item list &key key test test-not) * * :node node)
-                    (transform-list-item-seek ',name item list key test test-not node))
+                  ,@(unless (eq name 'member) ; tries its own thing first
+                      `((deftransform ,name ((item list &key key test test-not) * * :node node)
+                          (transform-list-item-seek ',name item list key test test-not node))))
                   (deftransform ,basic ((item list) * * :important nil :node node)
                     (transform-list-item-seek ',name item list nil nil nil node 'eql))
                   (deftransform ,basic ((item list) (eq-comparable-type t) * :important nil)
@@ -729,6 +793,8 @@
                          `(,',basic-eq item list))
                         (eql
                          `(,',basic item list))
+                        (char=
+                         `(,',test item list #'char=))
                         (t
                          (give-up-ir1-transform)))))
                   (deftransform ,key-test ((item list key test) (t t t t) * :important nil)
@@ -742,6 +808,8 @@
                          `(,',basic-key-eq item list key))
                         (eql
                          `(,',basic-key item list key))
+                        (char=
+                         `(,',key-test item list key #'char=))
                         (t
                          (give-up-ir1-transform)))))
                   ,@(when if/if-not
@@ -755,6 +823,83 @@
   (def assoc  t)
   (def member t)
   (def rassoc t))
+
+;; In situations where MEMBER is used only as a boolean, if we see (MEMBER x `(...))
+;; where it did not simplify to QUOTE, the instead of constructing a list  we can
+;; forward all args of LIST or LIST* to a new lambda that performs the membership
+;; test without consing. There are (at most) three collections of elements:
+;; (1) a bounded set of constants: These can use a hash-based, or range-based,
+;;     or bit-test-based comparison, or at worse an IF/ELSE chain.
+;;     It'll produce whatever the MEMBER optimizer would ordinarily do.
+;; (2) a bounded set of non-constants: this becomes an IF/ELSE chain.
+;; (3) a variable tail if present becomes another MEMBER call.
+;; If the list elements are all constants, it should have been folded to a constant
+;; list by the #\` optimizer, however the user might have hand-written an expression
+;; such as (MEMBER X (LIST 'a 'b 'c)) but more likely that came from a macro,
+;; in which case LIST would not have been folded.
+;;
+;; TODOs:
+;; - For non-constant lists, in general FIND gets more aggressive open-coding so
+;;   we should prefer to transform MEMBER to FIND,  taking care to avoid the semantic
+;;   difference where NIL is found, which for MEMBER is "true" since it returns a cons.
+;; - Consider similar ways that FIND-IF, MEMBER-IF can avoid constructing the list
+(defun try-member-predicate-transform (list-lvar key test test-not)
+  (let ((list-ctor (lvar-uses list-lvar)))
+    ;; I see no reason to attempt this transform with KEY or TEST-NOT.
+    (unless (and (and (null key) (null test-not))
+                 (combination-p list-ctor)
+                 (lvar-fun-is (combination-fun list-ctor)
+                              '(sb-impl::|List| sb-impl::|List*| list list*)))
+      (return-from try-member-predicate-transform))
+    (binding*
+        ((parameters (make-gensym-list (length (combination-args list-ctor))))
+         ((literals non-literals dotted-tail)
+          (let* ((star (lvar-fun-is (combination-fun list-ctor)
+                                    '(sb-impl::|List*| list*)))
+                 (args (combination-args list-ctor))
+                 (last (car (last args)))
+                 (formals parameters))
+            (collect ((literals) (non-literals))
+              (dolist (lvar (if star (butlast args) args))
+                (if (constant-lvar-p lvar)
+                    (literals (lvar-value lvar))
+                    (non-literals (car formals)))
+                (pop formals))
+              (cond ((not star)
+                     (values (literals) (non-literals) nil))
+                    ((constant-lvar-p last) ; `(a b ,x y z) has a dotted tail of (y z)
+                     (unless (proper-list-p (lvar-value last))
+                       (return-from try-member-predicate-transform))
+                     (values (nconc (literals) (lvar-value last)) (non-literals) nil))
+                    (t
+                     (values (literals) (non-literals) (car formals)))))))
+         ;; SET-DIFFERENCE does not promise to be order-preserving, but
+         ;; it doesn't matter.
+         (ignore (set-difference parameters (cons dotted-tail non-literals))))
+      (splice-fun-args list-lvar :any nil)
+      (when ignore (setq ignore `((declare (ignore ,@ignore)))))
+      (if (not test)
+          `(lambda (item ,@parameters)
+             ,@ignore
+             (or ,@(if literals `((member item ',literals)))
+                 (when (or ,@(mapcar (lambda (varname) `(eql item ,varname))
+                                     non-literals))
+                   '(t)) ; return a non-nil list as MEMBER requires
+                 ,@(if dotted-tail `((member item ,dotted-tail)))))
+          `(lambda (item ,@parameters &key test)
+             ,@ignore
+             (or ,@(if literals `((member item ',literals :test test)))
+                 (when (or ,@(mapcar (lambda (varname) `(funcall test item ,varname))
+                                     non-literals))
+                   '(t))
+                 ,@(if dotted-tail `((member item ,dotted-tail :test test)))))))))
+
+(deftransform member ((item list &key key test test-not) * * :node node)
+  ;; If the list argument is a runtime-constructed list, and the result of MEMBER
+  ;; is used only for its truth value, try to avoid constructing the list.
+  (or (and (if-p (node-dest node))
+           (try-member-predicate-transform list key test test-not))
+      (transform-list-item-seek 'member item list key test test-not node)))
 
 ;;; A similar transform used to apply to MEMBER and ASSOC, but since
 ;;; TRANSFORM-LIST-ITEM-SEEK now takes care of them those transform
@@ -1281,11 +1426,11 @@
                         (specifier-type 'character))
                        (t
                         *universal-type*))))
-        (multiple-value-bind (key-type key) (and key
-                                                 (lvar-fun-type key))
+        (multiple-value-bind (key-type key-name) (and key
+                                                      (lvar-fun-type key))
           (let ((*compiler-error-context* node))
             (when (and (or (not key)
-                           (eq key 'identity))
+                           (eq key-name 'identity))
                        (not (types-equal-or-intersect item (sequence-element-type (lvar-type sequence)))))
               (compiler-style-warn "Item of type ~s can't be found in a sequence of type ~s."
                                    (type-specifier item)
@@ -1295,7 +1440,7 @@
                 (unless (types-equal-or-intersect item returns)
                   (compiler-style-warn "Item of type ~s can't be found using :key ~s which returns ~s."
                                        (type-specifier item)
-                                       key
+                                       key-name
                                        (type-specifier returns)))))))))))
 
 (defun check-sequence-ranges (sequence start end node &key (suffix "") name (warn t))
@@ -1379,9 +1524,10 @@
     (find position
      remove delete
      count)
-    ((item sequence &key key test start end &allow-other-keys) node)
+    ((item sequence &key key test test-not start end &allow-other-keys) node)
   (check-sequence-ranges sequence start end node)
-  (check-sequence-test item sequence test key node))
+  (unless test-not
+    (check-sequence-test item sequence test key node)))
 
 (defoptimizers ir2-hook
     (remove-duplicates delete-duplicates
@@ -1457,7 +1603,7 @@
                       (> high high2))
               (setf high high2))))
         (when (or low high)
-          (let ((type (make-numeric-type :class 'integer :high  high :low low)))
+          (let ((type (make-numeric-type 'integer low high)))
             (if (and equality length1 length2
                      (/= length1 length2))
                 (if (eq equality '%sp-string-compare)
@@ -1740,9 +1886,16 @@
                            (type-specifier seq-type))))))))
 
 (defoptimizers ir2-hook
-    (substitute substitute-if substitute-if-not
-                nsubstitute nsubstitute-if nsubstitute-if-not)
-    ((new x seq &key start end &allow-other-keys) node)
+    (substitute nsubstitute)
+    ((new old seq &key start end test test-not key &allow-other-keys) node)
+  (check-sequence-ranges seq start end node)
+  (check-sequence-item new seq node "Can't substitute ~a into ~a")
+  (unless test-not
+    (check-sequence-test old seq test key node)))
+
+(defoptimizers ir2-hook
+    (substitute-if substitute-if-not nsubstitute-if nsubstitute-if-not)
+    ((new p seq &key start end test test-not key &allow-other-keys) node)
   (check-sequence-ranges seq start end node)
   (check-sequence-item new seq node "Can't substitute ~a into ~a"))
 
@@ -1756,6 +1909,57 @@
 (defoptimizer (vector-push-extend ir2-hook) ((item vector &optional min-extension) node)
   (check-sequence-item item vector node "Can't push ~a into ~a"))
 
+(defun check-concatenate-sequence-type (type result-element-type sequence node &key (description "concatenate")
+                                                                                    (constants t))
+  (when result-element-type
+    (let ((constant (and (constant-lvar-p sequence)
+                         (lvar-value sequence))))
+      (if (and constant
+               (proper-sequence-p constant))
+          (map nil
+               (lambda (elt)
+                 (multiple-value-bind (fits really) (ctypep elt result-element-type)
+                   (when (and really (not fits))
+                     (let ((*compiler-error-context* node))
+                       (compiler-warn "Can't ~a ~s into ~s"
+                                      description
+                                      elt
+                                      (if (ctype-p type)
+                                          (type-specifier (make-array-type '(*)
+                                                                           :specialized-element-type type
+                                                                           :element-type type))
+                                          type))
+                       (return-from check-concatenate-sequence-type)))))
+               constant)
+          (let ((element-type (sequence-elements-type sequence nil constants)))
+            (when (and element-type
+                       (not (eq element-type *wild-type*))
+                       (not (types-equal-or-intersect element-type result-element-type)))
+              (let ((*compiler-error-context* node))
+                (compiler-warn "Can't ~a elements of type ~s into ~s"
+                               description
+                               (type-specifier element-type)
+                               (if (ctype-p type)
+                                   (type-specifier (make-array-type '(*)
+                                                                    :specialized-element-type type
+                                                                    :element-type type))
+                                   type)))))))))
+
+(defun check-concatenate-element-type (type result-element-type element-type node &key (description "concatenate"))
+  (when (and result-element-type
+             element-type
+             (not (eq element-type *wild-type*))
+             (not (types-equal-or-intersect element-type result-element-type)))
+    (let ((*compiler-error-context* node))
+      (compiler-warn "Can't ~a elements of type ~s into ~s"
+                     description
+                     (type-specifier element-type)
+                     (if (ctype-p type)
+                         (type-specifier (make-array-type '(*)
+                                                          :specialized-element-type type
+                                                          :element-type type))
+                         type)))))
+
 (defun check-concatenate (type sequences node &optional (description "concatenate"))
   (let ((result-element-type (if (ctype-p type)
                                  type
@@ -1763,21 +1967,9 @@
                                                               (return-from check-concatenate))))))
     (unless (or (eq result-element-type *wild-type*)
                 (eq result-element-type *universal-type*))
-      (loop for i from 0
-            for sequence in sequences
-            for sequence-type = (lvar-type sequence)
-            for element-type = (type-array-element-type sequence-type)
-            do (unless (or (eq element-type *wild-type*)
-                           (types-equal-or-intersect element-type result-element-type))
-                 (let ((*compiler-error-context* node))
-                   (compiler-warn "Can't ~a ~s into ~s"
-                                  description
-                                  (type-specifier sequence-type)
-                                  (if (ctype-p type)
-                                      (type-specifier (make-array-type '(*)
-                                                                       :specialized-element-type type
-                                                                       :element-type type))
-                                      type))))))))
+      (loop for sequence in sequences
+            do (check-concatenate-sequence-type type result-element-type
+                                                sequence node :description description)))))
 
 (defoptimizer (%concatenate-to-string ir2-hook) ((&rest args) node)
   (check-concatenate 'string args node))
@@ -1795,7 +1987,7 @@
 
 (defoptimizer (merge ir2-hook) ((type sequence1 sequence2 predicate &key &allow-other-keys) node)
   (when (constant-lvar-p type)
-   (check-concatenate (lvar-value type) (list sequence1 sequence2) node "merge")))
+    (check-concatenate (lvar-value type) (list sequence1 sequence2) node "merge")))
 
 ;;; Expand simple cases of UB<SIZE>-BASH-COPY inline.  "simple" is
 ;;; defined as those cases where we are doing word-aligned copies from
@@ -2060,6 +2252,10 @@
          'seq))
       (give-up-ir1-transform)))
 
+(defun quote-list (list)
+  (loop for e in list
+        collect (list 'quote e)))
+
 (make-defs ((($fun $proper)
              (copy-list nil)
              (list-copy-seq t)))
@@ -2074,6 +2270,17 @@
          (remove-if-not *
           (change-full-call combination 'copy-remove-if-not)
           'seq))
+       (and (constant-lvar-p seq)
+            (let ((list (lvar-value seq)))
+              (when (proper-or-dotted-list-p list)
+                (multiple-value-bind (length dotted) (dotted-list-length list)
+                  (when (<= length 10)
+                    (if dotted
+                        (let ((last (last list)))
+                          `(list* ,@(quote-list (butlast list))
+                                  ',(car last)
+                                  ',(cdr last)))
+                        `(list ,@(quote-list list))))))))
        (when (policy node (or (> speed space) (> instrument-consing 1)))
          ;; If speed is more important than space, or cons profiling is wanted,
          ;; then inline the whole copy loop.
@@ -2257,9 +2464,8 @@
                                           1))
                                      (t
                                       min1))))
-    (specifier-type `(or (integer ,min-result
-                                  ,(- max-result min-sequence1-length))
-                         null))))
+    (type-union (make-numeric-type 'integer min-result (- max-result min-sequence1-length))
+                (specifier-type 'null))))
 
 (defun index-into-sequence-derive-type (sequence start end &key (inclusive t))
   (let* ((int-s (and start
@@ -2287,7 +2493,8 @@
   (declare (ignorable sequence2))
   ;; Could be as smart as the SEARCH one above but I ran out of steam.
   (multiple-value-bind (min max) (index-into-sequence-derive-type sequence1 start1 end1)
-    (specifier-type `(or (integer ,min ,max) null))))
+    (type-union (make-numeric-type 'integer min max)
+                (specifier-type 'null))))
 
 (defun position-derive-type (item sequence start end key test test-not)
   (if (eq (lvar-type sequence) (specifier-type 'null))
@@ -2295,7 +2502,7 @@
       (multiple-value-bind (min max)
           (index-into-sequence-derive-type sequence start end :inclusive nil)
         (when (>= max min)
-          (let ((integer-range `(integer ,min ,max))
+          (let ((integer-range (make-numeric-type 'integer min max))
                 (definitely-foundp nil))
             ;; Figure out whether this call will not return NIL.
             ;; This could be smarter about the keywords args, but the primary intent
@@ -2318,9 +2525,9 @@
                               (setq definitely-foundp nil)
                               (return)))
                           item-type))))))
-            (specifier-type (if definitely-foundp
-                                integer-range
-                                `(or ,integer-range null))))))))
+            (if definitely-foundp
+                integer-range
+                (type-union integer-range (specifier-type 'null))))))))
 
 (defun equal-type (type)
   (let ((result type))
@@ -2421,7 +2628,8 @@
   (declare (ignore function))
   (multiple-value-bind (min max)
       (index-into-sequence-derive-type sequence start end :inclusive nil)
-    (specifier-type `(or (integer ,min ,max) null))))
+    (type-union (make-numeric-type 'integer min max)
+                (specifier-type 'null))))
 
 (defoptimizer (position-if-not derive-type) ((function sequence
                                                        &key start end
@@ -2429,7 +2637,8 @@
   (declare (ignore function))
   (multiple-value-bind (min max)
       (index-into-sequence-derive-type sequence start end :inclusive nil)
-    (specifier-type `(or (integer ,min ,max) null))))
+    (type-union (make-numeric-type 'integer min max)
+                (specifier-type 'null))))
 
 (defoptimizer (%find-position derive-type) ((item sequence from-end start end key test))
   (let ((find (find-derive-type item sequence key test start end from-end))
@@ -2458,7 +2667,7 @@
   (declare (ignore item))
   (multiple-value-bind (min max)
       (index-into-sequence-derive-type sequence start end)
-    (specifier-type `(integer 0 ,(- max min)))))
+    (make-numeric-type 'integer 0 (- max min))))
 
 (defoptimizer (count-if derive-type) ((function sequence
                                                 &key start end
@@ -2466,7 +2675,7 @@
   (declare (ignore function))
   (multiple-value-bind (min max)
       (index-into-sequence-derive-type sequence start end)
-    (specifier-type `(integer 0 ,(- max min)))))
+    (make-numeric-type 'integer 0 (- max min))))
 
 (defoptimizer (count-if-not derive-type) ((function sequence
                                                     &key start end
@@ -2474,14 +2683,97 @@
   (declare (ignore function))
   (multiple-value-bind (min max)
       (index-into-sequence-derive-type sequence start end)
-    (specifier-type `(integer 0 ,(- max min)))))
+    (make-numeric-type 'integer 0 (- max min))))
+
+;;; This transform has to deal with unused bits in the
+;;; last data word of a simple-bit-vector can be random.
+(deftransform count ((item sequence &key (start 0) end test)
+                     (bit bit-vector &rest t)
+                     * :policy (>= speed space) :important nil)
+  (when (and test
+             (not (lvar-fun-is test '(eq eql))))
+    (give-up-ir1-transform))
+  (if (and (or (not start) (lvar-value-is start 0))
+           (eq end nil)
+           (lvar-subtypep sequence simple-bit-vector))
+      `(let* ((length (vector-length sequence))
+              (count 0)
+              (words (floor length sb-vm:n-word-bits)))
+         (declare (index count))
+         (declare (optimize (speed 3) (safety 0)))
+         (dotimes (i words)
+           (incf count (logcount (%vector-raw-bits sequence i))))
+         (let ((remainder (mod length sb-vm:n-word-bits)))
+           (unless (zerop remainder)
+             (incf count (logcount (shift-towards-end (%vector-raw-bits sequence words)
+                                                      (- sb-vm:n-word-bits remainder))))))
+         ,(if (constant-lvar-p item)
+              (if (zerop (lvar-value item)) '(- length count) 'count)
+              '(if (zerop item) (- length count) count)))
+      `(let ((count 0))
+         (declare (index count))
+         (with-array-data ((raw-bv sequence) (real-start start) (real-end end) :check-fill-pointer t)
+           (multiple-value-bind (start-words start-remainder)
+               (floor real-start sb-vm:n-word-bits)
+             (multiple-value-bind (end-words end-remainder)
+                 (floor real-end sb-vm:n-word-bits)
+               (cond
+                 ((= start-words end-words)
+                  ;; Less than a word.  Careful that SHL/SHR are masked to 5 bits, so
+                  ;; (count 1 #*111 :start 0 :end 0) would generate a shift of 64 here,
+                  ;; which is a NOP, so catch that first and avoid it!
+                  (unless (= start-remainder end-remainder)
+                    (incf count
+                          (logcount
+                           (shift-towards-end
+                            (shift-towards-start (%vector-raw-bits raw-bv start-words)
+                                                 start-remainder)
+                            (+ start-remainder (- sb-vm:n-word-bits end-remainder)))))))
+                 (t
+                  (unless (zerop start-remainder)
+                    (incf count (logcount (shift-towards-start
+                                           (%vector-raw-bits raw-bv start-words)
+                                           start-remainder)))
+                    (incf start-words))
+                  (loop for word-offset of-type index from start-words below end-words
+                        do (incf count (logcount (%vector-raw-bits raw-bv word-offset))))
+                  (unless (zerop end-remainder)
+                    (let ((num-1s (logcount (shift-towards-end
+                                             (%vector-raw-bits raw-bv end-words)
+                                             (- sb-vm:n-word-bits end-remainder)))))
+                      (incf count num-1s)))))
+               ,(if (constant-lvar-p item)
+                    (if (zerop (lvar-value item)) '(- real-end real-start count) 'count)
+                    '(if (zerop item) (- real-end real-start count) count))))))))
+
+(deftransform count ((item sequence &key test key) (t (not bit-vector) &rest t) *
+                     :important nil)
+  (when (not (types-equal-or-intersect (lvar-type item) (sequence-element-type sequence key)))
+    ;; When array cannot store the thing we are searching for, punt, user gets an
+    ;; Item of type X can't be found in a sequence of type Y message in later count transforms
+    (give-up-ir1-transform))
+  `(let ((count 0)
+         ,@(and key
+                `((key (%coerce-callable-to-fun key)))))
+     (declare (index count))
+     (map nil
+          (lambda (x)
+            (when (funcall ,(if test 'test ''eql)
+                           item
+                           ,(if key
+                                `(funcall key x)
+                                `x))
+              (incf count)))
+          sequence)
+     count))
 
 (defoptimizer (sb-impl::length-remove-duplicates derive-type) ((sequence &key &allow-other-keys))
   (multiple-value-bind (max min) (sequence-lvar-dimensions sequence)
-    (specifier-type `(integer ,(if min
-                                   (min 1 min)
-                                   0)
-                              ,(or max '*)))))
+    (make-numeric-type 'integer
+                       (if min
+                           (min 1 min)
+                           0)
+                       max)))
 
 (defoptimizer (subseq derive-type) ((sequence start &optional end) node)
   (let* ((sequence-type (lvar-type sequence))
@@ -2877,7 +3169,7 @@
     (map-all-uses (lambda (node)
                     (when use
                       (return-from fold-list-accessors))
-                    (setf use node)) cons nil)
+                    (setf use node)) cons :cast nil)
     (when (setf name (combination-is use '(list list*)))
       (map-refs (lambda (ref lvar)
                   (declare (ignore lvar))
@@ -3091,27 +3383,10 @@
           type))))
 
 (deftransform %find-position ((item sequence from-end start end key test))
-  (let* ((test (lvar-fun-is test '(eql equal equalp char= char-equal =)))
-         (test-origin test))
-    (when test
-      (setf test (change-test-based-on-item test (lvar-type item)))
-      (unless (eq test 'eq)
-        (let ((elt (sequence-element-type sequence key)))
-          (setf test (change-test-based-on-item test elt))
-          (cond ((and (memq test '(equalp =))
-                      (csubtypep (lvar-type item) (specifier-type 'integer))
-                      (csubtypep elt (specifier-type 'integer)))
-                 (setf test (if (or (csubtypep (lvar-type item) (specifier-type 'fixnum))
-                                    (csubtypep elt (specifier-type 'fixnum)))
-                                'eq
-                                'eql)))
-                ((and (eq test 'char=)
-                      (csubtypep (lvar-type item) (specifier-type 'character))
-                      (csubtypep elt (specifier-type 'character)))
-                 (setf test 'eq))))))
-    (if (eq test test-origin)
-        (give-up-ir1-transform)
-        `(%find-position item sequence from-end start end key #',test))))
+  (let ((new-test (change-test-based-on-item-and-sequence-type test item sequence key)))
+    (if new-test
+        `(%find-position item sequence from-end start end key #',new-test)
+        (give-up-ir1-transform))))
 
 ;;; %FIND-POSITION for LIST data can be expanded into %FIND-POSITION-IF
 ;;; without loss of efficiency. (I.e., the optimizer should be able
@@ -3759,27 +4034,6 @@
   (define-find-position find 0)
   (define-find-position position 1))
 
-;;; Lower :test
-(macrolet ((def (fun-name)
-             `(deftransform ,fun-name ((item sequence &key
-                                             from-end start end
-                                             key test test-not)
-                                       (t  &rest t))
-                (macrolet ((maybe-arg (arg &optional (key (keywordicate arg)))
-                             `(and ,arg `(,,key ,',arg))))
-                  (let ((test (and (not test-not)
-                                   (change-test-lvar-based-on-item test item))))
-                    (if test
-                        `(,',fun-name item sequence :test ',test
-                                      ,@(maybe-arg from-end)
-                                      ,@(maybe-arg start)
-                                      ,@(maybe-arg end)
-                                      ,@(maybe-arg key)
-                                      ,@(maybe-arg test-not))
-                        (give-up-ir1-transform)))))))
-  (def find)
-  (def position))
-
 (macrolet ((define-find-position-if (fun-name values-index)
              `(deftransform ,fun-name ((predicate sequence &key
                                                   from-end (start 0)
@@ -3939,17 +4193,47 @@
          (declare (ignore ,@ignored))
          (append ,@arguments)))))
 
-(deftransform reverse ((sequence) (vector) * :important nil)
-  `(sb-impl::vector-reverse sequence))
 
-(deftransform reverse ((sequence) (list) * :important nil)
-  `(sb-impl::list-reverse sequence))
+(defoptimizer (reverse rewrite-full-call) ((list) node)
+  (cond ((lvar-subtypep list list)
+         'sb-impl::list-reverse)
+        ((lvar-subtypep list vector)
+         'sb-impl::vector-reverse)))
 
-(deftransform nreverse ((sequence) (vector) * :important nil)
-  `(sb-impl::vector-nreverse sequence))
+(defoptimizer (nreverse rewrite-full-call) ((list) node)
+  (cond ((lvar-subtypep list list)
+         'sb-impl::list-nreverse)
+        ((lvar-subtypep list vector)
+         'sb-impl::vector-nreverse)))
 
-(deftransform nreverse ((sequence) (list) * :important nil)
-  `(sb-impl::list-nreverse sequence))
+(deftransforms (reverse nreverse) ((sequence) ((or vector list)) * :node node :important nil)
+  (or (combination-case sequence
+        (list *
+         (setf (combination-args combination) (reverse args))
+         (remove-lvar-dx sequence)
+         'sequence)
+        (list* *
+         (let ((last (last args)))
+           (cond ((lvar-subtypep (car last) null)
+                  (setf (combination-args combination)
+                        (append (cdr (reverse args)) last))
+                  (remove-lvar-dx sequence)
+                  'sequence)
+                 (t
+                  (splice-fun-args sequence 'list* nil)
+                  (remove-lvar-dx sequence)
+                  (let ((vars (make-gensym-list (length args))))
+                    `(lambda ,vars
+                       (,(case (combination-name node)
+                           (reverse 'revappend)
+                           (nreverse 'nreconc))
+                        ,(car (last vars))
+                        (list ,@(reverse (butlast vars))))))))))
+        (initialize-vector *
+         (setf (combination-args combination) (reverse args))
+         (remove-lvar-dx sequence)
+         'sequence))
+      (give-up-ir1-transform)))
 
 (deftransforms (intersection nintersection)
     ((list1 list2 &key key test test-not))
@@ -3965,6 +4249,17 @@
            'list1)
           (t
            (give-up-ir1-transform)))))
+
+(defoptimizer (intersection rewrite-full-call)
+    ((function sequence &rest args) node)
+  (when (block nil
+          (map-all-dests (lambda (dest lvar nth-value)
+                           (declare (ignore lvar nth-value))
+                           (unless (if-p dest)
+                             (return)))
+                         node)
+          t)
+    'sb-impl::intersection-p))
 
 (deftransform nunion ((list1 list2 &key key test test-not))
   (let ((null-type (specifier-type 'null)))
@@ -4214,18 +4509,34 @@
 (defoptimizer (read-sequence derive-type) ((sequence stream &key start end))
   (multiple-value-bind (min max)
       (index-into-sequence-derive-type sequence start end)
-    (specifier-type `(integer ,min ,max))))
+    (make-numeric-type 'integer min max)))
 
 (defoptimizers constants
-    (hairy-data-vector-ref hairy-data-vector-ref/check-bounds
-     data-vector-ref data-vector-ref-with-offset)
-    ((array index &optional offset))
-  array)
+    (nth nthcdr
+     %adjoin %adjoin-eq %adjoin-key %adjoin-test %adjoin-key-eq %adjoin-key-test %adjoin-key-test-not
+     %assoc %assoc-eq %assoc-key %assoc-test %assoc-key-eq %assoc-key-test %assoc-key-test-not
+     %rassoc %rassoc-eq %rassoc-key %rassoc-test %rassoc-key-eq %rassoc-key-test %rassoc-key-test-not
+     %member %member-eq %member-key %member-test %member-key-eq %member-key-test %member-key-test-not
+     %find-position %find-position-if %find-position-if-not
+     remove remove-if remove-if-not)
+    ((a b &rest args))
+  b)
 
-(defoptimizers constants (nth nthcdr) ((index list))
-  list)
-(defoptimizers constants (car cdr) ((cons))
-  cons)
+(defoptimizers constants
+    (car cdr last elt-list
+     hairy-data-vector-ref hairy-data-vector-ref/check-bounds
+     data-vector-ref data-vector-ref-with-offset)
+    ((a &rest args))
+  a)
+
+(defoptimizers constants
+    (sb-impl::append2 nreconc revappend
+     %adjoin %adjoin-eq %adjoin-key %adjoin-test %adjoin-key-eq %adjoin-key-test %adjoin-key-test-not)
+    ((a b &rest args))
+  (values b t)) ;; partial result
+
+(defoptimizers constants (append nconc list*) ((&rest args))
+  (values (car (last args)) t))
 
 (defoptimizer (vector-to-list derive-type) ((vector))
   (when (typep (nth-value 1 (sequence-lvar-dimensions vector)) '(integer 1))
@@ -4259,15 +4570,57 @@
                        (lvar-annotations value))
                  t))))
       (or (change test-keyword test :test-not)
-          (change test-not-keyword test-not :test)))))
+          (change test-not-keyword test-not :test))
+      nil)))
+
+(defun lower-item-test (node test item sequence key)
+  (let ((new-test (change-test-based-on-item-and-sequence-type test item sequence key)))
+    (when new-test
+      (change-keyword-value (find-global-fun new-test t) :test test node))
+    nil))
+
+(defun lower-two-sequences-test (node test sequence1 sequence2 key)
+  (let ((new-test (change-test-based-on-two-sequences-types test sequence1 sequence2 key)))
+    (when new-test
+      (change-keyword-value (find-global-fun new-test t) :test test node))
+    nil))
+
+(defun lower-one-sequence-test (node test sequence key)
+  (let ((new-test (change-test-based-on-sequence-type test sequence key)))
+    (when new-test
+      (change-keyword-value (find-global-fun new-test t) :test test node))
+    nil))
 
 (defoptimizers optimizer
-    (remove delete count find position
-     sublis nsublis copy-remove)
+    (remove delete count find position copy-remove)
     ((item sequence &rest args &key
            ((test test-keyword))
            ((test-not test-not-keyword))
-           &allow-other-keys))
+           key
+           &allow-other-keys) node)
+  (or (test-not-complementer test test-keyword test-not test-not-keyword
+                             args)
+      (unless test-not
+        (lower-item-test node test item sequence key))))
+
+(defoptimizers optimizer
+    (search mismatch)
+    ((sequence1 sequence2 &rest args &key
+                ((test test-keyword))
+                ((test-not test-not-keyword))
+                key
+                &allow-other-keys) node)
+  (or (test-not-complementer test test-keyword test-not test-not-keyword
+                             args)
+      (unless test-not
+        (lower-two-sequences-test node test sequence1 sequence2 key))))
+
+(defoptimizers optimizer
+    (sublis nsublis)
+    ((item sequence &rest args &key
+           ((test test-keyword))
+           ((test-not test-not-keyword))
+           &allow-other-keys) node)
   (test-not-complementer test test-keyword test-not test-not-keyword
                          args))
 
@@ -4277,18 +4630,42 @@
     ((sequence &rest args &key
                ((test test-keyword))
                ((test-not test-not-keyword))
-               &allow-other-keys))
+               key
+               &allow-other-keys)
+     node)
   (test-not-complementer test test-keyword test-not test-not-keyword
-                         args))
+                         args)
+  (unless test-not
+    (lower-one-sequence-test node test sequence key)))
 
 (defoptimizers optimizer
-    (substitute nsubstitute subst nsubst)
+    (substitute nsubstitute)
     ((new old sequence &rest args &key
           ((test test-keyword))
           ((test-not test-not-keyword))
-          &allow-other-keys))
+          key
+          &allow-other-keys)
+     node)
   (test-not-complementer test test-keyword test-not test-not-keyword
-                         args))
+                         args)
+  (unless test-not
+    (lower-item-test node test old sequence key)))
+
+(defoptimizers optimizer
+    (subst nsubst)
+    ((new old sequence &rest args &key
+          ((test test-keyword))
+          ((test-not test-not-keyword))
+          key
+          &allow-other-keys)
+     node)
+  (test-not-complementer test test-keyword test-not test-not-keyword
+                         args)
+  (unless test-not
+    (let ((new-test (change-test-lvar-based-on-item test old)))
+      (when new-test
+        (change-keyword-value (find-global-fun new-test t) :test test node))
+      nil)))
 
 (defoptimizers optimizer
     (mismatch search tree-equal

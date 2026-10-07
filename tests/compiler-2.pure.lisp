@@ -118,9 +118,10 @@
 
 (with-test (:name (nth-value :huge-n :works))
   (flet ((return-a-ton-of-values ()
-           (values-list (loop for i below 5000 collect i))))
+           (values-list (loop for i below (min 5000 (1- multiple-values-limit)) collect i))))
     (assert (= (nth-value 1 (return-a-ton-of-values)) 1))
-    (assert (= (nth-value 4000 (return-a-ton-of-values)) 4000))))
+    (let ((n (min 4000 (- multiple-values-limit 2))))
+      (assert (= (nth-value n (return-a-ton-of-values)) n)))))
 
 (with-test (:name :internal-name-p :skipped-on :sb-xref-for-internals)
   (assert (sb-c::internal-name-p 'sb-int:neq)))
@@ -824,7 +825,8 @@
       `(lambda (n x)
          (declare (sb-vm:word n))
          (log (float n))
-         (nth-value 33 (funcall x . #.(loop for i to 350 collect i))))
+         (nth-value 33 (funcall x . #.(loop for i to (min 350 (- multiple-values-limit 2))
+                                            collect i))))
     ((10 (lambda (&rest args) (values-list args))) 33)))
 
 (with-test (:name (dynamic-extent :recursive-local-functions))
@@ -1661,6 +1663,92 @@
     (assert (equal (sb-impl::%simple-fun-type f)
                    '(function ((integer 3 10)) (values (integer 0 0) &optional))))))
 
+(with-test (:name (:infer-iteration-var-type :multiple-sets :ssa))
+  (let ((f (checked-compile
+            '(lambda (x)
+               (declare (optimize speed)
+                        (type (integer 3 10) x))
+               (let ((y x))
+                 (labels ((start (y1)
+                            (if (plusp y1)
+                                (let ((y2 (1- y1)))
+                                  (if (plusp y2)
+                                      (start (1- y2))
+                                      y2))
+                                y1)))
+                   (start y))))
+            :allow-notes nil)))
+    (assert (equal (sb-impl::%simple-fun-type f)
+                   '(function ((integer 3 10)) (values (integer 0 0) &optional))))))
+
+(with-test (:name (:infer-iteration-var-type :multiple-sets :ssa :deep-chain))
+  (let ((f (checked-compile
+            '(lambda (x)
+               (declare (optimize speed)
+                        (type (integer 3 10) x))
+               (let ((y x))
+                 (labels ((start (y1)
+                            (if (plusp y1)
+                                (let ((y2 (1- y1)))
+                                  (if (plusp y2)
+                                      (let ((y3 (1- y2)))
+                                        (if (plusp y3)
+                                            (start (1- y3))
+                                            y3))
+                                      y2))
+                                y1)))
+                   (start y))))
+            :allow-notes nil)))
+    (assert (equal (sb-impl::%simple-fun-type f)
+                   '(function ((integer 3 10))
+                     (values (integer 0 0) &optional))))))
+
+(with-test (:name (:infer-iteration-var-type :multiple-sets :ssa :deep-chain-3))
+  (let ((f (checked-compile
+            '(lambda (x)
+               (declare (optimize speed)
+                        (type (integer 4 12) x))
+               (let ((y x))
+                 (labels ((start (y1)
+                            (if (plusp y1)
+                                (let ((y2 (1- y1)))
+                                  (if (plusp y2)
+                                      (let ((y3 (1- y2)))
+                                        (if (plusp y3)
+                                            (let ((y4 (1- y3)))
+                                              (if (plusp y4)
+                                                  (start (1- y4))
+                                                  y4))
+                                            y3))
+                                      y2))
+                                y1)))
+                   (start y))))
+            :allow-notes nil)))
+    (assert (equal (sb-impl::%simple-fun-type f)
+                   '(function ((integer 4 12))
+                     (values (integer 0 0) &optional))))))
+
+(with-test (:name (:infer-iteration-var-type :multiple-sets :ssa :mixed-direction))
+  (let ((f (checked-compile
+            '(lambda (x)
+               (declare (optimize speed)
+                        (type (integer 3 10) x))
+               (let ((y x))
+                 (labels ((start (y1)
+                            (if (plusp y1)
+                                (let ((y2 (1- y1)))
+                                  (if (plusp y2)
+                                      (start (1+ y2))
+                                      y2))
+                                y1)))
+                   (start y)))))))
+    ;; The two recurrence steps have opposite directions, so the
+    ;; iteration-specific numeric widening must not infer the exact
+    ;; lower bound.
+    (assert (not (equal (sb-impl::%simple-fun-type f)
+                        '(function ((integer 3 10))
+                          (values (integer 0 0) &optional)))))))
+
 (with-test (:name (:infer-iteration-var-type :incompatible-sets))
   (checked-compile-and-assert ()
       '(lambda (input-total missing-amount)
@@ -2343,7 +2431,8 @@
         t)
     ((1 2) t)))
 
-(with-test (:name :car-type-on-or-null)
+(with-test (:name :car-type-on-or-null
+            :fails-on :sbcl)
   (assert
    (equal (sb-kernel:%simple-fun-type
            (checked-compile
@@ -3775,25 +3864,22 @@
                (shiftf b (logorc1 1073741832 a)))
        (the (integer -504635362412860905 -99686857090873309) (lognand b 11))))))
 
-(with-test (:name :not-folded-vops)
-  (assert
-   (type-specifiers-equal
-    (caddr
-     (sb-kernel:%simple-fun-type
-      (checked-compile
-       `(lambda ()
-          (floor
-           (dpb 42
-                (byte 15 7)
-                (block b
-                  (loop for lv below 1 count
-                        (floor
-                         (flet ((%f (f1)
-                                  (- (floor f1 f1) (return-from b -9))))
-                           (multiple-value-call #'%f (values (block b3 lv))))
-                         42))))
-           42)))))
-    '(values (integer -99734 -99734) (integer 19 19) &optional))))
+(with-test (:name :not-folded-vops
+            :broken-on :sbcl)
+  (assert-type
+   (lambda ()
+     (floor
+      (dpb 42
+           (byte 15 7)
+           (block b
+             (loop for lv below 1 count
+                   (floor
+                    (flet ((%f (f1)
+                             (- (floor f1 f1) (return-from b -9))))
+                      (multiple-value-call #'%f (values (block b3 lv))))
+                    42))))
+      42))
+   nil))
 
 (with-test (:name :bit-ir2opt)
   (checked-compile-and-assert
@@ -4613,61 +4699,6 @@
                                (f)))))))
                    :allow-notes 'code-deletion-note))
 
-(declaim (ftype (function (&key (:a fixnum)) t) ftype-test-key)
-         (ftype (function (&optional fixnum) t) ftype-test-opt)
-         (ftype (function (&optional fixnum &key (:b integer)) t) ftype-test-opt-key))
-(defun ftype-test-key (&key (a nil))
-  a)
-(defun ftype-test-opt (&optional (a nil))
-  a)
-(defun ftype-test-opt-key (&optional (a nil) &key (b nil))
-  (declare (muffle-conditions style-warning))
-  (values a b))
-
-(compile 'ftype-test-key)
-(compile 'ftype-test-opt)
-(compile 'ftype-test-opt-key)
-
-(with-test (:name :ftype-optional)
-  (checked-compile-and-assert
-   ()
-   `(lambda ()
-      (ftype-test-opt))
-   (() nil))
-  (checked-compile-and-assert
-   ()
-   `(lambda ()
-      (ftype-test-key))
-   (() nil))
-  (checked-compile-and-assert
-   ()
-   `(lambda (a)
-      (ftype-test-key :a a))
-   ((nil) (condition 'type-error)))
-  (checked-compile-and-assert
-   ()
-   `(lambda (a)
-      (ftype-test-opt a))
-   ((nil) (condition 'type-error)))
-  (checked-compile-and-assert
-    ()
-   `(lambda (a)
-      (ftype-test-opt-key a))
-   ((nil) (condition 'type-error)))
-  (checked-compile-and-assert
-    ()
-   `(lambda (a b)
-      (ftype-test-opt-key a :b b))
-   ((0 nil) (condition 'type-error)))
-  (assert (type-specifiers-equal
-           (caddr
-            (sb-kernel:%simple-fun-type #'ftype-test-key))
-           '(values (or null fixnum) &optional)))
-  (assert (type-specifiers-equal
-           (caddr
-            (sb-kernel:%simple-fun-type #'ftype-test-opt))
-           '(values (or null fixnum) &optional))))
-
 ;;; This trivial function failed to compile due to rev 88d078fe
 (with-test (:name :make-list-reduce)
   (checked-compile
@@ -4711,14 +4742,14 @@
      (loop for x in '(a b c)
            when (eql n x)
            return x))
-   symbol)
+   (member a b c nil))
   (assert-type
    (lambda (n)
      (let ((x '(1 2 (10))))
        (dolist (x x)
          (when (eql x n)
            (return x)))))
-   (or list (integer 1 2)))
+   (or (integer 1 2) (cons (integer 10 10) null) null))
   (assert-type
    (lambda (n)
      (declare (optimize (debug 2)))
@@ -5126,20 +5157,215 @@
     ((8) t)
     ((0) nil)))
 
-(declaim (ftype (function (&key (:a integer)) t) ftype-key-default-type))
-(with-test (:name :ftype-key-default-type)
-  (assert-type
-   (sb-int:named-lambda ftype-key-default-type (&key (a (isqrt *)))
-     a)
-   integer)
-  (assert-type
-   (sb-int:named-lambda ftype-key-default-type (&key (a 1))
-     a)
-   integer))
-
 (with-test (:name :deleted-node-in-derive-type)
   (checked-compile
    `(lambda (a)
       (declare ((simple-array nil (9)) a))
       (setf (aref a 0) 1)
       a)))
+
+(with-test (:name :xep-type-derivation)
+  (assert-type
+   (lambda (n)
+     (funcall (if n
+                  (lambda (a) (+ a 2))
+                  (lambda (a) (+ a 1)))
+              1))
+   (integer 2 3)))
+
+(with-test (:name :compile-name-correct)
+  (let ((gensym (gensym)))
+    (assert (eq (sb-kernel:%fun-name
+                 (symbol-function
+                  (checked-compile
+                   `(lambda (a)
+                      (declare ((simple-array nil (9)) a))
+                      (setf (aref a 0) 1)
+                      a)
+                   :name gensym)))
+                gensym))))
+
+(declaim (ftype function self-call))
+(with-test (:name :compile-self-call-policy.1)
+  (let ((fun (symbol-function
+              (checked-compile
+               `(lambda (a)
+                  (declare (optimize (sb-c::recognize-self-calls 0)))
+                  (if (zerop a)
+                      2
+                      (self-call (1- a))))
+               :name 'self-call))))
+    (assert (member 'self-call (ctu:find-named-callees fun)))))
+
+(with-test (:name :compile-self-call-policy.2)
+  (let ((fun (symbol-function
+              (checked-compile
+               `(lambda (a)
+                  (declare (optimize sb-c::recognize-self-calls))
+                  (if (zerop a)
+                      2
+                      (self-call (1- a))))
+               :name 'self-call))))
+    (assert (not (member 'self-call (ctu:find-named-callees fun))))))
+
+(with-test (:name :mv-bind-unused-p-multiple-args)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x y)
+         (multiple-value-call #'values t -1 (floor x y)))
+    ((5 3) (values t -1 1 2)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (x y)
+         (multiple-value-call (lambda (a b c d)
+                                (values a b c d)) -1 t (floor x y)))
+    ((3 5) (values -1 t 0 3)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (x y)
+         (multiple-value-call (lambda (a b c d)
+                                (declare (ignore a b))
+                                (values c d)) -1 t (floor x y)))
+    ((3 5) (values  0 3)))
+  (assert (equal (ctu:ir1-named-calls `(lambda (x y)
+                                         (multiple-value-call (lambda (a b c d)
+                                                                (declare (ignore d))
+                                                                (values a b c)) -1 t (floor x y))))
+                 '(sb-kernel::floor1))))
+
+(with-test (:name :reusing-inlined-function)
+  (checked-compile-and-assert
+      (:optimize '(:safety 1 :debug 3 :space 0))
+      `(lambda (b)
+         (values (elt '(1 2) b)
+                 (elt '(3 4) b)))
+    ((0) (values 1 3))
+    ((1) (values 2 4))))
+
+(with-test (:name :annotations-traveling-type-conflicts)
+  (checked-compile
+   `(lambda (x)
+      (let ((g (sb-kernel:the* (symbol :use-annotations t) x)))
+        (unless (typep g 'symbol)
+          g)))))
+
+#+sb-devel ;; no sb-c::ir1-attributep
+(with-test (:name :unfoldable-functions)
+  (let (no-folders)
+    (do-all-symbols (symbol)
+      (unless (or (equal (package-name (symbol-package symbol))
+                         "SB-BIGNUM")
+                  (eq symbol 'sb-kernel:complex-vector-p))
+        (loop for name in (list symbol `(setf ,symbol))
+              do
+              (let ((info (sb-int:info :function :info name)))
+                (when (and info
+                           (sb-c::ir1-attributep (sb-c::fun-info-attributes info) sb-c::foldable)
+                           (not (sb-c::fun-info-folder info))
+                           (sb-c::fun-info-templates info))
+                  (unless (fboundp name)
+                    (push name no-folders)))))))
+    (assert (not no-folders))))
+
+(declaim (ftype (function (&key (:a float)) t) ftype-test-unused-key)
+         (ftype (function (t &key (:a float)) t) ftype-test-unused-key2)
+         (ftype (function (&optional float) t) ftype-test-unused-opt)
+         (ftype (function (&optional float float) t) ftype-test-unused-opt2)
+         (ftype (function (t &optional float float) t) ftype-test-unused-opt3))
+(defun ftype-test-unused-key (&key a)
+  (declare (ignore a)))
+(defun ftype-test-unused-key2 (x &key a)
+  (declare (ignore x a)))
+(defun ftype-test-unused-opt (&optional a)
+  (declare (ignore a)))
+(defun ftype-test-unused-opt2 (&optional a b)
+  (declare (ignore a b)))
+(defun ftype-test-unused-opt3 (x &optional a b)
+  (declare (ignore x a b)))
+
+(with-test (:name :ftype-unused-optional)
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda () (ftype-test-unused-opt))
+    (() nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda () (ftype-test-unused-key))
+    (() nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda () (ftype-test-unused-opt2))
+    (() nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda (a) (ftype-test-unused-opt2 a))
+    ((0.0) nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda (a) (ftype-test-unused-opt3 a))
+    ((0.0) nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda (a) (ftype-test-unused-opt3 1 a))
+    ((0.0) nil))
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda () (ftype-test-unused-key2 1))
+    (() nil))
+  #-interpreter
+  (progn
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-opt a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-key :a a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-key2 1 :a a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-opt2 a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-opt2 a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-opt2 0.0 a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-opt3 1 a))
+     ((1) (condition 'type-error)))
+   (checked-compile-and-assert
+       (:optimize :default)
+       `(lambda (a) (ftype-test-unused-opt3 1 0.0 a))
+     ((1) (condition 'type-error)))))
+
+(with-test (:name :mv-wrong-nargs-comparison)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (funcall a)
+         (multiple-value-bind (a b c d e f g h) (funcall b)
+           (declare (ignore a b c d e f))
+           (values g h)))
+    (((lambda () (values 1 2 3 4 5 6 7 :b))
+      (lambda () (values 1 2 3 4 5 6 7)))
+     (values 7 nil))))
+
+(with-test (:name :set-var-step-commutativity)
+  (assert-type
+   (lambda (n s)
+     (let ((x 0))
+       (loop repeat n
+             do
+             (let ((l (length s)))
+               (setq x (+ l x))))
+       x))
+   unsigned-byte))

@@ -28,18 +28,17 @@
   (number nil :type (or index null)))
 
 (defstruct (sset (:copier nil)
-                 (:constructor make-sset (&optional vector free count)))
+                 (:constructor %make-sset (vector limit count)))
   ;; Vector containing the set values. 0 is used for empty (since
-  ;; initializing a vector with 0 is cheaper than with NIL), -1
-  ;; is used to mark buckets that used to contain an element, but no
-  ;; longer do.
+  ;; initializing a vector with 0 is cheaper than with NIL).
   (vector #() :type simple-vector)
-  ;; How many elements can be inserted before rehashing.
-  ;; This is not the actual amount of free elements, but a ratio
-  ;; calculated from +sset-rehash-threshold+.
-  (free 0 :type index)
+  ;; The threshold count above which we double the vector.
+  (limit 0 :type index)
   ;; How many elements are currently members of the set.
   (count 0 :type index))
+(defun make-sset ()
+  (declare (inline %make-sset))
+  (%make-sset #() 0 0))
 
 (declaim (freeze-type sset))
 
@@ -53,37 +52,14 @@
               ,@body)
          finally (return ,result)))
 
-;;; Primary hash.
-(declaim (inline sset-hash1))
-(defun sset-hash1 (element)
-  #+sb-xc-host
-  (let ((result (sset-element-number element)))
-    ;; This is performance critical, and it's not certain that the host
-    ;; compiler does modular arithmetic optimization. Instad use
-    ;; something that most CL implementations will do efficiently.
-    (the fixnum (logxor (the fixnum result)
-                        (the fixnum (ash result -9))
-                        (the fixnum (ash result -5)))))
-  #-sb-xc-host
-  (let ((result (sset-element-number element)))
-    (declare (type sb-vm:word result))
-    ;; We only use the low-order bits.
-    (macrolet ((set-result (form)
-                 `(setf result (ldb (byte #.sb-vm:n-word-bits 0) ,form))))
-      (set-result (+ result (ash result -19)))
-      (set-result (logxor result (ash result -13)))
-      (set-result (+ result (ash result -9)))
-      (set-result (logxor result (ash result -5)))
-      (set-result (+ result (ash result -2)))
-      (logand most-positive-fixnum result))))
-
-;;; Secondary hash (for double hash probing). Needs to return an odd
-;;; number.
-(declaim (inline sset-hash2))
-(defun sset-hash2 (element)
-  (let ((number (sset-element-number element)))
-    (declare (fixnum number))
-    (logior 1 number)))
+;;; There is no "Primary" or "Secondary" hash now. Just the hash.
+;;; We use Linear Probing (step size = 1) with Knuth's Backward Shift Deletion
+;;; algorithm instead of leaving tombstones. And we rely on MIX to produce
+;;; a sufficiently good hash that linear probing is a reasonable strategy.
+;;; (Any probing strategy other than linear does not so readily admit a
+;;; deletion technique which shifts other elements on top of the deleted one.)
+(declaim (inline sset-hash))
+(defun sset-hash (element-number) (mix element-number 0))
 
 ;;; Rehash the sset when the proportion of free cells in the set is
 ;;; lower than this, the value is a reciprocal.
@@ -92,84 +68,94 @@
 ;;; Double the size of the hash vector of SET.
 (defun sset-grow (set)
   (let* ((vector (sset-vector set))
-         (length (if (zerop (length vector))
-                     2
-                     (* (length vector) 2)))
+         (length (* (length vector) 2))
          (new-vector (make-array length
-                                 :initial-element 0)))
+                                 :initial-element 0))
+         (new-limit (- length (truncate length +sset-rehash-threshold+))))
     (setf (sset-vector set) new-vector
-          ;; SSET-ADJOIN below will decrement this and shouldn't reach zero
-          (sset-free set) length
+          (sset-limit set) new-limit
           (sset-count set) 0)
     (loop for element across vector
           do (unless (fixnump element)
-               (sset-adjoin element set)))
-    ;; Now the real amount of elements which can be inserted before rehashing
-    (setf (sset-free set) (- (sset-free set)
-                             (max 1 (truncate length
-                                              +sset-rehash-threshold+))))))
-
+               (sset-adjoin element set)))))
 
 ;;; Destructively add ELEMENT to SET. If ELEMENT was not in the set,
 ;;; then we return true, otherwise we return false.
 (declaim (ftype (sfunction (sset-element sset) boolean) sset-adjoin))
 (defun sset-adjoin (element set)
-  (when (= (sset-free set) 0)
-    (sset-grow set))
-  (loop with vector = (sset-vector set)
-        with mask of-type fixnum = (1- (length vector))
-        with secondary-hash = (sset-hash2 element)
-        with deleted-index
-        for hash of-type index = (logand mask (sset-hash1 element)) then
-          (logand mask (+ hash secondary-hash))
+  #-sb-xc-host (declare (optimize (insert-array-bounds-checks 0)))
+  ;; This FIXNUM test could be expressed as (THE (NOT NULL) ...) but I think the
+  ;; decision is best left to the backend as to whether that's cheaper than FIXNUMP.
+  (let ((sset-hash (sset-hash (the fixnum (sset-element-number element))))
+        (vector (sset-vector set)))
+    (when (zerop (length vector))
+      (setf vector (make-array 2 :initial-element 0)
+            (sset-vector set) vector
+            (sset-limit set) 1))
+    (loop
+        with mask = (truly-the index (1- (length vector)))
+        for hash of-type index = (logand mask sset-hash) then (logand mask (1+ hash))
         for current = (aref vector hash)
         do (cond ((eql current 0)
-                  (incf (sset-count set))
-                  (cond (deleted-index
-                         (setf (aref vector deleted-index) element))
-                        (t
-                         (decf (sset-free set))
-                         (setf (aref vector hash) element)))
+                  (setf (aref vector hash) element)
+                  (when (> (incf (sset-count set)) (sset-limit set))
+                    (sset-grow set))
                   (return t))
-                 ((eql current -1)
-                  (setf deleted-index hash))
                  ((eq current element)
-                  (return nil)))))
+                  (return nil))))))
 
 ;;; Destructively remove ELEMENT from SET. If element was in the set,
 ;;; then return true, otherwise return false.
 (declaim (ftype (sfunction (sset-element sset) boolean) sset-delete))
 (defun sset-delete (element set)
-  (when (zerop (length (sset-vector set)))
+  #-sb-xc-host (declare (optimize (insert-array-bounds-checks 0)))
+  (when (zerop (sset-count set))
     (return-from sset-delete nil))
-  (loop with vector = (sset-vector set)
-        with mask fixnum = (1- (length vector))
-        with secondary-hash = (sset-hash2 element)
-        for hash of-type index = (logand mask (sset-hash1 element)) then
-          (logand mask (+ hash secondary-hash))
-        for current = (aref vector hash)
-        do (cond ((eql current 0)
-                  (return nil))
-                 ((eq current element)
-                  (decf (sset-count set))
-                  (setf (aref vector hash) -1)
-                  (return t)))))
+  (let* ((sset-hash (sset-hash (the fixnum (sset-element-number element))))
+         (vector (sset-vector set))
+         ;; COUNT nonzero implies LENGTH >= 1 (actually, >= 2 because a storage vector
+         ;; of 1 is impossible), but the compiler doesn't know this and consequently was
+         ;; verifying that MASK is non-negative.
+         (mask (truly-the index (1- (length vector)))))
+    (loop for hash of-type index = (logand mask sset-hash) then (logand mask (1+ hash))
+          for current = (aref vector hash)
+          do (cond ((eql current 0)
+                    (return nil))
+                   ((eq current element)
+                    ;; COUNT was nonzero, so it can't become negative.
+                    ;; Compiler isn't inferring that, so inform it.
+                    (setf (sset-count set) (truly-the index (1- (sset-count set))))
+                    (do ((i hash)) (nil)
+                      (do ((j (logand mask (1+ i)) (logand mask (1+ j)))) (nil)
+                        (declare (index j))
+                        (let ((candidate (aref vector j)))
+                          (when (eql candidate 0)
+                            (setf (aref vector i) 0)
+                            (return-from sset-delete t))
+                          ;; If nonzero then CANDIDATE is an SSET-ELEMENT, and since it was
+                          ;; previously inserted it must have an element-number.
+                          (let ((n (truly-the fixnum
+                                    (sset-element-number (truly-the sset-element candidate)))))
+                            (when (>= (logand mask (- j (logand mask (sset-hash n))))
+                                      (logand mask (- j i)))
+                              (setf (aref vector i) candidate i j)
+                              (return)))))))))))
 
 ;;; Return true if ELEMENT is in SET, false otherwise.
 (declaim (ftype (sfunction (sset-element sset) boolean) sset-member))
 (defun sset-member (element set)
-  (when (zerop (length (sset-vector set)))
+  #-sb-xc-host (declare (optimize (insert-array-bounds-checks 0)))
+  (when (zerop (sset-count set))
     (return-from sset-member nil))
   (loop with vector = (sset-vector set)
-        with mask fixnum = (1- (length vector))
-        with secondary-hash = (sset-hash2 element)
-        for hash of-type index = (logand mask (sset-hash1 element)) then
-          (logand mask (+ hash secondary-hash))
+        with mask = (truly-the index (1- (length vector)))
+        ;; There's an unavoidable test for fixnump on the sset-element-number of ELEMENT
+        ;; because the slot is nullable.
+        for hash of-type index = (logand mask (sset-hash (sset-element-number element)))
+          then (logand mask (1+ hash))
         for current = (aref vector hash)
-        do (cond ((eql current 0)
-                  (return nil))
-                 ((eq current element)
-                  (return t)))))
+        do (cond ((eq current element) (return t))
+                 ((eql current 0) (return nil)))))
 
 (declaim (ftype (sfunction (sset sset) boolean) sset=))
 (defun sset= (set1 set2)
@@ -183,23 +169,14 @@
 
 ;;; Return true if SET contains no elements, false otherwise.
 (declaim (ftype (sfunction (sset) boolean) sset-empty))
+(declaim (inline sset-empty))
 (defun sset-empty (set)
   (zerop (sset-count set)))
 
 ;;; Return a new copy of SET.
 (declaim (ftype (sfunction (sset) sset) copy-sset))
 (defun copy-sset (set)
-  (make-sset (let* ((vector (sset-vector set))
-                    (new-vector (make-array (length vector))))
-               (declare (type simple-vector vector new-vector)
-                        (optimize speed (safety 0)))
-               ;; There's no REPLACE deftransform for simple-vectors.
-               (dotimes (i (length vector))
-                 (setf (aref new-vector i)
-                       (aref vector i)))
-               new-vector)
-             (sset-free set)
-             (sset-count set)))
+  (%make-sset (copy-seq (sset-vector set)) (sset-limit set) (sset-count set)))
 
 ;;; Perform the appropriate set operation on SET1 and SET2 by
 ;;; destructively modifying SET1. We return true if SET1 was modified,
@@ -213,26 +190,60 @@
              (when (sset-adjoin element set1)
                (setf modified t)))
         finally (return modified)))
+
 (defun sset-intersection (set1 set2)
-  (loop with modified = nil
-        for element across (sset-vector set1)
-        for index of-type index from 0
-        do (unless (fixnump element)
-             (unless (sset-member element set2)
-               (decf (sset-count set1))
-               (setf (aref (sset-vector set1) index) -1
-                     modified t)))
-        finally (return modified)))
+  (cond
+    ((or (sset-empty set1) (eq set1 set2)) nil)
+    ;; Consing can always be bounded by the cardinality of the smaller set,
+    ;; we just have to decide whether to collect items to ADJOIN vs DELETE.
+    ;; In the situation where SET2 is empty (and SET1 is not, because empty was
+    ;; ruled out above), this correctly pick the first of the following two COND
+    ;; clauses, doing zero consing.
+    ;; When SET2 is no more than half the size of SET1, collecting kept elements
+    ;; by scanning SET2 conses at most |SET2| items, whereas scanning SET1
+    ;; conses at least |SET1| - |SET2| items.
+    ((<= (sset-count set2) (ash (sset-count set1) -1))
+     (let ((to-keep nil))
+       (do-sset-elements (element set2)
+         (when (sset-member element set1)
+           (push element to-keep)))
+       (fill (sset-vector set1) 0)
+       (setf (sset-count set1) 0)
+       ;; Since |SET2| < |SET1|, SET1 is guaranteed to shrink, so we always return T.
+       (dolist (element to-keep t)
+         (sset-adjoin element set1))))
+    (t
+     (let ((to-delete nil))
+       (do-sset-elements (element set1)
+         (unless (sset-member element set2)
+           (push element to-delete)))
+       (when to-delete
+         (dolist (element to-delete t)
+           (sset-delete element set1)))))))
+
 (defun sset-difference (set1 set2)
-  (loop with modified = nil
-        for element across (sset-vector set1)
-        for index of-type index from 0
-        do (unless (fixnump element)
+  ;; If sets are EQ, the algorithms below are either terribly broken (if you pick
+  ;; the first cond clause) or terribly stupid (if you pick the second).
+  ;; The result should technically be an empty set, but we don't need it.
+  (aver (neq set1 set2))
+  ;; If SET2 is smaller than SET1, or possibly even larger by an allowance,
+  ;; we should prefer to scan all of it, calling SSET-DELETE on each item.
+  ;; This technique never conses a list of items to delete.
+  ;; When SET1 drives iteration, we can not both delete from and iterate over it,
+  ;; so we necessarily cons an intermediate list.
+  (cond ((<= (ash (sset-count set2) -1) (sset-count set1)) ; allow 2x larger SET2
+         (let (modified)
+           (do-sset-elements (element set2 modified)
+             (when (sset-delete element set1)
+               (setq modified t)))))
+        (t
+         (let ((to-delete nil))
+           (do-sset-elements (element set1)
              (when (sset-member element set2)
-               (decf (sset-count set1))
-               (setf (aref (sset-vector set1) index) -1
-                     modified t)))
-        finally (return modified)))
+               (push element to-delete)))
+           (when to-delete
+             (dolist (element to-delete t)
+               (sset-delete element set1)))))))
 
 ;;; Destructively modify SET1 to include its union with the difference
 ;;; of SET2 and SET3. We return true if SET1 was modified, false

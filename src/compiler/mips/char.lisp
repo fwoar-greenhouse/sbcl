@@ -76,7 +76,6 @@
 ;;;; Other operations:
 (define-vop (char-code)
   (:translate char-code)
-  (:policy :fast-safe)
   (:args (ch :scs (character-reg) :target res))
   (:arg-types character)
   (:results (res :scs (any-reg)))
@@ -86,7 +85,6 @@
 
 (define-vop (code-char)
   (:translate code-char)
-  (:policy :fast-safe)
   (:args (code :scs (any-reg) :target res))
   (:arg-types positive-fixnum)
   (:results (res :scs (character-reg)))
@@ -102,21 +100,20 @@
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:conditional)
   (:info target not-p)
-  (:policy :fast-safe)
   (:note "inline comparison")
   (:variant-vars condition)
   (:generator 3
     (three-way-comparison x y condition :unsigned not-p target temp)))
 
-(define-vop (fast-char=/character character-compare)
+(define-vop (char=/character character-compare)
   (:translate char=)
   (:variant :eq))
 
-(define-vop (fast-char</character character-compare)
+(define-vop (char</character character-compare)
   (:translate char<)
   (:variant :lt))
 
-(define-vop (fast-char>/character character-compare)
+(define-vop (char>/character character-compare)
   (:translate char>)
   (:variant :gt))
 

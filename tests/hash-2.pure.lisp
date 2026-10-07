@@ -9,6 +9,11 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+;;; This test passes without aggressive scrubbing on #+win32 so let's not mess with it.
+;;; It appears that you can't touch the lowest address on your stack without first consuming
+;;; some stack pages from higher addresses. The OS enforces this as a precaution, I think.
+#+(and (not win32) x86-64) (setf (extern-alien "aggressive_scrub_control_stack" int) 1)
+
 (defstruct foo)
 (defstruct bar x y)
 
@@ -39,7 +44,7 @@
                                :initial-element 0)))
       ;; with this many sxhashes we should see a 1 bit in
       ;; in each bit position.
-      (when (make-things-for-sxhash-test (+ 20 #-x86-64 10))
+      (when (make-things-for-sxhash-test 60)
         (gc)
         (sb-int:dovector (thing *things*)
           (destructuring-bind (old-addr old-hash object) thing
@@ -562,3 +567,5 @@
              (test (1- (expt 2 i)))
              (test (- (expt 2 i) (random (expt 2 i))))
              (test (+ (expt 2 i) (random (expt 2 i)))))))
+
+#+x86-64 (setf (extern-alien "aggressive_scrub_control_stack" int) 0)

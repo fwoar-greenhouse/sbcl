@@ -33,7 +33,11 @@ strace -f -e futex -e signal=\!sigsegv -o $tracelog \
 
 (sb-thread:grab-mutex *m*)
 
-;; We need to simulate some thread observing the mutex in a contested state, while
+;; I don't know whether this test is actually valid with #+bitpacked-mutex
+;; but it passes with this minor modification.
+(defmacro our-state (m) \`(ldb (byte 32 0) (sb-thread::mutex-%state ,m)))
+
+;; We need to simulate some thread observing the mutex in a contended state, while
 ;; the thread that currently holds it releases and re-grabs it again quickly enough
 ;; to place it in state 1, not state 2 (but having correctly notified waiters).
 ;; It's also possible to have more than 2 threads involved because any number
@@ -57,7 +61,7 @@ strace -f -e futex -e signal=\!sigsegv -o $tracelog \
 ;;; Each "spin" on the lock bit would require a system call and return.
 
 (defun test ()
-(setf (sb-thread::mutex-state *m*) 2) ; contested state
+(setf (our-state *m*) 2) ; contended state
 (setq *thr*
       (sb-thread:make-thread
        (lambda ()
@@ -67,27 +71,27 @@ strace -f -e futex -e signal=\!sigsegv -o $tracelog \
          (format t "~&thread gets mutex~%"))))
 
 ;; Give the thread some time to enter its futex wait the normal way, but observing
-;; that the initial state is already contested. Therefore it avoids doing one compare-and-swap
-;; to set it to contested. And due to the bug, it was treating the state as *always*
-;; contested even when it was not. And the optimization to avoid changing the state
-;; to contested therefore caused every futex_wait call to return immediately.
+;; that the initial state is already contended. Therefore it avoids doing one compare-and-swap
+;; to set it to contended. And due to the bug, it was treating the state as *always*
+;; contended even when it was not. And the optimization to avoid changing the state
+;; to contended therefore caused every futex_wait call to return immediately.
 (sleep .025)
 ;; Now pretend this thread grabbed/notified/re-grabbed sooner than the other thread
 ;; could execute enough of its retry loop to win the grab. i.e. it's going to sleep
 ;; again on the futex word, but where it would incorrectly think the mutex is already
 ;; in state 2 and would not change it, thus failing the match condition in futex_wait.
-(setf (sb-thread::mutex-state *m*) 1)
+(setf (our-state *m*) 1)
 (sb-sys:with-pinned-objects (*m*)
   (let ((disp
          (- (* (+ sb-vm:instance-slots-offset
-                  (sb-kernel:get-dsd-index sb-thread::mutex sb-thread::state))
+                  (sb-kernel:get-dsd-index sb-thread::mutex sb-thread::%state))
                sb-vm:n-word-bytes)
             sb-vm:instance-pointer-lowtag)))
     (sb-thread::futex-wake (+ (sb-kernel:get-lisp-obj-address *m*) disp
                               #+(and 64-bit big-endian) 4)
                            1)))
 
-(format t "~&looks like mutex state is ~d~%" (sb-thread::mutex-state *m*))
+(format t "~&looks like mutex state is ~d~%" (our-state *m*))
 (sleep .05) ; let that thread lose for a while
 (sb-thread:release-mutex *m*)
 (sb-thread:join-thread *thr*))

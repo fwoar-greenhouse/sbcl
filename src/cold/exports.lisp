@@ -362,6 +362,7 @@
    "*PRINT-VECTOR-LENGTH*"
    "*PRINT-CIRCLE-NOT-SHARED*"
    "DECIMAL-WITH-GROUPED-DIGITS-WIDTH"
+   "UNENCAPSULATED-FUNCTION"
    ;;"OBJECT-SIZE"
 
    ;; stepping interface
@@ -419,17 +420,7 @@
    "%MAKE-SIMD-PACK-UB32"
    "%MAKE-SIMD-PACK-UB64"
    "%MAKE-SIMD-PACK-DOUBLE"
-   "%MAKE-SIMD-PACK-SINGLE"
-   "%SIMD-PACK-UB8S"
-   "%SIMD-PACK-UB16S"
-   "%SIMD-PACK-UB32S"
-   "%SIMD-PACK-UB64S"
-   "%SIMD-PACK-SB8S"
-   "%SIMD-PACK-SB16S"
-   "%SIMD-PACK-SB32S"
-   "%SIMD-PACK-SB64S"
-   "%SIMD-PACK-DOUBLES"
-   "%SIMD-PACK-SINGLES")
+   "%MAKE-SIMD-PACK-SINGLE")
   #+sb-simd-pack-256
   (:export
    "SIMD-PACK-256"
@@ -437,17 +428,18 @@
    "%MAKE-SIMD-PACK-256-UB32"
    "%MAKE-SIMD-PACK-256-UB64"
    "%MAKE-SIMD-PACK-256-DOUBLE"
-   "%MAKE-SIMD-PACK-256-SINGLE"
-   "%SIMD-PACK-256-UB8S"
-   "%SIMD-PACK-256-UB16S"
-   "%SIMD-PACK-256-UB32S"
-   "%SIMD-PACK-256-UB64S"
-   "%SIMD-PACK-256-SB8S"
-   "%SIMD-PACK-256-SB16S"
-   "%SIMD-PACK-256-SB32S"
-   "%SIMD-PACK-256-SB64S"
-   "%SIMD-PACK-256-DOUBLES"
-   "%SIMD-PACK-256-SINGLES"))
+   "%MAKE-SIMD-PACK-256-SINGLE")
+  #+sb-simd-pack-512
+  (:export
+   "SIMD-PACK-512"
+   "SIMD-PACK-512-P"
+   "SIMD-PACK-512-MASK"
+   "SIMD-PACK-512-MASK-P"
+   "%MAKE-SIMD-PACK-512-MASK"
+   "%MAKE-SIMD-PACK-512-UB32"
+   "%MAKE-SIMD-PACK-512-UB64"
+   "%MAKE-SIMD-PACK-512-DOUBLE"
+   "%MAKE-SIMD-PACK-512-SINGLE"))
 
 (defpackage "SB-INT"
   (:documentation
@@ -494,7 +486,7 @@ possibly temporarily, because it might be used internally.")
    "MAKE-SSET"
    "SSET" "SSET-ELEMENT"
    "SSET-ADJOIN" "SSET-DELETE" "SSET-EMPTY" "SSET-COUNT"
-   "SSET-MEMBER"
+   "SSET-MEMBER" "SSET-DIFFERENCE"
 
    ;; key-only hash lookup which saves space over a hash-table
    "MAKE-HASHSET" "HASHSET-INSERT" "HASHSET-REMOVE" "HASHSET-FIND"
@@ -581,6 +573,8 @@ possibly temporarily, because it might be used internally.")
 
    ;; error-reporting facilities
 
+   "BINARY-INPUT-STREAM-P" "BINARY-OUTPUT-STREAM-P"
+   "CHARACTER-INPUT-STREAM-P" "CHARACTER-OUTPUT-STREAM-P"
    "CLOSED-STREAM-ERROR" "CLOSED-SAVED-STREAM-ERROR"
    "COMPILED-PROGRAM-ERROR"
    "COMPILER-MACRO-KEYWORD-PROBLEM"
@@ -774,7 +768,7 @@ possibly temporarily, because it might be used internally.")
    "INDEX" "LOAD/STORE-INDEX"
    "SIGNED-BYTE-WITH-A-BITE-OUT"
    "UNSIGNED-BYTE-WITH-A-BITE-OUT"
-   "SFUNCTION" "UNSIGNED-BYTE*"
+   "SFUNCTION"
    "CONSTANT-DISPLACEMENT"
    "EXTENDED-FUNCTION-DESIGNATOR"
    "EXTENDED-FUNCTION-DESIGNATOR-P"
@@ -934,7 +928,6 @@ possibly temporarily, because it might be used internally.")
    "FAST-READ-CHAR-REFILL"
    "FAST-READ-S-INTEGER"
    "FAST-READ-U-INTEGER"
-   "FAST-READ-VAR-U-INTEGER"
    "FILE-NAME"
    "FORM-TRACKING-STREAM"
    "FORM-TRACKING-STREAM-OBSERVER"
@@ -1009,7 +1002,7 @@ Lisp extension proposal by David N. Gray")
            "%CAST"
            "%DEREF-ADDR" "%HEAP-ALIEN" "%HEAP-ALIEN-ADDR"
            "%LOCAL-ALIEN-ADDR" "%LOCAL-ALIEN-FORCED-TO-MEMORY-P" "%SAP-ALIEN"
-           "%NATURALIZE-C-STRING"
+           "%NATURALIZE-C-STRING" "%NATURALIZE-BASE-STRING/WORD"
            "%SET-DEREF" "%SET-HEAP-ALIEN" "%SET-LOCAL-ALIEN" "%SET-SLOT"
            "%SLOT-ADDR" "*SAVED-FP*" "*VALUES-TYPE-OKAY*"
            "*ALIEN-TYPE-HASHSETS*"
@@ -1061,12 +1054,12 @@ Lisp extension proposal by David N. Gray")
 (defpackage "SB-SYS"
   (:documentation
    "private: In theory, this \"contains functions and information
-necessary for system interfacing\" (said cmu-user.tex at the time
-of the SBCL code fork). That probably was and is a good idea, but in
-practice, the distinctions between this package and SB-KERNEL
-and even SB-VM seem to have become somewhat blurred over the years.
-Some anomalies (e.g. FIND-IF-IN-CLOSURE being in SB-SYS instead of
-SB-KERNEL) have been undone, but probably more remain.")
+necessary for system interfacing\" (said cmu-user.tex at the time of
+the SBCL code fork). That probably was and is a good idea, but in
+practice, the distinctions between this package and `SB-KERNEL` and even
+`SB-VM` seem to have become somewhat blurred over the years. Some
+anomalies (e.g. SB-IMPL::FIND-IF-IN-CLOSURE being in `SB-IMPL` instead
+of `SB-KERNEL`) have been undone, but probably more remain.")
   (:use "CL" "SB-EXT" "SB-INT")
   (:export
    ;; FIXME: %PRIMITIVE shouldn't be here. (I now know that %SYS
@@ -1138,6 +1131,11 @@ SB-KERNEL) have been undone, but probably more remain.")
    "SAP-REF-8"
    "SAP-REF-DOUBLE" "SAP-REF-LISPOBJ" "SAP-REF-LONG"
    "SAP-REF-SAP" "SAP-REF-SINGLE"
+   ;; The "internal" sap ref accessors are only to aid compiling DEREF
+   ;; and not for users.
+   "%SAP-REF-16-INDEXED" "%SIGNED-SAP-REF-16-INDEXED"
+   "%SAP-REF-32-INDEXED" "%SIGNED-SAP-REF-32-INDEXED"
+   "%SAP-REF-64-INDEXED" "%SIGNED-SAP-REF-64-INDEXED"
    "SAP<" "SAP<=" "SAP=" "SAP>" "SAP>="
    "SCRUB-CONTROL-STACK" "SERVE-ALL-EVENTS"
    "SIGNAL-DEADLINE"
@@ -1178,7 +1176,7 @@ SB-KERNEL) have been undone, but probably more remain.")
            "ASMSTREAM-CONSTANT-TABLE"
            "ASMSTREAM-CONSTANT-VECTOR"
            "APPEND-SECTIONS" "ASSEMBLE-SECTIONS"
-           "EMIT" ".ALIGN" ".BYTE" ".LISPWORD" ".SKIP"
+           "EMIT" ".ALIGN" ".BYTE" ".BYTES" ".LISPWORDS" ".SKIP"
            ".COMMENT"
            "EMIT-ALIGNMENT" "EMIT-BYTE" "EMIT-BACK-PATCH"
            "EMIT-CHOOSER" "DEFINE-BITFIELD-EMITTER"
@@ -1199,10 +1197,11 @@ SB-KERNEL) have been undone, but probably more remain.")
            "VARIABLE-LENGTH"
            "SEGMENT-COLLECT-DYNAMIC-STATISTICS"
            "SECTION-START"
-           "STMT-LABELS" "STMT-MNEMONIC" "STMT-OPERANDS"
+           "STMT-LABELS" "STMT-PREFIX" "STMT-OP" "STMT-OPERANDS"
            "STMT-PLIST"
            "STMT-PREV" "STMT-NEXT"
            "ADD-STMT-LABELS" "DELETE-STMT"
+           "REPLACE-PREFIXED" "REPLACE-STMT" "REPLACE-OPERANDS"
            "LABELED-STATEMENT-P"
            "DEFPATTERN"))
 
@@ -1212,9 +1211,9 @@ SB-KERNEL) have been undone, but probably more remain.")
   ;; SB-ALIEN/SB-C-CALL split. That split went away and was deprecated
   ;; in 0.7.0, so we should get rid of this nickname after a while.
   (:nicknames "SB-C-CALL")
-  (:documentation "public: the ALIEN foreign function interface (If you're
+  (:documentation "public: the `ALIEN` foreign function interface (If you're
 porting CMU CL code, note that this package corresponds roughly to a union
-of the packages ALIEN and C-CALL at the time of the SBCL fork. SB-C-CALL
+of the packages `ALIEN` and `C-CALL` at the time of the SBCL fork. `SB-C-CALL`
 is a deprecated nickname to help ease the transition from older versions
 of SBCL which maintained the CMU-CL-style split into two packages.)")
   (:use "CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-ALIEN-INTERNALS")
@@ -1466,11 +1465,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
                 "%MAKE-SIMD-PACK-UB32"
                 "%MAKE-SIMD-PACK-UB64"
                 "%MAKE-SIMD-PACK-DOUBLE"
-                "%MAKE-SIMD-PACK-SINGLE"
-                "%SIMD-PACK-UB32S"
-                "%SIMD-PACK-UB64S"
-                "%SIMD-PACK-DOUBLES"
-                "%SIMD-PACK-SINGLES")
+                "%MAKE-SIMD-PACK-SINGLE")
   (:export "%%DATA-VECTOR-REFFERS%%"
            "%%DATA-VECTOR-SETTERS%%"
            "%ACOS" "%ACOSH"
@@ -1551,8 +1546,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%HYPOT" "%HYPOTF"
            "%INSTANCE-CAS"
            "%LDB"
-           "%LOG" "%LOGB" "%LOG10"
-           "%LOGF" "%LOGBF" "%LOG10F"
+           "%LOG" "%LOG10"
+           "%LOGF" "%LOG10F"
            "%LAST0"
            "%LAST1"
            "%LASTN/FIXNUM"
@@ -1573,6 +1568,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%MAKE-RATIO"
            #+sb-simd-pack "%MAKE-SIMD-PACK"
            #+sb-simd-pack-256 "%MAKE-SIMD-PACK-256"
+           #+sb-simd-pack-512 "%MAKE-SIMD-PACK-512"
+           #+sb-simd-pack-512 "%MAKE-SIMD-PACK-512-MASK"
            "%MAKE-STRUCTURE-INSTANCE"
            "%MAKE-STRUCTURE-INSTANCE-ALLOCATOR"
            "%MAP" "%MAP-FOR-EFFECT-ARITY-1"
@@ -1611,7 +1608,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%RASSOC-TEST"
            "%RASSOC-TEST-NOT"
            "%VECTOR-RAW-BITS"
-           "%SCALB" "%SCALBN"
            "%RAW-INSTANCE-ATOMIC-INCF/WORD"
            "%RAW-INSTANCE-CAS/WORD" "%RAW-INSTANCE-XCHG/WORD"
            "%RAW-INSTANCE-REF/WORD" "%RAW-INSTANCE-SET/WORD"
@@ -1685,6 +1681,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "BIND" "BINDING-STACK-POINTER-SAP"
            "BOGUS-ARG-TO-VALUES-LIST-ERROR" "BOOLE-CODE"
            "BOUNDING-INDICES-BAD-ERROR" "BYTE-SPECIFIER" "%BYTE-BLT"
+           "BOOLEAN-OR"
            "FUNCTION-DESIGNATOR"
            "CAR-EQ-IF-LISTP"
            "CASE-BODY-ERROR"
@@ -1772,6 +1769,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "FUN-TYPE-KEYP" "FUN-TYPE-KEYWORDS" "FUN-TYPE-NARGS"
            "FUN-TYPE-OPTIONAL" "FUN-TYPE-P" "FUN-TYPE-REQUIRED"
            "FUN-TYPE-REST" "FUN-TYPE-RETURNS" "FUN-TYPE-WILD-ARGS"
+           "FUN-TYPE-CHANGE-RETURN"
            "GENERALIZED-BOOLEAN"
            "GENERIC-ABSTRACT-TYPE-FUNCTION"
            "GET-CLOSURE-LENGTH" "GET-HEADER-DATA"
@@ -1813,7 +1811,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "LAYOUT-EQUALP-IMPL"
            "BITMAP-NWORDS"
            "LAYOUT-DEPTHOID"
-           "LAYOUT-ID"
+           "LAYOUT-ID" "ENSURE-LAYOUT-ID"
            "LAYOUT-FOR-PCL-OBJ-P"
            #+(or x86-64 x86) "%LEA"
            "LEXENV" "LEXENV-DESIGNATOR" "LINE-LENGTH"
@@ -1841,7 +1839,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "MAKE-MEMBER-TYPE" "MAKE-NULL-LEXENV"
            "MAKE-EQL-TYPE" "MEMBER-TYPE-FROM-LIST"
            "MAKE-NEGATION-TYPE" "TYPE-NEGATION"
-           "MAKE-NUMERIC-TYPE"
+           "MAKE-NUMERIC-TYPE" "MAKE-NUMERIC-UNION-TYPE"
            "MAKE-SINGLE-FLOAT"
            "MAKE-UNBOUND-MARKER"
            "MAKE-SHORT-VALUES-TYPE" "MAKE-SINGLE-VALUE-TYPE"
@@ -1894,10 +1892,10 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "OBJECT-NOT-SIMPLE-ARRAY-COMPLEX-DOUBLE-FLOAT-ERROR"
            #+long-float
            "OBJECT-NOT-SIMPLE-ARRAY-COMPLEX-LONG-FLOAT-ERROR"
-           #+sb-simd-pack
-           "OBJECT-NOT-SIMD-PACK-ERROR"
-           #+sb-simd-pack-256
-           "OBJECT-NOT-SIMD-PACK-256-ERROR"
+           #+sb-simd-pack     "OBJECT-NOT-SIMD-PACK-ERROR"
+           #+sb-simd-pack-256 "OBJECT-NOT-SIMD-PACK-256-ERROR"
+           #+sb-simd-pack-512 "OBJECT-NOT-SIMD-PACK-512-ERROR"
+           #+sb-simd-pack-512 "OBJECT-NOT-SIMD-PACK-512-MASK-ERROR"
            "OBJECT-NOT-SIMPLE-ARRAY-COMPLEX-SINGLE-FLOAT-ERROR"
            "OBJECT-NOT-SIMPLE-ARRAY-DOUBLE-FLOAT-ERROR"
            "OBJECT-NOT-SIMPLE-ARRAY-ERROR"
@@ -2025,6 +2023,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%INSTANCE-SET"
            "TESTABLE-TYPE-P"
            "TLS-EXHAUSTED-ERROR"
+           "TOO-MANY-RETURN-VALUES-ERROR"
            "*TOP-LEVEL-FORM-P*"
            "TWO-ARG-*" "TWO-ARG-+" "TWO-ARG--" "TWO-ARG-/"
            "TWO-ARG-/=" "TWO-ARG-<" "TWO-ARG-<=" "TWO-ARG-="
@@ -2358,7 +2357,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "SIMPLE-BASE-STRING="
            #+sb-unicode "SIMPLE-CHARACTER-STRING="
            "%SP-STRING-COMPARE" "%SP-STRING="
-           "%SETNTH" "%SETELT"
+           "%SETNTH"
+           "%SETELT" "%SETELT-LIST"
+           "ELT-LIST"
            "%SET-ROW-MAJOR-AREF" "%SET-FILL-POINTER"
            "%SET-FDEFINITION" "%SCHARSET"
            "%RPLACD" "%RPLACA" "%PUT" "%CHARSET"
@@ -2366,18 +2367,15 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "INLINE-VOP"
            "WRAP-IF" "COND-DISPATCH"
            "MAKE-DEFS"
-           "COPY-REMOVE" "COPY-REMOVE-IF" "COPY-REMOVE-IF-NOT")
+           "COPY-REMOVE" "COPY-REMOVE-IF" "COPY-REMOVE-IF-NOT"
+           "QUIET=" "QUIET<")
   #+sb-simd-pack
   (:export "SIMD-PACK"
            "SIMD-PACK-P"
            "%MAKE-SIMD-PACK-UB32"
            "%MAKE-SIMD-PACK-UB64"
            "%MAKE-SIMD-PACK-DOUBLE"
-           "%MAKE-SIMD-PACK-SINGLE"
-           "%SIMD-PACK-UB32S"
-           "%SIMD-PACK-UB64S"
-           "%SIMD-PACK-DOUBLES"
-           "%SIMD-PACK-SINGLES")
+           "%MAKE-SIMD-PACK-SINGLE")
   #+sb-simd-pack
   (:export "%SIMD-PACK-TAG"
            "%SIMD-PACK-LOW"
@@ -2386,6 +2384,13 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
   (:export "%SIMD-PACK-256-TAG"
            "%SIMD-PACK-256-0" "%SIMD-PACK-256-1"
            "%SIMD-PACK-256-2" "%SIMD-PACK-256-3")
+  #+sb-simd-pack-512
+  (:export "%SIMD-PACK-512-TAG"
+           "%SIMD-PACK-512-MASK-VALUE"
+           "%SIMD-PACK-512-0" "%SIMD-PACK-512-1"
+           "%SIMD-PACK-512-2" "%SIMD-PACK-512-3"
+           "%SIMD-PACK-512-4" "%SIMD-PACK-512-5"
+           "%SIMD-PACK-512-6" "%SIMD-PACK-512-7")
   #+sb-simd-pack
   (:export "SIMD-PACK-SINGLE"
            "SIMD-PACK-DOUBLE"
@@ -2399,6 +2404,12 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "SIMD-PACK-256-INT"
            "SIMD-PACK-256-TYPE"
            "SIMD-PACK-256-TYPE-TAG-MASK")
+  #+sb-simd-pack-512
+  (:export "SIMD-PACK-512-SINGLE"
+           "SIMD-PACK-512-DOUBLE"
+           "SIMD-PACK-512-INT"
+           "SIMD-PACK-512-TYPE"
+           "SIMD-PACK-512-TYPE-TAG-MASK")
   #+long-float
   (:export "LONG-FLOAT-EXPONENT" "LONG-FLOAT-EXP-BITS"
            "LONG-FLOAT-HIGH-BITS" "LONG-FLOAT-LOW-BITS"
@@ -2406,7 +2417,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
 
 (defpackage "SB-SEQUENCE"
   (:documentation "semi-public: implements something which might eventually
-be submitted as a CDR")
+be submitted as a \\CDR")
   (:use)
   (:export "PROTOCOL-UNIMPLEMENTED"
            "PROTOCOL-UNIMPLEMENTED-OPERATION"
@@ -2626,6 +2637,16 @@ be submitted as a CDR")
            "ALLOC-ALIEN-STACK-SPACE" "ALLOC-NUMBER-STACK-SPACE"
            "ALLOCATE-CODE-OBJECT" "ALLOCATE-FRAME"
            "ALLOCATE-FULL-CALL-FRAME"
+           #+tls-based-mv-return
+           "ALLOCATE-DIRECT-MV-CALL-FRAME"
+           #+tls-based-mv-return
+           "CALL-DIRECT"
+           #+tls-based-mv-return
+           "CALL-DIRECT-NAMED"
+           #+tls-based-mv-return
+           "MV-CALL-DIRECT"
+           #+tls-based-mv-return
+           "MV-CALL-DIRECT-NAMED"
            "ALWAYS-TRANSLATABLE"
            "ANCESTOR-FRAME-REF" "ANCESTOR-FRAME-SET"
            "ANY"
@@ -2678,6 +2699,7 @@ be submitted as a CDR")
            "DO-FORMS-FROM-INFO"
            "EMIT-BLOCK-HEADER"
            "ENVIRONMENT-DEBUG-LIVE-TN" "ENVIRONMENT-LIVE-TN"
+           "EVAL-WITH-COMPILE-IN-LEXENV"
            "FAST-SYMBOL-VALUE"
            "FAST-SYMBOL-GLOBAL-VALUE"
            "FIXUP-NOTE-KIND"
@@ -2824,6 +2846,16 @@ be submitted as a CDR")
            ;; for SB-INTROSPECT
 
            "MAP-PACKED-XREF-DATA" "MAP-SIMPLE-FUNS"))
+
+#+adaptive-conset
+(defpackage "SB-INTEGER-SPARSE-SET"
+  (:use "CL" "SB-INT" "SB-EXT")
+  (:import-from "SB-C" "INSERT-ARRAY-BOUNDS-CHECKS")
+  (:export "MAKE-INT-SSET" "COPY-INT-SSET"
+           "DO-INT-SSET-ELEMENTS" "INT-SSET="
+           "INT-SSET-ADJOIN" "INT-SSET-DELETE" "INT-SSET-MEMBER"
+           "INT-SSET-UNION" "INT-SSET-INTERSECTION" "INT-SSET-DIFFERENCE"
+           "INT-SSET-EMPTY" "INT-SSET-COUNT"))
 
 (defpackage "SB-REGALLOC"
   (:documentation "private: implementation of the compiler's register allocator")
@@ -2984,7 +3016,6 @@ structure representations")
            "FLOAT-STICKY-BITS"
            "FLOAT-TRAPS-BYTE"
            "FP-CONSTANT-SC-NUMBER"
-           "FP-DOUBLE-ZERO-SC-NUMBER" "FP-SINGLE-ZERO-SC-NUMBER"
            "FUNCALLABLE-INSTANCE-TRAMPOLINE-SLOT"
            "FUNCALLABLE-INSTANCE-WIDETAG"
            "FUNCALLABLE-INSTANCE-INFO-OFFSET"
@@ -3208,7 +3239,23 @@ structure representations")
    "SIMD-PACK-256-P2-SLOT"
    "SIMD-PACK-256-P3-SLOT"
    "SIMD-PACK-256-SIZE"
-   "SIMD-PACK-256-WIDETAG"))
+   "SIMD-PACK-256-WIDETAG")
+  #+sb-simd-pack-512
+  (:export
+   "SIMD-PACK-512-TAG-SLOT"
+   "SIMD-PACK-512-P0-SLOT"
+   "SIMD-PACK-512-P1-SLOT"
+   "SIMD-PACK-512-P2-SLOT"
+   "SIMD-PACK-512-P3-SLOT"
+   "SIMD-PACK-512-P4-SLOT"
+   "SIMD-PACK-512-P5-SLOT"
+   "SIMD-PACK-512-P6-SLOT"
+   "SIMD-PACK-512-P7-SLOT"
+   "SIMD-PACK-512-SIZE"
+   "SIMD-PACK-512-WIDETAG"
+   "SIMD-PACK-512-MASK-WIDETAG"
+   "SIMD-PACK-512-MASK-SIZE"
+   "SIMD-PACK-512-MASK-VALUE-SLOT"))
 
 (defpackage "SB-DISASSEM"
   (:documentation "private: stuff related to the implementation of the disassembler")
@@ -3267,9 +3314,10 @@ structure representations")
 (defpackage "SB-DEBUG"
   (:documentation
    "sorta public: Eventually this should become the debugger interface, with
-basic stuff like BACKTRACE and ARG. For now, the actual supported interface
-is still mixed indiscriminately with low-level internal implementation stuff
-like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
+basic stuff like BACKTRACE and ARG. For now, the actual supported
+interface is still mixed indiscriminately with low-level internal
+implementation stuff like SB-DEBUG:*STACK-TOP-HINT* and unsupported
+stuff like SB-DEBUG::*TRACED-FUNS*.")
   (:use "CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-KERNEL")
   (:export "*BACKTRACE-FRAME-COUNT*"
            "*DEBUG-BEGINNER-HELP-P*"

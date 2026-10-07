@@ -562,6 +562,15 @@ evaluated as a PROGN."
                     ,n-result
                     ,(expand-forms t (rest forms)))))))))
 
+;;; Just return T, simplifying compilation by not needing LETs
+(sb-xc:defmacro boolean-or (&rest forms)
+  (named-let expand-forms ((forms forms))
+    (cond ((endp forms) nil)
+          (t
+           `(if ,(first forms)
+                t
+                ,(expand-forms (rest forms)))))))
+
 
 ;;;; Multiple value macros:
 
@@ -838,10 +847,11 @@ invoked. In that case it will store into PLACE and start over."
     (lambda (condition stream)
       (format stream
         "Duplicate key ~S in ~S form, ~
-         occurring in~{~#[~; and~]~{ clause ~a:~%~<  ~S~:>~}~^,~}."
+         occurring in ~{~{clause ~a:~%~<  ~S~:>~}~^~#[~;, and ~:;, ~]~}"
         (case-warning-key condition)
         (case-warning-case-kind condition)
-        (duplicate-case-key-warning-occurrences condition)))))
+        (remove-duplicates (duplicate-case-key-warning-occurrences condition)
+                           :test #'equal)))))
 
 ;;; Return three values:
 ;;; 1. an array of LAYOUT
@@ -1128,16 +1138,15 @@ invoked. In that case it will store into PLACE and start over."
           (case-position 1 (1+ case-position)))
          ((null cases) nil)
       (flet ((check-clause (case-keys)
-               (loop for k in case-keys
-                  for existing = (gethash k keys-seen)
-                  do (when existing
-                       (warn 'duplicate-case-key-warning
-                             :key k
-                             :case-kind name
-                             :occurrences `(,existing (,case-position (,clause))))))
                (let ((record (list case-position (list clause))))
-                 (dolist (k case-keys)
-                   (setf (gethash k keys-seen) record))))
+                 (loop for k in case-keys
+                       for existing = (gethash k keys-seen)
+                       do (when existing
+                            (warn 'duplicate-case-key-warning
+                                  :key k
+                                  :case-kind name
+                                  :occurrences `(,existing (,case-position (,clause)))))
+                          (setf (gethash k keys-seen) record))))
              (testify (k)
                (wrap-if
                 (and (eq test 'typep)
@@ -1769,7 +1778,7 @@ invoked. In that case it will store into PLACE and start over."
              ((t) '%instance-cas)
              #+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
              ((word) '%raw-instance-cas/word)
-             #+(or arm64 loongarch64 riscv x86 x86-64)
+             #+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
              ((sb-vm:signed-word) '%raw-instance-cas/signed-word))))
     (unless casser
       (error "Cannot use COMPARE-AND-SWAP with structure accessor ~
@@ -1796,38 +1805,38 @@ invoked. In that case it will store into PLACE and start over."
 (defun get-cas-expansion (place &optional environment)
   "Analogous to GET-SETF-EXPANSION. Returns the following six values:
 
- * list of temporary variables
+* list of temporary variables
 
- * list of value-forms whose results those variable must be bound
+* list of value-forms whose results those variable must be bound
 
- * temporary variable for the old value of PLACE
+* temporary variable for the old value of PLACE
 
- * temporary variable for the new value of PLACE
+* temporary variable for the new value of PLACE
 
- * form using the aforementioned temporaries which performs the
-   compare-and-swap operation on PLACE
+* form using the aforementioned temporaries which performs the
+  compare-and-swap operation on PLACE
 
- * form using the aforementioned temporaries with which to perform a volatile
-   read of PLACE
+* form using the aforementioned temporaries with which to perform a volatile
+  read of PLACE
 
 Example:
 
-  (get-cas-expansion '(car x))
-  ; => (#:CONS871), (X), #:OLD872, #:NEW873,
-  ;    (SB-KERNEL:%COMPARE-AND-SWAP-CAR #:CONS871 #:OLD872 :NEW873).
-  ;    (CAR #:CONS871)
+    (get-cas-expansion '(car x))
+    ; => (#:CONS871), (X), #:OLD872, #:NEW873,
+    ;    (SB-KERNEL:%COMPARE-AND-SWAP-CAR #:CONS871 #:OLD872 :NEW873).
+    ;    (CAR #:CONS871)
 
-  (defmacro my-atomic-incf (place &optional (delta 1) &environment env)
-    (multiple-value-bind (vars vals old new cas-form read-form)
-        (get-cas-expansion place env)
-     (let ((delta-value (gensym \"DELTA\")))
-       `(let* (,@(mapcar 'list vars vals)
-               (,old ,read-form)
-               (,delta-value ,delta)
-               (,new (+ ,old ,delta-value)))
-          (loop until (eq ,old (setf ,old ,cas-form))
-                do (setf ,new (+ ,old ,delta-value)))
-          ,new))))
+    (defmacro my-atomic-incf (place &optional (delta 1) &environment env)
+      (multiple-value-bind (vars vals old new cas-form read-form)
+          (get-cas-expansion place env)
+       (let ((delta-value (gensym \"DELTA\")))
+         `(let* (,@(mapcar 'list vars vals)
+                 (,old ,read-form)
+                 (,delta-value ,delta)
+                 (,new (+ ,old ,delta-value)))
+            (loop until (eq ,old (setf ,old ,cas-form))
+                  do (setf ,new (+ ,old ,delta-value)))
+            ,new))))
 
 EXPERIMENTAL: Interface subject to change."
   ;; FIXME: this seems wrong on two points:
@@ -1886,10 +1895,10 @@ EXPERIMENTAL: Interface subject to change."
 Additionally DEFUN, DEFGENERIC, DEFMETHOD, FLET, and LABELS can be also used to
 define CAS-functions analogously to SETF-functions:
 
-  (defvar *foo* nil)
+    (defvar *foo* nil)
 
-  (defun (cas foo) (old new)
-    (cas (symbol-value '*foo*) old new))
+    (defun (cas foo) (old new)
+      (cas (symbol-value '*foo*) old new))
 
 First argument of a CAS function is the expected old value, and the second
 argument of is the new value. Note that the system provides no automatic
@@ -1936,8 +1945,7 @@ SB-MOP:SLOT-VALUE-USING-CLASS, (SETF SB-MOP:SLOT-VALUE-USING-CLASS), or
 SB-MOP:SLOT-BOUNDP-USING-CLASS.
 
 Additionally, the PLACE can be a anything for which a CAS-function has
-been defined. (See SB-EXT:CAS for more information.)
-"
+been defined."
   `(cas ,place ,old ,new))
 
 
@@ -2040,20 +2048,25 @@ been defined. (See SB-EXT:CAS for more information.)
 the increment.
 
 PLACE must access one of the following:
- - a DEFSTRUCT slot with declared type (UNSIGNED-BYTE ~D~:*)
-   or AREF of a (SIMPLE-ARRAY (UNSIGNED-BYTE ~D~:*) (*))
-   The type SB-EXT:WORD can be used for these purposes.
- - CAR or CDR (respectively FIRST or REST) of a CONS.
- - a variable defined using DEFGLOBAL with a proclaimed type of FIXNUM.
-Macroexpansion is performed on PLACE before expanding ATOMIC-INCF.
 
-Incrementing is done using modular arithmetic,
-which is well-defined over two different domains:
+- a DEFSTRUCT slot with declared type (UNSIGNED-BYTE ~D~:*)
+  or AREF of a (SIMPLE-ARRAY (UNSIGNED-BYTE ~D~:*) (*))
+  The type SB-EXT:WORD can be used for these purposes.
+
+- CAR or CDR (respectively FIRST or REST) of a CONS.
+
+- a variable defined using DEFGLOBAL with a proclaimed type of FIXNUM.
+  Macroexpansion is performed on PLACE before expanding ATOMIC-INCF.
+
+Incrementing is done using modular arithmetic, which is well-defined
+over two different domains:
+
  - For structures and arrays, the operation accepts and produces
    an (UNSIGNED-BYTE ~D~:*), and DIFF must be of type (SIGNED-BYTE ~D).
-   ATOMIC-INCF of #x~x by one results in #x0 being stored in PLACE.
+   ATOMIC-INCF of `#x~x` by one results in #x0 being stored in PLACE.
+
  - For other places, the domain is FIXNUM, and DIFF must be a FIXNUM.
-   ATOMIC-INCF of #x~x by one results in #x~x
+   ATOMIC-INCF of `#x~x` by one results in `#x~x`
    being stored in PLACE.
 
 DIFF defaults to 1.
@@ -2069,21 +2082,28 @@ EXPERIMENTAL: Interface subject to change."
 the decrement.
 
 PLACE must access one of the following:
- - a DEFSTRUCT slot with declared type (UNSIGNED-BYTE ~D~:*)
-   or AREF of a (SIMPLE-ARRAY (UNSIGNED-BYTE ~D~:*) (*))
-   The type SB-EXT:WORD can be used for these purposes.
- - CAR or CDR (respectively FIRST or REST) of a CONS.
- - a variable defined using DEFGLOBAL with a proclaimed type of FIXNUM.
+
+- a DEFSTRUCT slot with declared type `(UNSIGNED-BYTE ~D~:*)` or AREF
+  of a `(SIMPLE-ARRAY (UNSIGNED-BYTE ~D~:*) (*))` (the type
+  SB-EXT:WORD can be used for these purposes)
+
+- CAR or CDR (respectively FIRST or REST) of a CONS,
+
+- a variable defined using DEFGLOBAL with a proclaimed type of FIXNUM.
+
 Macroexpansion is performed on PLACE before expanding ATOMIC-DECF.
 
 Decrementing is done using modular arithmetic,
 which is well-defined over two different domains:
+
  - For structures and arrays, the operation accepts and produces
-   an (UNSIGNED-BYTE ~D~:*), and DIFF must be of type (SIGNED-BYTE ~D).
-   ATOMIC-DECF of #x0 by one results in #x~x being stored in PLACE.
+   an (UNSIGNED-BYTE ~D~:*), and DIFF must be of type `(SIGNED-BYTE
+   ~D)`. ATOMIC-DECF of `#x0` by one results in `#x~x` being stored in
+   PLACE.
+
  - For other places, the domain is FIXNUM, and DIFF must be a FIXNUM.
-   ATOMIC-DECF of #x~x by one results in #x~x
-   being stored in PLACE.
+   ATOMIC-DECF of `#x~x` by one results in `#x~x` being stored in
+   PLACE.
 
 DIFF defaults to 1.
 
@@ -2105,24 +2125,23 @@ PLACE can be any place supported by SB-EXT:COMPARE-AND-SWAP.
 
 Examples:
 
-  ;;; Conses T to the head of FOO-LIST.
-  (defstruct foo list)
-  (defvar *foo* (make-foo))
-  (atomic-update (foo-list *foo*) #'cons t)
+    ;;; Conses T to the head of FOO-LIST.
+    (defstruct foo list)
+    (defvar *foo* (make-foo))
+    (atomic-update (foo-list *foo*) #'cons t)
 
-  (let ((x (cons :count 0)))
-     (mapc #'sb-thread:join-thread
-           (loop repeat 1000
-                 collect (sb-thread:make-thread
-                          (lambda ()
-                            (loop repeat 1000
-                                  do (atomic-update (cdr x) #'1+)
-                                     (sleep 0.00001))))))
-     ;; Guaranteed to be (:COUNT . 1000000) -- if you replace
-     ;; atomic update with (INCF (CDR X)) above, the result becomes
-     ;; unpredictable.
-     x)
-"
+    (let ((x (cons :count 0)))
+       (mapc #'sb-thread:join-thread
+             (loop repeat 1000
+                   collect (sb-thread:make-thread
+                            (lambda ()
+                              (loop repeat 1000
+                                    do (atomic-update (cdr x) #'1+)
+                                       (sleep 0.00001))))))
+       ;; Guaranteed to be (:COUNT . 1000000) -- if you replace
+       ;; atomic update with (INCF (CDR X)) above, the result becomes
+       ;; unpredictable.
+       x)"
   (multiple-value-bind (vars vals old new cas-form read-form)
       (get-cas-expansion place env)
     `(let* (,@(mapcar 'list vars vals)

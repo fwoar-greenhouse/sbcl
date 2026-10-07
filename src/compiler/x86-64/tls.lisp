@@ -45,7 +45,6 @@
   (:temporary (:sc descriptor-reg :to (:result 0)) cell)
   #+gs-seg (:temporary (:sc unsigned-reg) thread-temp)
   (:results (result :scs (descriptor-reg any-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
   (:generator 15
@@ -186,7 +185,6 @@
 
 (define-vop (symbol-value)
   (:translate symbol-value)
-  (:policy :fast-safe)
   (:args (symbol :scs (descriptor-reg constant immediate) :to (:result 1)))
   (:arg-refs symbol-ref)
   (:temporary (:unused-if (or (symbol-always-has-tls-value-p symbol-ref (sb-c::vop-node vop))
@@ -213,7 +211,6 @@
 
 (define-vop (boundp)
   (:translate boundp)
-  (:policy :fast-safe)
   (:args (symbol :scs (descriptor-reg constant immediate)))
   (:node-var node)
   (:conditional :ne)
@@ -369,25 +366,26 @@
     (inst mov (thread-tls-ea tls-index) val)))
 
 (defun bind (bsp symbol tmp)
-  (inst mov bsp (* binding-size n-word-bytes))
-  (inst xadd (thread-slot-ea thread-binding-stack-pointer-slot) bsp)
+  (load-binding-stack-pointer bsp)
+  (inst add bsp (* binding-size n-word-bytes))
+  (store-binding-stack-pointer bsp)
   (let* ((tls-index (load-time-tls-offset symbol))
          (tls-cell (thread-tls-ea tls-index)))
     ;; Too bad we can't use "XCHG [thread + disp], val" to write new value
     ;; and read the old value in one step. It will violate the constraints
     ;; prescribed in the internal documentation on special binding.
     (inst mov tmp tls-cell)
-    (storew tmp bsp binding-value-slot)
+    (storew tmp bsp (- binding-value-slot binding-size))
     ;; Indices are small enough to be written as :DWORDs which avoids
     ;; a REX prefix if 'bsp' happens to be any of the low 8 registers.
-    (inst mov :dword (ea (ash binding-symbol-slot word-shift) bsp) tls-index)
+    (inst mov :dword (object-slot-ea bsp (- binding-symbol-slot binding-size) 0) tls-index)
     (values tls-cell tmp)))
 
 (define-vop (bind) ; bind a known symbol
   (:args (val :scs (any-reg descriptor-reg)
               :load-if (not (let ((imm (encode-value-if-immediate val)))
                               (or (fixup-p imm)
-                                  (plausible-signed-imm32-operand-p imm))))))
+                                  (imm32-p imm))))))
   (:temporary (:sc unsigned-reg) bsp tmp)
   (:info symbol)
   (:generator 10
@@ -419,10 +417,11 @@
                            &optional (newval nil newvalp)
                            &aux (value-ea (ea 1 index-temp)))
   (inst mov val-temp (ea index-temp thread-tn))
-  (inst mov bsp (* binding-size n-word-bytes))
-  (inst xadd (thread-slot-ea thread-binding-stack-pointer-slot) bsp)
-  (inst mov (ea (ash binding-value-slot word-shift) bsp) val-temp)
-  (inst mov :dword (ea (ash binding-symbol-slot word-shift) bsp) index-temp)
+  (load-binding-stack-pointer bsp)
+  (inst add bsp (* binding-size n-word-bytes))
+  (store-binding-stack-pointer bsp)
+  (storew val-temp bsp (- binding-value-slot binding-size))
+  (inst mov :dword (object-slot-ea bsp (- binding-symbol-slot binding-size) 0) index-temp)
   ;; (usually) update the indirect pointer
   (cond ((not symbol) ; compile-time-unknown if indirection word exists
          (assemble ()
@@ -445,7 +444,7 @@
   (unless newvalp (return-from binding-stack-push))
   (let ((repr (encode-value-if-immediate newval)))
     (cond ((or (gpr-tn-p repr) (fixup-p repr)
-               (plausible-signed-imm32-operand-p repr))
+               (imm32-p repr))
            (setq newval repr))
           ((nil-relative-p repr)
            (move-immediate (setq newval val-temp) repr))
@@ -504,11 +503,19 @@
 ) ; end #+tls-load-indirect
 
 (define-vop (unbind-n)
-  (:temporary (:sc unsigned-reg) temp bsp)
+  ;; The reason for explicitly picking registers is that this needs to avoid
+  ;; affecting the argument/return registers for pass-through cleanups.
+  (:temporary (:sc unsigned-reg :offset rax-offset) bsp)
+  (:temporary (:sc unsigned-reg :offset rbx-offset) temp)
+  (:temporary (:sc unsigned-reg :offset r11-offset) flags-temp)
   (:temporary (:sc complex-double-reg) zero)
   (:info symbols)
   (:vop-var vop)
   (:generator 0
+    ;; The CMP instruction touches the carry flag, which must remain intact
+    ;; for pass-through cleanups. For now, always preserve CF whether or not it's
+    ;; needed (even if #-tls-based-mv-return)
+    (inst set :c flags-temp)
     (load-binding-stack-pointer bsp)
     (inst xorps zero zero)
     (dolist (symbol symbols)
@@ -516,13 +523,13 @@
              (tls-cell (thread-tls-ea tls-index)))
         #+ultrafutex
         (when (eq symbol '*current-mutex*)
-          (let ((uncontested (gen-label)))
+          (let ((uncontended (gen-label)))
             (inst mov temp tls-cell) ; load the current value
             (inst mov :qword (mutex-slot temp %owner) 0)
             (inst dec :lock :byte (mutex-slot temp state))
-            (inst jmp :z uncontested) ; if ZF then previous value was 1, no waiters
+            (inst jmp :z uncontended) ; if ZF then previous value was 1, no waiters
             (invoke-asm-routine 'call 'mutex-wake-waiter vop)
-            (emit-label uncontested)))
+            (emit-label uncontended)))
 
         (inst sub bsp (* binding-size n-word-bytes))
 
@@ -546,6 +553,7 @@
 
         ;; Zero out the stack.
         (inst movaps (ea bsp) zero)))
+    (inst shr :dword flags-temp 1) ; restore carry flag from low bit
     (store-binding-stack-pointer bsp)))
 
 (define-vop (atomic-inc-symbol-global-value cell-xadd)
@@ -554,12 +562,10 @@
   ;; be used unless the variable is proclaimed as fixnum.
   ;; All stores are checked in a safe policy, so this
   ;; vop is safe because it increments a known fixnum.
-  (:policy :fast-safe)
   (:arg-types * tagged-num)
   (:variant symbol-value-slot other-pointer-lowtag))
 
 (define-vop (atomic-dec-symbol-global-value cell-xsub)
   (:translate %atomic-dec-symbol-global-value)
-  (:policy :fast-safe)
   (:arg-types * tagged-num)
   (:variant symbol-value-slot other-pointer-lowtag))

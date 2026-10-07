@@ -760,7 +760,6 @@
            (:results (r :scs (single-reg single-stack)))
            (:arg-types single-float single-float)
            (:result-types single-float)
-           (:policy :fast-safe)
            (:note "inline float arithmetic")
            (:vop-var vop)
            (:save-p :compute-only)
@@ -901,7 +900,6 @@
            (:results (r :scs (double-reg double-stack)))
            (:arg-types double-float double-float)
            (:result-types double-float)
-           (:policy :fast-safe)
            (:note "inline float arithmetic")
            (:vop-var vop)
            (:save-p :compute-only)
@@ -1041,7 +1039,6 @@
            (:results (r :scs (long-reg)))
            (:arg-types long-float long-float)
            (:result-types long-float)
-           (:policy :fast-safe)
            (:note "inline float arithmetic")
            (:vop-var vop)
            (:save-p :compute-only)
@@ -1135,7 +1132,6 @@
                (:args (x :scs (,sc) :target fr0))
                (:results (y :scs (,sc)))
                (:translate ,translate)
-               (:policy :fast-safe)
                (:arg-types ,type)
                (:result-types ,type)
                (:temporary (:sc double-reg :offset fr0-offset
@@ -1169,33 +1165,42 @@
   (:args (x) (y))
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:save-p :compute-only)
   (:note "inline float comparison")
   (:ignore temp)
+  (:variant-vars quiet)
+  (:variant nil)
   (:generator 3
-     (note-this-location vop :internal-error)
-     (cond
+    (note-this-location vop :internal-error)
+    (cond
       ;; x is in ST0; y is in any reg.
       ((zerop (tn-offset x))
-       (inst fucom y))
+       (if quiet
+           (inst fucom y)
+           (inst fcom y)))
       ;; y is in ST0; x is in another reg.
       ((zerop (tn-offset y))
-       (inst fucom x))
+       (if quiet
+           (inst fucom x)
+           (inst fcom x)))
       ;; x and y are the same register, not ST0
       ((location= x y)
        (inst fxch x)
-       (inst fucom fr0-tn)
+       (if quiet
+           (inst fucom fr0-tn)
+           (inst fcom fr0-tn))
        (inst fxch x))
       ;; x and y are different registers, neither ST0.
       (t
        (inst fxch x)
-       (inst fucom y)
+       (if quiet
+           (inst fucom y)
+           (inst fcom y))
        (inst fxch x)))
-     (inst fnstsw)                      ; status word to ax
-     (inst and ah-tn #x45)              ; C3 C2 C0
-     (inst cmp ah-tn #x40)))
+    (inst fnstsw)                       ; status word to ax
+    (inst and ah-tn #x45)               ; C3 C2 C0
+    (inst cmp ah-tn #x40)))
 
 (define-vop (=/single-float =/float)
   (:translate =)
@@ -1208,6 +1213,14 @@
   (:args (x :scs (double-reg))
          (y :scs (double-reg)))
   (:arg-types double-float double-float))
+
+(define-vop (quiet=/single-float =/single-float)
+  (:variant t)
+  (:translate quiet=))
+
+(define-vop (quiet=/double-float =/double-float)
+  (:variant t)
+  (:translate quiet=))
 
 #+long-float
 (define-vop (=/long-float =/float)
@@ -1224,43 +1237,56 @@
   (:temporary (:sc single-reg :offset fr0-offset :from :eval) fr0)
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:ignore temp)
+  (:variant-vars quiet)
+  (:variant nil)
   (:generator 3
     ;; Handle a few special cases.
     (cond
-     ;; y is ST0.
-     ((and (sc-is y single-reg) (zerop (tn-offset y)))
+      ;; y is ST0.
+      ((and (sc-is y single-reg) (zerop (tn-offset y)))
+       (sc-case x
+         (single-reg
+          (if quiet
+              (inst fucom x)
+              (inst fcom x)))
+         ((single-stack descriptor-reg)
+          (if quiet
+              (inst fucom (if (sc-is x single-stack)
+                             (ea-for-sf-stack x)
+                             (ea-for-sf-desc x)))
+              (inst fcom (if (sc-is x single-stack)
+                             (ea-for-sf-stack x)
+                             (ea-for-sf-desc x))))))
+       (inst fnstsw)                    ; status word to ax
+       (inst and ah-tn #x45))
+
+      ;; general case when y is not in ST0
+      (t
+       ;; x to ST0
       (sc-case x
         (single-reg
-         (inst fcom x))
+         (unless (zerop (tn-offset x))
+           (copy-fp-reg-to-fr0 x)))
         ((single-stack descriptor-reg)
+         (inst fstp fr0)
          (if (sc-is x single-stack)
-             (inst fcom (ea-for-sf-stack x))
-           (inst fcom (ea-for-sf-desc x)))))
-      (inst fnstsw)                     ; status word to ax
-      (inst and ah-tn #x45))
-
-     ;; general case when y is not in ST0
-     (t
-      ;; x to ST0
-      (sc-case x
-         (single-reg
-          (unless (zerop (tn-offset x))
-                  (copy-fp-reg-to-fr0 x)))
-         ((single-stack descriptor-reg)
-          (inst fstp fr0)
-          (if (sc-is x single-stack)
-              (inst fld (ea-for-sf-stack x))
-            (inst fld (ea-for-sf-desc x)))))
+             (inst fld (ea-for-sf-stack x))
+             (inst fld (ea-for-sf-desc x)))))
       (sc-case y
         (single-reg
-         (inst fcom y))
+         (if quiet
+             (inst fucom y)
+             (inst fcom y)))
         ((single-stack descriptor-reg)
-         (if (sc-is y single-stack)
-             (inst fcom (ea-for-sf-stack y))
-           (inst fcom (ea-for-sf-desc y)))))
+         (if quiet
+             (inst fucom (if (sc-is y single-stack)
+                            (ea-for-sf-stack y)
+                            (ea-for-sf-desc y)))
+             (inst fcom (if (sc-is y single-stack)
+                            (ea-for-sf-stack y)
+                            (ea-for-sf-desc y))))))
       (inst fnstsw)                     ; status word to ax
       (inst and ah-tn #x45)             ; C3 C2 C0
       (inst cmp ah-tn #x01)))))
@@ -1273,46 +1299,74 @@
   (:temporary (:sc double-reg :offset fr0-offset :from :eval) fr0)
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:ignore temp)
+  (:variant-vars quiet)
+  (:variant nil)
   (:generator 3
     ;; Handle a few special cases
     (cond
-     ;; y is ST0.
-     ((and (sc-is y double-reg) (zerop (tn-offset y)))
+      ;; y is ST0.
+      ((and (sc-is y double-reg) (zerop (tn-offset y)))
+       (sc-case x
+         (double-reg
+          (if quiet
+              (inst fucom x)
+              (inst fcomd x)))
+         ((double-stack descriptor-reg)
+          (if quiet
+              (inst fucom
+                    (if (sc-is x double-stack)
+                        (ea-for-df-stack x)
+                        (ea-for-df-desc x)))
+              (inst fcomd
+                    (if (sc-is x double-stack)
+                        (ea-for-df-stack x)
+                        (ea-for-df-desc x))))))
+       (inst fnstsw)                    ; status word to ax
+       (inst and ah-tn #x45))
+
+      ;; General case when y is not in ST0.
+      (t
+       ;; x to ST0
       (sc-case x
         (double-reg
-         (inst fcomd x))
+         (unless (zerop (tn-offset x))
+           (copy-fp-reg-to-fr0 x)))
         ((double-stack descriptor-reg)
+         (inst fstp fr0)
          (if (sc-is x double-stack)
-             (inst fcomd (ea-for-df-stack x))
-           (inst fcomd (ea-for-df-desc x)))))
-      (inst fnstsw)                     ; status word to ax
-      (inst and ah-tn #x45))
-
-     ;; General case when y is not in ST0.
-     (t
-      ;; x to ST0
-      (sc-case x
-         (double-reg
-          (unless (zerop (tn-offset x))
-                  (copy-fp-reg-to-fr0 x)))
-         ((double-stack descriptor-reg)
-          (inst fstp fr0)
-          (if (sc-is x double-stack)
-              (inst fldd (ea-for-df-stack x))
-            (inst fldd (ea-for-df-desc x)))))
+             (inst fldd (ea-for-df-stack x))
+             (inst fldd (ea-for-df-desc x)))))
       (sc-case y
         (double-reg
-         (inst fcomd y))
+         (if quiet
+             (inst fucom y)
+             (inst fcomd y)))
         ((double-stack descriptor-reg)
-         (if (sc-is y double-stack)
-             (inst fcomd (ea-for-df-stack y))
-           (inst fcomd (ea-for-df-desc y)))))
+         (if quiet
+             (inst fucom
+                   (if (sc-is y double-stack)
+                       (ea-for-df-stack y)
+                       (ea-for-df-desc y)))
+             (inst fcomd
+                   (if (sc-is y double-stack)
+                       (ea-for-df-stack y)
+                       (ea-for-df-desc y))))))
       (inst fnstsw)                     ; status word to ax
       (inst and ah-tn #x45)             ; C3 C2 C0
       (inst cmp ah-tn #x01)))))
+
+(define-vop (quiet<double-float <double-float)
+  (:args (x :scs (double-reg))
+         (y :scs (double-reg)))
+  (:translate quiet<)
+  (:variant t))
+(define-vop (quiet<single-float <single-float)
+  (:args (x :scs (single-reg))
+         (y :scs (single-reg)))
+  (:translate quiet<)
+  (:variant t))
 
 #+long-float
 (define-vop (<long-float)
@@ -1322,7 +1376,6 @@
   (:arg-types long-float long-float)
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:ignore temp)
   (:generator 3
@@ -1356,7 +1409,6 @@
   (:temporary (:sc single-reg :offset fr0-offset :from :eval) fr0)
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:ignore temp)
   (:generator 3
@@ -1405,7 +1457,6 @@
   (:temporary (:sc double-reg :offset fr0-offset :from :eval) fr0)
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:ignore temp)
   (:generator 3
@@ -1454,7 +1505,6 @@
   (:arg-types long-float long-float)
   (:temporary (:sc word-reg :offset eax-offset :from :eval) temp)
   (:conditional :e)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:ignore temp)
   (:generator 3
@@ -1487,7 +1537,6 @@
   (:conditional :e)
   (:info y)
   (:variant-vars code)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:save-p :compute-only)
   (:note "inline float comparison")
@@ -1574,7 +1623,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types signed-num)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -1601,7 +1649,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types unsigned-num)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -1627,7 +1674,6 @@
                (:results (y :scs (,to-sc)))
                (:arg-types ,from-type)
                (:result-types ,to-type)
-               (:policy :fast-safe)
                (:note "inline float coercion")
                (:translate ,translate)
                (:vop-var vop)
@@ -1686,7 +1732,6 @@
                (:arg-types ,from-type)
                (:result-types signed-num)
                (:translate ,trans)
-               (:policy :fast-safe)
                (:note "inline float truncate")
                (:vop-var vop)
                (:save-p :compute-only)
@@ -1734,7 +1779,6 @@
                (:arg-types ,from-type)
                (:result-types unsigned-num)
                (:translate ,trans)
-               (:policy :fast-safe)
                (:note "inline float truncate")
                (:vop-var vop)
                (:save-p :compute-only)
@@ -1780,7 +1824,6 @@
   (:arg-types signed-num)
   (:result-types single-float)
   (:translate make-single-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case res
@@ -1809,7 +1852,6 @@
   (:arg-types signed-num unsigned-num)
   (:result-types double-float)
   (:translate make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (let ((offset (tn-offset temp)))
@@ -1829,7 +1871,6 @@
   (:arg-types signed-num unsigned-num unsigned-num)
   (:result-types long-float)
   (:translate make-long-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let ((offset (tn-offset temp)))
@@ -1848,7 +1889,6 @@
   (:arg-types single-float)
   (:result-types signed-num)
   (:translate single-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -1878,7 +1918,6 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-high-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
      (sc-case float
@@ -1902,7 +1941,6 @@
   (:arg-types double-float)
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
      (sc-case float
@@ -1927,7 +1965,6 @@
   (:arg-types long-float)
   (:result-types signed-num)
   (:translate long-float-exp-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
      (sc-case float
@@ -1957,7 +1994,6 @@
   (:arg-types long-float)
   (:result-types unsigned-num)
   (:translate long-float-high-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
      (sc-case float
@@ -1982,7 +2018,6 @@
   (:arg-types long-float)
   (:result-types unsigned-num)
   (:translate long-float-low-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
      (sc-case float
@@ -2013,7 +2048,6 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate floating-point-modes)
-  (:policy :fast-safe)
   (:temporary (:sc unsigned-reg :offset eax-offset :target res
                    :to :result) eax)
   (:generator 8
@@ -2035,7 +2069,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:temporary (:sc unsigned-reg :offset eax-offset
                    :from :eval :to :result) eax)
   (:generator 3
@@ -2059,7 +2092,6 @@
   (:arg-types double-float)
   (:result-types double-float)
   (:translate %sqrt)
-  (:policy :fast-safe)
   (:note "inline npx function")
   (:vop-var vop)
   (:save-p :compute-only)
@@ -2082,7 +2114,6 @@
   (:arg-types single-float)
   (:result-types single-float)
   (:translate %sqrtf)
-  (:policy :fast-safe)
   (:note "inline npx function")
   (:vop-var vop)
   (:save-p :compute-only)
@@ -2110,7 +2141,6 @@
                :load-if (not (sc-is r complex-single-stack))))
   (:result-types complex-single-float)
   (:note "inline complex single-float creation")
-  (:policy :fast-safe)
   (:generator 5
     (sc-case r
       (complex-single-reg
@@ -2154,7 +2184,6 @@
                :load-if (not (sc-is r complex-double-stack))))
   (:result-types complex-double-float)
   (:note "inline complex double-float creation")
-  (:policy :fast-safe)
   (:generator 5
     (sc-case r
       (complex-double-reg
@@ -2199,7 +2228,6 @@
                :load-if (not (sc-is r complex-long-stack))))
   (:result-types complex-long-float)
   (:note "inline complex long-float creation")
-  (:policy :fast-safe)
   (:generator 5
     (sc-case r
       (complex-long-reg
@@ -2238,7 +2266,6 @@
   (:args (x :target r))
   (:results (r))
   (:variant-vars offset)
-  (:policy :fast-safe)
   (:generator 3
     (cond ((sc-is x complex-single-reg complex-double-reg
                   #+long-float complex-long-reg)

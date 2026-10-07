@@ -339,7 +339,6 @@ alloc_immobile_fixedobj(int size_class, int spacing_words, uword_t header)
 {
   size_class = fixnum_value(size_class);
   spacing_words = fixnum_value(spacing_words);
-  header = fixnum_value(header);
 
   unsigned int page;
   lispobj word;
@@ -537,44 +536,58 @@ lispobj* search_immobile_code(char* ptr) {
     return 0;
 }
 
-/* If 'addr' points to an immobile object, then make the object
-   live by promotion. But if the object is not in the generation
-   being collected, do nothing */
-bool immobile_space_preserve_pointer(void* addr)
+/* If 'addr' is a valid pointer to an immobile object, return the tagged pointer.
+ * 'addr' must already be properly tagged unless it is an interior pointer to code.
+ * If there is no object, return 0. 'match_gen' identifies a single generation to
+ * consider, or -1 to consider all.
+ * IMPORTANT: 'match_gen' does not promise to filter out the objects in non-matching
+ * generations. It is strictly an optimization */
+lispobj immobile_space_obj_from_ambiguous_ptr(void* addr, int match_gen)
 {
-    unsigned char genmask = compacting_p() ? 1<<from_space : 0xff;
-    lispobj* object_start;
-    int valid = 0;
     low_page_index_t page_index;
+    lispobj *object_start;
 
-    if ((page_index = find_fixedobj_page_index(addr)) >= 0
-        && ((fixedobj_pages[page_index].gens & genmask) != 0)) {
+    if ((page_index = find_fixedobj_page_index(addr)) >= 0) {
+        // Quit now if object's generation could not posibly match
+        unsigned char mask = fixedobj_pages[page_index].gens;
+        if (!mask || (match_gen >= 0 && ((mask >> match_gen) & 1) == 0))
+            return 0;
         int obj_spacing = fixedobj_page_obj_align(page_index);
         int obj_index = ((uword_t)addr & (IMMOBILE_CARD_BYTES-1)) / obj_spacing;
         dprintf((logfile,"Pointer %p is to immobile page %d, object %d\n",
                  addr, page_index, obj_index));
         char* page_start_addr = PTR_ALIGN_DOWN(addr, IMMOBILE_CARD_BYTES);
         object_start = (lispobj*)(page_start_addr + obj_index * obj_spacing);
-        valid = !fixnump(*object_start)
-            && properly_tagged_descriptor_p(addr, object_start);
-    } else if (compacting_p() && (lispobj*)addr < tlsf_mem_start) {
-        // Can ignore this pointer if it's point to pseudostatic text
+        if (!fixnump(*object_start) && properly_tagged_descriptor_p(addr, object_start))
+            return (lispobj)addr;
         return 0;
-    } else if ((object_start = search_immobile_code(addr)) != 0) {
-        valid = instruction_ptr_p(addr, object_start)
-                || properly_tagged_descriptor_p(addr, object_start);
     }
-    if (valid && (!compacting_p() ||
-                  immobile_obj_gen_bits(object_start) == from_space)) {
-        dprintf((logfile,"immobile obj @ %p (<- %p) is conservatively live\n",
-                 object_start, addr));
-        if (compacting_p())
-            enliven_immobile_obj(object_start, 0);
-        else
-            gc_mark_obj(compute_lispobj(object_start));
-        return 1;
+    // Avoid searching for a codeblob unless its address is within the
+    // allocatable pages (above the initial high-water-mark) after coreparse.
+    // However, for a full trace (no generationa are roots) always search.
+    if ((addr >= (void*)tlsf_mem_start || match_gen < 0)
+        && (object_start = search_immobile_code(addr)) != 0) {
+        if (properly_tagged_descriptor_p(addr, object_start)
+            || instruction_ptr_p(addr, object_start))
+            return make_lispobj(object_start, OTHER_POINTER_LOWTAG);
     }
     return 0;
+}
+
+/* Look for an immobile object at 'addr'. For a normal gencgc cycle, liven the found
+ * object unless it is not in the generation being collected, in which case do nothing.
+ * For a full mark-and-sweep pass, alway mark an object if found  */
+bool immobile_space_preserve_pointer(void* addr)
+{
+    lispobj obj = immobile_space_obj_from_ambiguous_ptr(addr, from_space);
+    if (!obj) return 0;
+    if (from_space < 0) {
+        gc_mark_obj(obj);
+    } else {
+        if (immobile_obj_gen_bits(native_pointer(obj)) == from_space)
+            enliven_immobile_obj(native_pointer(obj), 0);
+    }
+    return 1;
 }
 
 // Turn a grey node black.
@@ -802,22 +815,6 @@ younger_p(lispobj thing, int gen, int keep_gen, int new_gen)
     return is_lisp_pointer(thing) && pointee_gen(thing, keep_gen, new_gen) < gen;
 }
 
-// Scan range between start and end (exclusive) for old-to-young pointers.
-static int
-range_points_to_younger_p(lispobj* obj, lispobj* end,
-                          int gen, int keep_gen, int new_gen)
-{
-#ifdef DEBUG
-  lispobj* __attribute__((unused)) saved_obj = obj, __attribute__((unused)) header = *obj;
-#endif
-    do {
-        lispobj thing = *obj;
-        if (is_lisp_pointer(thing) && pointee_gen(thing, keep_gen, new_gen) < gen)
-            return 1; // yes, points to younger
-    } while (++obj < end);
-    return 0; // no, does not point to younger
-}
-
 // Scan a fixed-size object for old-to-young pointers.
 // Since fixed-size objects are boxed and on known boundaries,
 // we never start in the middle of random bytes, so the answer is exact.
@@ -849,18 +846,18 @@ fixedobj_points_to_younger_p(lispobj* obj, int n_words,
         return 1;
     struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
     gc_assert(bitmap.nwords == 1);
-    if (bitmap.bits[0] != (sword_t)-1) {
+    // the bitmap of a LAYOUT is never the default (all-tagged) bitmap
+    gc_assert(bitmap.bits[0] != (sword_t)-1);
+    {
         sword_t mask = bitmap.bits[0];
         lispobj* where = obj + 1;
         lispobj* limit = obj + n_words;
         for ( ; where < limit ; ++where, mask >>= 1 )
-            if ((mask & 1) != 0 && younger_p(*where, gen, keep_gen, new_gen))
-                return 1;
+            if ((mask & 1) != 0 && younger_p(*where, gen, keep_gen, new_gen)) return 1;
         return 0;
     }
-    // FALLTHROUGH_INTENDED
   }
-  return range_points_to_younger_p(obj+1, obj+n_words, gen, keep_gen, new_gen);
+  lose("Unhandled widetag in fixedobj_points_to_younger");
 }
 
 /// The next two functions are analogous to 'update_page_write_prot()'

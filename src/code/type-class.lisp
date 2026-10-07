@@ -347,6 +347,8 @@
       (simd-pack     simd-pack-type)
       #+sb-simd-pack-256
       (simd-pack-256 simd-pack-256-type)
+      #+sb-simd-pack-512
+      (simd-pack-512 simd-pack-512-type)
       ;; clearly alien-type-type is not consistent with the (FOO FOO-TYPE) theme
       (alien         alien-type-type)))
   (defun ctype-instance->type-class (name)
@@ -621,6 +623,12 @@
         do (setq res (logxor (ash res -1) (type-%bits type)))
         ;; This returns a positive number so that it can be passed to MIX
         finally (return (ldb (byte (1- ctype-hash-size) 0) res))))
+(defun mix-hash-ctype-list (types)
+  (declare (optimize (speed 3) (safety 0)))
+  (loop with res of-type (and sb-xc:fixnum unsigned-byte) = 0
+        for type in types
+        do (setq res (mix (type-hash-value type) res))
+        finally (return (ldb (byte (1- ctype-hash-size) 0) res))))
 
 (defun hash-ctype-set (types) ; ctype list hashed order-insensitively
   (let ((hash (type-%bits (car types)))
@@ -641,7 +649,7 @@
   (and (= (length a) (length b)) (every (lambda (x) (memq x b)) a)))
 
 (define-load-time-global *ctype-list-hashset*
-  (make-hashset 32 #'list-elts-eq #'hash-ctype-list :weakness t :synchronized t))
+  (make-hashset 32 #'list-elts-eq #'mix-hash-ctype-list :weakness t :synchronized t))
 (define-load-time-global *ctype-set-hashset*
   (make-hashset 32 #'ctype-set= #'hash-ctype-set :weakness t :synchronized t))
 
@@ -748,7 +756,7 @@
                           ,(ecase name ; Compute or propagate the flag bits
                              (hairy-type ctype-contains-hairy)
                              (unknown-type (logior ctype-contains-unknown ctype-contains-hairy))
-                             ((simd-pack-type simd-pack-256-type alien-type-type) 0)
+                             ((simd-pack-type simd-pack-256-type simd-pack-512-type alien-type-type) 0)
                              (negation-type '(type-flags type))
                              (array-type '(type-flags element-type)))
                           ,@(cdr private-ctor-args))))))))
@@ -1269,6 +1277,14 @@
 #+sb-simd-pack-256
 (def-type-model (simd-pack-256-type
                  (:constructor* %make-simd-pack-256-type (tag-mask)))
+  (tag-mask (missing-arg)
+   :test = :hasher identity ; the tag-mask is its own hash
+   :type (and (unsigned-byte #.(length +simd-pack-element-types+))
+              (not (eql 0)))))
+
+#+sb-simd-pack-512
+(def-type-model (simd-pack-512-type
+                 (:constructor* %make-simd-pack-512-type (tag-mask)))
   (tag-mask (missing-arg)
    :test = :hasher identity ; the tag-mask is its own hash
    :type (and (unsigned-byte #.(length +simd-pack-element-types+))

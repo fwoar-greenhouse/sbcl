@@ -73,27 +73,22 @@
 
 ;;; X is source, Y is destination.
 
-(define-move-fun (load-fp-zero 1) (vop x y)
-  ((fp-single-zero) (single-reg)
-   (fp-double-zero) (double-reg)
-   (fp-complex-single-zero) (complex-single-reg)
-   (fp-complex-double-zero) (complex-double-reg))
-  (identity x)
-  (sc-case y
-    ((single-reg complex-single-reg) (inst xorps y y))
-    ((double-reg complex-double-reg) (inst xorpd y y))))
-
 (define-move-fun (load-fp-immediate 1) (vop x y)
-  ((fp-single-immediate) (single-reg)
-   (fp-double-immediate) (double-reg)
-   (fp-complex-single-immediate) (complex-single-reg)
-   (fp-complex-double-immediate) (complex-double-reg))
-  (let ((x (register-inline-constant (tn-value x))))
-    (sc-case y
-      (single-reg (inst movss y x))
-      (double-reg (inst movsd y x))
-      (complex-single-reg (inst movq y x))
-      (complex-double-reg (inst movapd y x)))))
+  ((fp-immediate) (single-reg)
+   (fp-immediate) (double-reg)
+   (fp-immediate) (complex-single-reg)
+   (fp-immediate) (complex-double-reg))
+  (let ((x (tn-value x)))
+    (if (member x '(0f0 0d0 #c(0d0 0d0) #c(0f0 0f0)))
+        (sc-case y
+          ((single-reg complex-single-reg) (inst xorps y y))
+          ((double-reg complex-double-reg) (inst xorpd y y)))
+        (let ((c (register-inline-constant x)))
+          (etypecase x
+            (single-float (inst movss y c))
+            (double-float (inst movsd y c))
+            ((complex single-float) (inst movq y c))
+            ((complex double-float) (inst movupd y c)))))))
 
 (define-move-fun (load-single 2) (vop x y)
   ((single-stack) (single-reg))
@@ -331,42 +326,37 @@
 (define-vop (float-op)
   (:args (x) (y))
   (:results (r))
-  (:policy :fast-safe)
   (:note "inline float arithmetic")
   (:vop-var vop)
   (:save-p :compute-only))
 
-(macrolet ((frob (name comm-name sc constant-sc ptype)
+(macrolet ((frob (name comm-name sc ptype)
              `(progn
                 (define-vop (,name float-op)
-                  (:args (x :scs (,sc ,constant-sc)
+                  (:args (x :scs (,sc fp-immediate)
                             :target r
-                            :load-if (not (sc-is x ,constant-sc)))
-                         (y :scs (,sc ,constant-sc)
-                            :load-if (not (sc-is y ,constant-sc))))
+                            :load-if (not (sc-is x fp-immediate)))
+                         (y :scs (,sc fp-immediate)
+                            :load-if (not (sc-is y fp-immediate))))
                   (:results (r :scs (,sc)))
                   (:arg-types ,ptype ,ptype)
                   (:result-types ,ptype))
                 (define-vop (,comm-name float-op)
-                  (:args (x :scs (,sc ,constant-sc)
-                            :target r
-                            :load-if (not (sc-is x ,constant-sc)))
-                         (y :scs (,sc ,constant-sc)
-                            :target r
-                            :load-if (not (sc-is y ,constant-sc))))
+                  (:args (x :scs (,sc)
+                            :target r)
+                         (y :scs (,sc fp-immediate)
+                            :target r))
                   (:results (r :scs (,sc)))
                   (:arg-types ,ptype ,ptype)
                   (:result-types ,ptype)))))
   (frob single-float-op single-float-comm-op
-        single-reg fp-single-immediate single-float)
+        single-reg single-float)
   (frob double-float-op double-float-comm-op
-        double-reg fp-double-immediate double-float)
+        double-reg double-float)
   (frob complex-single-float-op complex-single-float-comm-op
-        complex-single-reg fp-complex-single-immediate
-        complex-single-float)
+        complex-single-reg complex-single-float)
   (frob complex-double-float-op complex-double-float-comm-op
-        complex-double-reg fp-complex-double-immediate
-        complex-double-float))
+        complex-double-reg complex-double-float))
 
 (defun note-float-location (op vop &rest args)
   (let ((*location-context*
@@ -383,11 +373,11 @@
                                               (or (tn-offset arg) 0))))))))
     (note-this-location vop :internal-error)))
 
-(macrolet ((generate (op opinst commutative constant-sc load-inst)
+(macrolet ((generate (op opinst commutative load-inst)
              `(flet ((get-constant (tn &optional maybe-aligned)
                        (declare (ignorable maybe-aligned))
                        (let ((value (tn-value tn)))
-                         ,(if (eq constant-sc 'fp-complex-single-immediate)
+                         ,(if (eq load-inst 'movq)
                               `(if maybe-aligned
                                    (register-inline-constant
                                     :aligned value)
@@ -399,24 +389,24 @@
                 (cond
                   ((location= x r)
                    (note-location x y)
-                   (when (sc-is y ,constant-sc)
+                   (when (sc-is y fp-immediate)
                      (setf y (get-constant y t)))
                    (inst ,opinst x y))
                   ((and ,commutative (location= y r))
                    (note-location y x)
-                   (when (sc-is x ,constant-sc)
+                   (when (sc-is x fp-immediate)
                      (setf x (get-constant x t)))
                    (inst ,opinst y x))
                   ((not (location= r y))
-                   (if (sc-is x ,constant-sc)
+                   (if (sc-is x fp-immediate)
                        (inst ,load-inst r (get-constant x))
                        (move r x))
                    (note-location r y)
-                   (when (sc-is y ,constant-sc)
+                   (when (sc-is y fp-immediate)
                      (setf y (get-constant y t)))
                    (inst ,opinst r y))
                   (t
-                   (if (sc-is x ,constant-sc)
+                   (if (sc-is x fp-immediate)
                        (inst ,load-inst tmp (get-constant x))
                        (move tmp x))
                    (note-location tmp y)
@@ -432,7 +422,7 @@
                   (:temporary (:sc single-reg) tmp)
                   (:vop-var vop)
                   (:generator ,scost
-                    (generate ,op ,sinst ,commutative fp-single-immediate movss)))
+                    (generate ,op ,sinst ,commutative movss)))
                 (define-vop (,dname ,(if commutative
                                          'double-float-comm-op
                                          'double-float-op))
@@ -440,7 +430,7 @@
                   (:temporary (:sc double-reg) tmp)
                   (:vop-var vop)
                   (:generator ,dcost
-                    (generate ,op ,dinst ,commutative fp-double-immediate movsd)))
+                    (generate ,op ,dinst ,commutative movsd)))
                 ,(when csinst
                    `(define-vop (,csname
                                  ,(if commutative
@@ -450,8 +440,7 @@
                       (:temporary (:sc complex-single-reg) tmp)
                       (:vop-var vop)
                       (:generator ,cscost
-                        (generate ,op ,csinst ,commutative
-                                  fp-complex-single-immediate movq))))
+                        (generate ,op ,csinst ,commutative movq))))
                 ,(when cdinst
                    `(define-vop (,cdname
                                  ,(if commutative
@@ -461,8 +450,7 @@
                       (:temporary (:sc complex-double-reg) tmp)
                       (:vop-var vop)
                       (:generator ,cdcost
-                        (generate ,op ,cdinst ,commutative
-                                  fp-complex-double-immediate movapd)))))))
+                        (generate ,op ,cdinst ,commutative movapd)))))))
   (frob + addss +/single-float 2 addsd +/double-float 2 t
         addps +/complex-single-float 3 addpd +/complex-double-float 3)
   (frob - subss -/single-float 2 subsd -/double-float 2 nil
@@ -471,29 +459,23 @@
   (frob / divss //single-float 12 divsd //double-float 19 nil))
 
 (macrolet ((frob (op cost commutativep
-                     duplicate-inst op-inst real-move-inst complex-move-inst
-                     real-sc real-constant-sc real-type
-                     complex-sc complex-constant-sc complex-type
-                     real-complex-name complex-real-name)
+                  duplicate-inst op-inst complex-move-inst
+                  real-sc real-type
+                  complex-sc complex-type
+                  real-complex-name complex-real-name)
              (cond ((not duplicate-inst) ; simple case
                     `(flet ((load-into (r x)
                               (sc-case x
-                                (,real-constant-sc
-                                 (inst ,real-move-inst r
-                                       (register-inline-constant (tn-value x))))
-                                (,complex-constant-sc
-                                 (inst ,complex-move-inst r
-                                       (register-inline-constant (tn-value x))))
+                                (fp-immediate
+                                 (load-fp-immediate nil x r))
                                 (t (move r x)))))
                        ,(when real-complex-name
                           `(define-vop (,real-complex-name float-op)
                              (:translate ,op)
-                             (:args (x :scs (,real-sc ,real-constant-sc)
-                                       :target r
-                                       :load-if (not (sc-is x ,real-constant-sc)))
-                                    (y :scs (,complex-sc ,complex-constant-sc)
-                                       ,@(when commutativep '(:target r))
-                                       :load-if (not (sc-is y ,complex-constant-sc))))
+                             (:args (x :scs (,real-sc fp-immediate)
+                                       :target r)
+                                    (y :scs (,complex-sc fp-immediate)
+                                       ,@(when commutativep '(:target r))))
                              (:arg-types ,real-type ,complex-type)
                              (:results (r :scs (,complex-sc)
                                           ,@(unless commutativep '(:from (:argument 0)))))
@@ -505,7 +487,7 @@
                                      (rotatef x y)))
                                (load-into r x)
                                (note-float-location ',op vop r y)
-                               (when (sc-is y ,real-constant-sc ,complex-constant-sc)
+                               (when (sc-is y fp-immediate)
                                  (setf y (register-inline-constant
                                           :aligned (tn-value y))))
                                (inst ,op-inst r y))))
@@ -513,12 +495,10 @@
                        ,(when complex-real-name
                           `(define-vop (,complex-real-name float-op)
                              (:translate ,op)
-                             (:args (x :scs (,complex-sc ,complex-constant-sc)
-                                       :target r
-                                       :load-if (not (sc-is x ,complex-constant-sc)))
-                                    (y :scs (,real-sc ,real-constant-sc)
-                                       ,@(when commutativep '(:target r))
-                                       :load-if (not (sc-is y ,real-constant-sc))))
+                             (:args (x :scs (,complex-sc fp-immediate)
+                                       :target r)
+                                    (y :scs (,real-sc fp-immediate)
+                                       ,@(when commutativep '(:target r))))
                              (:arg-types ,complex-type ,real-type)
                              (:results (r :scs (,complex-sc)
                                           ,@(unless commutativep '(:from (:argument 0)))))
@@ -530,22 +510,20 @@
                                      (rotatef x y)))
                                (load-into r x)
                                (note-float-location ',op vop r y)
-                               (when (sc-is y ,real-constant-sc ,complex-constant-sc)
+                               (when (sc-is y fp-immediate fp-immediate)
                                  (setf y (register-inline-constant
                                           :aligned (tn-value y))))
                                (inst ,op-inst r y))))))
-                   (commutativep ; must duplicate, but commutative
+                   (commutativep     ; must duplicate, but commutative
                     `(progn
                        ,(when real-complex-name
                           `(define-vop (,real-complex-name float-op)
                              (:translate ,op)
-                             (:args (x :scs (,real-sc ,real-constant-sc)
-                                       :target dup
-                                       :load-if (not (sc-is x ,real-constant-sc)))
-                                    (y :scs (,complex-sc ,complex-constant-sc)
+                             (:args (x :scs (,real-sc fp-immediate)
+                                       :target dup)
+                                    (y :scs (,complex-sc fp-immediate)
                                        :target r
-                                       :to  :result
-                                       :load-if (not (sc-is y ,complex-constant-sc))))
+                                       :to :result))
                              (:arg-types ,real-type ,complex-type)
                              (:temporary (:sc ,complex-sc :target r
                                           :from (:argument 0)
@@ -557,7 +535,7 @@
                              (:generator ,cost
                                (let (first-value
                                      (second-value r))
-                                 (if (sc-is x ,real-constant-sc)
+                                 (if (sc-is x fp-immediate)
                                      (inst ,complex-move-inst dup
                                            (register-inline-constant
                                             (complex (setf first-value (tn-value x)) (tn-value x))))
@@ -568,12 +546,12 @@
                                  (when (location= dup r)
                                    (rotatef dup y)
                                    (setf second-value dup))
-                                 (if (sc-is y ,complex-constant-sc)
+                                 (if (sc-is y fp-immediate)
                                      (inst ,complex-move-inst r
                                            (register-inline-constant (tn-value y)))
                                      (move r y))
                                  (note-float-location ',op vop first-value second-value)
-                                 (when (sc-is dup ,complex-constant-sc)
+                                 (when (sc-is dup fp-immediate)
                                    (setf dup (register-inline-constant
                                               :aligned (tn-value dup))))
                                  (inst ,op-inst r dup)))))
@@ -581,13 +559,11 @@
                        ,(when complex-real-name
                           `(define-vop (,complex-real-name float-op)
                              (:translate ,op)
-                             (:args (x :scs (,complex-sc ,complex-constant-sc)
+                             (:args (x :scs (,complex-sc fp-immediate)
                                        :target r
-                                       :to  :result
-                                       :load-if (not (sc-is x ,complex-constant-sc)))
-                                    (y :scs (,real-sc ,real-constant-sc)
-                                       :target dup
-                                       :load-if (not (sc-is y ,real-constant-sc))))
+                                       :to :result)
+                                    (y :scs (,real-sc fp-immediate)
+                                       :target dup))
                              (:arg-types ,complex-type ,real-type)
                              (:temporary (:sc ,complex-sc :target r
                                           :from (:argument 1)
@@ -599,7 +575,7 @@
                              (:generator ,cost
                                (let ((first-value r)
                                      second-value)
-                                 (if (sc-is y ,real-constant-sc)
+                                 (if (sc-is y fp-immediate)
                                      (inst ,complex-move-inst dup
                                            (register-inline-constant
                                             (complex (setf second-value (tn-value y))
@@ -610,32 +586,30 @@
                                  (when (location= dup r)
                                    (rotatef x dup)
                                    (setf first-value dup))
-                                 (if (sc-is x ,complex-constant-sc)
+                                 (if (sc-is x fp-immediate)
                                      (inst ,complex-move-inst r
                                            (register-inline-constant (tn-value x)))
                                      (move r x))
                                  (note-float-location ',op vop first-value second-value)
-                                 (when (sc-is dup ,complex-constant-sc)
+                                 (when (sc-is dup fp-immediate)
                                    (setf dup (register-inline-constant
                                               :aligned (tn-value dup))))
                                  (inst ,op-inst r dup)))))))
-                   (t ; duplicate, not commutative
+                   (t                   ; duplicate, not commutative
                     `(progn
                        ,(when real-complex-name
                           `(define-vop (,real-complex-name float-op)
                              (:translate ,op)
-                             (:args (x :scs (,real-sc ,real-constant-sc)
-                                       :target r
-                                       :load-if (not (sc-is x ,real-constant-sc)))
-                                    (y :scs (,complex-sc ,complex-constant-sc)
-                                       :to :result
-                                       :load-if (not (sc-is y ,complex-constant-sc))))
+                             (:args (x :scs (,real-sc fp-immediate)
+                                       :target r)
+                                    (y :scs (,complex-sc fp-immediate)
+                                       :to :result))
                              (:arg-types ,real-type ,complex-type)
                              (:results (r :scs (,complex-sc) :from (:argument 0)))
                              (:result-types ,complex-type)
                              (:vop-var vop)
                              (:generator ,cost
-                               (if (sc-is x ,real-constant-sc)
+                               (if (sc-is x fp-immediate)
                                    (inst ,complex-move-inst dup
                                          (register-inline-constant
                                           (complex (tn-value x) (tn-value x))))
@@ -643,7 +617,7 @@
                                          (dup  r))
                                      ,duplicate-inst))
                                (note-float-location ',op vop r y)
-                               (when (sc-is y ,complex-constant-sc)
+                               (when (sc-is y fp-immediate)
                                  (setf y (register-inline-constant
                                           :aligned (tn-value y))))
                                (inst ,op-inst r y))))
@@ -654,9 +628,8 @@
                              (:args (x :scs (,complex-sc)
                                        :target r
                                        :to :eval)
-                                    (y :scs (,real-sc ,real-constant-sc)
-                                       :target dup
-                                       :load-if (not (sc-is y ,complex-constant-sc))))
+                                    (y :scs (,real-sc fp-immediate)
+                                       :target dup))
                              (:arg-types ,complex-type ,real-type)
                              (:temporary (:sc ,complex-sc :from (:argument 1))
                                          dup)
@@ -665,7 +638,7 @@
                              (:vop-var vop)
                              (:generator ,cost
                                (let (second-value)
-                                 (if (sc-is y ,real-constant-sc)
+                                 (if (sc-is y fp-immediate)
                                      (setf dup (register-inline-constant
                                                 :aligned (complex (setf second-value (tn-value y))
                                                                   (tn-value y))))
@@ -676,27 +649,27 @@
                                  (note-float-location ',op vop r second-value)
                                  (inst ,op-inst r dup)))))))))
            (def-real-complex-op (op commutativep duplicatep
-                                    single-inst single-real-complex-name single-complex-real-name single-cost
-                                    double-inst double-real-complex-name double-complex-real-name double-cost)
-               `(progn
-                  (frob ,op ,single-cost ,commutativep
-                        ,(and duplicatep
-                              `(progn
-                                 (move dup real)
-                                 (inst unpcklps dup dup)))
-                        ,single-inst movss movq
-                        single-reg fp-single-immediate single-float
-                        complex-single-reg fp-complex-single-immediate complex-single-float
-                        ,single-real-complex-name ,single-complex-real-name)
-                  (frob ,op ,double-cost ,commutativep
-                        ,(and duplicatep
-                              `(progn
-                                 (move dup real)
-                                 (inst unpcklpd dup dup)))
-                        ,double-inst movsd movapd
-                        double-reg fp-double-immediate double-float
-                        complex-double-reg fp-complex-double-immediate complex-double-float
-                        ,double-real-complex-name ,double-complex-real-name))))
+                                 single-inst single-real-complex-name single-complex-real-name single-cost
+                                 double-inst double-real-complex-name double-complex-real-name double-cost)
+             `(progn
+                (frob ,op ,single-cost ,commutativep
+                      ,(and duplicatep
+                            `(progn
+                               (move dup real)
+                               (inst unpcklps dup dup)))
+                      ,single-inst movq
+                      single-reg single-float
+                      complex-single-reg complex-single-float
+                      ,single-real-complex-name ,single-complex-real-name)
+                (frob ,op ,double-cost ,commutativep
+                      ,(and duplicatep
+                            `(progn
+                               (move dup real)
+                               (inst unpcklpd dup dup)))
+                      ,double-inst movapd
+                      double-reg double-float
+                      complex-double-reg complex-double-float
+                      ,double-real-complex-name ,double-complex-real-name))))
   (def-real-complex-op + t nil
     addps +/real-complex-single-float +/complex-real-single-float 3
     addpd +/real-complex-double-float +/complex-real-double-float 4)
@@ -712,13 +685,11 @@
 
 (define-vop (//complex-real-single-float float-op)
   (:translate /)
-  (:args (x :scs (complex-single-reg fp-complex-single-immediate fp-complex-single-zero)
+  (:args (x :scs (complex-single-reg fp-immediate)
             :to (:result 0)
-            :target r
-            :load-if (not (sc-is x fp-complex-single-immediate fp-complex-single-zero)))
-         (y :scs (single-reg fp-single-immediate fp-single-zero)
-            :target dup
-            :load-if (not (sc-is y fp-single-immediate fp-single-zero))))
+            :target r)
+         (y :scs (single-reg fp-immediate)
+            :target dup))
   (:arg-types complex-single-float single-float)
   (:temporary (:sc complex-single-reg :from (:argument 1)) dup)
   (:results (r :scs (complex-single-reg)))
@@ -734,19 +705,19 @@
                                              (single-float-bits (realpart x)))))))
                  (register-inline-constant :oword (logior (ash word 64) word)))))
         (sc-case y
-          (fp-single-immediate
-           (setf dup (duplicate (complex (setf second-value (tn-value y))
-                                         (tn-value y)))))
-          (fp-single-zero
-           (inst xorps dup dup))
+          (fp-immediate
+           (if (eql (tn-value y) 0f0)
+               (inst xorps dup dup)
+               (setf dup (duplicate (complex (setf second-value (tn-value y))
+                                             (tn-value y))))))
           (t (move dup y)
              (setf second-value y)
              (inst shufps dup dup #b00000000)))
         (sc-case x
-          (fp-complex-single-immediate
-           (inst movaps r (duplicate (setf first-value (tn-value x)))))
-          (fp-complex-single-zero
-           (inst xorps r r))
+          (fp-immediate
+           (if (eql (tn-value x) #c(0f0 0f0))
+               (inst xorps r r)
+               (inst movaps r (duplicate (setf first-value (tn-value x))))))
           (t
            (move r x)
            (setf first-value x)
@@ -822,27 +793,67 @@
     (inst mulpd imag y)
     (inst addpd r imag)))
 
+(define-vop (*/complex-double-float/sse3)
+  (:translate *)
+  (:args (x :scs (complex-double-reg))
+         (y :scs (complex-double-reg)))
+  (:arg-types complex-double-float complex-double-float)
+  (:results (r :scs (complex-double-reg) :from :load))
+  (:result-types complex-double-float)
+  (:guard (member :sse3 *backend-subfeatures*))
+  (:temporary (:sc complex-double-reg) temp)
+  (:generator 14
+    (move r x)
+    (inst shufpd r r #b01)
+    (move temp y)
+    (inst unpckhpd temp temp)
+    (inst mulpd temp r)
+
+    (inst movddup r y)
+    (inst mulpd r x)
+
+    (inst addsubpd r temp)))
+
+(define-vop (*/complex-single-float/sse3)
+  (:translate *)
+  (:args (x :scs (complex-single-reg) :target r)
+         (y :scs (complex-single-reg)))
+  (:arg-types complex-single-float complex-single-float)
+  (:results (r :scs (complex-single-reg)))
+  (:result-types complex-single-float)
+  (:guard (member :sse3 *backend-subfeatures*))
+  (:temporary (:sc complex-single-reg) temp1 temp2)
+  (:generator 14
+    (inst movsldup temp1 y)
+    (inst mulps    temp1 x)
+
+    (inst movshdup temp2 y)
+    (move r x)
+    (inst shufps   r r #b11100001)
+    (inst mulps    temp2 r)
+
+    (move r temp1)
+    (inst addsubps r temp2)))
+
 (define-vop (fsqrt)
   (:args (x :scs (double-reg)))
   (:results (y :scs (double-reg)))
   (:translate %sqrt)
-  (:policy :fast-safe)
   (:arg-types double-float)
   (:result-types double-float)
   (:note "inline float arithmetic")
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
-     (unless (location= x y)
-       (inst xorpd y y))
-     (note-float-location 'sqrt vop x)
-     (inst sqrtsd y x)))
+    (unless (location= x y)
+      (inst xorpd y y))
+    (note-float-location 'sqrt vop x)
+    (inst sqrtsd y x)))
 
 (define-vop ()
   (:args (x :scs (single-reg)))
   (:results (y :scs (single-reg)))
   (:translate %sqrtf)
-  (:policy :fast-safe)
   (:arg-types single-float)
   (:result-types single-float)
   (:note "inline float arithmetic")
@@ -854,12 +865,17 @@
      (note-float-location 'sqrt vop x)
      (inst sqrtss y x)))
 
+
+(deftransform conjugate ((number) (:or ((complex-double-float) *)
+                                       ((complex-single-float) *)) *
+                         :vop t)
+  t)
+
 (macrolet ((frob ((name translate sc type) &body body)
              `(define-vop (,name)
                   (:args (x :scs (,sc) :target y))
                 (:results (y :scs (,sc)))
                 (:translate ,translate)
-                (:policy :fast-safe)
                 (:arg-types ,type)
                 (:result-types ,type)
                 (:note "inline float arithmetic")
@@ -892,18 +908,17 @@
 ;;;; comparison
 
 (define-vop (float-compare)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:save-p :compute-only)
   (:note "inline float comparison"))
 
 ;;; EQL
-(macrolet ((define-float-eql (name cost sc constant-sc type)
+(macrolet ((define-float-eql (name cost sc type)
                `(define-vop (,name float-compare)
                   (:translate eql)
                   (:args (x :scs (,sc)
                             :target mask)
-                         (y :scs (,sc ,constant-sc)
+                         (y :scs (,sc fp-immediate)
                             :target mask))
                   (:arg-types ,type ,type)
                   (:temporary (:sc ,sc :from :eval) mask)
@@ -913,19 +928,19 @@
                     (when (location= y mask)
                       (rotatef x y))
                     (move mask x)
-                    (when (sc-is y ,constant-sc)
+                    (when (sc-is y fp-immediate)
                       (setf y (register-inline-constant :aligned (tn-value y))))
                     (inst pcmpeqd mask y)
                     (inst movmskps bits mask)
                     (inst cmp :byte bits #b1111)))))
   (define-float-eql eql/single-float 4
-    single-reg fp-single-immediate single-float)
+    single-reg single-float)
   (define-float-eql eql/double-float 4
-    double-reg fp-double-immediate double-float)
+    double-reg double-float)
   (define-float-eql eql/complex-single-float 5
-    complex-single-reg fp-complex-single-immediate complex-single-float)
+    complex-single-reg complex-single-float)
   (define-float-eql eql/complex-double-float 5
-    complex-double-reg fp-complex-double-immediate complex-double-float))
+    complex-double-reg complex-double-float))
 
 (define-vop (generic-eq/single-float/c float-compare)
   (:translate eq)
@@ -943,68 +958,68 @@
 
 (define-vop (single-float-compare float-compare)
   (:args (x :scs (single-reg))
-         (y :scs (single-reg single-stack fp-single-immediate)
-            :load-if (not (sc-is y single-stack fp-single-immediate))))
+         (y :scs (single-reg single-stack fp-immediate)))
   (:arg-types single-float single-float))
 (define-vop (double-float-compare float-compare)
   (:args (x :scs (double-reg))
-         (y :scs (double-reg double-stack descriptor-reg fp-double-immediate)
-            :load-if (not (sc-is y double-stack descriptor-reg fp-double-immediate))))
+         (y :scs (double-reg double-stack descriptor-reg fp-immediate)))
   (:arg-types double-float double-float))
 
 (define-vop (=/single-float single-float-compare)
   (:translate =)
-  (:args (x :scs (single-reg single-stack fp-single-immediate)
-            :target xmm
-            :load-if (not (sc-is x single-stack fp-single-immediate)))
-         (y :scs (single-reg single-stack fp-single-immediate)
-            :target xmm
-            :load-if (not (sc-is y single-stack fp-single-immediate))))
+  (:args (x :scs (single-reg single-stack fp-immediate)
+            :target xmm)
+         (y :scs (single-reg single-stack fp-immediate)
+            :target xmm))
   (:temporary (:sc single-reg :from :eval) xmm)
   (:conditional not :p :ne)
   (:vop-var vop)
+  (:variant-vars quiet)
+  (:variant nil)
   (:generator 3
     (when (or (location= y xmm)
-              (and (not (xmm-tn-p x)) (xmm-tn-p y)))
+              (and (not (float-tn-p x)) (float-tn-p y)))
       (rotatef x y))
     (sc-case x
       (single-reg (setf xmm x))
       (single-stack (inst movss xmm (ea-for-sf-stack x)))
-      (fp-single-immediate
+      (fp-immediate
        (inst movss xmm (register-inline-constant (tn-value x)))))
     (note-float-location '= vop xmm y)
     (sc-case y
       (single-stack
        (setf y (ea-for-sf-stack y)))
-      (fp-single-immediate
+      (fp-immediate
        (setf y (register-inline-constant (tn-value y))))
       (t))
-    (inst comiss xmm y)
+    (if quiet
+        (inst ucomiss xmm y)
+        (inst comiss xmm y))
     ;; if PF&CF, there was a NaN involved => not equal
     ;; otherwise, ZF => equal
     ))
 
 (define-vop (=/double-float double-float-compare)
   (:translate =)
-  (:args (x :scs (double-reg double-stack fp-double-immediate descriptor-reg)
-            :target xmm
-            :load-if (not (sc-is x double-stack fp-double-immediate descriptor-reg)))
-         (y :scs (double-reg double-stack fp-double-immediate descriptor-reg)
-            :target xmm
-            :load-if (not (sc-is y double-stack fp-double-immediate descriptor-reg))))
+  (:args (x :scs (double-reg double-stack descriptor-reg)
+            :target xmm)
+         (y :scs (double-reg double-stack fp-immediate descriptor-reg)
+            :target xmm))
   (:temporary (:sc double-reg :from :eval) xmm)
   (:conditional not :p :ne)
+  (:variant-vars quiet)
+  (:variant nil)
   (:vop-var vop)
   (:generator 3
     (when (or (location= y xmm)
-              (and (not (xmm-tn-p x)) (xmm-tn-p y)))
+              (and (not (float-tn-p x)) (float-tn-p y)))
       (rotatef x y))
     (sc-case x
       (double-reg
        (setf xmm x))
       (double-stack
        (inst movsd xmm (ea-for-df-stack x)))
-      (fp-double-immediate
+      (fp-immediate
        (inst movsd xmm (register-inline-constant (tn-value x))))
       (descriptor-reg
        (inst movsd xmm (ea-for-df-desc x))))
@@ -1012,74 +1027,65 @@
     (sc-case y
       (double-stack
        (setf y (ea-for-df-stack y)))
-      (fp-double-immediate
+      (fp-immediate
        (setf y (register-inline-constant (tn-value y))))
       (descriptor-reg
        (setf y (ea-for-df-desc y)))
       (t))
-    (inst comisd xmm y)))
+    (if quiet
+        (inst ucomisd xmm y)
+        (inst comisd xmm y))))
 
 (macrolet ((define-complex-float-= (complex-complex-name complex-real-name real-complex-name
-                                    real-sc real-constant-sc real-type
-                                    complex-sc complex-constant-sc complex-type
-                                    real-move-inst complex-move-inst
+                                    real-sc real-type
+                                    complex-sc complex-type
                                     cmp-inst mask-inst mask)
-               `(progn
-                  (define-vop (,complex-complex-name float-compare)
-                    (:translate =)
-                    (:args (x :scs (,complex-sc ,complex-constant-sc)
-                              :target cmp
-                              :load-if (not (sc-is x ,complex-constant-sc)))
-                           (y :scs (,complex-sc ,complex-constant-sc)
-                              :target cmp
-                              :load-if (not (sc-is y ,complex-constant-sc))))
-                    (:arg-types ,complex-type ,complex-type)
-                    (:temporary (:sc ,complex-sc :from :eval) cmp)
-                    (:temporary (:sc unsigned-reg) bits)
-                    (:info)
-                    (:conditional :e)
-                    (:generator 3
-                      (when (location= y cmp)
-                        (rotatef x y))
-                      (sc-case x
-                        (,real-constant-sc
-                         (inst ,real-move-inst cmp (register-inline-constant
-                                                    (tn-value x))))
-                        (,complex-constant-sc
-                         (inst ,complex-move-inst cmp (register-inline-constant
-                                                       (tn-value x))))
-                        (t
-                         (move cmp x)))
-                      (note-float-location '= vop cmp y)
-                      (when (sc-is y ,real-constant-sc ,complex-constant-sc)
-                        (setf y (register-inline-constant :aligned (tn-value y))))
-                      (inst ,cmp-inst :eq cmp y)
-                      (inst ,mask-inst bits cmp)
-                      (inst cmp :byte bits ,mask)))
-                  (define-vop (,complex-real-name ,complex-complex-name)
-                    (:args (x :scs (,complex-sc ,complex-constant-sc)
-                              :target cmp
-                              :load-if (not (sc-is x ,complex-constant-sc)))
-                           (y :scs (,real-sc ,real-constant-sc)
-                              :target cmp
-                              :load-if (not (sc-is y ,real-constant-sc))))
-                    (:arg-types ,complex-type ,real-type))
-                  (define-vop (,real-complex-name ,complex-complex-name)
-                    (:args (x :scs (,real-sc ,real-constant-sc)
-                              :target cmp
-                              :load-if (not (sc-is x ,real-constant-sc)))
-                           (y :scs (,complex-sc ,complex-constant-sc)
-                              :target cmp
-                              :load-if (not (sc-is y ,complex-constant-sc))))
-                    (:arg-types ,real-type ,complex-type)))))
+             `(progn
+                (define-vop (,complex-complex-name float-compare)
+                  (:translate =)
+                  (:args (x :scs (,complex-sc)
+                            :target cmp)
+                         (y :scs (,complex-sc fp-immediate)
+                            :target cmp))
+                  (:arg-types ,complex-type ,complex-type)
+                  (:temporary (:sc ,complex-sc :from :eval) cmp)
+                  (:temporary (:sc unsigned-reg) bits)
+                  (:info)
+                  (:conditional :e)
+                  (:generator 3
+                    (when (location= y cmp)
+                      (rotatef x y))
+                    (sc-case x
+                      (fp-immediate
+                       (load-fp-immediate nil x cmp))
+                      (t
+                       (move cmp x)))
+                    (note-float-location '= vop cmp y)
+                    (when (sc-is y fp-immediate)
+                      (setf y (register-inline-constant :aligned (tn-value y))))
+                    (inst ,cmp-inst :eq cmp y)
+                    (inst ,mask-inst bits cmp)
+                    (inst cmp :byte bits ,mask)))
+                (define-vop (,complex-real-name ,complex-complex-name)
+                  (:args (x :scs (,complex-sc fp-immediate)
+                            :target cmp)
+                         (y :scs (,real-sc fp-immediate)
+                            :target cmp))
+                  (:arg-types ,complex-type ,real-type))
+                (define-vop (,real-complex-name ,complex-complex-name)
+                  (:args (x :scs (,real-sc fp-immediate)
+                            :target cmp)
+                         (y :scs (,complex-sc fp-immediate)
+                            :target cmp))
+                  (:arg-types ,real-type ,complex-type)))))
   (define-complex-float-= =/complex-single-float =/complex-real-single-float =/real-complex-single-float
-    single-reg fp-single-immediate single-float
-    complex-single-reg fp-complex-single-immediate complex-single-float
-    movss movq cmpps movmskps #b1111)
+    single-reg  single-float
+    complex-single-reg complex-single-float
+    cmpps movmskps #b1111)
   (define-complex-float-= =/complex-double-float =/complex-real-double-float =/real-complex-double-float
-    double-reg fp-double-immediate double-float
-    complex-double-reg fp-complex-double-immediate complex-double-float
-    movsd movapd cmppd movmskpd #b11))
+    double-reg double-float
+    complex-double-reg complex-double-float
+    cmppd movmskpd #b11))
 
 (macrolet ((define (op single-name double-name flags &optional flip)
              `(progn
@@ -1088,6 +1094,8 @@
                   (:info)
                   (:vop-var vop)
                   (:conditional ,@flags)
+                  (:variant-vars quiet)
+                  (:variant nil)
                   (:generator 3
                     (note-float-location ',op vop x y)
                     (sc-case y
@@ -1095,32 +1103,37 @@
                        (setf y (ea-for-df-stack y)))
                       (descriptor-reg
                        (setf y (ea-for-df-desc y)))
-                      (fp-double-immediate
+                      (fp-immediate
                        (setf y (register-inline-constant (tn-value y))))
                       ,(if flip
                            `(t
                              (change-vop-flags vop '(,flip))
                              (rotatef x y))
                            `(t)))
-                    (inst comisd x y)))
+                    (if quiet
+                        (inst ucomisd x y)
+                        (inst comisd x y))))
                 (define-vop (,single-name single-float-compare)
                   (:translate ,op)
                   (:info)
                   (:conditional ,@flags)
+                  (:variant-vars quiet)
+                  (:variant nil)
                   (:generator 3
                     (note-float-location ',op vop x y)
                     (sc-case y
                       (single-stack
                        (setf y (ea-for-sf-stack y)))
-                      (fp-single-immediate
+                      (fp-immediate
                        (setf y (register-inline-constant (tn-value y))))
                       ,(if flip
                            `(t
                              (change-vop-flags vop '(,flip))
                              (rotatef x y))
                            `(t)))
-
-                    (inst comiss x y))))))
+                    (if quiet
+                        (inst ucomiss x y)
+                        (inst comiss x y)))))))
   ;;   UNORDERED:    ZF,PF,CF <- 111;
   ;;   GREATER_THAN: ZF,PF,CF <- 000;
   ;;   LESS_THAN:    ZF,PF,CF <- 001;
@@ -1132,6 +1145,19 @@
   (define <= <=single-float <=double-float (not :p :a) :nb)
   (define >= >=single-float >=double-float (:nb)))
 
+
+(define-vop (quiet<double-float <double-float)
+  (:translate quiet<)
+  (:variant t))
+(define-vop (quiet<single-float <single-float)
+  (:translate quiet<)
+  (:variant t))
+(define-vop (quiet=/double-float =/double-float)
+  (:translate quiet=)
+  (:variant t))
+(define-vop (quiet=/single-float =/single-float)
+  (:translate quiet=)
+  (:variant t))
 
 ;;;; conversion
 
@@ -1141,7 +1167,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types signed-num)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -1161,7 +1186,6 @@
                (:results (y :scs (,to-sc)))
                (:arg-types ,from-type)
                (:result-types ,to-type)
-               (:policy :fast-safe)
                (:note "inline float coercion")
                (:translate ,translate)
                (:vop-var vop)
@@ -1194,7 +1218,6 @@
                (:arg-types ,from-type)
                (:result-types signed-num)
                (:translate ,trans)
-               (:policy :fast-safe)
                (:note "inline float truncate")
                (:vop-var vop)
                (:save-p :compute-only)
@@ -1224,7 +1247,6 @@
   (:arg-types signed-num)
   (:result-types single-float)
   (:translate make-single-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case res
@@ -1250,7 +1272,6 @@
   (:arg-types signed-num unsigned-num)
   (:result-types double-float)
   (:translate make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (move temp hi-bits)
@@ -1264,7 +1285,6 @@
   (:arg-types signed-num unsigned-num)
   (:result-types double-float)
   (:translate make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:guard (member :sse4 *backend-subfeatures*))
   (:generator 2
@@ -1277,7 +1297,6 @@
   (:arg-types signed-num)
   (:result-types double-float)
   (:translate %make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (inst movq res bits)))
@@ -1289,7 +1308,6 @@
   (:arg-types single-float)
   (:result-types signed-num)
   (:translate single-float-bits)
-  (:policy :fast-safe)
   (:generator 4
      (sc-case float
        (single-reg
@@ -1307,7 +1325,6 @@
   (:args (float :scs (descriptor-reg)))
   (:arg-types single-float)
   (:results (res :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:generator 3
     (move res float)
     ;; preserve only the sign bit and widetag
@@ -1324,7 +1341,6 @@
   (:arg-types single-float single-float)
   (:results (res :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
-  (:policy :fast-safe)
   (:generator 3
     (move temp x)
     (move res y)
@@ -1339,7 +1355,6 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-bits)
-  (:policy :fast-safe)
   (:generator 5
      (sc-case float
        (double-reg
@@ -1356,7 +1371,6 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-high-bits)
-  (:policy :fast-safe)
   (:generator 5
      (sc-case float
        (double-reg
@@ -1378,7 +1392,6 @@
   (:arg-types double-float)
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
-  (:policy :fast-safe)
   (:generator 5
      (sc-case float
         (double-reg
@@ -1399,52 +1412,50 @@
 
 (define-vop (make-complex-single-float)
   (:translate complex)
-  (:args (real :scs (single-reg fp-single-zero)
-               :target r
-               :load-if (not (sc-is real fp-single-zero)))
-         (imag :scs (single-reg fp-single-zero)
-               :load-if (not (sc-is imag fp-single-zero))))
+  (:args (real :scs (single-reg (fp-immediate
+                                 (eql (tn-value tn) 0f0)))
+               :target r)
+         (imag :scs (single-reg (fp-immediate
+                                 (eql (tn-value tn) 0f0)))))
   (:arg-types single-float single-float)
   (:results (r :scs (complex-single-reg) :from (:argument 0)))
   (:result-types complex-single-float)
   (:note "inline complex single-float creation")
-  (:policy :fast-safe)
   (:generator 5
-    (cond ((sc-is real fp-single-zero)
+    (cond ((sc-is real fp-immediate)
            (inst xorps r r)
-           (unless (sc-is imag fp-single-zero)
+           (unless (sc-is imag fp-immediate)
              (inst unpcklps r imag)))
           ((location= real imag)
            (move r real)
            (inst unpcklps r r))
           (t
            (move r real)
-           (unless (sc-is imag fp-single-zero)
+           (unless (sc-is imag fp-immediate)
              (inst unpcklps r imag))))))
 
 (define-vop (make-complex-double-float)
   (:translate complex)
-  (:args (real :scs (double-reg fp-double-zero)
-               :target r
-               :load-if (not (sc-is real fp-double-zero)))
-         (imag :scs (double-reg fp-double-zero)
-               :load-if (not (sc-is imag fp-double-zero))))
+  (:args (real :scs (double-reg (fp-immediate
+                                 (eql (tn-value tn) 0d0)))
+               :target r)
+         (imag :scs (double-reg (fp-immediate
+                                 (eql (tn-value tn) 0d0)))))
   (:arg-types double-float double-float)
   (:results (r :scs (complex-double-reg) :from (:argument 0)))
   (:result-types complex-double-float)
   (:note "inline complex double-float creation")
-  (:policy :fast-safe)
   (:generator 5
-    (cond ((sc-is real fp-double-zero)
+    (cond ((sc-is real fp-immediate)
            (inst xorpd r r)
-           (unless (sc-is imag fp-double-zero)
+           (unless (sc-is imag fp-immediate)
              (inst unpcklpd r imag)))
           ((location= real imag)
            (move r real)
            (inst unpcklpd r r))
           (t
            (move r real)
-           (unless (sc-is imag fp-double-zero)
+           (unless (sc-is imag fp-immediate)
              (inst unpcklpd r imag))))))
 
 (define-vop (complex-float-value)
@@ -1452,7 +1463,6 @@
   (:temporary (:sc complex-double-reg) zero)
   (:results (r))
   (:variant-vars offset)
-  (:policy :fast-safe)
   (:generator 3
     (cond ((sc-is x complex-double-reg)
            (move r x)
@@ -1537,7 +1547,6 @@
   (complex (imagpart x) (realpart x)))
 (define-vop (swap-complex-single-float)
   (:translate swap-complex)
-  (:policy :fast-safe)
   (:args (x :scs (complex-single-reg) :target r))
   (:arg-types complex-single-float)
   (:results (r :scs (complex-single-reg)))
@@ -1547,7 +1556,6 @@
      (inst shufps r r #b11110001)))
 (define-vop (swap-complex-double-float)
   (:translate swap-complex)
-  (:policy :fast-safe)
   (:args (x :scs (complex-double-reg) :target r))
   (:arg-types complex-double-float)
   (:results (r :scs (complex-double-reg)))
@@ -1560,7 +1568,6 @@
 (progn
   (define-vop ()
     (:translate round-double)
-    (:policy :fast-safe)
     (:args (x :scs (double-reg) :target r))
     (:arg-types double-float (:constant symbol))
     (:info mode)
@@ -1579,7 +1586,6 @@
 
  (define-vop ()
    (:translate round-single)
-   (:policy :fast-safe)
    (:args (x :scs (single-reg) :target r))
    (:arg-types single-float (:constant symbol))
    (:info mode)

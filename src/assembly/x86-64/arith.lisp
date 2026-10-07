@@ -45,10 +45,10 @@
                                         (:translate ,fun)
                                         (:policy :safe)
                                         (:save-p t))
-                ((:arg x (descriptor-reg any-reg) rdx-offset)
-                 (:arg y (descriptor-reg any-reg) rdi-offset)
+                ((:arg x (descriptor-reg any-reg) (:lisp-reg 0))
+                 (:arg y (descriptor-reg any-reg) (:lisp-reg 1))
 
-                 (:res res (descriptor-reg any-reg) rdx-offset)
+                 (:res res (descriptor-reg any-reg) (:lisp-reg 0))
 
                  ;; + and - can make do with only 1 temp.
                  ;; RCX is always needed for lisp call.
@@ -60,17 +60,16 @@
                 (inst jmp :nz DO-STATIC-FUN)    ; no - do generic
 
                 ,@body
-                (inst clc) ; single-value return
                 (inst ret)
 
                 DO-STATIC-FUN
                 (tail-call-lisp-fun ',(symbolicate "TWO-ARG-" fun) 2))))
 
-  (define-generic-arith-routine (+ 10)
+  (define-generic-arith-routine (+ 30)
     (move res x)
     (inst add res y)
     (inst jmp :o BIGNUM)
-    (inst clc) (inst ret)
+    (inst ret)
     BIGNUM
     ;; Unbox the overflowed result, recovering the correct sign from
     ;; the carry flag, then re-box as a bignum.
@@ -79,11 +78,11 @@
       (inst sar res (1- n-fixnum-tag-bits)))
     (return-single-word-bignum res rcx res))
 
-  (define-generic-arith-routine (- 10)
+  (define-generic-arith-routine (- 30)
     (move res x)
     (inst sub res y)
     (inst jmp :o BIGNUM)
-    (inst clc) (inst ret)
+    (inst ret)
     BIGNUM
     ;; Unbox the overflowed result, recovering the correct sign from
     ;; the carry flag, then re-box as a bignum.
@@ -99,21 +98,21 @@
     (inst imul y)                    ; result in edx:eax
     (inst jmp :o BIGNUM)
     (move res rax)
-    (inst clc) (inst ret)
+    (inst ret)
 
     BIGNUM
-    (inst shrd rax x n-fixnum-tag-bits) ; high bits from edx
-    (inst sar x n-fixnum-tag-bits)      ; now shift edx too
+    (inst shrd rax rdx-tn n-fixnum-tag-bits) ; high bits from edx
+    (inst sar rdx-tn n-fixnum-tag-bits)      ; now shift edx too
 
-    (move rcx x)                   ; save high bits from cqo
+    (move rcx rdx-tn)              ; save high bits from cqo
     (inst cqo)                     ; edx:eax <- sign-extend of eax
-    (inst cmp x rcx)
+    (inst cmp rdx-tn rcx)
     (inst jmp :e SINGLE-WORD-BIGNUM)
 
     (emit-alloc-other nil thread-tn bignum-widetag (+ bignum-digits-offset 2) res)
     (storew rax res bignum-digits-offset other-pointer-lowtag)
     (storew rcx res (1+ bignum-digits-offset) other-pointer-lowtag)
-    (inst clc) (inst ret)
+    (inst ret)
 
     SINGLE-WORD-BIGNUM
     (return-single-word-bignum res res rax)))
@@ -121,13 +120,13 @@
 ;;;; negation
 
 (define-assembly-routine (generic-negate
-                          (:cost 10)
+                          (:cost 30)
                           (:return-style :full-call-no-return)
                           (:policy :safe)
                           (:translate %negate)
                           (:save-p t))
-                         ((:arg x (descriptor-reg any-reg) rdx-offset)
-                          (:res res (descriptor-reg any-reg) rdx-offset))
+                         ((:arg x (descriptor-reg any-reg) (:lisp-reg 0))
+                          (:res res (descriptor-reg any-reg) (:lisp-reg 0)))
   (inst test :byte x fixnum-tag-mask)
   (inst jmp :nz GENERIC)
   (move res x)
@@ -138,7 +137,7 @@
                                     (+ (ash code-constants-offset word-shift)
                                        (- other-pointer-lowtag)))
                         rip-tn))
-  (inst clc) (inst ret)
+  (inst ret)
   GENERIC
   (tail-call-lisp-fun '%negate 1))
 
@@ -154,8 +153,8 @@
                                         (:save-p t)
                                         (:conditional ,test)
                                         (:cost 10))
-                  ((:arg x (descriptor-reg any-reg) rdx-offset)
-                   (:arg y (descriptor-reg any-reg) rdi-offset)
+                  ((:arg x (descriptor-reg any-reg) (:lisp-reg 0))
+                   (:arg y (descriptor-reg any-reg) (:lisp-reg 1))
 
                    (:temp rcx unsigned-reg rcx-offset))
 
@@ -182,8 +181,8 @@
                           (:save-p t)
                           (:conditional :e)
                           (:cost 10))
-                         ((:arg x (descriptor-reg any-reg) rdx-offset)
-                          (:arg y (descriptor-reg any-reg) rdi-offset)
+                         ((:arg x (descriptor-reg any-reg) (:lisp-reg 0))
+                          (:arg y (descriptor-reg any-reg) (:lisp-reg 1))
 
                           (:temp rcx unsigned-reg rcx-offset))
   (both-fixnum-p rcx x y)
@@ -200,7 +199,7 @@
 
 #+sb-assembling
 (define-assembly-routine (logcount)
-                         ((:arg arg (descriptor-reg any-reg) rdx-offset)
+                         ((:arg arg (descriptor-reg any-reg) (:lisp-reg 0))
                           (:temp mask unsigned-reg rcx-offset)
                           (:temp temp unsigned-reg rax-offset))
   (inst push temp)
@@ -263,7 +262,6 @@
       `(define-vop (,name)
          (:translate logcount)
          (:note ,(format nil "inline ~a logcount" arg-type))
-         (:policy :fast-safe)
          (:args (arg :scs (,arg-sc)))
          (:arg-types ,arg-type)
          (:results (result :scs (unsigned-reg)))
@@ -499,12 +497,11 @@
                           (:translate eql)
                           ;; :safe would imply signaling an error
                           ;; if the args are not integer, which this doesn't.
-                          (:policy :fast-safe)
                           (:conditional :e)
                           (:cost 10)
                           (:arg-types (:or integer bignum) *))
-                         ((:arg x (descriptor-reg) rdx-offset)
-                          (:arg y (descriptor-reg any-reg) rdi-offset)
+                         ((:arg x (descriptor-reg) (:lisp-reg 0))
+                          (:arg y (descriptor-reg any-reg) (:lisp-reg 1))
                           (:temp rcx unsigned-reg rcx-offset)
                           (:temp rax unsigned-reg rax-offset))
   (inst cmp x y)

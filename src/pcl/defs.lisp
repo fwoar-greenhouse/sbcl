@@ -38,19 +38,6 @@
            has already been partially loaded. This may not work, you may~%~
            need to get a fresh lisp (reboot) and then load PCL."))
 
-(declaim (inline gdefinition))
-(defun gdefinition (spec)
-  ;; This is null layer right now, but once FDEFINITION stops bypasssing
-  ;; fwrappers/encapsulations we can do that here.
-  (fdefinition spec))
-
-(defun (setf gdefinition) (new-value spec)
-  ;; This is almost a null layer right now, but once (SETF
-  ;; FDEFINITION) stops bypasssing fwrappers/encapsulations we can do
-  ;; that here.
-  (sb-c::note-name-defined spec :function) ; FIXME: do we need this? Why?
-  (setf (fdefinition spec) new-value))
-
 ;;;; type specifier hackery
 
 ;;; internal to this file

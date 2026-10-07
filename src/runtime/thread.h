@@ -146,7 +146,7 @@ extern int dynamic_values_bytes;
 #else
 #  if defined(BINDING_STACK_POINTER)
 #define get_binding_stack_pointer(thread)       \
-    SymbolValue(BINDING_STACK_POINTER, thread)
+    ((lispobj*)SymbolValue(BINDING_STACK_POINTER, thread))
 #define set_binding_stack_pointer(thread,value) \
     SetSymbolValue(BINDING_STACK_POINTER, (lispobj)(value), thread)
 #  else
@@ -365,5 +365,8 @@ extern int handle_tls_deref_trap(os_context_t*, os_vm_address_t);
 #else
 # define bytes_per_tls_symbol N_WORD_BYTES
 #endif
+
+// Return N in-use words of thread's multiple-value return area
+extern int thread_mv_cell_count(struct thread*);
 
 #endif /* _INCLUDE_THREAD_H_ */

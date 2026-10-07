@@ -249,8 +249,8 @@
 
 (declaim (inline readtable-normalization))
 (defun readtable-normalization (readtable)
-  "Returns T if READTABLE normalizes symbols to NFKC, and NIL otherwise.
-The READTABLE-NORMALIZATION of the standard readtable is T."
+  "Returns T if READTABLE normalizes symbols to SB-MANUAL::@NFKC, and NIL
+otherwise. The READTABLE-NORMALIZATION of the standard readtable is T."
   (%readtable-normalization readtable))
 
 (defun (setf readtable-normalization) (new-value readtable)
@@ -351,9 +351,9 @@ readtable when not provided."
 
 (defun set-syntax-from-char (to-char from-char &optional
                              (to-readtable *readtable*) (from-readtable nil))
-  "Causes the syntax of TO-CHAR to be the same as FROM-CHAR in the optional
-readtable (defaults to the current readtable). The FROM-TABLE defaults to the
-standard Lisp readtable when NIL."
+  "Causes the syntax of TO-CHAR in TO-READTABLE to be the same as
+FROM-CHAR in FROM-READTABLE. TO-READTABLE defaults to *READTABLE*, and
+FROM-READTABLE defaults to the standard Lisp readtable when NIL."
   ;; TO-READTABLE is a readtable, not a readtable-designator
   (assert-not-standard-readtable to-readtable 'set-syntax-from-char)
   (let* ((from-readtable (or from-readtable *standard-readtable*))
@@ -924,14 +924,15 @@ standard Lisp readtable when NIL."
                stream "More than one object follows . in list.")))))))
 
 (defun read-string (stream closech)
-  ;; This accumulates chars until it sees same char that invoked it.
-  ;; We avoid copying any given input character more than twice-
-  ;; once to a temp buffer and then to the result. In the worst case,
-  ;; we can waste space equal the unwasted space, if the final character
-  ;; causes allocation of a new buffer for just that character,
-  ;; because the buffer size is doubled each time it overflows.
-  ;; (Would be better to peek at the frc-buffer if the stream has one.)
-  ;; Scratch vectors are GC-able as soon as this function returns though.
+  ;; Accumulate chars until an unescaped CLOSECH. We avoid copying any
+  ;; given input character more than twice: once into a temp buffer
+  ;; and then to the result. In the worst case, the total size of the
+  ;; chained buffers is 3 times the length of the result string (if
+  ;; the final character causes allocation of a new buffer for just
+  ;; that character) because the buffer size is doubled each time it
+  ;; overflows. (Would be better to peek at the frc-buffer if the
+  ;; stream has one.) Scratch vectors are GC-able as soon as this
+  ;; function returns though.
   (declare (character closech))
   (macrolet ((scan (read-a-char eofp &optional finish)
                `(loop (let ((char ,read-a-char))
@@ -946,6 +947,7 @@ standard Lisp readtable when NIL."
                         (when (>= ptr lim)
                           (unless suppress
                             (push buf chain)
+                            (incf total-chain-length lim)
                             (setq lim (the index (ash lim 1))
                                   buf (make-array lim :element-type 'character)))
                           (setq ptr 0))
@@ -960,8 +962,10 @@ standard Lisp readtable when NIL."
            (lim (length buf))
            (ptr 0)
            (only-base-chars t)
+           (total-chain-length 0)
            (chain))
-      (declare (type (simple-array character (*)) buf))
+      (declare (type (simple-array character (*)) buf)
+               (type index ptr total-chain-length))
       (reset-read-buffer token-buf)
       (if (ansi-stream-p stream)
           (prepare-for-fast-read-char stream
@@ -970,20 +974,18 @@ standard Lisp readtable when NIL."
           (scan (read-char stream nil +EOF+) (eq char +EOF+)))
       (if suppress
           ""
-          (let* ((sum (loop for buf in chain sum (length buf)))
-                 (result
-                  (make-array (+ sum ptr)
-                              :element-type (if only-base-chars
-                                                (%readtable-string-preference rt)
-                                                'character))))
-            (setq ptr sum)
+          (let* ((element-type (if only-base-chars
+                                   (%readtable-string-preference rt)
+                                   'character))
+                 (result (make-array (+ total-chain-length ptr)
+                                     :element-type element-type)))
+            (setq ptr total-chain-length)
             ;; Now work backwards from the end
             (replace result buf :start1 ptr)
             (dolist (buf chain result)
               (declare (type (simple-array character (*)) buf))
-              (let ((len (length buf)))
-                (decf ptr len)
-                (replace result buf :start1 ptr))))))))
+              (decf ptr (length buf))
+              (replace result buf :start1 ptr)))))))
 
 (defun read-right-paren (stream ignore)
   (declare (ignore ignore))
@@ -1572,37 +1574,41 @@ extended <package-name>::<form-in-package> syntax."
             (if package-designator
                 (reader-find-package package-designator stream t)
                 (or *reader-package* (sane-package)))
-          (if (eq restart-kind :uninterned)
-              (return (make-symbol (copy-token-buf-string buf)))
-              (let* ((intern-p (or (/= colons 1)
-                                   (eq pkg *keyword-package*)
-                                   (eq restart-kind :current))))
-                (unless intern-p        ; Try %FIND-SYMBOL
-                  (multiple-value-bind (symbol accessibility)
-                      (%find-symbol (token-buf-string buf) (token-buf-fill-ptr buf) pkg)
-                    (when (eq accessibility :external) (return symbol))
-                    (when (and accessibility
-                               (check-deprecated-export pkg symbol))
-                      (return symbol))
-                    (with-simple-restart (continue "Use symbol anyway.")
-                      (error 'simple-reader-package-error
-                             :package pkg
-                             :stream stream
-                             :format-arguments
-                             (list (copy-token-buf-string buf) (package-name pkg))
-                             :format-control
-                             (if accessibility
-                                 "The symbol ~S is not external in the ~A package."
-                                 "Symbol ~S not found in the ~A package.")))))
-                (return (%intern (token-buf-string buf)
-                                 (token-buf-fill-ptr buf)
-                                 pkg
-                                 (if (token-buf-only-base-chars buf)
-                                     (%readtable-symbol-preference rt)
-                                     'character)
-                                 ;; reader-package behaves as if *package* were that package.
-                                 ;; Hence it should be allowed to create new symbols.
-                                 (eq pkg *reader-package*))))))))))
+          (case restart-kind
+            (:uninterned
+             (return (make-symbol (copy-token-buf-string buf))))
+            (:symbol
+             (return pkg))
+            (t
+             (let ((intern-p (or (/= colons 1)
+                                 (eq pkg *keyword-package*)
+                                 (eq restart-kind :current))))
+               (unless intern-p         ; Try %FIND-SYMBOL
+                 (multiple-value-bind (symbol accessibility)
+                     (%find-symbol (token-buf-string buf) (token-buf-fill-ptr buf) pkg)
+                   (when (eq accessibility :external) (return symbol))
+                   (when (and accessibility
+                              (check-deprecated-export pkg symbol))
+                     (return symbol))
+                   (with-simple-restart (continue "Use symbol anyway.")
+                     (error 'simple-reader-package-error
+                            :package pkg
+                            :stream stream
+                            :format-arguments
+                            (list (copy-token-buf-string buf) (package-name pkg))
+                            :format-control
+                            (if accessibility
+                                "The symbol ~S is not external in the ~A package."
+                                "Symbol ~S not found in the ~A package.")))))
+               (return (%intern (token-buf-string buf)
+                                (token-buf-fill-ptr buf)
+                                pkg
+                                (if (token-buf-only-base-chars buf)
+                                    (%readtable-symbol-preference rt)
+                                    'character)
+                                ;; reader-package behaves as if *package* were that package.
+                                ;; Hence it should be allowed to create new symbols.
+                                (eq pkg *reader-package*)))))))))))
 
 ;;; For semi-external use: Return 3 values: the token-buf,
 ;;; a flag for whether there was an escape char, and the position of

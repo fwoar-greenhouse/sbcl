@@ -38,13 +38,7 @@ EOF
 fi
 # Build it.
 version_head=`git rev-parse HEAD`
-if grep -q "ref: refs/heads/.*" .git/HEAD > /dev/null 2>&1
-then
-    version_branchname=`cut -d / -f 3- < .git/HEAD`
-else
-    # Detached head.
-    version_branchname="HEAD"
-fi
+version_branchname=`git symbolic-ref --short -q HEAD || echo HEAD`
 if [ -z "$SBCL_BUILDING_RELEASE_FROM" ]
 then
     version_root=`git merge-base HEAD origin/master`
@@ -76,6 +70,12 @@ cat >version.lisp-expr <<EOF
 ;;; you re-run make.sh, this file will be overwritten if you are
 ;;; working from a Git checkout.
 EOF
+if [ "0" = "$version_n_root" ]
+then
+    version_n_root_pretty=""
+else
+    version_n_root_pretty=".$version_n_root"
+fi
 if [ "$version_base" = "$version_head" ]
 then
     if [ "0" = "$version_n_root" ]
@@ -90,8 +90,8 @@ then
 else
     echo "base=$version_base"
     echo "head=$version_head"
-    printf "\"%s.%s.%s.%s%s%s\"\n" \
-        $version_release $version_n_root \
-        $version_branchname $version_n_branch \
-        $version_hash $version_dirty >>version.lisp-expr
+    printf "\"%s%s.%s.%s%s%s\"\n" \
+           $version_release "$version_n_root_pretty" \
+           $version_branchname $version_n_branch \
+           $version_hash $version_dirty >>version.lisp-expr
 fi

@@ -504,7 +504,7 @@
              (simd-pack
               (unless (similar-check-table x file)
                 (dump-fop 'fop-simd-pack file)
-                (dump-integer-as-n-bytes (%simd-pack-tag  x) 8 file)
+                (dump-byte (%simd-pack-tag  x) file)
                 (dump-integer-as-n-bytes (%simd-pack-low  x) 8 file)
                 (dump-integer-as-n-bytes (%simd-pack-high x) 8 file)
                 (similar-save-object x file)))
@@ -512,6 +512,18 @@
              (simd-pack-256
               (unless (similar-check-table x file)
                 (dump-simd-pack-256 x file)
+                (similar-save-object x file)))
+             #+(and (not sb-xc-host) sb-simd-pack-512)
+             (simd-pack-512
+              (unless (similar-check-table x file)
+                (dump-simd-pack-512 x file)
+                (similar-save-object x file)))
+             #+(and (not sb-xc-host) sb-simd-pack-512)
+             (simd-pack-512-mask
+              (unless (similar-check-table x file)
+                (dump-fop 'fop-simd-pack-512-mask file)
+                (dump-integer-as-n-bytes
+                 (%simd-pack-512-mask-value x) 8 file)
                 (similar-save-object x file)))
              (t
               ;; This probably never happens, since bad things tend to
@@ -523,11 +535,24 @@
 #+(and (not sb-xc-host) sb-simd-pack-256)
 (defun dump-simd-pack-256 (x file)
   (dump-fop 'fop-simd-pack file)
-  (dump-integer-as-n-bytes (logior (%simd-pack-256-tag x) (ash 1 6)) 8 file)
+  (dump-byte (logior (%simd-pack-256-tag x) (ash 1 6)) file)
   (dump-integer-as-n-bytes (%simd-pack-256-0 x) 8 file)
   (dump-integer-as-n-bytes (%simd-pack-256-1 x) 8 file)
   (dump-integer-as-n-bytes (%simd-pack-256-2 x) 8 file)
   (dump-integer-as-n-bytes (%simd-pack-256-3 x) 8 file))
+
+#+(and (not sb-xc-host) sb-simd-pack-512)
+(defun dump-simd-pack-512 (x file)
+  (dump-fop 'fop-simd-pack file)
+  (dump-byte (logior (%simd-pack-512-tag x) (ash 1 7)) file)
+  (dump-integer-as-n-bytes (%simd-pack-512-0 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-1 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-2 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-3 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-4 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-5 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-6 x) 8 file)
+  (dump-integer-as-n-bytes (%simd-pack-512-7 x) 8 file))
 
 ;;; Dump an object of any type by dispatching to the correct
 ;;; type-specific dumping function. We pick off immediate objects,

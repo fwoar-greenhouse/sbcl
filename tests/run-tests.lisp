@@ -50,6 +50,8 @@
                   (error "~@<Invalid evaluator mode: ~A. Must be one ~
                            of interpret, compile.~@:>"
                          mode)))))
+            ((string= arg "--interpret")
+             (setf *test-evaluator-mode* :interpret))
             ((or (string= arg "--break-on-failure")
                  (string= arg "-b"))
              (setf *break-on-error* t)
@@ -279,7 +281,6 @@
       sb-impl::*package-names-cookie*
       sb-impl::*available-buffers*
       sb-impl::*available-char-buffers*
-      sb-impl::*available-ub8-buffers*
       sb-impl::*token-buf-pool*
       sb-impl::*user-hash-table-tests*
       sb-impl::*pn-dir-table*
@@ -314,7 +315,8 @@
       #+win32 sb-impl::*waitable-timer-handle*
       #+win32 sb-impl::*timer-thread*
       sb-unicode::*name->char-buffers*
-      sb-impl::*finalizer-thread*)))
+      sb-impl::*finalizer-thread*
+      sb-impl::*read-line-buffers*)))
 
 (defun collect-symbol-values ()
   (let (result)
@@ -608,6 +610,7 @@
            #+gc-verify "--eval" #+gc-verify "(push :gc-verify *features*)"
            #+slow "--eval" #+slow "(push :slow *features*)"
            #+coverage "--eval" #+coverage "(push :coverage *features*)"
+           #+sb-devel "--eval" #+sb-devel "(setf sb-kernel::*check-type-error-consistency* t)"
            "--load" load
            "--eval" (write-to-string eval
                                      :right-margin 1000))

@@ -151,17 +151,24 @@
               (aver (basic-combination-p dest))
               (delete-filter node lvar (cast-value node)))
              ((and (not (delay-p node))
-                   (not (cast-type-check node))
-                   (return-p dest))
+                   (not (cast-type-check node)))
               (let ((value (cast-value node))
                     (type (node-derived-type node)))
-                (setf (lvar-%derived-type (cast-value node))
-                      type)
-                (do-uses (use value)
-                  (let ((type (values-type-intersection (node-derived-type use) type)))
-                    (unless (eq type *empty-type*)
-                      (setf (node-derived-type use) type))))
-                (delete-filter node lvar (cast-value node))))))
+                (block stop
+                  (do-uses (use value)
+                    (let ((type (values-type-intersection (node-derived-type use) type)))
+                      ;; Don't do anything if there are type
+                      ;; mismatches, too late do delete anything
+                      ;; properly
+                      (when (eq type *empty-type*)
+                        (return-from stop))
+                      ;; don't confuse stack-analyze
+                      (unless (only-harmless-cleanups (node-block use)
+                                                      (node-block node))
+                        (return-from stop))
+                      (setf (node-derived-type use) type)))
+                  (setf (lvar-%derived-type (cast-value node)) type)
+                  (delete-filter node lvar (cast-value node)))))))
           (combination
            (when (eq (combination-kind node) :known)
              (ir1-optimize-functional-arguments node))))))))

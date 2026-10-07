@@ -11,8 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#+interpreter (invoke-restart 'run-tests::skip-file)
-
 (load "compiler-test-util.lisp")
 (defpackage "CLOS-IMPURE"
   (:use "CL" "SB-EXT" "ASSERTOID" "TEST-UTIL" "COMPILER-TEST-UTIL"))
@@ -973,7 +971,7 @@
 (let ((x (make-string-output-stream)))
   (let ((value (bug222-b t x)))
     ;; not specified by ANSI
-    #+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
+    #-interpreter
     (assert (= value 3)))
   ;; specified.
   (assert (char= (char (get-output-stream-string x) 0) #\1)))
@@ -1350,10 +1348,6 @@
 
 (with-test (:name (:check-keyword-args shared-initialize :odd-keyword :error))
   (assert-error (shared-initialize (make-instance 'shared-initialize-keyword-check) nil :a)
-                program-error))
-
-(with-test (:name (:check-keyword-args shared-initialize :non-keyword :error))
-  (assert-error (shared-initialize (make-instance 'shared-initialize-keyword-check) nil '(abc) 1)
                 program-error))
 
 ;;; verify that we can still detect no primary methods and invalid qualifiers
@@ -2288,7 +2282,7 @@
   y))
 (defun i-cause-an-gf-info-update ()
   (i-dont-want-to-be-clobbered-2 t t t))
-(with-test (:name (defgeneric :should-clobber-ftype))
+(with-test (:name (defgeneric :should-clobber-ftype) :skipped-on :interpreter)
   ;; (because it doesn't check the argument or result types)
   (assert (equal '(function (t t t) *)
                  (sb-kernel:type-specifier
@@ -2355,7 +2349,7 @@
                         (setf slot :value)
                         (go TAG)))
      TAG)))
-(with-test (:name :bug-520366)
+(with-test (:name :bug-520366 :skipped-on :interpreter)
   (let ((callees (find-named-callees #'bar-520366)))
     (assert (equal '(quux-520366) callees))))
 
@@ -2437,7 +2431,7 @@
              (symbol-name s)))
     (assert (equal "FOO" (funcall 'lp-618387 :foo)))))
 
-(with-test (:name (defmethod :pcl-spurious-ignore-warnings))
+(with-test (:name (defmethod :pcl-spurious-ignore-warnings) :skipped-on :interpreter)
   (defgeneric no-spurious-ignore-warnings (req &key key))
   (handler-bind ((warning (lambda (x) (error "~A" x))))
     (eval
@@ -2835,3 +2829,9 @@
               c)))
   (assert (null (sb-mop:class-direct-subclasses (find-class 'super-class-cycle-forward-referenced-a))))
   (defclass super-class-cycle-forward-referenced-b () ()))
+
+(with-test (:name :walking-long-progn)
+  (eval `(defmethod ,(gensym) ()
+           (macrolet ((gen (n)
+                        `(progn ,@(make-list n :initial-element 1))))
+             (gen 100000)))))

@@ -942,9 +942,9 @@
       '(lambda (x) (logand x x 0))
     ((-1) 0)))
 
-;;; MISC.99 from Paul Dietz' random tester: FAST-ASH-MOD32-C VOP
+;;; MISC.99 from Paul Dietz' random tester: ash-MOD32-C VOP
 ;;; produced wrong result for shift >=32 on X86
-(with-test (:name (compile mask-field :fast-ash-mod32-c-vop 18))
+(with-test (:name (compile mask-field :ash-mod32-c-vop 18))
   (checked-compile-and-assert ()
       '(lambda (a)
          (declare (type (integer 4303063 101130078) a))
@@ -954,13 +954,13 @@
 ;;; rewrite the test case to get the unsigned-byte 32/64
 ;;; implementation even after implementing some modular arithmetic
 ;;; with signed-byte 30:
-(with-test (:name (compile mask-field :fast-ash-mod32-c-vop 30))
+(with-test (:name (compile mask-field :ash-mod32-c-vop 30))
   (checked-compile-and-assert ()
       '(lambda (a)
         (declare (type (integer 4303063 101130078) a))
         (mask-field (byte 30 2) (ash a 77)))
     ((57132532) 0)))
-(with-test (:name (compile mask-field :fast-ash-mod32-c-vop 64))
+(with-test (:name (compile mask-field :ash-mod32-c-vop 64))
   (checked-compile-and-assert ()
       '(lambda (a)
          (declare (type (integer 4303063 101130078) a))
@@ -968,13 +968,13 @@
     ((57132532) 0)))
 ;;; and a similar test case for the signed masking extension (not the
 ;;; final interface, so change the call when necessary):
-(with-test (:name (compile sb-c::mask-signed-field :fast-ash-mod32-c-vop 30))
+(with-test (:name (compile sb-c::mask-signed-field :ash-mod32-c-vop 30))
   (checked-compile-and-assert ()
       '(lambda (a)
          (declare (type (integer 4303063 101130078) a))
          (sb-c::mask-signed-field 30 (ash a 77)))
     ((57132532) 0)))
-(with-test (:name (compile sb-c::mask-signed-field :fast-ash-mod32-c-vop 61))
+(with-test (:name (compile sb-c::mask-signed-field :ash-mod32-c-vop 61))
   (checked-compile-and-assert ()
       '(lambda (a)
          (declare (type (integer 4303063 101130078) a))
@@ -3117,7 +3117,26 @@
            (setq x (make-array '(4 4)))
            (adjust-array y '(3 5))
            (array-dimension (the (array t) y) 0)))
+    (((make-array '(4 4) :initial-element nil :adjustable t)) 3))
+  (checked-compile-and-assert (:optimize nil)
+      `(lambda (x)
+         (declare (optimize speed))
+         (declare (type (array * (4 4)) x))
+         (let ((y x))
+           (adjust-array y '(3 5))
+           (array-dimension (the (array t) y) 0)))
     (((make-array '(4 4) :initial-element nil :adjustable t)) 3)))
+
+(with-test (:name :cons-type-derivation-conservative)
+  (checked-compile-and-assert ()
+      `(lambda (x)
+         (declare (type (or null (cons fixnum)) x))
+         (let ((y x))
+           (setf (car y) 'foo)
+           (if y
+               (+ (car y) 4)
+               0)))
+    (((list 9 10)) (condition 'type-error))))
 
 (with-test (:name :with-timeout-code-deletion-note)
   (checked-compile `(lambda ()
@@ -4447,7 +4466,7 @@
          (logand 254
                  (case x
                    ((3) x)
-                   ((2 2 0 -2 -1 2) 9223372036854775803)
+                   ((0 -2 -1) 9223372036854775803)
                    (t 358458651))))
       ((-10470605025) 26)))
 
@@ -4457,7 +4476,7 @@
            (lambda () (append nil 10)) (integer 10 10)
            (lambda (x) (append x 10)) (or (integer 10 10) cons)
            (lambda (x) (append x (cons 1 2))) cons
-           (lambda (x y) (append x (cons 1 2) y)) cons
+           (lambda (x y) (append x (list 1 2) y)) cons
            (lambda (x y) (nconc x (the list y) x)) t
            (lambda (x y) (nconc (the atom x) y)) t
            (lambda (x y) (nconc (the (or null (eql 10)) x) y)) t
@@ -4916,13 +4935,6 @@
          (unless (eql b 1/2)
            (min a -1f0)))
     ((0f0 1) -1f0)))
-
-(with-test (:name :malformed-declare)
-  (assert (nth-value
-           1 (checked-compile `(lambda (x)
-                                 (declare (unsigned-byte (x)))
-                                 x)
-                              :allow-failure t))))
 
 (with-test (:name :no-dubious-asterisk-warning)
   (checked-compile
@@ -6252,3 +6264,223 @@
      `(lambda ()
         (let ((x (error "fail")))
           x)))))
+
+;;; lp#486416: a local function's parameter types were computed by
+;;; unioning the argument types across its call sites, starting from T
+;;; and narrowing. That cannot converge once the argument flow has a
+;;; cycle in it: a call that hands a parameter back to itself
+;;; contributes the parameter's own current type, so the union comes
+;;; out (UNION <whatever> T) = T on every round and stays there. The
+;;; same loop therefore got two different answers depending on how it
+;;; was written,
+;;;
+;;;   (do ((i n (1- i)) (x (list 1) x)) ((zerop i) x))     => CONS
+;;;   (labels ((rec (i x) (if (zerop i) x (rec (1- i) x))))
+;;;     (rec n (list 1)))                                  => T
+;;;
+;;; because the DO loop assigns to X, and PROPAGATE-FROM-SETS derives
+;;; a variable's type from the values assigned to it, which do not
+;;; depend on the variable's own type. The equations are now also
+;;; solved from the other end of the lattice, upward from the empty
+;;; type, which converges on the cyclic case too.
+(with-test (:name (:local-call-arg-type :cycle))
+  (flet ((derived (form &rest args)
+           (apply (checked-compile form) args)))
+    ;; The parameter is handed straight back to itself.
+    (assert (eq 'cons
+                (derived '(lambda (n)
+                           (labels ((rec (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (rec (1- i) x))))
+                             (rec n (list 1))))
+                         0)))
+    ;; The cycle runs through a second function, so it is not enough to
+    ;; ignore arguments that reference the callee's own parameters.
+    (assert (eq 'cons
+                (derived '(lambda (n)
+                           (labels ((a (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (b (1- i) x)))
+                                    (b (i x) (a (1- i) x)))
+                             (a n (list 1))))
+                         0)))
+    ;; Two entering edges of different types: the answer is the union
+    ;; of them, not either one on its own.
+    (assert (eq 'list
+                (derived '(lambda (n p)
+                           (labels ((rec (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (rec (1- i) x))))
+                             (if p (rec n (list 1)) (rec n nil))))
+                         0 t)))
+    ;; The back edge carries a type no entering edge does, and it
+    ;; reaches the parameter through an argument that merges it with a
+    ;; reference to the parameter itself.
+    (assert (eq 'list
+                (derived '(lambda (n p)
+                           (labels ((rec (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (rec (1- i) (if p x nil)))))
+                             (rec n (list 1))))
+                         0 nil)))
+    (assert (eq 'unsigned-byte
+                (derived '(lambda (k)
+                           (labels ((rec (i n)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type n)
+                                          (rec (1- i) (1+ n)))))
+                             (rec k 0)))
+                         0)))))
+
+;;; Check that a local function's return type depending on optimistic
+;;; type propagation derives to a tight result as well.
+(with-test (:name (:local-call-arg-type :return-type))
+  (flet ((result-type (form)
+           (let ((type (sb-kernel:%simple-fun-type (checked-compile form))))
+             (second (third type)))))
+    (assert (eq 'cons (result-type '(lambda (p)
+                                     (labels ((rec (x) (if p (rec x) x)))
+                                       (rec (list 1)))))))
+    (assert (eq 'cons (result-type '(lambda (n)
+                                     (labels ((rec (i x)
+                                                (if (zerop i) x (rec (1- i) x))))
+                                       (rec n (list 1)))))))
+    (assert (eq 'cons (result-type '(lambda (n)
+                                     (labels ((a (i x)
+                                                (if (zerop i) x (b (1- i) x)))
+                                              (b (i x) (a (1- i) x)))
+                                       (a n (list 1)))))))
+    ;; The value comes back through a non-tail call, so the result is
+    ;; not simply the parameter's type.
+    (assert (eq 'cons (result-type '(lambda (p)
+                                     (labels ((rec (x) (if p (list (rec x)) x)))
+                                       (rec (list 1)))))))))
+
+;;; The note lp#486416 was reported for: FN is declared FUNCTION at the
+;;; outer call, but the declaration did not survive the trip around the
+;;; recursion, so the FUNCALL was compiled as a full call through
+;;; FDEFINITION.
+(with-test (:name (:local-call-arg-type :lp486416))
+  (checked-compile '(lambda (x fn)
+                     (declare (optimize speed) (type function fn) (type fixnum x))
+                     (labels ((recurse (x fn)
+                                (if (zerop x)
+                                    (funcall fn x)
+                                    (recurse (the fixnum (1- x)) fn))))
+                       (recurse x fn)))
+                   :allow-notes nil))
+
+;;; Test basic iteration-as-local-call type inference.
+(with-test (:name (:local-call-arg-type :stepped-by-known-function))
+  (flet ((derived (form &rest args)
+           (apply (checked-compile form) args)))
+    (assert (eq 'cons
+                (derived '(lambda (n)
+                           (labels ((rec (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (rec (1- i) (nreverse x)))))
+                             (rec n (list 1 2 3))))
+                         0)))
+    (assert (eq 'cons
+                (derived '(lambda (n)
+                           (do ((i n (1- i))
+                                (x (list 1 2 3) (nreverse x)))
+                               ((zerop i) (ctu:compiler-derived-type x))))
+                         0)))
+    (assert (eq 'cons
+                (derived '(lambda (n)
+                           (labels ((rec (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (rec (1- i) (cons 1 x)))))
+                             (rec n (list 1))))
+                         0)))
+    (assert (eq 'cons
+                (derived '(lambda (n)
+                           (labels ((rec (i x)
+                                      (if (zerop i)
+                                          (ctu:compiler-derived-type x)
+                                          (rec (1- i) (list x)))))
+                             (rec n (list 1))))
+                         0)))
+    ;; ASH does not converge until the bounds are dropped, so only the
+    ;; class of the type survives. The imperative loop does no better
+    ;; here; see :SPELLING-PARITY-NUMERIC-STEPS.
+    (assert (subtypep (derived '(lambda (k)
+                                 (labels ((rec (i n)
+                                            (if (zerop i)
+                                                (ctu:compiler-derived-type n)
+                                                (rec (1- i) (ash n 1)))))
+                                   (rec k 1)))
+                               0)
+                      'integer))))
+
+;;; Check that the types from loops written with DO and with local
+;;; calls infer to the same type.
+(with-test (:name (:local-call-arg-type :spelling-parity))
+  (labels ((as-do (step init)
+             `(lambda (n)
+                (do ((i n (1- i))
+                     (x ,init ,step))
+                    ((zerop i) (ctu:compiler-derived-type x)))))
+           (as-labels (step init)
+             `(lambda (n)
+                (labels ((rec (i x)
+                           (if (zerop i)
+                               (ctu:compiler-derived-type x)
+                               (rec (1- i) ,step))))
+                  (rec n ,init))))
+           (derived (form)
+             (funcall (checked-compile form) 0)))
+    (dolist (case '(((nreverse x) (list 1 2 3))
+                    ((cdr x) (list 1 2 3))
+                    ((cons 1 x) (list 1))
+                    ((list x) (list 1))
+                    ((1+ x) 1)
+                    ((+ x 2) 1)
+                    ((- x 3) 1)
+                    ((ash x 1) 1)
+                    ((logior x 3) 1)))
+      (destructuring-bind (step init) case
+        (let ((from-do (derived (as-do step init)))
+              (from-labels (derived (as-labels step init))))
+          (unless (equal from-do from-labels)
+            (error "~S: DO derives ~S, LABELS derives ~S"
+                   step from-do from-labels)))))))
+
+(with-test (:name (:assignment-convert :lp2162990))
+  (checked-compile-and-assert ()
+    `(lambda (a)
+       (block done
+         (let ((done (lambda (&rest values) (return-from done (values-list values))))
+               (l (lambda ())))
+           (flet ((c (f)
+                    (funcall f)))
+             (declare (inline c))
+             (if a
+                 (c l)
+                 (c l)))
+           (funcall done nil))))
+    ((t) nil)
+    ((nil) nil)))
+
+(with-test (:name (:local-call-arg-type :constraint-eql-propagate))
+  (checked-compile '(lambda ()
+                     (declare (optimize speed))
+                     (labels ((phi (index)
+                                (declare (type (integer 0) index))
+                                (if (> index 9)
+                                    nil
+                                    (rec 0 index)))
+                              (rec (zoot gindex)
+                                (declare (fixnum zoot))
+                                (if (< zoot 5)
+                                    (rec (1+ zoot) gindex)
+                                    (phi (1+ gindex)))))
+                       (phi 0)))
+                   :allow-notes nil))

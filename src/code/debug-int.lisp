@@ -18,8 +18,7 @@
   ;; Compilation to memory stores each toplevel form given to %COMPILE.
   ;; That form can generate multiple functions, and those functions can
   ;; be in one or more code components. They all point at the same form.
-  form
-  (function nil :read-only t))
+  form)
 
 ;;; FIXME: There are an awful lot of package prefixes in this code.
 ;;; Couldn't we have SB-DI use the SB-C and SB-VM packages?
@@ -1531,7 +1530,7 @@
                        tag-and-info)
                    result))
            (var-or-deleted (index-or-deleted)
-             (if (eq index-or-deleted 'sb-c::deleted)
+             (if (eq index-or-deleted 'sb-c::%deleted)
                  :deleted
                  (svref vars index-or-deleted))))
       (loop
@@ -1539,24 +1538,24 @@
         do
            (let ((ele (aref args i)))
              (cond
-               ((eq ele 'sb-c::optional-args)
+               ((eq ele 'sb-c::%optional)
                 (setf optionalp t))
-               ((eq ele 'sb-c::rest-arg)
+               ((eq ele 'sb-c::%rest)
                 (push-var '(:rest) 1))
                ;; The next two args are the &MORE arg context and
                ;; count.
-               ((eq ele 'sb-c::more-arg)
+               ((eq ele 'sb-c::%more)
                 (push-var '(:more) 2))
                ;; SUPPLIED-P var immediately following keyword or
                ;; optional. Stick the extra var in the result element
                ;; representing the keyword or optional, which is the
                ;; previous one.
-               ((eq ele 'sb-c::supplied-p)
+               ((eq ele 'sb-c::%supplied-p)
                 (push-var (pop result) 1))
                ;; The keyword of a keyword parameter. Store it so the next
                ;; element can be used to form a (:keyword KEYWORD VALUE)
                ;; entry.
-               ((typep ele '(and symbol (not (eql sb-c::deleted))))
+               ((typep ele '(and symbol (not (eql sb-c::%deleted))))
                 (setf keyword ele))
                ;; The previous element was the keyword of a keyword
                ;; parameter and is stored in KEYWORD. The current element
@@ -1570,7 +1569,7 @@
                (optionalp
                 (push-var (list :optional (var-or-deleted ele))))
                ;; Deleted required, optional or keyword argument.
-               ((eq ele 'sb-c::deleted)
+               ((eq ele 'sb-c::%deleted)
                 (push-var :deleted))
                ;; Required arg at beginning of args array.
                (t
@@ -1584,7 +1583,7 @@
            (simple-vector vars))
   (let ((ele (aref args i)))
     (cond ((typep ele 'index) (svref vars ele))
-          ((eq ele 'sb-c::deleted) :deleted)
+          ((eq ele 'sb-c::%deleted) :deleted)
           (t (error "malformed arguments description")))))
 
 (defun compiled-debug-fun-debug-info (debug-fun)
@@ -1725,6 +1724,8 @@
 ;;; Parse the packed representation of DEBUG-VARs from
 ;;; DEBUG-FUN's SB-C::COMPILED-DEBUG-FUN, returning a vector
 ;;; of DEBUG-VARs, or NIL if there was no information to parse.
+;;;
+;;; This is written by SB-C::DUMP-1-VAR
 (defun parse-compiled-debug-vars (debug-fun)
   (let* ((cdebug-fun (compiled-debug-fun-compiler-debug-fun
                       debug-fun))
@@ -1742,51 +1743,68 @@
           (id 0)
           (len (length packed-vars))
           (buffer (make-array 0 :fill-pointer 0 :adjustable t))
-          prev-name)
+          prev-name
+          previously-read-package
+          previous-package)
       (loop
-        ;; The routines in the "SB-C" package are macros that advance the
-        ;; index.
-        (let* ((flags (prog1 (aref packed-vars i) (incf i)))
-               (minimal (logtest sb-c::compiled-debug-var-minimal-p flags))
-               (deleted (logtest sb-c::compiled-debug-var-deleted-p flags))
-               (name (cond (minimal "")
-                           ((logtest sb-c::compiled-debug-var-same-name-p flags)
-                            prev-name)
-                           (t (sb-c::read-var-string packed-vars i))))
-               (package (cond
-                          (minimal default-package)
-                          ((logtest sb-c::compiled-debug-var-packaged
-                                    flags)
-                           (find-package (sb-c::read-var-string packed-vars i)))
-                          ((logtest sb-c::compiled-debug-var-uninterned
-                                    flags)
-                           nil)
-                          (t
-                           default-package)))
-               (sc+offset
-                 (if deleted 0 (sb-c::read-var-integerf packed-vars i)))
-               (save-sc+offset
-                 (if (logtest sb-c::compiled-debug-var-save-loc-p flags)
-                     (sb-c::read-var-integerf packed-vars i)
-                     nil))
-               (indirect-sc+offset
-                 (if (logtest sb-c::compiled-debug-var-indirect-p flags)
-                     (sb-c::read-var-integerf packed-vars i)
-                     nil)))
-          (aver (not (and args-minimal (not minimal))))
-          (cond ((and prev-name (string= prev-name name))
-                 (incf id))
-                (t
-                 (setf id 0
-                       prev-name name)))
-          (vector-push-extend
-           (make-compiled-debug-var
-            name package id
-            (logtest sb-c::compiled-debug-var-environment-live flags)
-            sc+offset save-sc+offset
-            indirect-sc+offset)
-           buffer))
-        (when (>= i len) (return)))
+       ;; The routines in the "SB-C" package are macros that advance the
+       ;; index.
+       (let* ((flags (prog1 (aref packed-vars i) (incf i)))
+              (minimal (logtest sb-c::compiled-debug-var-minimal-p flags))
+              (deleted (logtest sb-c::compiled-debug-var-deleted-p flags))
+              (packaged (logtest sb-c::compiled-debug-var-packaged flags))
+              (same-name-p (logtest sb-c::compiled-debug-var-same-name-p flags))
+              (uninterned (logtest sb-c::compiled-debug-var-uninterned flags))
+              (name (cond (minimal "")
+                          ;; If packaged is 1 then same-name-p means same-package-p
+                          ((and (not packaged)
+                                same-name-p)
+                           prev-name)
+                          (t (sb-c::read-var-string packed-vars i))))
+              (package (cond
+                         (minimal default-package)
+                         (packaged
+                          (cond (same-name-p ; now same-package-p
+                                 previously-read-package)
+                                ;; packaged & uninterned means it's
+                                ;; writen as an integer package-id
+                                (uninterned
+                                 (aref sb-impl::*id->package*
+                                       (prog1 (aref packed-vars i) (incf i))))
+                                (t
+                                 (setf previously-read-package
+                                       (find-package (sb-c::read-var-string packed-vars i))))))
+                         (uninterned
+                          nil)
+                         (same-name-p
+                          previous-package)
+                         (t
+                          default-package)))
+              (sc+offset
+                (if deleted 0 (sb-c::read-var-integerf packed-vars i)))
+              (save-sc+offset
+                (if (logtest sb-c::compiled-debug-var-save-loc-p flags)
+                    (sb-c::read-var-integerf packed-vars i)
+                    nil))
+              (indirect-sc+offset
+                (if (logtest sb-c::compiled-debug-var-indirect-p flags)
+                    (sb-c::read-var-integerf packed-vars i)
+                    nil)))
+         (aver (not (and args-minimal (not minimal))))
+         (cond ((and prev-name (string= prev-name name))
+                (incf id))
+               (t
+                (setf id 0
+                      prev-name name)))
+         (setf previous-package package)
+         (vector-push-extend
+          (make-compiled-debug-var
+           name package id
+           (logtest sb-c::compiled-debug-var-environment-live flags)
+           sc+offset save-sc+offset
+           indirect-sc+offset)
+          buffer))
+       (when (>= i len) (return)))
       (let ((result (coerce buffer 'simple-vector)))
         (when args-minimal
           (assign-minimal-var-names result))
@@ -1867,15 +1885,15 @@
               (let ((arg (sb-c::read-var-integerf map i)))
                 (case arg
                   (#.sb-c::packed-debug-fun-arg-deleted
-                   (vector-push-extend 'sb-c::deleted buffer))
+                   (vector-push-extend 'sb-c::%deleted buffer))
                   (#.sb-c::packed-debug-fun-arg-supplied-p
-                   (vector-push-extend 'sb-c::supplied-p buffer))
+                   (vector-push-extend 'sb-c::%supplied-p buffer))
                   (#.sb-c::packed-debug-fun-arg-optional
-                   (vector-push-extend 'sb-c::optional buffer))
+                   (vector-push-extend 'sb-c::%optional buffer))
                   (#.sb-c::packed-debug-fun-arg-rest
-                   (vector-push-extend 'sb-c::rest buffer))
+                   (vector-push-extend 'sb-c::%rest buffer))
                   (#.sb-c::packed-debug-fun-arg-more
-                   (vector-push-extend 'sb-c::more buffer))
+                   (vector-push-extend 'sb-c::%more buffer))
                   (#.sb-c::packed-debug-fun-key-arg-keyword
                    (vector-push-extend (intern (sb-c::read-var-string map i)
                                                *keyword-package*)
@@ -2306,7 +2324,13 @@
           (escaped
            (sub-access-debug-var-slot
             (frame-pointer frame)
-            (compiled-debug-var-sc+offset debug-var)
+            ;; Immediately after a call returns, saved locations have
+            ;; not been restored yet, so we access the debug var
+            ;; directly from the save location.
+            (or (and (memq (code-location-kind (frame-code-location frame))
+                           '(:single-value-return :unknown-return :known-return))
+                     (compiled-debug-var-save-sc+offset debug-var))
+                (compiled-debug-var-sc+offset debug-var))
             escaped))
           (t
            (sub-access-debug-var-slot
@@ -2395,6 +2419,7 @@
                          nil)))))))
 
 (defun sub-access-debug-var-slot (fp sc+offset &optional escaped integer-float)
+  (declare ((or null system-area-pointer) fp))
   ;; NOTE: The long-float support in here is obviously decayed.  When
   ;; the x86oid and non-x86oid versions of this function were unified,
   ;; the behavior of long-floats was preserved, which only served to
@@ -2402,7 +2427,7 @@
   (macrolet ((with-escaped-value ((var) &body forms)
                `(if escaped
                     (let ((,var (context-register escaped
-                                 (sb-c:sc+offset-offset sc+offset))))
+                                                  (sb-c:sc+offset-offset sc+offset))))
                       ,@forms)
                     :invalid-value-for-unescaped-register-storage))
              (escaped-boxed-value ()
@@ -2414,7 +2439,7 @@
              (escaped-float-value (format)
                `(if escaped
                     (context-float-register escaped
-                     (sb-c:sc+offset-offset sc+offset) ',format integer-float)
+                                            (sb-c:sc+offset-offset sc+offset) ',format integer-float)
                     :invalid-value-for-unescaped-register-storage))
              (with-nfp ((var) &body body)
                ;; x86oids have no separate number stack, so dummy it
@@ -2446,78 +2471,79 @@
          (int-sap val)))
       (#.signed-reg-sc-number
        (with-escaped-value (val)
-         (if (logbitp (1- n-word-bits) val)
-             (logior val (ash -1 n-word-bits))
-             val)))
+         (sb-c::mask-signed-field n-word-bits val)))
       ((#.unsigned-reg-sc-number #-c-stack-is-control-stack #.non-descriptor-reg-sc-number)
        (with-escaped-value (val)
          val))
       #+sb-simd-pack
-      ((#.sb-vm::sse-reg-sc-number #.sb-vm::int-sse-reg-sc-number)
-       (escaped-float-value simd-pack-int))
+      ((#+x86-64 #.sb-vm::sse-reg-sc-number #+x86-64 #.sb-vm::int-sse-reg-sc-number
+        #+arm64 #.sb-vm::neon-reg-sc-number #+arm64 #.sb-vm::int-neon-reg-sc-number)
+       (escaped-float-value simd-pack))
       #+sb-simd-pack
-      ((#.sb-vm::single-sse-reg-sc-number)
-       (escaped-float-value simd-pack-single))
+      ((#+x86-64 #.sb-vm::single-sse-reg-sc-number
+        #+arm64 #.sb-vm::single-neon-reg-sc-number)
+       (escaped-float-value simd-pack))
       #+sb-simd-pack
-      ((#.sb-vm::double-sse-reg-sc-number)
-       (escaped-float-value simd-pack-double))
+      ((#+x86-64 #.sb-vm::double-sse-reg-sc-number
+        #+arm64 #.sb-vm::double-neon-reg-sc-number)
+       (escaped-float-value simd-pack))
       #+sb-simd-pack
-      ((#.sb-vm::int-sse-stack-sc-number)
+      ((#+x86-64 #.sb-vm::int-sse-stack-sc-number
+        #+arm64 #.sb-vm::int-neon-stack-sc-number)
        (with-nfp (nfp)
-         (%make-simd-pack-ub64
-          (sap-ref-64 nfp (number-stack-offset 0))
-          (sap-ref-64 nfp (number-stack-offset 8)))))
+         (sb-vm::sap-ref-128 nfp (number-stack-offset 0))))
       #+sb-simd-pack
-      ((#.sb-vm::single-sse-stack-sc-number)
+      ((#+x86-64 #.sb-vm::single-sse-stack-sc-number
+        #+arm64 #.sb-vm::single-neon-stack-sc-number)
        (with-nfp (nfp)
-         (%make-simd-pack-single
-          (sap-ref-single nfp (number-stack-offset 0))
-          (sap-ref-single nfp (number-stack-offset 4))
-          (sap-ref-single nfp (number-stack-offset 8))
-          (sap-ref-single nfp (number-stack-offset 12)))))
+         (sb-vm::%simd-pack-int-to-single (sb-vm::sap-ref-128 nfp (number-stack-offset 0)))))
       #+sb-simd-pack
-      ((#.sb-vm::double-sse-stack-sc-number)
+      ((#+x86-64 #.sb-vm::double-sse-stack-sc-number
+        #+arm64 #.sb-vm::double-neon-stack-sc-number)
        (with-nfp (nfp)
-         (%make-simd-pack-double
-          (sap-ref-double nfp (number-stack-offset 0))
-          (sap-ref-double nfp (number-stack-offset 8)))))
+         (sb-vm::%simd-pack-int-to-double (sb-vm::sap-ref-128 nfp (number-stack-offset 0)))))
       #+sb-simd-pack-256
-      ((#.sb-vm::ymm-reg-sc-number #.sb-vm::int-avx2-reg-sc-number)
-       (escaped-float-value simd-pack-256-int))
+      (#.sb-vm::int-avx2-reg-sc-number
+       (escaped-float-value simd-pack-256))
       #+sb-simd-pack-256
       ((#.sb-vm::single-avx2-reg-sc-number)
-       (escaped-float-value simd-pack-256-single))
+       (escaped-float-value simd-pack-256))
       #+sb-simd-pack-256
       ((#.sb-vm::double-avx2-reg-sc-number)
-       (escaped-float-value simd-pack-256-double))
+       (escaped-float-value simd-pack-256))
       #+sb-simd-pack-256
       ((#.sb-vm::int-avx2-stack-sc-number)
        (with-nfp (nfp)
-         (%make-simd-pack-256-ub64
-          (sap-ref-64 nfp (number-stack-offset 0))
-          (sap-ref-64 nfp (number-stack-offset 8))
-          (sap-ref-64 nfp (number-stack-offset 16))
-          (sap-ref-64 nfp (number-stack-offset 24)))))
+         (sb-vm::sap-ref-256 nfp (number-stack-offset 0))))
       #+sb-simd-pack-256
       ((#.sb-vm::single-avx2-stack-sc-number)
        (with-nfp (nfp)
-         (%make-simd-pack-256-single
-          (sap-ref-single nfp (number-stack-offset 0))
-          (sap-ref-single nfp (number-stack-offset 4))
-          (sap-ref-single nfp (number-stack-offset 8))
-          (sap-ref-single nfp (number-stack-offset 12))
-          (sap-ref-single nfp (number-stack-offset 16))
-          (sap-ref-single nfp (number-stack-offset 20))
-          (sap-ref-single nfp (number-stack-offset 24))
-          (sap-ref-single nfp (number-stack-offset 28)))))
+         (sb-vm::%simd-pack-256-int-to-single (sb-vm::sap-ref-256 nfp (number-stack-offset 0)))))
       #+sb-simd-pack-256
       ((#.sb-vm::double-avx2-stack-sc-number)
        (with-nfp (nfp)
-         (%make-simd-pack-256-double
-          (sap-ref-double nfp (number-stack-offset 0))
-          (sap-ref-double nfp (number-stack-offset 8))
-          (sap-ref-double nfp (number-stack-offset 16))
-          (sap-ref-double nfp (number-stack-offset 24)))))
+         (sb-vm::%simd-pack-256-int-to-double (sb-vm::sap-ref-256 nfp (number-stack-offset 0)))))
+      #+sb-simd-pack-512
+      (#.sb-vm::int-avx512-reg-sc-number
+       (escaped-float-value simd-pack-512))
+      #+sb-simd-pack-512
+      ((#.sb-vm::single-avx512-reg-sc-number)
+       (escaped-float-value simd-pack-512))
+      #+sb-simd-pack-512
+      ((#.sb-vm::double-avx512-reg-sc-number)
+       (escaped-float-value simd-pack-512))
+      #+sb-simd-pack-512
+      ((#.sb-vm::int-avx512-stack-sc-number)
+       (with-nfp (nfp)
+         (sb-vm::sap-ref-512 nfp (number-stack-offset 0))))
+      #+sb-simd-pack-512
+      ((#.sb-vm::single-avx512-stack-sc-number)
+       (with-nfp (nfp)
+         (sb-vm::%simd-pack-512-int-to-single (sb-vm::sap-ref-512 nfp (number-stack-offset 0)))))
+      #+sb-simd-pack-512
+      ((#.sb-vm::double-avx512-stack-sc-number)
+       (with-nfp (nfp)
+         (sb-vm::%simd-pack-512-int-to-double (sb-vm::sap-ref-512 nfp (number-stack-offset 0)))))
       (#.single-reg-sc-number
        (escaped-float-value single-float))
       (#.double-reg-sc-number
@@ -2549,9 +2575,11 @@
           (sap-ref-single nfp (number-stack-offset 4)))))
       (#.complex-double-stack-sc-number
        (with-nfp (nfp)
-         (complex
-          (sap-ref-double nfp (number-stack-offset))
-          (sap-ref-double nfp (number-stack-offset 8)))))
+         (let ((offset (number-stack-offset #+stack-grows-downward-not-upward
+                                            (- sb-vm:n-word-bytes))))
+           (complex
+            (sap-ref-double nfp offset)
+            (sap-ref-double nfp (+ offset 8))))))
       #+long-float
       (#.complex-long-stack-sc-number
        (with-nfp (nfp)
@@ -2584,7 +2612,22 @@
       (#.immediate-sc-number
        (sb-c:sc+offset-offset sc+offset))
       (#.sb-vm::negative-immediate-sc-number
-       (- (sb-c:sc+offset-offset sc+offset))))))
+       (- (sb-c:sc+offset-offset sc+offset)))
+      #+(or arm64 x86-64)
+      (#.sb-vm::signed-128-reg-sc-number
+       (if escaped
+           (let* ((offset (sb-c:sc+offset-offset sc+offset))
+                  (lo (context-register escaped offset))
+                  (hi (context-register escaped (1+ offset))))
+             (+ (ash (sb-c::mask-signed-field 64 hi) 64)
+                lo))
+           :invalid-value-for-unescaped-register-storage))
+      #+(or arm64 x86-64)
+      (#.sb-vm::signed-128-stack-sc-number
+       (with-nfp (nfp)
+         (+ (ash (signed-sap-ref-word nfp (+ (number-stack-offset) 8))
+                 64)
+            (sap-ref-word nfp (number-stack-offset))))))))
 
 ;;; This stores value as the value of DEBUG-VAR in FRAME. In the
 ;;; COMPILED-DEBUG-VAR case, access the current value to determine if
@@ -2615,6 +2658,7 @@
          value))))
 
 (defun sub-set-debug-var-slot (fp sc+offset value &optional escaped)
+  (declare ((or null system-area-pointer) fp))
   ;; Like sub-access-debug-var-slot, this is the unification of two
   ;; divergent copy-pasted functions.  The astute reviewer will notice
   ;; that long-floats are messed up here as well, that x86oids
@@ -2683,36 +2727,28 @@
       (#.non-descriptor-reg-sc-number
        (error "Local non-descriptor register access?"))
       #+sb-simd-pack
-      ((#.sb-vm::sse-reg-sc-number #.sb-vm::int-sse-reg-sc-number)
+      ((#+x86-64 #.sb-vm::sse-reg-sc-number #+x86-64 #.sb-vm::int-sse-reg-sc-number
+        #+arm64 #.sb-vm::neon-reg-sc-number #+arm64 #.sb-vm::int-neon-reg-sc-number)
        (set-escaped-float-value simd-pack-int value))
       #+sb-simd-pack
-      ((#.sb-vm::single-sse-reg-sc-number)
+      ((#+x86-64 #.sb-vm::single-sse-reg-sc-number
+        #+arm64 #.sb-vm::single-neon-reg-sc-number)
        (set-escaped-float-value simd-pack-single value))
       #+sb-simd-pack
-      ((#.sb-vm::double-sse-reg-sc-number)
+      ((#+x86-64 #.sb-vm::double-sse-reg-sc-number
+        #+arm64 #.sb-vm::double-neon-reg-sc-number)
        (set-escaped-float-value simd-pack-double value))
       #+sb-simd-pack
-      ((#.sb-vm::int-sse-stack-sc-number)
-       (multiple-value-bind (a b) (%simd-pack-ub64s value)
-         (with-nfp (nfp)
-           (setf (sap-ref-64 nfp (number-stack-offset 0)) a
-                 (sap-ref-64 nfp (number-stack-offset 8)) b))))
-      #+sb-simd-pack
-      ((#.sb-vm::single-sse-stack-sc-number)
-       (multiple-value-bind (a b c d) (%simd-pack-singles value)
-         (with-nfp (nfp)
-           (setf (sap-ref-single nfp (number-stack-offset 0)) a
-                 (sap-ref-single nfp (number-stack-offset 4)) b
-                 (sap-ref-single nfp (number-stack-offset 8)) c
-                 (sap-ref-single nfp (number-stack-offset 12)) d))))
-      #+sb-simd-pack
-      ((#.sb-vm::double-sse-stack-sc-number)
-       (multiple-value-bind (a b) (%simd-pack-doubles value)
-         (with-nfp (nfp)
-           (setf (sap-ref-double nfp (number-stack-offset 0)) a
-                 (sap-ref-double nfp (number-stack-offset 8)) b))))
+      ((#+x86-64 #.sb-vm::single-sse-stack-sc-number
+        #+x86-64 #.sb-vm::int-sse-stack-sc-number
+        #+x86-64 #.sb-vm::double-sse-stack-sc-number
+        #+arm64 #.sb-vm::double-neon-stack-sc-number
+        #+arm64 #.sb-vm::single-neon-stack-sc-number
+        #+arm64 #.sb-vm::int-neon-stack-sc-number)
+       (with-nfp (nfp)
+         (setf (sb-vm::sap-ref-128 nfp (number-stack-offset 0)) (sb-vm::sap-ref-128 value 0))))
       #+sb-simd-pack-256
-      ((#.sb-vm::ymm-reg-sc-number #.sb-vm::int-avx2-reg-sc-number)
+      (#.sb-vm::int-avx2-reg-sc-number
        (set-escaped-float-value simd-pack-256-int value))
       #+sb-simd-pack-256
       ((#.sb-vm::single-avx2-reg-sc-number)
@@ -2721,33 +2757,13 @@
       ((#.sb-vm::double-avx2-reg-sc-number)
        (set-escaped-float-value simd-pack-256-double value))
       #+sb-simd-pack-256
-      ((#.sb-vm::int-avx2-stack-sc-number)
+      ((#.sb-vm::int-avx2-stack-sc-number #.sb-vm::single-avx2-stack-sc-number #.sb-vm::double-avx2-stack-sc-number)
        (with-nfp (nfp)
-         (multiple-value-bind (a b c d) (%simd-pack-256-ub64s value)
-           (setf (sap-ref-64 nfp (number-stack-offset 0)) a
-                 (sap-ref-64 nfp (number-stack-offset 8)) b
-                 (sap-ref-64 nfp (number-stack-offset 16)) c
-                 (sap-ref-64 nfp (number-stack-offset 24)) d))))
-      #+sb-simd-pack-256
-      ((#.sb-vm::single-avx2-stack-sc-number)
-       (multiple-value-bind (a b c d e f g h) (%simd-pack-256-singles value)
-         (with-nfp (nfp)
-           (setf (sap-ref-single nfp (number-stack-offset 0)) a
-                 (sap-ref-single nfp (number-stack-offset 4)) b
-                 (sap-ref-single nfp (number-stack-offset 8)) c
-                 (sap-ref-single nfp (number-stack-offset 12)) d
-                 (sap-ref-single nfp (number-stack-offset 16)) e
-                 (sap-ref-single nfp (number-stack-offset 20)) f
-                 (sap-ref-single nfp (number-stack-offset 24)) g
-                 (sap-ref-single nfp (number-stack-offset 28)) h))))
-      #+sb-simd-pack-256
-      ((#.sb-vm::double-avx2-stack-sc-number)
-       (multiple-value-bind (a b c d) (%simd-pack-256-doubles value)
-         (with-nfp (nfp)
-           (setf (sap-ref-double nfp (number-stack-offset 0)) a
-                 (sap-ref-double nfp (number-stack-offset 8)) b
-                 (sap-ref-double nfp (number-stack-offset 16)) c
-                 (sap-ref-double nfp (number-stack-offset 24)) d))))
+         (setf (sb-vm::sap-ref-256 nfp (number-stack-offset 0)) (sb-vm::sap-ref-256 value 0))))
+      #+sb-simd-pack-512
+      ((#.sb-vm::int-avx512-stack-sc-number #.sb-vm::single-avx512-stack-sc-number #.sb-vm::double-avx512-stack-sc-number)
+       (with-nfp (nfp)
+         (setf (sb-vm::sap-ref-512 nfp (number-stack-offset 0)) (sb-vm::sap-ref-512 value 0))))
       (#.single-reg-sc-number
        #-(or x86 x86-64) ;; don't have escaped floats.
        (set-escaped-float-value single-float value))
@@ -2790,16 +2806,18 @@
                (the single-float (realpart value)))))
       (#.complex-double-stack-sc-number
        (with-nfp (nfp)
-         (setf (sap-ref-double nfp (number-stack-offset))
-               #+(or x86 x86-64)
-               (realpart (the (complex double-float) value))
-               #-(or x86 x86-64)
-               (the double-float (realpart value)))
-         (setf (sap-ref-double nfp (number-stack-offset 8))
-               #+(or x86 x86-64)
-               (imagpart (the (complex double-float) value))
-               #-(or x86 x86-64)
-               (the double-float (realpart value)))))
+         (let ((offset (number-stack-offset #+stack-grows-downward-not-upward
+                                            (- sb-vm:n-word-bytes))))
+           (setf (sap-ref-double nfp offset)
+                 #+(or x86 x86-64)
+                 (realpart (the (complex double-float) value))
+                 #-(or x86 x86-64)
+                 (the double-float (realpart value)))
+           (setf (sap-ref-double nfp (+ offset 8))
+                 #+(or x86 x86-64)
+                 (imagpart (the (complex double-float) value))
+                 #-(or x86 x86-64)
+                 (the double-float (realpart value))))))
       #+long-float
       (#.complex-long-stack-sc-number
        (with-nfp (nfp)
@@ -2811,7 +2829,7 @@
                (the long-float (realpart value)))
          (setf (sap-ref-long
                 nfp (number-stack-offset #+sparc 4
-                                        #+(or x86 x86-64) 3))
+                                         #+(or x86 x86-64) 3))
                #+(or x86 x86-64)
                (imagpart (the (complex long-float) value))
                #-(or x86 x86-64)
@@ -3631,10 +3649,25 @@
                   (compiled-debug-fun-compiler-debug-fun
                    (breakpoint-what bpt))))
         (results nil))
+    #+tls-based-mv-return (declare (ignorable ocfp))
     (case returns
       (:standard
        (let ((nargs (boxed-context-register scp sb-vm::nargs-offset))
              (reg-arg-offsets '#.sb-vm::*register-arg-offsets*))
+         #+tls-based-mv-return
+         (let* ((misc (sb-vm::current-thread-offset-sap sb-vm::thread-breakpoint-misc-slot))
+                (mv-sap (if (zerop (sap-int misc))
+                            (sap+ (sb-thread::current-thread-sap)
+                                  (ash sb-vm::thread-mv-return-values-slot sb-vm:word-shift))
+                            misc)))
+           (dotimes (arg-num nargs)
+             (push (if reg-arg-offsets
+                       (boxed-context-register scp (pop reg-arg-offsets))
+                       (sap-ref-lispobj mv-sap
+                                        (ash (- arg-num sb-vm::register-arg-count)
+                                             sb-vm:word-shift)))
+                   results)))
+         #-tls-based-mv-return
          (dotimes (arg-num nargs)
            (push (if reg-arg-offsets
                      (boxed-context-register scp (pop reg-arg-offsets))

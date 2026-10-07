@@ -729,47 +729,46 @@ environment. The hash function must compute the same hash code for any two
 objects for which NAME returns true, and subsequent calls with already hashed
 objects must always return the same hash code.
 
-Note: The :HASH-FUNCTION keyword argument to MAKE-HASH-TABLE can be used to
-override the specified default hash-function.
+> _Note_: The :HASH-FUNCTION keyword argument to MAKE-HASH-TABLE can
+> be used to override the specified default hash-function.
 
 Attempting to define NAME in a locked package as hash-table test causes a
 package lock violation.
 
 Examples:
 
-  ;;; 1.
+```
+;; We want to use objects of type FOO as keys (by their
+;; names.) EQUALP would work, but would make the names
+;; case-insensitive -- which we don't want.
+(defstruct foo (name nil :type (or null string)))
 
-  ;; We want to use objects of type FOO as keys (by their
-  ;; names.) EQUALP would work, but would make the names
-  ;; case-insensitive -- which we don't want.
-  (defstruct foo (name nil :type (or null string)))
+;; Define an equivalence test function and a hash function.
+(defun foo-name= (f1 f2) (equal (foo-name f1) (foo-name f2)))
+(defun sxhash-foo-name (f) (sxhash (foo-name f)))
 
-  ;; Define an equivalence test function and a hash function.
-  (defun foo-name= (f1 f2) (equal (foo-name f1) (foo-name f2)))
-  (defun sxhash-foo-name (f) (sxhash (foo-name f)))
+(define-hash-table-test foo-name= sxhash-foo-name)
 
-  (define-hash-table-test foo-name= sxhash-foo-name)
+;; #'foo-name would work too.
+(defun make-foo-table () (make-hash-table :test 'foo-name=))
+```
 
-  ;; #'foo-name would work too.
-  (defun make-foo-table () (make-hash-table :test 'foo-name=))
+```
+(defun == (x y) (= x y))
 
-  ;;; 2.
+(define-hash-table-test ==
+  (lambda (x)
+    ;; Hash codes must be consistent with test, so
+    ;; not (SXHASH X), since
+    ;;   (= 1 1.0)                   => T
+    ;;   (= (SXHASH 1) (SXHASH 1.0)) => NIL
+    ;; Note: this doesn't deal with complex numbers or
+    ;; bignums too large to represent as double floats.
+    (sxhash (coerce x 'double-float))))
 
-  (defun == (x y) (= x y))
-
-  (define-hash-table-test ==
-    (lambda (x)
-      ;; Hash codes must be consistent with test, so
-      ;; not (SXHASH X), since
-      ;;   (= 1 1.0)                   => T
-      ;;   (= (SXHASH 1) (SXHASH 1.0)) => NIL
-      ;; Note: this doesn't deal with complex numbers or
-      ;; bignums too large to represent as double floats.
-      (sxhash (coerce x 'double-float))))
-
-  ;; #'== would work too
-  (defun make-number-table () (make-hash-table :test '==))
-"
+;; #'== would work too
+(defun make-number-table () (make-hash-table :test '==))
+```"
   (check-type name symbol)
   (if (member name '(eq eql equal equalp))
       (error "Cannot redefine standard hash table test ~S." name)
@@ -893,63 +892,75 @@ Examples:
                              (synchronized))
   "Create and return a new hash table. The keywords are as follows:
 
-  :TEST
-    Determines how keys are compared. Must a designator for one of the
-    standard hash table tests, or a hash table test defined using
-    SB-EXT:DEFINE-HASH-TABLE-TEST. Additionally, when an explicit
-    HASH-FUNCTION is provided (see below), any two argument equivalence
-    predicate can be used as the TEST.
+  - :TEST
 
-  :SIZE
-    A hint as to how many elements will be put in this hash table.
+      Determines how keys are compared. Must be a designator for one of
+      the standard hash table tests, or a hash table test defined
+      using SB-EXT:DEFINE-HASH-TABLE-TEST. Additionally, when an
+      explicit HASH-FUNCTION is provided (see below), any two argument
+      equivalence predicate can be used as the TEST.
 
-  :REHASH-SIZE
-    Indicates how to expand the table when it fills up. If an integer, add
-    space for that many elements. If a floating point number (which must be
-    greater than 1.0), multiply the size by that amount.
+  - :SIZE
 
-  :REHASH-THRESHOLD
-    Indicates how dense the table can become before forcing a rehash. Can be
-    any positive number <=1, with density approaching zero as the threshold
-    approaches 0. Density 1 means an average of one entry per bucket.
+      A hint as to how many elements will be put in this hash table.
 
-  :HASH-FUNCTION
-    If unsupplied, a hash function based on the TEST argument is used,
-    which then must be one of the standardized hash table test functions, or
-    one for which a default hash function has been defined using
-    SB-EXT:DEFINE-HASH-TABLE-TEST. If HASH-FUNCTION is specified, the TEST
-    argument can be any two argument predicate consistent with it. The
-    HASH-FUNCTION is expected to return a non-negative fixnum hash code.
-    If TEST is neither standard nor defined by DEFINE-HASH-TABLE-TEST,
-    then the HASH-FUNCTION must be specified.
+  - :REHASH-SIZE
 
-  :WEAKNESS
-    When :WEAKNESS is not NIL, garbage collection may remove entries from the
-    hash table. The value of :WEAKNESS specifies how the presence of a key or
-    value in the hash table preserves their entries from garbage collection.
+      Indicates how to expand the table when it fills up. If an
+      integer, add space for that many elements. If a floating point
+      number (which must be greater than 1.0), multiply the size by
+      that amount.
 
-    Valid values are:
+  - :REHASH-THRESHOLD
 
-      :KEY means that the key of an entry must be live to guarantee that the
-        entry is preserved.
+      Indicates how dense the table can become before forcing a
+      rehash. Can be any positive number <=1, with density approaching
+      zero as the threshold approaches 0. Density 1 means an average
+      of one entry per bucket.
 
-      :VALUE means that the value of an entry must be live to guarantee that
-        the entry is preserved.
+  - :HASH-FUNCTION
 
-      :KEY-AND-VALUE means that both the key and the value must be live to
+      If unsupplied, a hash function based on the TEST argument is
+      used, which then must be one of the standardized hash table test
+      functions, or one for which a default hash function has been
+      defined using SB-EXT:DEFINE-HASH-TABLE-TEST. If HASH-FUNCTION is
+      specified, the TEST argument can be any two argument predicate
+      consistent with it. The HASH-FUNCTION is expected to return a
+      non-negative fixnum hash code. If TEST is neither standard nor
+      defined by DEFINE-HASH-TABLE-TEST, then the HASH-FUNCTION must
+      be specified.
+
+  - :WEAKNESS
+
+      When :WEAKNESS is not NIL, garbage collection may remove entries
+      from the hash table. The value of :WEAKNESS specifies how the
+      presence of a key or value in the hash table preserves their
+      entries from garbage collection.
+
+      Valid values are:
+
+      - :KEY means that the key of an entry must be live to guarantee
+        that the entry is preserved.
+
+      - :VALUE means that the value of an entry must be live to
         guarantee that the entry is preserved.
 
-      :KEY-OR-VALUE means that either the key or the value must be live to
-        guarantee that the entry is preserved.
+      - :KEY-AND-VALUE means that both the key and the value must be
+        live to guarantee that the entry is preserved.
 
-      NIL (the default) means that entries are always preserved.
+      - :KEY-OR-VALUE means that either the key or the value must be
+        live to guarantee that the entry is preserved.
 
-  :SYNCHRONIZED
-    If NIL (the default), the hash-table may have multiple concurrent readers,
-    but results are undefined if a thread writes to the hash-table
-    concurrently with another reader or writer. If T, all concurrent accesses
-    are safe, but note that CLHS 3.6 (Traversal Rules and Side Effects)
-    remains in force. See also: SB-EXT:WITH-LOCKED-HASH-TABLE."
+      - NIL (the default) means that entries are always preserved.
+
+  - :SYNCHRONIZED
+
+      If NIL (the default), the hash-table may have multiple
+      concurrent readers, but results are undefined if a thread writes
+      to the hash-table concurrently with another reader or writer. If
+      T, all concurrent accesses are safe, but note that CLHS
+      3.6 (Traversal Rules and Side Effects) remains in force. See
+      also: SB-EXT:WITH-LOCKED-HASH-TABLE."
   (declare (type (or function symbol) test))
   (declare (type unsigned-byte size))
   (let* ((size (max +min-hash-table-size+
@@ -1965,7 +1976,9 @@ multiple threads accessing the same hash-table without locking."
             ;; have been cleared already in another thread.
             (when (or (/= (kv-vector-rehash-stamp old-kv-vector) initial-stamp)
                       (not (zerop (kv-vector-rehash-stamp new-kv-vector))))
-              (setq new-index-vector (make-index-vector new-n-buckets))))
+              (setq new-index-vector
+                    (allocating-for-hash-table (table)
+                      (make-index-vector new-n-buckets)))))
 
           ;; Preserve only the 'hashing' bit on the OLD-KV-VECTOR so that
           ;; its high-water-mark can meaningfully be reduced to 0 when done.

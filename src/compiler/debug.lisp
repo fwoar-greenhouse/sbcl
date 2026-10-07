@@ -27,6 +27,11 @@
 (defvar *seen-blocks*)
 (defvar *seen-funs*)
 
+(defvar *debug-print-types* nil)
+(defvar *debug-print-vop-temps* nil)
+#+sb-devel
+(defvar *debug-print-lvar-annotations* nil)
+
 ;;; Barf if NODE is in a block which wasn't reached during the graph
 ;;; walk.
 (defun check-node-reached (node)
@@ -428,7 +433,8 @@
      (let ((leaf (ref-leaf node)))
        (when (functional-p leaf)
          (if (functional-kind-eq leaf toplevel-xep)
-             (unless (component-toplevelish-p (block-component (node-block node)))
+             (unless (eq (component-kind (block-component (node-block node)))
+                         :toplevel)
                (barf ":TOPLEVEL-XEP ref in non-top-level component: ~S"
                      node))
              (check-fun-reached leaf node)))))
@@ -979,6 +985,10 @@
                :unknown))
       (format t "uv~D " (cont-num cont))
       (format t "v~D " (cont-num cont)))
+  #+sb-devel
+  (when (and *debug-print-lvar-annotations*
+             (lvar-annotations cont))
+    (format t "~a " (lvar-annotations cont)))
   (values))
 
 (defun print-lvar-stack (stack &optional (stream *standard-output*))
@@ -987,9 +997,6 @@
                    (eq (ir2-lvar-kind (lvar-info lvar)) :stack)
                    (cont-num lvar)
                    rest)))
-
-(defvar *debug-print-types* nil)
-(defvar *debug-print-vop-temps* nil)
 
 ;;; Print out the nodes in BLOCK in a format oriented toward
 ;;; representing what the code does.
@@ -1051,6 +1058,8 @@
            (loop for (index . target) in (jump-table-targets node)
                  do (format t "~a>" index)
                     (print-ctran (block-start target))))
+          (vop-jumper
+           (write-string "vop-jumper "))
           (bind
            (write-string "bind ")
            (print-leaf (bind-lambda node))
@@ -1186,6 +1195,15 @@
   (pprint-logical-block (*standard-output* nil)
     (princ (vop-name vop))
     (princ #\space)
+    (let ((node (vop-node vop)))
+      (cond ((bind-p node)
+             (princ (functional-debug-name (bind-lambda node)))
+             (princ #\Space))
+            ((combination-p node)
+             (when (and (member (combination-info node) '(:local :full))
+                        (vop-info-save-p (vop-info vop)))
+               (princ (combination-fun-debug-name node))
+               (pprint-newline :linear)))))
     (pprint-indent :current 0)
     (print-operands (vop-args vop))
     (when *debug-print-vop-temps*
@@ -1380,12 +1398,14 @@
   (or (and (listp showp) (member fun-name showp :test 'equal))
       (eq showp t)))
 
-(defun show-transform (kind name new-form &optional combination)
+(defvar *debug-print-transform* nil)
+
+(defun show-transform (kind name new-form &optional combination transform)
   (let ((*print-length* 100)
         (*print-level* 50)
         (*print-right-margin* 128)
         (*print-readably* nil))
-    (format *trace-output* "~&xform (~a) ~S~@[ -> ~S~]~% => ~S~%"
+    (format *trace-output* "~&xform (~a) ~S~@[ -> ~S~]~@[  ~s~]~% => ~S~%"
             kind
             (if combination
                 (cons name
@@ -1396,6 +1416,8 @@
                 name)
             (and combination
                  (type-specifier (node-derived-type combination)))
+            (when *debug-print-transform*
+              transform)
             new-form)))
 
 (defun show-type-derivation (combination type)
@@ -1429,7 +1451,7 @@ is replaced with replacement."
           when pos do (write-string replacement out)
             while pos)))
 
-(defun ir1-to-dot (component output-file)
+(defun ir1-to-dot (component output-file &key show-constraints)
   (with-open-file (stream output-file :if-exists :supersede
                                       :if-does-not-exist :create
                                       :direction :output)
@@ -1458,7 +1480,9 @@ is replaced with replacement."
                          (block-label block)
                          (replace-all
                           (replace-all (with-output-to-string (*standard-output*)
-                                         (print-nodes block))
+                                         (if show-constraints
+                                             (print-constraints block)
+                                             (print-nodes block)))
                                        (string #\Newline)
                                        "\\l")
                           "\""
@@ -1514,20 +1538,19 @@ is replaced with replacement."
     (format t "Not in set2~%")
     (print-conset diff2)))
 
-(defun print-constraints (component &optional kind)
-  (do-blocks (block component)
-    (handler-case (progn
-                    (terpri)
-                    (terpri)
-                    ;(print-conset (block-in block) kind)
-                    (print-nodes block)
-                    (let ((last (block-last block)))
-                      (cond ((if-p last)
-                             (format t "  CONSEQ~%")
-                             (print-conset (if-consequent-constraints last) kind)
-                             (format t "  ALT~%")
-                             (print-conset (if-alternative-constraints last) kind))
-                            (t
-                             (print-conset (block-out block) kind)))))
-      (error (condition)
-        (format t "~&~A...~%" condition)))))
+(defun print-constraints (block &optional kind)
+  (handler-case (progn
+                  (terpri)
+                  (terpri)
+                  (print-conset (block-in block) kind)
+                  (print-nodes block)
+                  (let ((last (block-last block)))
+                    (cond ((if-p last)
+                           (format t "  CONSEQ~%")
+                           (print-conset (if-consequent-constraints last) kind)
+                           (format t "  ALT~%")
+                           (print-conset (if-alternative-constraints last) kind))
+                          (t
+                           (print-conset (block-out block) kind)))))
+    (error (condition)
+      (format t "~&~A...~%" condition))))

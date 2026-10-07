@@ -54,6 +54,17 @@
     (let ((addr (get-lisp-obj-address x)))
       (< sb-vm:dynamic-space-start addr (sap-int (dynamic-space-free-pointer))))))
 
+#+system-tlabs
+(progn
+(declaim (inline sb-vm::force-to-heap-p))
+(defun sb-vm::force-to-heap-p (x)
+  (and (not (zerop (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-arena-slot))))
+       (or (dynamic-space-obj-p x)
+           ;; Saving a core may relocate any unboxed vector or 0-length simple-vector from
+           ;; dynamic into readonly space, therefore those must be thought of as equivalent
+           ;; in terms of their governance of a pending allocation going to the heap.
+           (read-only-space-obj-p x)))))
+
 (define-alien-variable ("TEXT_SPACE_START" sb-vm:text-space-start) sb-kernel::os-vm-size-t)
 
 #+(or x86-64 immobile-space)
@@ -66,14 +77,6 @@
 
 (declaim (inline memmove))
 (define-alien-routine ("memmove" memmove) void ; BUG: technically returns void*
-  (dest system-area-pointer)
-  (src system-area-pointer)
-  (n sb-unix::size-t))
-;;; The overhead of Lisp may make the distinction between memmove() and memcpy()
-;;; irrelevant, but we may as well promise that the ranges don't overlap when one
-;;; of them is a freshly consed string, for example.
-(declaim (inline memcpy))
-(define-alien-routine ("memcpy" memcpy) system-area-pointer
   (dest system-area-pointer)
   (src system-area-pointer)
   (n sb-unix::size-t))
@@ -95,11 +98,17 @@
 (declaim (maybe-inline get-errno))
 (define-alien-routine ("os_get_errno" get-errno) int)
 (setf (documentation 'get-errno 'function)
-      "Return the value of the C library pseudo-variable named \"errno\".")
+      "Return the value of the \\C library pseudo-variable named `errno`.
+
+Since in modern \\C libraries, `errno` is typically no longer a
+variable, but some bizarre artificial construct which behaves
+superficially like a variable within a given thread, it can no longer
+reliably be accessed through the ordinary DEFINE-ALIEN-VARIABLE
+mechanism.")
 
 (define-alien-routine ("os_set_errno" set-errno) void (new-errno int))
 (setf (documentation 'set-errno 'function)
-      "Set the C library pseudo-variable named \"errno\", for obscure syscalls.")
+      "Set the C library pseudo-variable named `\\errno` for obscure syscalls.")
 
 ;;; Decode errno into a string.
 #-win32

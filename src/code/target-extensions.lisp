@@ -66,7 +66,7 @@ order when SBCL process exits.
 
 Unused by SBCL itself: reserved for user and applications.
 
-Using (SB-EXT:EXIT :ABORT T), or calling exit(3) directly circumvents
+Using (SB-EXT:EXIT :ABORT T), or calling `exit(3)` directly circumvents
 these hooks.")
 
 (defun call-hooks (kind hooks &key (on-error :error))
@@ -203,7 +203,7 @@ unspecified."
                        :interactive
                        (lambda ()
                          (read-evaluated-form-of-type 'symbol))
-                       (values value :symbol)))))
+                       (return (values value :symbol))))))
        (go retry))))
 
 ;;;; Deprecating stuff

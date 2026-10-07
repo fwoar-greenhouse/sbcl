@@ -13,7 +13,6 @@
 
 ;;;; Allocator for the array header.
 (define-vop (make-array-header)
-  (:policy :fast-safe)
   (:translate make-array-header)
   (:args (type :scs (any-reg))
          (rank :scs (any-reg)))
@@ -49,7 +48,6 @@
 
 (define-vop ()
   (:translate array-rank)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
@@ -58,14 +56,12 @@
     ;; ASSUMPTION: n-widetag-bits = 8 and rank is adjacent to widetag
     (inst lbu res x #+little-endian (- 1 other-pointer-lowtag)
                     #+big-endian    (- 2 other-pointer-lowtag))
-    (inst nop)
     (inst addu res 1)
     (inst and res array-rank-mask)))
 
 ;;;; Bounds checking routine.
 (define-vop (check-bound)
   (:translate %check-bound)
-  (:policy :fast-safe)
   (:args (array :scs (descriptor-reg))
          (bound :scs (any-reg descriptor-reg))
          (index :scs (any-reg descriptor-reg)))
@@ -108,7 +104,6 @@
     vector-data-offset other-pointer-lowtag (descriptor-reg any-reg) * data-vector-ref)
   (define-vop (data-vector-set/simple-vector)
     (:translate data-vector-set)
-    (:policy :fast-safe)
     (:args (object :scs (descriptor-reg)) (index :scs (any-reg))
            (value :scs (descriptor-reg any-reg null zero)))
     (:arg-types simple-vector tagged-num *)
@@ -126,7 +121,6 @@
         (storew value ea 0 0))))
   (define-vop (data-vector-set/simple-vector-c)
     (:translate data-vector-set)
-    (:policy :fast-safe)
     (:args (object :scs (descriptor-reg)) (value :scs (descriptor-reg any-reg null zero)))
     (:temporary (:scs (non-descriptor-reg)) ea temp)
     (:info index)
@@ -182,7 +176,6 @@
        (define-vop (,(symbolicate "DATA-VECTOR-REF/" type))
          (:note "inline array access")
          (:translate data-vector-ref)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (index :scs (unsigned-reg)))
          (:arg-types ,type positive-fixnum)
@@ -207,7 +200,6 @@
            (inst sll value result n-fixnum-tag-bits)))
        (define-vop (,(symbolicate "DATA-VECTOR-REF-C/" type))
          (:translate data-vector-ref)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg)))
          (:arg-types ,type
                      (:constant
@@ -233,7 +225,6 @@
        (define-vop (,(symbolicate "DATA-VECTOR-SET/" type))
          (:note "inline array store")
          (:translate data-vector-set)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (index :scs (unsigned-reg) :target shift)
                 (value :scs (unsigned-reg zero immediate)))
@@ -271,7 +262,6 @@
                     other-pointer-lowtag))))
        (define-vop (,(symbolicate "DATA-VECTOR-SET-C/" type))
          (:translate data-vector-set)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (value :scs (unsigned-reg zero immediate)))
          (:arg-types ,type
@@ -325,7 +315,6 @@
 (define-vop (data-vector-ref/simple-array-single-float)
   (:note "inline array access")
   (:translate data-vector-ref)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg)))
   (:arg-types simple-array-single-float positive-fixnum)
@@ -336,13 +325,11 @@
     (inst addu lip object index)
     (inst lwc1 value lip
           (- (* vector-data-offset n-word-bytes)
-             other-pointer-lowtag))
-    (inst nop)))
+             other-pointer-lowtag))))
 
 (define-vop (data-vector-set/simple-array-single-float)
   (:note "inline array store")
   (:translate data-vector-set)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg))
          (value :scs (single-reg)))
@@ -357,7 +344,6 @@
 (define-vop (data-vector-ref/simple-array-double-float)
   (:note "inline array access")
   (:translate data-vector-ref)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg)))
   (:arg-types simple-array-double-float positive-fixnum)
@@ -383,13 +369,11 @@
        (inst lwc1-odd value lip
              (+ (- (* vector-data-offset n-word-bytes)
                    other-pointer-lowtag)
-                n-word-bytes))))
-    (inst nop)))
+                n-word-bytes))))))
 
 (define-vop (data-vector-set/simple-array-double-float)
   (:note "inline array store")
   (:translate data-vector-set)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg))
          (value :scs (double-reg)))
@@ -420,7 +404,6 @@
 (define-vop (data-vector-ref/simple-array-complex-single-float)
   (:note "inline array access")
   (:translate data-vector-ref)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg)))
   (:arg-types simple-array-complex-single-float positive-fixnum)
@@ -435,13 +418,11 @@
                                 other-pointer-lowtag)))
     (let ((imag-tn (complex-single-reg-imag-tn value)))
       (inst lwc1 imag-tn lip (- (* (1+ vector-data-offset) n-word-bytes)
-                                other-pointer-lowtag)))
-    (inst nop)))
+                                other-pointer-lowtag)))))
 
 (define-vop (data-vector-set/simple-array-complex-single-float)
   (:note "inline array store")
   (:translate data-vector-set)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg))
          (value :scs (complex-single-reg)))
@@ -461,7 +442,6 @@
 (define-vop (data-vector-ref/simple-array-complex-double-float)
   (:note "inline array access")
   (:translate data-vector-ref)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg) :target shift))
   (:arg-types simple-array-complex-double-float positive-fixnum)
@@ -477,13 +457,11 @@
                                 other-pointer-lowtag)))
     (let ((imag-tn (complex-double-reg-imag-tn value)))
       (ld-double imag-tn lip (- (* (+ vector-data-offset 2) n-word-bytes)
-                                other-pointer-lowtag)))
-    (inst nop)))
+                                other-pointer-lowtag)))))
 
 (define-vop (data-vector-set/simple-array-complex-double-float)
   (:note "inline array store")
   (:translate data-vector-set)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg) :target shift)
          (value :scs (complex-double-reg)))

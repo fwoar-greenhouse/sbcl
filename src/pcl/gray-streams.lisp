@@ -28,8 +28,8 @@
 (!def-stream-generic stream-element-type (stream)
   (:documentation
    "Return a type specifier for the kind of object returned by the
-  STREAM. The class FUNDAMENTAL-CHARACTER-STREAM provides a default method
-  which returns CHARACTER."))
+  STREAM. The class SB-GRAY:FUNDAMENTAL-CHARACTER-STREAM provides a
+  default method which returns CHARACTER."))
 
 (defmethod stream-element-type ((stream fundamental-character-stream))
   'character)
@@ -57,29 +57,40 @@
 (progn
   (!def-stream-generic input-stream-p (stream)
     (:documentation "Can STREAM perform input operations?"))
-
-  (defmethod input-stream-p ((stream fundamental-stream))
-    nil)
-
-  (defmethod input-stream-p ((stream fundamental-input-stream))
-    t))
+  (defmethod input-stream-p ((stream fundamental-stream)) nil)
+  (defmethod input-stream-p ((stream fundamental-input-stream)) t))
 
 (progn
   (!def-stream-generic interactive-stream-p (stream)
     (:documentation "Is STREAM an interactive stream?"))
-
-  (defmethod interactive-stream-p ((stream fundamental-stream))
-    nil))
+  (defmethod interactive-stream-p ((stream fundamental-stream)) nil))
 
 (progn
   (!def-stream-generic output-stream-p (stream)
     (:documentation "Can STREAM perform output operations?"))
-
-  (defmethod output-stream-p ((stream fundamental-stream))
-    nil)
-
-  (defmethod output-stream-p ((stream fundamental-output-stream))
-    t))
+  (defmethod output-stream-p ((stream fundamental-stream)) nil)
+  (defmethod output-stream-p ((stream fundamental-output-stream)) t))
+
+(progn
+  (!def-stream-generic binary-input-stream-p (stream)
+    (:documentation "Does STREAM perform binary input operations?"))
+  (defmethod binary-input-stream-p ((stream fundamental-stream)) nil)
+  (defmethod binary-input-stream-p ((stream fundamental-binary-input-stream)) t))
+(progn
+  (!def-stream-generic binary-output-stream-p (stream)
+    (:documentation "Does STREAM perform binary output operations?"))
+  (defmethod binary-output-stream-p ((stream fundamental-stream)) nil)
+  (defmethod binary-output-stream-p ((stream fundamental-binary-output-stream)) t))
+(progn
+  (!def-stream-generic character-input-stream-p (stream)
+    (:documentation "Does STREAM perform character input operations?"))
+  (defmethod character-input-stream-p ((stream fundamental-stream)) nil)
+  (defmethod character-input-stream-p ((stream fundamental-character-input-stream)) t))
+(progn
+  (!def-stream-generic character-output-stream-p (stream)
+    (:documentation "Does STREAM perform character output operations?"))
+  (defmethod character-output-stream-p ((stream fundamental-stream)) nil)
+  (defmethod character-output-stream-p ((stream fundamental-character-output-stream)) t))
 
 ;;; character input streams
 ;;;
@@ -114,9 +125,9 @@
 
 (defgeneric stream-peek-char (stream)
   (:documentation
-   "This is used to implement PEEK-CHAR; this corresponds to PEEK-TYPE of NIL.
-  It returns either a character or :EOF. The default method calls
-  STREAM-READ-CHAR and STREAM-UNREAD-CHAR."))
+   "This is used to implement PEEK-CHAR; this corresponds to `PEEK-TYPE`
+  of NIL. It returns either a character or :EOF. The default method
+  calls STREAM-READ-CHAR and STREAM-UNREAD-CHAR."))
 
 (defmethod stream-peek-char ((stream fundamental-character-input-stream))
   (let ((char (stream-read-char stream)))
@@ -218,7 +229,7 @@
    "Return the column number where the next character
   will be written, or NIL if that is not meaningful for this stream.
   The first column on a line is numbered 0. This function is used in
-  the implementation of PPRINT and the FORMAT ~T directive. For every
+  the implementation of PPRINT and the FORMAT `~T` directive. For every
   character output stream class that is defined, a method must be
   defined for this function, although it is permissible for it to
   always return NIL."))
@@ -271,7 +282,7 @@
 (defgeneric stream-terpri (stream)
   (:documentation
    "Writes an end of line, as for TERPRI. Returns NIL. The default
-  method does (STREAM-WRITE-CHAR stream #\NEWLINE)."))
+  method does (STREAM-WRITE-CHAR stream `#\\Newline`)."))
 
 (defmethod stream-terpri ((stream fundamental-character-output-stream))
   (stream-write-char stream #\Newline))
@@ -316,11 +327,12 @@
 (defgeneric stream-advance-to-column (stream column)
   (:documentation
    "Write enough blank space so that the next character will be
-  written at the specified column. Returns true if the operation is
-  successful, or NIL if it is not supported for this stream. This is
-  intended for use by by PPRINT and FORMAT ~T. The default method uses
-  STREAM-LINE-COLUMN and repeated calls to STREAM-WRITE-CHAR with a
-  #\SPACE character; it returns NIL if STREAM-LINE-COLUMN returns NIL."))
+   written at the specified column. Returns true if the operation is
+   successful, or NIL if it is not supported for this stream. This is
+   intended for use by by PPRINT and FORMAT `~T`. The default method
+   uses STREAM-LINE-COLUMN and repeated calls to STREAM-WRITE-CHAR
+   with a #\\SPACE character; it returns NIL if STREAM-LINE-COLUMN
+   returns NIL."))
 
 (defmethod stream-advance-to-column ((stream fundamental-character-output-stream)
                                      column)

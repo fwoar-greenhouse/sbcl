@@ -13,24 +13,27 @@
 
 ;;; Instruction-like macros.
 
-(defmacro move (dst src)
+(defmacro move (dst src &optional vector-size)
   "Move SRC into DST unless they are location=."
   (once-only ((n-dst dst)
               (n-src src))
     `(unless (location= ,n-dst ,n-src)
-       (inst mov ,n-dst ,n-src))))
+       (inst mov ,n-dst ,n-src ,@(when vector-size
+                                   `(,vector-size))))))
+
+(defmacro move-128 (dst src)
+  (once-only ((n-dst dst)
+              (n-src src))
+    `(unless (location= ,n-dst ,n-src)
+       (with-128-parts (lo-dst hi-dst ,n-dst lo-src hi-src ,n-src)
+         (inst mov lo-dst lo-src)
+         (inst mov hi-dst hi-src)))))
 
 (defmacro move-float (dst src)
   (once-only ((n-dst dst)
               (n-src src))
     `(unless (location= ,n-dst ,n-src)
        (inst fmov ,n-dst ,n-src))))
-
-(defmacro move-complex-double (dst src)
-  (once-only ((n-dst dst)
-              (n-src src))
-    `(unless (location= ,n-dst ,n-src)
-       (inst s-mov ,n-dst ,n-src))))
 
 (defun logical-mask (x)
   (cond ((encode-logical-immediate x)
@@ -252,7 +255,7 @@
        (when ,type-code
          (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
          ,@(and store-type-code
-                `((storew ,flag-tn ,result-tn 0 ,lowtag))))
+                `((storew ,flag-tn tmp-tn))))
        ,@body)))
 
 ;;;; Error Code
@@ -366,7 +369,6 @@
   `(define-vop (,name)
      ,@(when translate
          `((:translate ,translate)))
-     (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg unsigned-reg signed-reg immediate)))
      (:arg-types ,type tagged-num)
@@ -391,7 +393,6 @@
     ((data-vector-set/simple-vector %weakvec-set)
      `(define-vop (,name)
         (:translate ,translate)
-        (:policy :fast-safe)
         (:args (object :scs (descriptor-reg))
                (index :scs (any-reg unsigned-reg signed-reg immediate))
                (value :scs (,@scs zero)))
@@ -426,12 +427,13 @@
     (t
      `(define-vop (,name)
         (:translate ,translate)
-        (:policy :fast-safe)
         (:args (object :scs (descriptor-reg))
                (index :scs (any-reg unsigned-reg signed-reg immediate))
                (value :scs (,@scs ,(case el-type
                                      (double-float
-                                      '(double-immediate (eql (tn-value tn) 0d0)))
+                                      '(fp-immediate (eql (tn-value tn) 0d0)))
+                                     (complex-single-float
+                                      '(fp-immediate (eql (tn-value tn) #c(0f0 0f0))))
                                      (t
                                       'zero)))))
         (:arg-types ,type tagged-num ,el-type)
@@ -443,8 +445,8 @@
               '((when barrier
                   (emit-gengc-barrier object nil tmp-tn t))))
           ,@(case el-type
-              (double-float
-               '((when (sc-is value double-immediate)
+              ((double-float complex-single-float)
+               '((when (sc-is value fp-immediate)
                    (setf value zr-tn)))))
           (sc-case index
             (immediate
@@ -461,7 +463,6 @@
   `(define-vop (,name)
      ,@(when translate
          `((:translate ,translate)))
-     (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg unsigned-reg signed-reg immediate)))
      (:arg-types ,type tagged-num)
@@ -502,7 +503,7 @@
                                  &optional translate)
   (multiple-value-bind (immediate-sc immediate-value)
       (case el-type
-        (single-float (values 'single-immediate 0f0))
+        (single-float (values 'fp-immediate 0f0))
         (t (values 'immediate 0)))
     (let ((value `((value :scs (,@scs (,immediate-sc
                                        (eql (tn-value tn) ,immediate-value))))))
@@ -510,7 +511,6 @@
       `(define-vop (,name)
          ,@(when translate
              `((:translate ,translate)))
-         (:policy :fast-safe)
          (:args ,@(when setf-p
                     value)
                 (object :scs (descriptor-reg))
@@ -554,7 +554,10 @@
                               ,value (@ tmp-tn (- (* ,offset n-word-bytes) ,lowtag))))))))))))))
 
 (defun load-inline-constant (dst &rest constant-descriptor)
-  (inst load-from-label dst (cdr (apply #'register-inline-constant constant-descriptor))))
+  (let ((label (cdr (apply #'register-inline-constant constant-descriptor))))
+   (if (vectorp (car constant-descriptor))
+       (inst adr dst label)
+       (inst load-from-label dst label))))
 
 ;;;
 
@@ -581,6 +584,11 @@
   `(inst str ,reg (@ thread-tn ,(info :variable :wired-tls symbol)))
   #-sb-thread
   `(store-symbol-value ,reg ,symbol))
+
+#+tls-based-mv-return
+(defmacro thread-mv-count ()
+  ;; This is byte index 1 of thread_state_word
+  '(@ thread-tn (1+ (ash thread-state-word-slot word-shift))))
 
 ;;; Load constants, stack-values, reusing when possible
 (defmacro maybe-load (tn &optional (temp 'temp))
@@ -609,3 +617,14 @@
         (setf prev-constant nil)
         (load-stack-tn ,temp ,tn)
         ,temp))))
+
+(defun bic-mask (x)
+  (ldb (byte 64 0) (lognot x)))
+
+(defun stp-stack (a b stack &optional (fp cfp-tn) (tmp tmp-tn))
+  (let ((offset (tn-byte-offset stack)))
+    (cond ((ldp-stp-offset-p offset)
+           (inst stp a b (@ fp offset)))
+          (t
+           (inst str a (@ fp (load-store-offset offset tmp)))
+           (inst str b (@ fp (load-store-offset (+ offset 8) tmp)))))))

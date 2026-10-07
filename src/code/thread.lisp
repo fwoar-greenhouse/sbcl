@@ -24,8 +24,12 @@ any time."
 (setf (documentation '*current-thread* 'variable)
       "Bound in each thread to the thread itself.")
 
+#+bitpacked-mutex
+(progn (defmacro mutex-%owner (mu) `(owner-tid-from-word (mutex-%state ,mu)))
+       (defmacro owner-tid-from-word (word) `(ash ,word -32)))
+
 (defun mutex-value (mutex)
-  "Current owner of the mutex, NIL if the mutex is free. May return a
+  "Current owner of MUTEX, NIL if the mutex is free. May return a
 stale value, use MUTEX-OWNER instead."
   (mutex-owner-lookup (mutex-%owner mutex)))
 
@@ -46,29 +50,35 @@ stale value, use MUTEX-OWNER instead."
 ;;; representation so that on 32-bit builds we never cons when reading the slot.
 ;;; I'm not sure where consing was happening, but it did, which caused
 ;;; failure of the (:no-consing :mutex) test.
+#-bitpacked-mutex
+(progn
 (defmacro current-vmthread-id ()
   '(sb-ext:truly-the fixnum (%make-lisp-obj (current-thread-sap-int))))
 (defmacro vmthread-id->addr (x) `(get-lisp-obj-address ,x))
+)
 
 (declaim (inline holding-mutex-p))
 (defun holding-mutex-p (mutex)
   "Test whether the current thread is holding MUTEX."
   ;; This is about the only use for which a stale value of owner is
   ;; sufficient.
-  (= (mutex-%owner mutex) (current-vmthread-id)))
+  (= (mutex-%owner mutex) #+bitpacked-mutex (thread-os-tid *current-thread*)
+                          #-bitpacked-mutex (current-vmthread-id)))
 
-(declaim (inline mutex-owner))
 (defun mutex-owner (mutex)
-  "Current owner of the mutex, NIL if the mutex is free. Naturally,
+  "Current owner of MUTEX, NIL if the mutex is free. Naturally,
 this is racy by design (another thread may acquire the mutex after
 this function returns), it is intended for informative purposes. For
 testing whether the current thread is holding a mutex see
 HOLDING-MUTEX-P."
   ;; Make sure to get the current value.
-  (let ((vmthread (sb-ext:compare-and-swap (mutex-%owner mutex) 0 0)))
-    (cond ((= vmthread (current-vmthread-id)) *current-thread*)
-          ((= vmthread 0) nil)
-          (t (mutex-owner-lookup vmthread)))))
+  (barrier (:read))
+  (let ((self #+bitpacked-mutex (thread-os-tid *current-thread*)
+              #-bitpacked-mutex (current-vmthread-id))
+        (owner (mutex-%owner mutex)))
+    (cond ((= owner self) *current-thread*)
+          ((= owner 0) nil)
+          (t (mutex-owner-lookup owner)))))
 
 (defsetf mutex-value set-mutex-value)
 
@@ -188,10 +198,10 @@ HOLDING-MUTEX-P."
 and the MUTEX is not immediately available, sleep until it is available.
 
 If TIMEOUT is given, it specifies a relative timeout, in seconds, on how long
-the system should try to acquire the lock in the contested case.
+the system should try to acquire the lock in the contended case.
 
-If the mutex isn't acquired successfully due to either WAIT-P or TIMEOUT, the
-body is not executed, and WITH-MUTEX returns NIL.
+If the mutex isn't acquired successfully due to either WAIT-P or
+TIMEOUT, BODY is not executed, and WITH-MUTEX returns NIL.
 
 Otherwise body is executed with the mutex held by current thread, and
 WITH-MUTEX returns the values of BODY.
@@ -249,10 +259,10 @@ If WAIT-P is true (the default), and the MUTEX is not immediately available or
 held by the current thread, sleep until it is available.
 
 If TIMEOUT is given, it specifies a relative timeout, in seconds, on how long
-the system should try to acquire the lock in the contested case.
+the system should try to acquire the lock in the contended case.
 
-If the mutex isn't acquired successfully due to either WAIT-P or TIMEOUT, the
-body is not executed, and WITH-RECURSIVE-LOCK returns NIL.
+If the mutex isn't acquired successfully due to either WAIT-P or
+TIMEOUT, BODY is not executed, and WITH-RECURSIVE-LOCK returns NIL.
 
 Otherwise body is executed with the mutex held by current thread, and
 WITH-RECURSIVE-LOCK returns the values of BODY.

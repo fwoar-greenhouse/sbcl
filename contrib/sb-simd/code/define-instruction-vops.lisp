@@ -13,7 +13,8 @@
                         (associative sb-simd-internals:instruction-record-associative)
                         (prefix sb-simd-internals:instruction-record-prefix)
                         (suffix sb-simd-internals:instruction-record-suffix)
-                        (encoding sb-simd-internals:instruction-record-encoding))
+                        (encoding sb-simd-internals:instruction-record-encoding)
+                        (instruction-set sb-simd-internals:instruction-record-instruction-set))
            (sb-simd-internals:find-function-record instruction-record-name)
          (let* ((asyms (sb-simd-internals:prefixed-symbols "A" (length argument-records)))
                 (rsyms (sb-simd-internals:prefixed-symbols "R" (length result-records)))
@@ -23,7 +24,10 @@
                          (values ,@(mapcar #'sb-simd-internals:value-record-name result-records) &optional)
                          (,@(when (and always-translatable (not (eq encoding :fake-vop)))
                               '(always-translatable))
-                          ,@(when pure '(foldable flushable movable)))
+                          ,@(when pure
+                              (if (sb-simd-internals:instruction-set-available-p instruction-set)
+                                  '(foldable flushable movable)
+                                  '(flushable movable))))
                        :overwrite-fndb-silently t))
                 (arg-types
                   (mapcar #'sb-simd-internals:value-record-primitive-type argument-records))
@@ -52,7 +56,6 @@
                  ,defknown
                  (define-vop (,vop)
                    (:translate ,vop)
-                   (:policy :fast-safe)
                    (:args ,@args)
                    (:info ,@info)
                    (:results ,@results)
@@ -69,7 +72,6 @@
                    ,defknown
                    (define-vop (,vop)
                      (:translate ,vop)
-                     (:policy :fast-safe)
                      (:args (,@(first args) :target ,dst) ,@(rest args))
                      (:info ,@info)
                      (:results ,@results)
@@ -89,7 +91,6 @@
                    ,defknown
                    (define-vop (,vop)
                      (:translate ,vop)
-                     (:policy :fast-safe)
                      (:args (,@(first args) :target ,r) ,@(rest args))
                      (:temporary (:sc ,(first (sb-simd-internals:value-record-scs (first argument-records)))) tmp)
                      (:info ,@info)
@@ -118,7 +119,6 @@
                    ,defknown
                    (define-vop (,vop)
                      (:translate ,vop)
-                     (:policy :fast-safe)
                      (:args (,@(first args) :target ,r) (,@(second args) :to :save) (,@(third args) :target xmm0))
                      (:temporary (:sc ,(first (sb-simd-internals:value-record-scs (second argument-records)))
                                   :from (:argument 2) :to :save :offset 0) xmm0)
@@ -142,7 +142,6 @@
                    ,defknown
                    (define-vop (,vop)
                      (:translate ,vop)
-                     (:policy :fast-safe)
                      (:args (,@(first args) :target ,r) ,@(rest args))
                      (:temporary (:sc ,(first (sb-simd-internals:value-record-scs (first argument-records)))) tmp)
                      (:info ,@info)
@@ -162,7 +161,62 @@
                             (t
                              (move tmp ,x)
                              (inst ,mnemonic ,@prefix tmp ,y ,z ,@rest ,@suffix)
-                             (move ,r tmp))))))))))))
+                             (move ,r tmp))))))))
+             (:neon-rmw
+              (assert mnemonic)
+              (let ((x (first asyms))
+                    (y (second asyms))
+                    (rest (rest (rest asyms)))
+                    (r (first rsyms)))
+                `(progn
+                   ,defknown
+                   (define-vop (,vop)
+                     (:translate ,vop)
+                     (:args (,@(first args) :target ,r) ,@(loop for arg in (rest args) collect (append arg (list :to :save))))
+                     (:temporary (:sc ,(first (sb-simd-internals:value-record-scs (first argument-records)))) tmp)
+                     (:info ,@info)
+                     (:results ,@results)
+                     (:arg-types ,@arg-types)
+                     (:result-types ,@result-types)
+                     (:generator
+                      ,cost
+                      (cond ((location= ,x ,r)
+                             (inst ,mnemonic ,@prefix ,r ,y ,@rest ,@suffix))
+                            ((or (not (tn-p ,y))
+                                 (not (location= ,y ,r)))
+                             (inst mov ,r ,x :16b)
+                             (inst ,mnemonic ,@prefix ,r ,y ,@rest ,@suffix))
+                            (t
+                             (inst mov tmp ,x :16b)
+                             (inst ,mnemonic ,@prefix tmp ,y ,@rest ,@suffix)
+                             (inst mov ,r tmp :16b))))))))
+             (:neon-int-result
+              (assert mnemonic)
+              (let* ((result-ty (sb-simd-internals:value-record-type (first result-records)))
+                     (signedp (and (listp result-ty)
+                                   (eql (first result-ty) 'signed-byte)))
+                     (width (ecase (sb-simd-internals:value-record-bits (first result-records))
+                              (8 :b)
+                              (16 :h)
+                              (32 :s)
+                              (64 :d))))
+                `(progn
+                   ,defknown
+                   (define-vop (,vop)
+                     (:translate ,vop)
+                     (:args ,@args)
+                     (:temporary (:sc ,(first (sb-simd-internals:value-record-scs (first argument-records)))) tmp)
+                     (:info ,@info)
+                     (:results ,@results)
+                     (:arg-types ,@arg-types)
+                     (:result-types ,@result-types)
+                     (:generator
+                      ,cost
+                      (inst ,mnemonic ,@prefix tmp ,@asyms ,@suffix)
+                      ,(cond ((and signedp (not (eql width :d)))
+                              `(inst smov ,(first rsyms) tmp 0 ,width))
+                             (t
+                              `(inst umov ,(first rsyms) tmp 0 ,width))))))))))))
      (define-instruction-vops ()
        `(progn
           ,@(loop for instruction-record

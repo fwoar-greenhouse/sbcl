@@ -16,7 +16,7 @@
 #include "pseudo-atomic.h"
 #include "interrupt.h"
 #include "lispregs.h"
-#include "atomiclog.inc"
+#include "genesis/events.h"
 
 #ifdef LISP_FEATURE_SB_THREAD
 
@@ -123,8 +123,11 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
 #ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
     /* The stop signal was already processed by
        handle_foreign_call_trigger */
-    if (!atomic_load(&stopping_the_world))
+    if (!atomic_load(&stopping_the_world)) {
+        gc_assert(read_TLS(STOP_FOR_GC_PENDING, get_sb_vm_thread()) == NIL);
+        gc_assert(read_TLS(GC_PENDING, get_sb_vm_thread()) == NIL);
         return;
+    }
 #endif
 
     struct thread *thread = get_sb_vm_thread();
@@ -132,17 +135,17 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
     /* Test for GC_INHIBIT _first_, else we'd trap on every single
      * pseudo atomic until gc is finally allowed. */
     if (read_TLS(GC_INHIBIT,thread) != NIL) {
-        event0("stop_for_gc deferred for *GC-INHIBIT*");
+        event_StopDeferred_GCinhibit();
         write_TLS(STOP_FOR_GC_PENDING, LISP_T, thread);
         return;
     } else if (arch_pseudo_atomic_atomic(thread)) {
-        event0("stop_for_gc deferred for PA");
+        event_StopDeferred_PA();
         write_TLS(STOP_FOR_GC_PENDING, LISP_T, thread);
         arch_set_pseudo_atomic_interrupted(thread);
         maybe_save_gc_mask_and_block_deferrables(context);
         return;
     }
-    event0("stop_for_gc");
+    event_StopForGC();
 
     if (!thread->state_word.control_stack_guard_page_protected) {
         protect_control_stack_return_guard_page(0, thread);
@@ -171,7 +174,7 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
      * GC. GC_BLOCKED_DEFERRABLES is also left at 1. So let's tidy it
      * up. */
     if (thread_interrupt_data(thread).gc_blocked_deferrables) {
-        event0("cleaning up after gc_blocked_deferrables");
+        event_AfterGCblockedDeferrables();
         clear_pseudo_atomic_interrupted(thread);
         struct interrupt_data *interrupt_data = &thread_interrupt_data(thread);
         sigcopyset(os_context_sigmask_addr(context), &interrupt_data->pending_mask);
@@ -189,18 +192,28 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
     struct timespec t_beginpause;
     clock_gettime(CLOCK_MONOTONIC, &t_beginpause);
 #endif
-
+#if defined LISP_FEATURE_NONSTOP_FOREIGN_CALL && defined LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+    thread->control_stack_pointer = (lispobj*)*os_context_register_addr(context, reg_SP);
+#endif
     /* We say that the thread is "stopped" as of now, but the blocking operation
      * occurs below at thread_wait_until_not(STATE_STOPPED). Note that sem_post()
      * is expressly permitted in signal handlers, and set_thread_state uses it */
     set_thread_state(thread, STATE_STOPPED, 0);
-    event0("suspended");
+    event_Suspended();
 
     /* While waiting for gc to finish occupy ourselves with zeroing
      * the unused portion of the control stack to reduce conservatism.
      * On the platforms with threads and exact gc it is
      * actually a must. */
-    scrub_control_stack();
+#if defined LISP_FEATURE_NONSTOP_FOREIGN_CALL && defined LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+    /* It's coming from handle_foreign_call_trigger, which runs on the
+       altstack (being a memory fault). Instead of getting the right
+       RSP to scrub_thread_control_stack just don't worry about it,
+       the same thread won't be getting stuck on foreign exit forever,
+       a little imprecision is fine. */
+    if (signal != 0)
+#endif
+      scrub_thread_control_stack(thread);
 
     /* Now we wait on a semaphore, which, to be pedantic, is not specified as async-safe.
      * Normally the way to implement a "suspend" operation is to issue any blocking
@@ -219,7 +232,7 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
     sigdelset(os_context_sigmask_addr(context), SIG_STOP_FOR_GC);
 #endif
 
-    event0("resumed");
+    event_Resumed();
 
     /* The state can't go from STOPPED to DEAD because it's this thread is reading
      * its own state, hence it must be running.
@@ -269,9 +282,7 @@ handle_foreign_call_trigger (os_context_t *context, os_vm_address_t fault_addres
             else {
                 /* gc_stop_the_world has either already sent a signal
                    or will send it soon, wait for it. */
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-                th->control_stack_pointer = (lispobj*)*os_context_register_addr(context, reg_SP);
-#endif
+
                 /* sigsuspend appears to be broken on macOS, call the
                    handler directly and then ignore it outside of stop_the_world */
                 sig_stop_for_gc_handler(0, NULL, context);
@@ -419,7 +430,7 @@ void gc_stop_the_world()
 #ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
     atomic_store(&stopping_the_world, 0);
 #endif
-    event0("/gc_stop_the_world:end");
+    event_STW_end();
 }
 
 void gc_start_the_world()

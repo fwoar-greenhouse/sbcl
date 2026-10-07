@@ -175,7 +175,6 @@
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
-  (:policy :fast-safe)
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
@@ -186,7 +185,6 @@
 
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
-  (:policy :fast-safe)
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
@@ -231,7 +229,6 @@
 
 (define-vop (dealloc-number-stack-space)
   (:info amount)
-  (:policy :fast-safe)
   (:generator 0
     (unless (zerop amount)
       (let ((delta (logandc2 (+ amount +number-stack-alignment-mask+)
@@ -343,11 +340,10 @@
 
 (defoptimizer (sign-extend derive-type) ((x size))
   (when (sb-c:constant-lvar-p size)
-    (specifier-type `(signed-byte ,(sb-c:lvar-value size)))))
+    (make-numeric-type 'signed-byte (sb-c:lvar-value size))))
 
 (define-vop (sign-extend)
   (:translate sign-extend)
-  (:policy :fast-safe)
   (:args (val :scs (signed-reg)))
   (:arg-types signed-num (:constant fixnum))
   (:info size)

@@ -136,6 +136,7 @@ See SB-EXT:SEED-RANDOM-STATE for a SBCL extension to this functionality."
 for deterministic pseudo-random number generation.
 
 As per the Common Lisp standard for MAKE-RANDOM-STATE,
+
 - If STATE is NIL or not supplied, return a copy of the default
   *RANDOM-STATE*.
 - If STATE is a random state, return a copy of it.
@@ -145,8 +146,10 @@ As per the Common Lisp standard for MAKE-RANDOM-STATE,
 
 As a supported SBCL extension, we also support receiving as a seed an object
 of the following types:
+
 - (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (*))
 - UNSIGNED-BYTE
+
 While we support arguments of any size and will mix the provided bits into
 the random state, it is probably overkill to provide more than 256 bits worth
 of actual information.
@@ -156,8 +159,7 @@ This particular SBCL version also accepts an argument of the following type:
 
 This particular SBCL version uses the popular MT19937 PRNG algorithm, and its
 internal state only effectively contains about 19937 bits of information.
-http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
-"
+<http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html>"
   (declare (explicit-check))
   (named-let seed-random-state ((state state))
    (etypecase state

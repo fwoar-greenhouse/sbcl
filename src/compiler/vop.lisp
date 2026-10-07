@@ -244,7 +244,10 @@
   ;;
   ;; If this is :STACK, then this LVAR represents the stack pointer
   ;; used to undo stack allocation of dynamic extent objects.
-  (kind :fixed :type (member :delayed :fixed :unknown :unused :stack))
+  ;;
+  ;; :DIRECT means it's between (mv-call x (uknown-call))
+  (kind :fixed :type (member :delayed :fixed :unknown :unused :stack :pass-through
+                             :direct))
   ;; The primitive-type of the first value of this LVAR. This is
   ;; primarily for internal use during LTN, but it also records the
   ;; type restriction on delayed references. In multiple-value
@@ -675,7 +678,7 @@
   ;;    used by NLX entry vops.
   ;; -- If :COMPUTE-ONLY, just compute the save set, don't do any saving.
   ;;    This is used to get the live variables for debug info.
-  (save-p nil :type (member t nil :force-to-stack :compute-only))
+  (save-p nil :type (member t nil :force-to-stack :compute-only #+sb-simd-pack-512 :avx512))
   ;; info for automatic emission of move-arg VOPs by representation
   ;; selection. If NIL, then do nothing special. If non-null, then
   ;; there must be a more arg. Each more arg is moved to its passing
@@ -745,7 +748,10 @@
   (gc-barrier nil)
   (translate nil)
   ;; A bit mask of arguments for which this VOP checks the type
-  (check-type 0 :type fixnum))
+  (check-type 0 :type fixnum)
+  (boxing-variant nil :type (or null vop-info))
+  ;; Which args prefer the same tagging as the results?
+  (related-args -1 :type fixnum))
 (!set-load-form-method vop-info (:xc :target) :ignore-it)
 
 (declaim (inline vop-name))

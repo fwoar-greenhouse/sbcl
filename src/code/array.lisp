@@ -1297,7 +1297,7 @@ of specialized arrays is supported."
   (array-total-size array))
 
 (defun array-displacement (array)
-  "Return the values of :DISPLACED-TO and :DISPLACED-INDEX-offset
+  "Return the values of :DISPLACED-TO and :DISPLACED-INDEX-OFFSET
    options to MAKE-ARRAY, or NIL and 0 if not a displaced array."
   (declare (type array array))
   (if (and (array-header-p array) ; if unsimple and
@@ -1756,9 +1756,9 @@ vector. Multidimensional arrays, arrays with fill pointers, and adjustable
 arrays have an underlying storage vector with the same ARRAY-ELEMENT-TYPE as
 ARRAY, which this function returns.
 
-Important note: the underlying vector is an implementation detail. Even though
-this function exposes it, changes in the implementation may cause this
-function to be removed without further warning."
+> _Note_: the underlying vector is an implementation detail. Even
+> though this function exposes it, changes in the implementation may
+> cause this function to be removed without further warning."
   ;; KLUDGE: Without TRULY-THE the system is not smart enough to figure out that
   ;; the return value is always of the known type.
   (truly-the (simple-array * (*))

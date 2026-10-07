@@ -1,5 +1,3 @@
-;;; -*- lisp -*-
-;;;
 ;;; **********************************************************************
 ;;; This code was written by Paul Foley and has been placed in the public
 ;;; domain.
@@ -45,6 +43,20 @@
   (any-stream-instance-flags stream :input))
 
 (defmethod output-stream-p ((stream simple-stream))
+  (any-stream-instance-flags stream :output))
+
+(defmethod sb-int:binary-input-stream-p ((stream simple-stream))
+  (and (any-stream-instance-flags stream :input)
+       (not (any-stream-instance-flags stream :string))))
+
+(defmethod sb-int:binary-output-stream-p ((stream simple-stream))
+  (and (any-stream-instance-flags stream :output)
+       (not (any-stream-instance-flags stream :string))))
+
+(defmethod sb-int:character-input-stream-p ((stream simple-stream))
+  (any-stream-instance-flags stream :input))
+
+(defmethod sb-int:character-output-stream-p ((stream simple-stream))
   (any-stream-instance-flags stream :output))
 
 (defmethod open-stream-p ((stream simple-stream))

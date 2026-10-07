@@ -189,11 +189,11 @@
   (assert-type
      (lambda (y)
        (coerce "ab" y))
-     (or list (simple-array * (*)) sb-kernel:extended-sequence))
+     (or cons (simple-array * (2)) sb-kernel:extended-sequence))
   (assert-type
    (lambda (x y)
      (coerce (the function x) y))
-   (or function sequence))
+   (or list (simple-array * (*)) function sb-kernel:extended-sequence))
   (assert-type
    (lambda (x y)
      (coerce (the (and symbol (not null)) x) y))
@@ -219,4 +219,27 @@
   (assert-type
    (lambda (x n)
      (coerce n (if x 'single-float 'double-float)))
-   float))
+   float)
+  (assert-type
+   (lambda (n e)
+     (coerce n `(simple-array ,e (* *))))
+   (simple-array * (* *)))
+  (assert-type
+   (lambda (n e)
+     (coerce n `(array ,e (*))))
+   vector))
+
+(with-test (:name :coerce-excluded-types)
+  (assert-type
+   (lambda (x y)
+     (coerce (the (not real) x) y))
+   (not real))
+  (assert-type
+   (lambda (x y)
+     (coerce (the (not fixnum) x) y))
+   (not fixnum)))
+
+(with-test (:name :numbero-to-list-error)
+  (assert-error (coerce (opaque-identity 1)
+                        (opaque-identity 'list))
+                type-error))

@@ -452,6 +452,9 @@ with that condition (or with no condition) will be returned."
     (when (eq (%instance-ref condition i) 'dx-object-type)
       (return (%instance-ref condition (1+ i))))))
 
+#+sb-devel
+(defvar *check-type-error-consistency* nil)
+
 (defun make-condition (type &rest initargs)
   "Make an instance of a condition object using the specified initargs."
   ;; Note: While ANSI specifies no exceptional situations in this function,
@@ -484,6 +487,19 @@ with that condition (or with no condition) will be returned."
         (push (cons (condition-slot-name hslot)
                     (find-slot-default condition classoid hslot))
               (condition-assigned-slots condition))))
+
+    #+sb-devel
+    (when (and *check-type-error-consistency* (typep condition 'type-error))
+      (let* ((expected-type (type-error-expected-type condition))
+             (typecheckfun (compile nil `(lambda (x)
+                                           (declare (optimize safety))
+                                           (the ,expected-type x)))))
+        (handler-case
+            (let ((*check-type-error-consistency* nil))
+              (funcall typecheckfun (type-error-datum condition)))
+          (type-error ())
+          (:no-error (x)
+            (bug "DATUM ~S is of EXPECTED-TYPE ~S" x expected-type)))))
 
     condition))
 
@@ -622,9 +638,9 @@ with that condition (or with no condition) will be returned."
    report function from the specified PARENT-TYPEs. A slot spec is a list of:
      (slot-name :reader <rname> :initarg <iname> {Option Value}*
 
-   The DEFINE-CLASS slot options :ALLOCATION, :INITFORM, [slot] :DOCUMENTATION
-   and :TYPE and the overall options :DEFAULT-INITARGS and
-   [type] :DOCUMENTATION are also allowed.
+   The DEFCLASS slot options :ALLOCATION, :INITFORM, [slot]
+   :DOCUMENTATION and :TYPE and the overall options :DEFAULT-INITARGS
+   and [type] :DOCUMENTATION are also allowed.
 
    The :REPORT option is peculiar to DEFINE-CONDITION. Its argument is either
    a string or a two-argument lambda or function name. If a function, the
@@ -1317,6 +1333,10 @@ signalled when an operation on a symbol violates a package lock. The
 symbol that caused the violation is accessed by the function
 SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
 
+(setf (documentation #'package-locked-error-symbol t)
+      "Return the symbol that caused the SYMBOL-PACKAGE-LOCKED-ERROR
+      condition.")
+
 (define-condition undefined-alien-error (cell-error) ()
   (:report
    (lambda (condition stream)
@@ -1450,21 +1470,25 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
    (lambda (condition stream)
      (let ((sequence (slot-value condition 'sequence))
            (index (type-error-datum condition)))
-       (if (vectorp sequence)
-           (format stream "Invalid index ~D for ~S~@[ with fill-pointer ~D~]~
+       (cond ((integerp sequence)
+              (format stream "Invalid index ~d for a &rest list of length ~d."
+                      index sequence))
+             ((vectorp sequence)
+              (format stream "Invalid index ~D for ~S~@[ with fill-pointer ~D~]~
 ~@[, ~:@_should be a non-negative integer below ~D~]."
-                   index
-                   (type-of sequence)
-                   (and (array-has-fill-pointer-p sequence)
-                        (fill-pointer sequence))
-                   (let ((l (length sequence))) (if (> l 0) l)))
-           (format stream
-                   "The index ~D is too large for a ~a of length ~D."
-                   index
-                   (if (listp sequence)
-                       "list"
-                       "sequence")
-                   (length sequence)))))))
+                      index
+                      (type-of sequence)
+                      (and (array-has-fill-pointer-p sequence)
+                           (fill-pointer sequence))
+                      (let ((l (length sequence))) (if (> l 0) l))))
+             (t
+              (format stream
+                      "The index ~D is too large for a ~a of length ~D."
+                      index
+                      (if (listp sequence)
+                          "list"
+                          "sequence")
+                      (length sequence))))))))
 
 (define-condition bounding-indices-bad-error (reference-condition type-error)
   ((object :reader bounding-indices-bad-object :initarg :object))
@@ -1661,18 +1685,14 @@ stepped."))
                (step-condition-args condition)))))
   (:documentation "Condition signalled by code compiled with
 single-stepping information when about to execute a form.
-STEP-CONDITION-FORM holds the form, STEP-CONDITION-PATHNAME holds the
-pathname of the original file or NIL, and STEP-CONDITION-SOURCE-PATH
-holds the source-path to the original form within that file or NIL.
-Associated with this condition are always the restarts STEP-INTO,
-STEP-NEXT, and STEP-CONTINUE."))
+STEP-CONDITION-FORM holds the form. Associated with this condition are
+always the restarts STEP-INTO, STEP-NEXT, and STEP-CONTINUE."))
 
 (define-condition step-result-condition (step-condition)
   ((result :initarg :result :reader step-condition-result)))
 
 (setf (documentation 'step-condition-result 'function)
-      "Return values associated with STEP-VALUES-CONDITION as a list,
-or the variable value associated with STEP-VARIABLE-CONDITION.")
+      "Return values associated with STEP-VALUES-CONDITION as a list.")
 
 (define-condition step-values-condition (step-result-condition)
   ()

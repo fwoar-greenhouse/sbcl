@@ -87,6 +87,24 @@ otherwise evaluate ELSE and return its values. ELSE defaults to NIL."
                     (link-blocks start-block block))
                   collect (cons index block))))))
 
+(def-ir1-translator vop-jumper ((&rest targets) start next result)
+  (declare (inline make-vop-jumper))
+  (let ((node (make-vop-jumper)))
+    (link-node-to-previous-ctran node start)
+    (let ((start-block (ctran-block start)))
+      (setf (block-last start-block) node)
+      (setf (vop-jumper-default node)
+            (ctran-starts-block next))
+      (link-blocks start-block (vop-jumper-default node))
+      (loop for tag in targets
+            for (nil ctran) = (or (lexenv-find tag tags :test #'eql)
+                                  (compiler-error "attempt to GO to nonexistent tag: ~S"
+                                                  tag))
+            for block = (ctran-block ctran)
+            do
+            (unless (memq block (block-succ start-block))
+              (link-blocks start-block block))))))
+
 ;;; then or else can be already converted blocks
 (def-ir1-translator if-to-blocks ((test then &optional else) start next result)
   (flet ((to-block (x)
@@ -233,11 +251,12 @@ extent of the block."
 (def-ir1-translator tagbody ((&rest statements) start next result)
   "TAGBODY {tag | statement}*
 
-Define tags for use with GO. The STATEMENTS are evaluated in order, skipping
-TAGS, and NIL is returned. If a statement contains a GO to a defined TAG
-within the lexical scope of the form, then control is transferred to the next
-statement following that tag. A TAG must be an integer or a symbol. A
-STATEMENT must be a list. Other objects are illegal within the body."
+Define tags for use with GO. The `STATEMENT`s are evaluated in order,
+skipping TAGs, and NIL is returned. If a statement contains a GO to a
+defined TAG within the lexical scope of the form, then control is
+transferred to the next statement following that tag. A TAG must be an
+integer or a symbol. A `STATEMENT` must be a list. Other objects are
+illegal within the body."
   (let ((segments (and statements
                        (parse-tagbody statements))))
     (cond
@@ -410,9 +429,10 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
 (def-ir1-translator macrolet ((definitions &rest body) start next result)
   "MACROLET ({(name lambda-list form*)}*) body-form*
 
-Evaluate the BODY-FORMS in an environment with the specified local macros
-defined. NAME is the local macro name, LAMBDA-LIST is a DEFMACRO style
-destructuring lambda list, and the FORMS evaluate to the expansion."
+Evaluate `BODY-FORM`s in an environment with the specified local
+macros defined. NAME is the local macro name, LAMBDA-LIST is a
+DEFMACRO style destructuring lambda list, and the `FORM`s evaluate to
+the expansion."
   (funcall-in-macrolet-lexenv
    definitions
    (lambda (&optional funs)
@@ -452,8 +472,9 @@ destructuring lambda list, and the FORMS evaluate to the expansion."
     ((macrobindings &body body) start next result)
   "SYMBOL-MACROLET ({(name expansion)}*) decl* form*
 
-Define the NAMES as symbol macros with the given EXPANSIONS. Within the
-body, references to a NAME will effectively be replaced with the EXPANSION."
+Define the NAMEs as symbol macros with the given EXPANSIONs. Within
+the body, references to a NAME will effectively be replaced with the
+EXPANSION."
   (funcall-in-symbol-macrolet-lexenv
    macrobindings
    (lambda (&optional vars)
@@ -899,8 +920,8 @@ form to reference any of the previous VARS."
   "LOCALLY declaration* form*
 
 Sequentially evaluate the FORMS in a lexical environment where the
-DECLARATIONS have effect. If LOCALLY is a top level form, then the FORMS are
-also processed as top level forms."
+DECLARATIONs have effect. If LOCALLY is a top level form, then the
+FORMs are also processed as top level forms."
   (ir1-translate-locally body start next result))
 
 ;;;; FLET and LABELS
@@ -979,9 +1000,10 @@ also processed as top level forms."
                           start next result)
   "FLET ({(name lambda-list declaration* form*)}*) declaration* body-form*
 
-Evaluate the BODY-FORMS with local function definitions. The bindings do
-not enclose the definitions; any use of NAME in the FORMS will refer to the
-lexically apparent function definition in the enclosing environment."
+Evaluate the `BODY-FORM`s with local function definitions. The
+bindings do not enclose the definitions; any use of NAME in the
+`FORM`s will refer to the lexically apparent function definition in
+the enclosing environment."
   (multiple-value-bind (names defs forms decls)
       (parse-fletish definitions body 'flet)
     (let* ((fvars (mapcar (lambda (name def original)
@@ -1010,9 +1032,9 @@ lexically apparent function definition in the enclosing environment."
 (def-ir1-translator labels ((definitions &body body) start next result)
   "LABELS ({(name lambda-list declaration* form*)}*) declaration* body-form*
 
-Evaluate the BODY-FORMS with local function definitions. The bindings enclose
-the new definitions, so the defined functions can call themselves or each
-other."
+Evaluate the `BODY-FORM`s with local function definitions. The
+bindings enclose the new definitions, so the defined functions can
+call themselves or each other."
   (multiple-value-bind (names defs forms decls)
       (parse-fletish definitions body 'labels)
     (let* ((new-fenv
@@ -1298,7 +1320,9 @@ care."
                               (explode-setq source 'compiler-error))))
 
 ;;; This is kind of like REFERENCE-LEAF, but we generate a SET node.
-;;; This should only need to be called in SETQ.
+;;; This should only need to be called in SETQ. If VAR is a lambda var
+;;; and declared dynamic extent, we set the dynamic extent of VALUE to
+;;; a dynamic extent corresponding to the contour of the VAR's lambda.
 (defun setq-var (start next result var value)
   (declare (type ctran start next) (type (or lvar null) result)
            (type basic-var var)
@@ -1307,6 +1331,12 @@ care."
         (dest-lvar (make-lvar))
         (type (or (lexenv-find var type-restrictions)
                   (leaf-type var))))
+    (when (and (lambda-var-p var)
+               (leaf-dynamic-extent var))
+      (let ((dynamic-extent (bind-dynamic-extent
+                             (lambda-bind (lambda-var-home var)))))
+        (setf (lvar-dynamic-extent dest-lvar) dynamic-extent)
+        (push dest-lvar (dynamic-extent-values dynamic-extent))))
     (ir1-convert start dest-ctran dest-lvar (wrap-if (neq type *universal-type*)
                                                      `(the ,(type-specifier type))
                                                      value))

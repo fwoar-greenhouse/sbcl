@@ -47,7 +47,6 @@
 #include "pseudo-atomic.h"
 #include "interrupt.h"
 #include "lispregs.h"
-#include "atomiclog.inc"
 
 #ifdef LISP_FEATURE_SB_THREAD
 
@@ -784,7 +783,7 @@ static void detach_os_thread(init_thread_data *scribble)
 }
 
 #if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
-extern void funcall_alien_callback(lispobj arg1, lispobj arg2, lispobj arg0,
+extern void funcall_alien_callback(lispobj arg0, lispobj arg1, lispobj arg2,
                                    struct thread* thread)
   __attribute__((sysv_abi));
 #endif
@@ -815,7 +814,7 @@ callback_wrapper_trampoline(lispobj arg0, lispobj arg1, lispobj arg2)
     WITH_GC_AT_SAFEPOINTS_ONLY()
     {
 #if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
-        funcall_alien_callback(arg1, arg2, arg0, th);
+        funcall_alien_callback(arg0, arg1, arg2, th);
 #else
         funcall3(StaticSymbolFunction(ENTER_ALIEN_CALLBACK), arg0,arg1,arg2);
 #endif
@@ -901,7 +900,7 @@ void lispmutex_wake_waiter()
                      1 +
 #endif
         (int*)&m->uw_state;
-    *word = 0; // slam 0 in, meaning uncontested
+    *word = 0; // slam 0 in, meaning uncontended
     futex_wake(word, 1);
 }
 #endif

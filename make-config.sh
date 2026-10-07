@@ -555,7 +555,9 @@ echo "(lambda (features) (set-difference (union features (list :${sbcl_arch}$WIT
 
 # Automatically block sb-simd on non-x86 platforms, at least for now.
 case "$sbcl_arch" in
-    x86-64) ;; *) SBCL_CONTRIB_BLOCKLIST="$SBCL_CONTRIB_BLOCKLIST sb-simd" ;;
+    x86-64) ;;
+    arm64) ;;
+    *) SBCL_CONTRIB_BLOCKLIST="$SBCL_CONTRIB_BLOCKLIST sb-simd" ;;
 esac
 case "$sbcl_os" in
     linux) ;; *) SBCL_CONTRIB_BLOCKLIST="$SBCL_CONTRIB_BLOCKLIST sb-perf" ;;
@@ -733,7 +735,7 @@ case "$sbcl_arch" in
     fi
     ;;
   x86-64)
-    printf ' :sb-simd-pack :sb-simd-pack-256 :avx2' >> $ltf # not mandatory
+    printf ' :sb-simd-pack :sb-simd-pack-256 :avx2 :sb-simd-pack-512 :avx512' >> $ltf # not mandatory
 
     if $android; then
         $GNUMAKE -C tools-for-build avx2 2> /dev/null
@@ -751,6 +753,9 @@ case "$sbcl_arch" in
         printf ' :immobile-space' >> $ltf
     esac
     ;;
+  arm64)
+      printf ' :sb-simd-pack' >> $ltf # not mandatory
+      ;;
   ppc)
     if [ "$sbcl_os" = "darwin" ]; then
         # We provide a dlopen shim, so a little lie won't hurt
@@ -765,6 +770,16 @@ case "$sbcl_arch" in
     fi
     ;;
   ppc64)
+    # The ppc64 C calling convention is either ELFv1, which passes function
+    # pointers as 3-word descriptors, or ELFv2, which branches to the entry
+    # address directly.  This is a property of the toolchain, independent of
+    # endianness (ppc64le is always ELFv2; ppc64 big-endian may be either), so
+    # ask the C compiler which ABI it targets via its _CALL_ELF predefine
+    # (2 = ELFv2, 1 or undefined = ELFv1) and add :ppc64-elfv1 for the
+    # descriptor ABI.
+    if [ "`echo | ${CC:-cc} -E -dM - 2>/dev/null | grep -w _CALL_ELF | awk '{print $3}'`" != 2 ]; then
+        printf ' :ppc64-elfv1' >> $ltf
+    fi
    ;;
   riscv)
     if [ "$xlen" = "64" ]; then

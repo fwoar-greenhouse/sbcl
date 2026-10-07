@@ -46,6 +46,15 @@
           (unless (= result 0) (error "C execution failed")))))))
 
 (defparameter +genfile+ "generated-constants")
+
+(defun resolve-up-directory-components (pathname-directory)
+  (let ((result ()))
+    (dolist (c pathname-directory)
+      (if (eq c :up)
+          (pop result)
+          (push c result)))
+    (nreverse result)))
+
 (defun logicalize (path generated)
   (make-pathname :host "SYS"
                  :directory
@@ -53,8 +62,9 @@
                          (if generated
                              (list "OBJ" "FROM-SELF" "CONTRIB" *system*)
                              (list* "CONTRIB"
-                                    (append (last (pathname-directory *default-pathname-defaults*))
-                                            (cdr (pathname-directory path))))))
+                                    (resolve-up-directory-components
+                                     (append (last (pathname-directory *default-pathname-defaults*))
+                                             (cdr (pathname-directory path)))))))
                  :name (pathname-name path)
                  :type (pathname-type path)))
 
@@ -134,6 +144,8 @@
         ;; foreign-glue contains macros needed to compile the generated file
         (let ((*evaluator-mode* :compile)) (load "../sb-grovel/foreign-glue")))
       (let (wcu-warnings)
+        ;; SETQ is fine, we're going to exit this image soon enough
+        (setq sb-ext:*derive-function-types* t)
         (handler-bind (((and warning (not style-warning))
                         (lambda (c)
                           (unless (ignorable-warning-p c)
@@ -141,13 +153,15 @@
           (with-compilation-unit ()
             (loop for (generated-p stem) in (flattened-sources)
              do (let ((fasl
-                       (if (string= (pathname-type stem) "fasl")
-                           stem
-                           (multiple-value-bind (output warnings errors)
-                               (compile-file (logicalize stem generated-p)
-                                             :output-file (format nil "~A~A.fasl" objdir stem))
-                             (when (or warnings errors) (sb-sys:os-exit 1))
-                             output))))
+                        (if (string= (pathname-type stem) "fasl")
+                            stem
+                            (multiple-value-bind (output warnings errors)
+                                (compile-file
+                                 (logicalize stem generated-p)
+                                 :output-file (ensure-directories-exist
+                                               (merge-pathnames stem objdir)))
+                              (when (or warnings errors) (sb-sys:os-exit 1))
+                              output))))
                   (fasls fasl)
                   (load fasl)))))
         ;; Deferred warnings occur *after* exiting the W-C-U body.

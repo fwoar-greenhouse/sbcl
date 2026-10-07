@@ -363,8 +363,8 @@ static lispobj examine_threads(struct hopscotch_table* targets,
             }
         // Examine the binding stack
         *root_kind = BINDING_STACK;
-        where = (lispobj*)th->binding_stack_start;
-        end   = (lispobj*)get_binding_stack_pointer(th);
+        where = th->binding_stack_start;
+        end   = get_binding_stack_pointer(th);
         for( ; where < end ; where += 2)
             if (interestingp(*where, targets)) {
                 *root_thread = th;
@@ -966,9 +966,6 @@ __attribute__((unused)) static void add_to_roots(os_context_register_t word, voi
     // fprintf(stderr, "  reg %lx -> %p\n", word, obj);
     if (obj) hopscotch_put(arg, compute_lispobj(obj), 1);
 }
-
-extern void visit_context_registers(void (*proc)(os_context_register_t, void*),
-                                    os_context_t *context, void*);
 
 /* Return number of sought objects that had paths to them.
  * Return -1 for invalid input.

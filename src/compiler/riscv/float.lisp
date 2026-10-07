@@ -365,7 +365,6 @@
 (define-vop (float-op)
   (:args (x) (y))
   (:results (r))
-  (:policy :fast-safe)
   (:note "inline float arithmetic")
   (:vop-var vop)
   (:save-p :compute-only))
@@ -400,7 +399,6 @@
                 (:args (x :scs (,sc)))
                 (:results (y :scs (,sc)))
                 (:translate ,translate)
-                (:policy :fast-safe)
                 (:arg-types ,type)
                 (:result-types ,type)
                 (:note "inline float arithmetic")
@@ -419,7 +417,6 @@
                 (:args (x :scs (,sc)))
                 (:results (y :scs (,sc)))
                 (:translate ,name)
-                (:policy :fast-safe)
                 (:arg-types ,ptype)
                 (:result-types ,ptype)
                 (:note "inline float arithmetic")
@@ -436,7 +433,6 @@
   (:conditional)
   (:info target not-p)
   (:temporary (:scs (non-descriptor-reg)) temp)
-  (:policy :fast-safe)
   (:note "inline float comparison")
   (:vop-var vop)
   (:save-p :compute-only))
@@ -472,10 +468,12 @@
                         (inst beq temp zero-tn target)
                         (inst bne temp zero-tn target)))))))
   (frob < flt nil </single-float </double-float)
+  (frob quiet< flt nil quiet</single-float quiet</double-float)
   (frob <= fle nil <=/single-float <=/double-float)
   (frob > flt t >/single-float >/double-float)
   (frob >= fle t >=/single-float >=/double-float)
-  (frob = feq nil =/single-float =/double-float))
+  (frob = feq nil =/single-float =/double-float)
+  (frob quiet= feq nil quiet=/single-float quiet=/double-float))
 
 
 ;;;; Conversion:
@@ -487,7 +485,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types ,from-type)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -521,7 +518,6 @@
                 (:arg-types ,from-type)
                 (:result-types signed-num)
                 (:translate ,trans)
-                (:policy :fast-safe)
                 (:note "inline float round/truncate")
                 (:vop-var vop)
                 (:save-p :compute-only)
@@ -539,7 +535,6 @@
    (:arg-types signed-num)
    (:result-types single-float)
    (:translate make-single-float)
-   (:policy :fast-safe)
    (:generator 1
      (inst fmvx-> :single res bits)))
 
@@ -551,7 +546,6 @@
   (:arg-types signed-num unsigned-num)
   (:result-types double-float)
   (:translate make-double-float)
-  (:policy :fast-safe)
   (:generator 2
     (inst subi nsp-tn nsp-tn (* 2 n-word-bytes))
     (storew lo-bits nsp-tn 0)
@@ -568,7 +562,6 @@
   (:arg-types signed-num unsigned-num)
   (:result-types double-float)
   (:translate make-double-float)
-  (:policy :fast-safe)
   (:generator 2
     (inst slli temp hi-bits 32)
     (inst add temp temp lo-bits)
@@ -581,7 +574,6 @@
   (:arg-types signed-num)
   (:result-types double-float)
   (:translate %make-double-float)
-  (:policy :fast-safe)
   (:generator 2
     (inst fmvx-> :double res bits)))
 
@@ -593,7 +585,6 @@
   (:arg-types single-float)
   (:result-types signed-num)
   (:translate single-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 1
     (sc-case float
@@ -616,7 +607,6 @@
   (:result-types signed-num)
   (:translate double-float-bits)
   (:vop-var vop)
-  (:policy :fast-safe)
   (:generator 2
     (sc-case float
       (double-reg
@@ -635,7 +625,6 @@
   (:temporary (:sc non-descriptor-reg) temp)
   (:translate double-float-high-bits)
   (:vop-var vop)
-  (:policy :fast-safe)
   (:generator #-64-bit 2 #+64-bit 5
     (sc-case float
       (double-reg
@@ -662,7 +651,6 @@
   (:arg-types double-float)
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator #-64-bit 2 #+64-bit 5
     (sc-case float
@@ -692,7 +680,6 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate floating-point-modes)
-  (:policy :fast-safe)
   (:generator 3
     (inst csrr res :fcsr)))
 
@@ -702,7 +689,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:generator 3
     (inst csrw :fcsr new)
     (move res new)))
@@ -721,7 +707,6 @@
                :load-if (not (sc-is r complex-single-stack))))
   (:result-types complex-single-float)
   (:note "inline complex single-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -761,7 +746,6 @@
                :load-if (not (sc-is r complex-double-stack))))
   (:result-types complex-double-float)
   (:note "inline complex double-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -788,7 +772,6 @@
   (:results (r :scs (single-reg)))
   (:result-types single-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (sc-case x
@@ -830,7 +813,6 @@
   (:results (r :scs (double-reg)))
   (:result-types double-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (sc-case x

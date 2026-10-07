@@ -16,7 +16,6 @@
 
 (define-vop (make-array-header)
   (:translate make-array-header)
-  (:policy :fast-safe)
   (:args (type :scs (any-reg))
          (rank :scs (any-reg)))
   (:arg-types tagged-num tagged-num)
@@ -40,7 +39,7 @@
       (inst orr ndescr type (lsl ndescr array-rank-position))
       (inst lsr ndescr ndescr n-fixnum-tag-bits)
       ;; And store the header value.
-      (storew ndescr header 0 other-pointer-lowtag))
+      (storew ndescr tmp-tn))
     (move result header)))
 
 ;;;; Additional accessors and setters for the array header.
@@ -54,7 +53,6 @@
 
 (define-vop ()
   (:translate array-rank)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
@@ -65,7 +63,6 @@
 
 (define-vop ()
   (:translate array-rank=)
-  (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
   (:temporary (:scs (unsigned-reg)) x)
   (:info rank)
@@ -117,7 +114,6 @@
 ;;;; Bounds checking routine.
 (define-vop (check-bound)
   (:translate %check-bound)
-  (:policy :fast-safe)
   (:args (array :scs (descriptor-reg constant))
          (bound :scs (any-reg descriptor-reg)
                 :load-if (not (and (sc-is bound immediate)
@@ -253,7 +249,8 @@
   (partial simple-array-signed-byte-32 tagged-num :word t signed-reg)
 
   (partial simple-array-single-float single-float :single-float nil single-reg)
-  (full simple-array-double-float double-float double-reg))
+  (full simple-array-double-float double-float double-reg)
+  (full simple-array-complex-single-float complex-single-float complex-single-reg))
 
 ;;; Integer vectors whose elements are smaller than a byte.  I.e. bit, 2-bit,
 ;;; and 4-bit vectors.
@@ -264,7 +261,6 @@
        (define-vop (,(symbolicate "DATA-VECTOR-REF/" type))
          (:note "inline array access")
          (:translate data-vector-ref)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (index :scs (unsigned-reg) :to :save))
          (:arg-types ,type positive-fixnum)
@@ -294,7 +290,6 @@
        (define-vop (,(symbolicate "DATA-VECTOR-REF/" type "-C"))
          (:note "inline array access")
          (:translate data-vector-ref)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg)))
          (:info index)
          (:arg-types ,type (:constant index))
@@ -311,7 +306,6 @@
        (define-vop (,(symbolicate "DATA-VECTOR-SET/" type "-C"))
          (:note "inline array store")
          (:translate data-vector-set)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (value :scs (unsigned-reg)
                        :load-if (not (and (sc-is value immediate)
@@ -341,7 +335,6 @@
        (define-vop (,(symbolicate "DATA-VECTOR-SET/" type))
          (:note "inline array store")
          (:translate data-vector-set)
-         (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (index :scs (unsigned-reg)
                        ,@(unless (= bits 1)
@@ -395,7 +388,6 @@
   (def-small-data-vector-frobs simple-array-unsigned-byte-4 4))
 
 (define-vop (data-vector-ref/simple-bit-vector-eq)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg)) (index :scs (unsigned-reg)))
   (:arg-types simple-bit-vector positive-fixnum)
   (:conditional :eq)
@@ -408,7 +400,6 @@
     (inst tst x 1)))
 
 (define-vop (data-vector-ref/simple-bit-vector-c-eq)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg)))
   (:info index)
   (:arg-types simple-bit-vector (:constant index))
@@ -424,69 +415,56 @@
 
 ;;; Complex float arrays.
 
-(define-vop (data-vector-ref/simple-array-complex-single-float)
-  (:note "inline array access")
-  (:translate data-vector-ref)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg) :to :result)
-         (index :scs (any-reg)))
-  (:arg-types simple-array-complex-single-float positive-fixnum)
-  (:results (value :scs (complex-single-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:result-types complex-single-float)
-  (:generator 5
-    (inst lsl offset index (- word-shift n-fixnum-tag-bits))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                              other-pointer-lowtag))
-    (inst ldr value (@ object offset))))
-
-(define-vop (data-vector-set/simple-array-complex-single-float)
-  (:note "inline array store")
-  (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg) :to :result)
-         (index :scs (any-reg))
-         (value :scs (complex-single-reg)))
-  (:arg-types simple-array-complex-single-float positive-fixnum
-              complex-single-float)
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:generator 5
-    (inst lsl offset index (- word-shift n-fixnum-tag-bits))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst str value (@ object offset))))
 
 (define-vop (data-vector-ref/simple-array-complex-double-float)
-  (:note "inline array access")
   (:translate data-vector-ref)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg) :to :result)
-         (index :scs (any-reg)))
-  (:arg-types simple-array-complex-double-float positive-fixnum)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg unsigned-reg signed-reg immediate)))
+  (:arg-types simple-array-complex-double-float tagged-num)
   (:results (value :scs (complex-double-reg)))
   (:result-types complex-double-float)
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:generator 7
-    (inst lsl offset index (1+ (- word-shift n-fixnum-tag-bits)))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst ldr value (@ object offset))))
+  (:generator 5
+    (sc-case index
+      (immediate
+       (inst ldr value
+             (@ object
+                (load-store-offset
+                 (- (+ (ash vector-data-offset word-shift)
+                       (ash (tn-value index) (1+ word-shift)))
+                    other-pointer-lowtag)))))
+      (t
+       (inst add tmp-tn object
+             (lsl index
+                  (1+ (- word-shift
+                         (if (sc-is index any-reg)
+                             n-fixnum-tag-bits
+                             0)))))
+       (loadw value tmp-tn vector-data-offset other-pointer-lowtag)))))
 
 (define-vop (data-vector-set/simple-array-complex-double-float)
-  (:note "inline array store")
   (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg) :to :result)
-         (index :scs (any-reg))
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg unsigned-reg signed-reg immediate))
          (value :scs (complex-double-reg)))
-  (:arg-types simple-array-complex-double-float positive-fixnum
+  (:arg-types simple-array-complex-double-float tagged-num
               complex-double-float)
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
+  (:vop-var vop)
   (:generator 5
-    (inst lsl offset index (1+ (- word-shift n-fixnum-tag-bits)))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst str value (@ object offset))))
+    (sc-case index
+      (immediate
+       (inst str value
+             (@ object
+                (load-store-offset
+                 (- (+ (ash vector-data-offset word-shift)
+                       (ash (tn-value index) (1+ word-shift)))
+                    other-pointer-lowtag)))))
+      (t
+       (let ((unshift
+               (if (sc-is index any-reg)
+                   n-fixnum-tag-bits
+                   0)))
+         (inst add tmp-tn object (lsl index (1+ (- word-shift unshift)))))
+       (storew value tmp-tn vector-data-offset other-pointer-lowtag)))))
 
 ;;; These vops are useful for accessing the bits of a vector irrespective of
 ;;; what type of vector it is.
@@ -503,21 +481,18 @@
 
 (define-vop (%compare-and-swap-svref word-index-cas)
   (:note "inline array compare-and-swap")
-  (:policy :fast-safe)
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate %compare-and-swap-svref)
   (:arg-types simple-vector positive-fixnum * *))
 
 (define-vop (%compare-and-swap-svref-v8.1 word-index-cas-v8.1)
   (:note "inline array compare-and-swap")
-  (:policy :fast-safe)
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate %compare-and-swap-svref)
   (:arg-types simple-vector positive-fixnum * *))
 
 (define-vop (array-atomic-incf/word)
   (:translate %array-atomic-incf/word)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg) :target offset)
          (diff :scs (unsigned-reg)))
@@ -543,7 +518,6 @@
 
 (define-vop (array-atomic-incf/word-v8.1)
   (:translate %array-atomic-incf/word)
-  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg) :target offset)
          (diff :scs (unsigned-reg)))

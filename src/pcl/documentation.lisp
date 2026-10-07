@@ -216,7 +216,12 @@
                 (t
                  x)))
         (documentation (call-next-method)))
-    (maybe-add-deprecation-note namespace name documentation)))
+    (maybe-add-deprecation-note namespace name
+                                #+sb-doc
+                                (normalize-sbcl-docstring x name doc-type
+                                                          documentation)
+                                #-sb-doc
+                                documentation)))
 
 ;;; functions, macros, and special forms
 
@@ -231,7 +236,8 @@
                        ((and (symbolp name) (special-operator-p name))
                         (fdefinition name))
                        ((and (symbolp name) (macro-function name)))
-                       ((fdefinition name))))))))
+                       ((fdefinition name)
+                        (sb-ext:unencapsulated-function name))))))))
 
   (defmethod documentation ((x function) (doc-type (eql 't)))
     (fun-doc x))
@@ -405,25 +411,48 @@
     (new-value (slotd standard-slot-definition) (doc-type (eql 't)))
   (setf (slot-value slotd '%documentation) (canonical-docstring new-value)))
 
+;;; declarations
+(defmethod documentation ((x symbol) (doc-type (eql 'declaration)))
+  (values (info :declaration :documentation x)))
+
+(defmethod (setf documentation) (new-value (x symbol)
+                                 (doc-type (eql 'declaration)))
+  (if new-value
+      (setf (info :declaration :documentation x) new-value)
+      (clear-info :declaration :documentation x)))
+
 ;;; Now that we have created the machinery for setting documentation, we can
 ;;; set the documentation for the machinery for setting documentation.
 (setf (documentation 'documentation 'function)
-      "Return the documentation string of Doc-Type for X, or NIL if none
-exists. System doc-types are VARIABLE, FUNCTION, STRUCTURE, TYPE, SETF, and T.
+      "Return the documentation string of DOC-TYPE for OBJECT,
+or NIL if none exists. In addition to the DOC-TYPEs and methods
+required by ANSI, SBCL's DOCUMENTATION (and its SETF) supports methods
+with the following signatures:
+
+- `(OBJECT SYMBOL) (DOC-TYPE (EQL DECLARATION))`
+
+- `(OBJECT SB-MOP:SLOT-DEFINITION) (DOC-TYPE (EQL T))`
+
+Since CONDITIONs are implemented as classes in SBCL, the following
+also work:
+
+- `(OBJECT CONDITION) (DOC-TYPE (EQL T))`
+
+- `(OBJECT CONDITION) (DOC-TYPE (EQL 'TYPE))`
 
 Function documentation is stored separately for function names and objects:
 DEFUN, LAMBDA, &co create function objects with the specified documentation
 strings.
 
- \(SETF (DOCUMENTATION NAME 'FUNCTION) STRING)
+    (setf (documentation name 'function) string)
 
 sets the documentation string stored under the specified name, and
 
- \(SETF (DOCUMENTATION FUNC T) STRING)
+    (setf (documentation func t) string)
 
 sets the documentation string stored in the function object.
 
- \(DOCUMENTATION NAME 'FUNCTION)
+    (documentation name 'function)
 
 returns the documentation stored under the function name if any, and
 falls back on the documentation in the function object if necessary.")
@@ -443,3 +472,234 @@ comparison.")
 
 (dolist (args (prog1 *!docstrings* (makunbound '*!docstrings*)))
   (apply #'(setf documentation) args))
+
+
+;;;; We NORMALIZE-SBCL-DOCSTRINGs at run-time to support interactive
+;;;; docstring authoring (see SB-MANUAL).
+
+#+sb-doc
+(locally (declare (optimize space))
+
+(defvar *normalize-sbcl-docstrings* t)
+
+;;; To reduce the core size, we aggressively inline functions with one
+;;; or two uses.
+(declaim (inline non-setf-name))
+(defun non-setf-name (name)
+  (if (and (consp name)
+           (eq (first name) 'setf)
+           (consp (cdr name)))
+      (second name)
+      name))
+
+(defun sbcl-package-name-p (name)
+  (when (stringp name)
+    (or (string= name "COMMON-LISP")
+        (and (>= (length name) 3)
+             (string= name "SB-" :end1 3)))))
+
+(declaim (inline sbcl-definition-name-p))
+(defun sbcl-definition-name-p (object name doc-type)
+  (and (member doc-type '(t compiler-macro function method-combination setf
+                          structure type variable declaration))
+       (if (and (packagep object) (eq doc-type t))
+           (sbcl-package-name-p (package-name name))
+           (let ((name (non-setf-name name)))
+             (if (null name)
+                 (null object)
+                 (when (symbolp name)
+                   (let ((package (symbol-package name)))
+                     (when package
+                       (sbcl-package-name-p (package-name package))))))))))
+
+;;; Strip markup intended for documentation generation from the
+;;; docstrings of SBCL definitions, and remove indentation from the
+;;; docstrings.
+(defun normalize-sbcl-docstring (object name doc-type docstring)
+  (if (and *normalize-sbcl-docstrings*
+           docstring
+           (sbcl-definition-name-p object name doc-type))
+      (string-right-trim '(#\Newline) (markdown-to-plain-text
+                                       (reindent-docstring docstring)))
+      docstring))
+
+
+;;; Return the number of leading WHITESPACEP characters in LINE or NIL
+;;; if LINE is NIL or blank.
+(defun indentation (line)
+  (position-if-not #'whitespacep line))
+
+;;; Return the minimum number of leading whitespace characters in
+;;; non-blank lines. Ignore the first line.
+(declaim (inline docstring-indentation))
+(defun docstring-indentation (docstring)
+  (with-input-from-string (s docstring)
+    (read-line s nil nil)
+    (loop for line = (read-line s nil nil)
+          while line
+          ;; This relies on MINIMIZE returning 0 if it is not
+          ;; evaluated at all.
+          when (indentation line)
+            minimize it)))
+
+(declaim (inline strip-docstring-indent))
+(defun strip-docstring-indent (docstring indentation)
+  (declare (type fixnum indentation))
+  (with-output-to-string (out)
+    (with-input-from-string (s docstring)
+      (loop for first = t then nil
+            do (multiple-value-bind (line missing-newline-p)
+                   (read-line s nil nil)
+                 (unless line
+                   (return))
+                 (write-string line out
+                               :start (if first
+                                          0
+                                          (min (length line) indentation)))
+                 (unless missing-newline-p
+                   (terpri out)))))))
+
+;;; Normalize docstring indentation by stripping the longest run of
+;;; leading spaces common to all non-blank lines except the first.
+;;;
+;;; If all our docstrings were indented the same way, this could be
+;;; moved to SB-MANUAL, reducing the core size.
+(defun reindent-docstring (docstring)
+  (let ((indent (docstring-indentation docstring)))
+    (strip-docstring-indent docstring indent)))
+
+;;;; A Markdown to plain text converter along the lines of
+;;;; SB-MANUAL::MARKDOWN-TO-TEXINFO but supports only what's
+;;;; absolutely needed for SBCL docstrings.
+
+(defun string-lines (string)
+  (coerce (with-input-from-string (s string)
+            (loop for line = (read-line s nil nil)
+                  while line
+                  collect line))
+          'vector))
+
+(defun whitespacep (char)
+  (find char '(#\Tab #\Space #\Page #\Newline #\Return)))
+
+(defun blankp (line)
+  (null (indentation line)))
+
+(defun write-md-paragraph (reversed-lines out)
+  (when reversed-lines
+    (let* ((str (format nil "~{~A~^~%~}" (reverse reversed-lines)))
+           (len (length str))
+           (bound t))
+      (loop for i below len
+            for c = (char str i)
+            do (cond
+                 ((and bound (char= c #\\))
+                  (when (and (< (1+ i) len)
+                             (char= (char str (1+ i)) #\\))
+                    (incf i))
+                  (setf bound nil))
+                 ((char= c #\`)
+                  (incf i)
+                  (loop repeat 2
+                        while (< i len)
+                        while (char= (char str i) #\\)
+                        do (incf i))
+                  (loop while (< i len)
+                        while (char/= (char str i) #\`)
+                        do (write-char (char str i) out)
+                           (incf i))
+                  (setq bound nil))
+                 (t
+                  (write-char c out)
+                  (setq bound (whitespacep c)))))
+      (terpri out))))
+
+(declaim (inline write-md-fenced-code))
+(defun write-md-fenced-code (lines start base-indent out flush-fn)
+  (declare (ignore base-indent))
+  (let* ((line (svref lines start))
+         (indent (indentation line)))
+    (when (and indent (>= (length line) (+ indent 3))
+               (string= line "```" :start1 indent :end1 (+ indent 3)))
+      (funcall flush-fn)
+      (loop for l from (1+ start) below (length lines)
+            for line = (svref lines l)
+            for indent = (indentation line)
+            if (and indent (>= (length line) (+ indent 3))
+                    (string= line "```" :start1 indent :end1 (+ indent 3)))
+              do (return (- (1+ l) start))
+            else do (write-line line out)
+            finally (return (- l start))))))
+
+(declaim (inline write-md-indented-code))
+(defun write-md-indented-code (lines start base-indent out flush-fn)
+  (when (or (zerop start)
+            (blankp (svref lines (1- start))))
+    (let ((indent (indentation (svref lines start))))
+      (when (and indent (>= indent (+ base-indent 4)))
+        (funcall flush-fn)
+        (loop for l from start below (length lines)
+              for line = (svref lines l)
+              for indent = (indentation line)
+              while (or (null indent)
+                        (>= indent (+ base-indent 4)))
+              do (write-line line out)
+              finally (return (- l start)))))))
+
+(declaim (inline write-md-itemize))
+(defun write-md-itemize (lines start base-indent out flush-fn)
+  (flet ((maybe-itemize-offset (line)
+           (let ((indent (indentation line)))
+             (when (and indent (< (1+ indent) (length line))
+                        (find (char line indent) "-*")
+                        (char= (char line (1+ indent)) #\Space))
+               indent))))
+    (when (eql (maybe-itemize-offset (svref lines start)) base-indent)
+      (funcall flush-fn)
+      (let ((child (+ base-indent 4))
+            (buf nil))
+        (labels ((flush ()
+                   (write-md-paragraph buf out)
+                   (setq buf nil)))
+          (loop for l from start below (length lines)
+                for line = (svref lines l)
+                for indent = (indentation line)
+                do (cond ((null indent)
+                          (flush)
+                          (write-line line out))
+                         ((eql (maybe-itemize-offset line) base-indent)
+                          (flush)
+                          (push line buf))
+                         ((>= indent child)
+                          (let ((n (write-md-block lines l child out #'flush)))
+                            (if n
+                                (incf l (1- n))
+                                (push line buf))))
+                         ((> indent base-indent)
+                          (push line buf))
+                         (t
+                          (loop-finish)))
+                finally (flush)
+                        (return (- l start))))))))
+
+(defun write-md-block (lines index base-indent out flush-fn)
+  (or (write-md-fenced-code lines index base-indent out flush-fn)
+      (write-md-indented-code lines index base-indent out flush-fn)
+      (write-md-itemize lines index base-indent out flush-fn)))
+
+(defun markdown-to-plain-text (string)
+  (with-output-to-string (out)
+    (let ((buf nil)
+          (lines (string-lines string)))
+      (labels ((flush ()
+                 (write-md-paragraph buf out)
+                 (setq buf nil)))
+        (loop for l below (length lines)
+              for line = (svref lines l)
+              do (let ((n (write-md-block lines l 0 out #'flush)))
+                   (if n
+                       (incf l (1- n))
+                       (push line buf))))
+        (flush)))))
+
+) ; end #+sb-doc

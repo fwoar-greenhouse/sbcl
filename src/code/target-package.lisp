@@ -618,7 +618,7 @@ if PACKAGE doesn't designate a valid package."
 
 (defun lock-package (package)
   "Locks PACKAGE and returns T. Has no effect if PACKAGE was already
-locked. Signals an error if PACKAGE is not a valid package designator"
+locked. Signals an error if PACKAGE is not a valid package designator."
   (flet ((unoptimize (table)
            (dovector (x (symtbl-cells table))
              ;; By some small miracle this was mostly correct for NIL
@@ -919,10 +919,10 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
   (def package-shadowing-symbols package-%shadowing-symbols))
 
 (defun package-local-nicknames (package-designator)
-  "Returns an alist of \(local-nickname . actual-package) describing the
+  "Returns an alist of `(LOCAL-NICKNAME . ACTUAL-PACKAGE)` describing the
 nicknames local to the designated package.
 
-When in the designated package, calls to FIND-PACKAGE with the any of the
+When in the designated package, calls to FIND-PACKAGE with any of the
 local-nicknames will return the corresponding actual-package instead. This
 also affects all implied calls to FIND-PACKAGE, including those performed by
 the reader.
@@ -930,9 +930,6 @@ the reader.
 When printing a package prefix for a symbol with a package local nickname, the
 local nickname is used instead of the real name in order to preserve
 print-read consistency.
-
-See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCALLY-NICKNAMED-BY-LIST,
-REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
   (package-local-nickname-alist
@@ -957,9 +954,6 @@ Experimental: interface subject to change."
   "Returns a list of packages which have a local nickname for the designated
 package.
 
-See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
-REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
-
 Experimental: interface subject to change."
   (let ((designee (find-undeleted-package-or-lose package-designator))
         (result))
@@ -979,10 +973,11 @@ ACTUAL-PACKAGE must be a package designator.
 
 Returns the designated package.
 
-Signals a continuable error if LOCAL-NICKNAME is already a package local
-nickname for a different package, or if LOCAL-NICKNAME is one of \"CL\",
-\"COMMON-LISP\", or, \"KEYWORD\", or if LOCAL-NICKNAME is a global name or
-nickname for the package to which the nickname would be added.
+Signals a continuable error if LOCAL-NICKNAME is already a package
+local nickname for a different package, or if LOCAL-NICKNAME is one of
+`\"CL\"`, `\"COMMON-LISP\"`, `\"KEYWORD\"`, or if LOCAL-NICKNAME is a
+global name or nickname for the package to which the nickname would be
+added.
 
 When in the designated package, calls to FIND-PACKAGE with the LOCAL-NICKNAME
 will return the package the designated ACTUAL-PACKAGE instead. This also
@@ -992,9 +987,6 @@ reader.
 When printing a package prefix for a symbol with a package local nickname,
 local nickname is used instead of the real name in order to preserve
 print-read consistency.
-
-See also: PACKAGE-LOCAL-NICKNAMES, PACKAGE-LOCALLY-NICKNAMED-BY-LIST,
-REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
   (let ((package (find-undeleted-package-or-lose package-designator)))
@@ -1051,10 +1043,10 @@ Experimental: interface subject to change."
                already nickname for ~A.~:@>"
               nick (package-name actual) (package-name package) (package-name old-actual))
           (keep-old ()
-           :report (lambda (s)
-                     (format s "Keep ~A as local nickname for ~A."
-                             nick (package-name old-actual))
-                     (return-from %add-package-local-nickname package)))
+            :report (lambda (s)
+                      (format s "Keep ~A as local nickname for ~A."
+                              nick (package-name old-actual)))
+            (return-from %add-package-local-nickname package))
           (change-nick ()
             :report (lambda (s)
                       (format s "Use ~A as local nickname for ~A instead."
@@ -1066,9 +1058,6 @@ Experimental: interface subject to change."
   "If the designated package had OLD-NICKNAME as a local nickname for
 another package, it is removed. Returns true if the nickname existed and was
 removed, and NIL otherwise.
-
-See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
-PACKAGE-LOCALLY-NICKNAMED-BY-LIST, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
   (let* ((nick (string old-nickname))
@@ -1253,6 +1242,7 @@ Experimental: interface subject to change."
                (len (length vec)))
           (when (functionp magic)
             (let ((perfect-hash (funcall magic name-hash)))
+              (declare (type fixnum perfect-hash))
               (when (< perfect-hash len)
                 (let ((symbol (truly-the symbol (svref vec perfect-hash))))
                   (when (and (eql (symbol-name-hash symbol) name-hash)
@@ -1548,15 +1538,32 @@ Experimental: interface subject to change."
           :report (lambda (s)
                     (ecase function
                       (export
-                       (format s "Make ~S accessible in ~A (uninterning ~S)."
+                       (format s "Make ~S accessible in ~A (uninterning or shadowing ~S)."
                                datum pname (old-symbol)))
                       (use-package
-                       (format s "Make ~S accessible in ~A (uninterning ~S)."
+                       (format s "Make ~S accessible in ~A (uninterning or shadowing ~S)."
                                (car datum) pname (old-symbol)))))
           :test use1-or-export-p
           (dolist (s symbols)
-            (when (eq s (find-symbol (symbol-name s) package))
-              (unintern s package))))
+            (multiple-value-bind (accessible-symbol status)
+                (find-symbol (symbol-name s) package)
+              (cond ((and (eq accessible-symbol s)
+                          (member status '(:internal :exported)))
+                     ;; The symbol S is present in PACKAGE.  Unintern
+                     ;; to resolve the conflict.
+                     (unintern s package))
+                    ((eq status :inherited)
+                     ;; Two symbols with the same symbol name would be
+                     ;; inherited from different packages.  This case
+                     ;; happens when S is the "old" symbol which is
+                     ;; currently inherited.  Shadowing-import the
+                     ;; "new" symbol to resolve the conflict.
+                     (shadowing-import s package)
+                     ;; Stop the iteration so that the "new" symbol
+                     ;; which is now present in PACKAGE does not get
+                     ;; uninterned again by the other case in the next
+                     ;; iteration.
+                     (return))))))
         ;; IMPORT with a pair of symbols conflicting.
         (shadowing-import-it ()
           :report (lambda (s)

@@ -73,7 +73,6 @@
 
 (define-vop (char-code)
   (:translate char-code)
-  (:policy :fast-safe)
   (:args (ch :scs (character-reg) :target res))
   (:arg-types character)
   (:results (res :scs (any-reg)))
@@ -83,7 +82,6 @@
 
 (define-vop (code-char)
   (:translate code-char)
-  (:policy :fast-safe)
   (:args (code :scs (any-reg) :target res))
   (:arg-types positive-fixnum)
   (:results (res :scs (character-reg)))
@@ -98,22 +96,21 @@
   (:arg-types character character)
   (:conditional)
   (:info target not-p)
-  (:policy :fast-safe)
   (:note "inline comparison")
   (:variant-vars condition not-condition)
   (:generator 3
     (inst cmplw x y)
     (inst b? (if not-p not-condition condition) target)))
 
-(define-vop (fast-char=/character character-compare)
+(define-vop (char=/character character-compare)
   (:translate char=)
   (:variant :eq :ne))
 
-(define-vop (fast-char</character character-compare)
+(define-vop (char</character character-compare)
   (:translate char<)
   (:variant :lt :ge))
 
-(define-vop (fast-char>/character character-compare)
+(define-vop (char>/character character-compare)
   (:translate char>)
   (:variant :gt :le))
 
@@ -122,21 +119,20 @@
   (:arg-types character (:constant (character-set ((0 . #xFFFF)))))
   (:conditional)
   (:info target not-p y)
-  (:policy :fast-safe)
   (:note "inline comparison")
   (:variant-vars condition not-condition)
   (:generator 2
     (inst cmplwi x (char-code y))
     (inst b? (if not-p not-condition condition) target)))
 
-(define-vop (fast-char=/character/c character-compare/c)
+(define-vop (char=/character/c character-compare/c)
   (:translate char=)
   (:variant :eq :ne))
 
-(define-vop (fast-char</character/c character-compare/c)
+(define-vop (char</character/c character-compare/c)
   (:translate char<)
   (:variant :lt :ge))
 
-(define-vop (fast-char>/character/c character-compare/c)
+(define-vop (char>/character/c character-compare/c)
   (:translate char>)
   (:variant :gt :le))

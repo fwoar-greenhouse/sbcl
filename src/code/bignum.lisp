@@ -102,6 +102,11 @@
 (defconstant digit-size sb-vm:n-word-bits)
 
 (defconstant all-ones-digit most-positive-word)
+
+(eval-when (:compile-toplevel)
+  ;; DECLAIM would also eval this form at load-time (cold-init-time) which
+  ;; is too soon to actually work.
+  (sb-xc:proclaim '(muffle-conditions compiler-note)))
 
 #+bignum-assertions
 (progn
@@ -290,7 +295,6 @@
 (defun %normalize-bignum (result len)
   (declare (type bignum result)
            (type bignum-length len)
-           (muffle-conditions compiler-note)
            (inline %normalize-bignum-buffer))
   #+bignum-assertions (aver (= (%bignum-length result) len))
   (let ((newlen (%normalize-bignum-buffer result len)))
@@ -481,84 +485,101 @@
                         %normalize-bignum-buffer))
 
 ;;;; multiplication
+(declaim (inline %subtract-bignum-in-place))
+(defun %subtract-bignum-in-place (a b offset len)
+  (declare (type bignum a b)
+           (type bignum-length offset len)
+           (optimize speed (safety 0)))
+  (let ((borrow 1))
+    (declare (type (integer 0 1) borrow))
+    (dotimes (i len)
+      (declare (type bignum-index i))
+      (let ((a-idx (the bignum-index (+ offset i))))
+        (multiple-value-bind (diff new-borrow)
+            (%subtract-with-borrow (%bignum-ref a a-idx)
+                                   (%bignum-ref b i)
+                                   borrow)
+          (setf (%bignum-ref a a-idx) diff)
+          (setf borrow new-borrow))))))
 
+;;; See x86-64-vm.lisp for variants with mulx
 (defun multiply-bignums (a b)
   (declare (type bignum a b)
            (optimize speed (safety 0)))
-  (let* ((a-plusp (bignum-plus-p a))
-         (b-plusp (bignum-plus-p b))
-         (a (if a-plusp a (negate-bignum-not-fully-normalized a)))
-         (b (if b-plusp b (negate-bignum-not-fully-normalized b)))
-         (len-a (%bignum-length a))
+  (let* ((len-a (%bignum-length a))
          (len-b (%bignum-length b))
          (len-res (+ len-a len-b))
-         (res (%allocate-bignum len-res))
-         (negate-res (not (eq a-plusp b-plusp))))
-    (declare (type bignum-length len-a len-b len-res))
+         (res (%allocate-bignum len-res)))
     (when (> len-a len-b)
       (rotatef a b)
       (rotatef len-a len-b))
+    (sb-c::if-vop-existsp (:named sb-vm::bignum-multiply-loop)
+      (sb-sys:%primitive sb-vm::bignum-multiply-loop a len-a b len-b res)
 
-    ;; The partial result is zero on the first iteration,
-    ;; so don't include it. And no need to zero when allocating it.
-    (let ((x (%bignum-ref a 0)))
-      (sb-c::if-vop-existsp (:named sb-vm::bignum-mult-and-add-word-loop)
-        (sb-sys:%primitive sb-vm::bignum-mult-and-add-word-loop b x len-b res)
+      ;; The partial result is zero on the first iteration,
+      ;; so don't include it. And no need to zero when allocating it.
+      (let ((x (%bignum-ref a 0)))
         (let ((carry-digit 0))
           (declare (fixnum carry-digit))
           (dotimes (index len-b)
             (declare (type bignum-index index))
-            (setf (values carry-digit
-                          (%bignum-ref res index))
+            (setf (values carry-digit (%bignum-ref res index))
                   (%multiply-and-add (%bignum-ref b index) x carry-digit)))
-          (setf (%bignum-ref res len-b) carry-digit))))
-
-    (loop for i of-type bignum-index from 1 below len-a
-          do
-          (let ((x (%bignum-ref a i))
-                (k i)
-                (carry-digit 0))
-            (declare (type bignum-index k))
-            (dotimes (j len-b)
-              (setf (values carry-digit (%bignum-ref res k))
-                    (%multiply-and-add x
-                                       (%bignum-ref b j)
-                                       (%bignum-ref res k)
-                                       carry-digit))
-              (incf k))
-            (setf (%bignum-ref res k) carry-digit)))
-    (when negate-res (negate-bignum-in-place res))
+          (setf (%bignum-ref res len-b) carry-digit))
+        (loop for i of-type bignum-index from 1 below len-a
+              do
+              (let ((x (%bignum-ref a i)))
+                (let ((k i)
+                      (carry-digit 0))
+                  (declare (type bignum-index k))
+                  (dotimes (j len-b)
+                    (setf (values carry-digit (%bignum-ref res k))
+                          (%multiply-and-add x
+                                             (%bignum-ref b j)
+                                             (%bignum-ref res k)
+                                             carry-digit))
+                    (incf k))
+                  (setf (%bignum-ref res k) carry-digit))))))
+    (unless (bignum-plus-p a)
+      (%subtract-bignum-in-place res b len-a len-b))
+    (unless (bignum-plus-p b)
+      (%subtract-bignum-in-place res a len-b len-a))
     (%normalize-bignum res len-res)))
 
 (defun multiply-bignum-and-fixnum (bignum fixnum)
   (declare (type bignum bignum) (type fixnum fixnum)
            (optimize speed (safety 0)))
-  (let* ((bignum-plus-p (bignum-plus-p bignum))
-         (fixnum-plus-p (not (minusp fixnum)))
-         (bignum (if bignum-plus-p bignum (negate-bignum-not-fully-normalized bignum)))
-         (bignum-len (%bignum-length bignum))
-         (fixnum (if fixnum-plus-p fixnum (- fixnum)))
-         (result (%allocate-bignum (1+ bignum-len))))
-    (declare (type bignum bignum result)
-             (type bignum-element-type fixnum))
-    (sb-c::if-vop-existsp (:named sb-vm::bignum-mult-and-add-word-loop)
-      (sb-sys:%primitive sb-vm::bignum-mult-and-add-word-loop bignum fixnum bignum-len result)
-      (let ((carry-digit 0))
-        (declare (fixnum carry-digit))
-        (dotimes (index bignum-len)
-          (declare (type bignum-index index))
-          (setf (values carry-digit
-                        (%bignum-ref result index))
-                (%multiply-and-add (%bignum-ref bignum index) fixnum carry-digit)))
-        (setf (%bignum-ref result bignum-len) carry-digit)))
-    (unless (eq bignum-plus-p fixnum-plus-p)
-      (negate-bignum-in-place result))
-    (%normalize-bignum result (1+ bignum-len))))
+  (cond ((eql fixnum 1)
+         bignum)
+        ((eql fixnum -1)
+         (- bignum))
+        (t
+         (let* ((bignum-len (%bignum-length bignum))
+                (abs-fixnum (abs fixnum))
+                (result (%allocate-bignum (1+ bignum-len))))
+           (declare (type bignum bignum result)
+                    (type bignum-element-type abs-fixnum))
+           (sb-c::if-vop-existsp (:named sb-vm::bignum-mult-and-add-word-loop)
+             (sb-sys:%primitive sb-vm::bignum-mult-and-add-word-loop bignum abs-fixnum bignum-len result)
+             (let ((carry-digit 0))
+               (declare (fixnum carry-digit))
+               (dotimes (index bignum-len)
+                 (declare (type bignum-index index))
+                 (setf (values carry-digit
+                               (%bignum-ref result index))
+                       (%multiply-and-add (%bignum-ref bignum index) abs-fixnum carry-digit)))
+               (setf (%bignum-ref result bignum-len) carry-digit)))
+           (unless (bignum-plus-p bignum)
+             (setf (%bignum-ref result bignum-len)
+                   (logand (- (%bignum-ref result bignum-len) abs-fixnum)
+                           most-positive-word)))
+           (when (minusp fixnum)
+             (negate-bignum-in-place result))
+           (%normalize-bignum result (1+ bignum-len))))))
 
 (sb-c::unless-vop-existsp (:named sb-vm::*/signed=>integer)
   (defun multiply-fixnums (a b)
     (declare (fixnum a b))
-    (declare (muffle-conditions compiler-note)) ; returns lispobj, so what.
     (let* ((a-minusp (minusp a))
            (b-minusp (minusp b)))
       (multiple-value-bind (high low)
@@ -708,7 +729,6 @@
 ;;; paper, but uses some clever bit-twiddling nicked from Nickle to do it.
 (declaim (inline bmod))
 (defun bmod (u v)
-  (declare (muffle-conditions compiler-note)) ; returns lispobj, so what.
   (let ((ud (%bignum-ref u 0))
         (vd (%bignum-ref v 0))
         (umask 0)
@@ -1133,8 +1153,7 @@
 ;;; locals established by the macro.
 (defun bignum-ashift-right (bignum count)
   (declare (type bignum bignum)
-           (type unsigned-byte count)
-           (muffle-conditions compiler-note))
+           (type unsigned-byte count))
   (let ((bignum-len (%bignum-length bignum)))
     (cond ((fixnump count)
            (multiple-value-bind (digits n-bits) (truncate count digit-size)
@@ -1386,9 +1405,7 @@
 
 (declaim (inline bignum-negate-last-two))
 (defun bignum-negate-last-two (bignum &optional (len (%bignum-length bignum)))
-  (declare (bignum-length len)
-           #+sb-xc
-           (muffle-conditions compiler-note))
+  (declare (bignum-length len))
   (sb-c::if-vop-existsp (:named sb-vm::bignum-negate-last-two-loop)
     (sb-sys:%primitive sb-vm::bignum-negate-last-two-loop bignum len)
     (let* ((last1 0)
@@ -1414,7 +1431,6 @@
 (defun double-float-from-bits (bits exp plusp)
   (declare (fixnum exp))
   ;; "float to pointer coercion -> return value"
-  (declare (muffle-conditions compiler-note))
   (let ((hi (dpb exp
                  sb-vm:double-float-hi-exponent-byte
                  (logandc2 (ecase sb-vm:n-word-bits
@@ -1486,6 +1502,7 @@
          (flet ((const (name)
                   (package-symbolicate :sb-vm type '- name)))
            `(defun ,name (bignum)
+              (declare (muffle-conditions compiler-note))
               (let ((bignum-length (%bignum-length bignum)))
                 ;; word-sized bignums shouldn't reach here
                 (declare ((integer 2) bignum-length))
@@ -1795,9 +1812,7 @@
   (declare (type bit-index byte-pos)
            (type (integer 0 #.sb-vm:n-word-bits) byte-size-left)
            (bignum bignum)
-           (optimize speed)
-           #+sb-xc
-           (muffle-conditions compiler-note))
+           (optimize speed))
   (multiple-value-bind (word-index bit-index) (floor byte-pos digit-size)
     (let ((one (%bignum-ref bignum word-index)))
       (cond ((<= bit-index byte-size-left) ; contained in one word
@@ -1896,7 +1911,6 @@
 ;;; reduction in readability that was introduced. --JES, 2004-08-07
 (defun bignum-truncate (x y)
   (declare (type bignum x y))
-  (declare (muffle-conditions compiler-note)) ; returns lispobj, so what.
   (let (truncate-x truncate-y)
     (labels
         ;; This returns a guess for the next division step. Y1 is the
@@ -2161,7 +2175,6 @@
   (declare (type bignum x)
            (type (or word sb-vm:signed-word) y)
            (optimize (safety 0)))
-  (declare (muffle-conditions compiler-note)) ; returns lispobj, so what.
   (labels
       ((bignum-truncate-single-digit (x len-x y)
          (declare (type bignum-length len-x)
@@ -2246,8 +2259,7 @@
 ;;; bignum by a base into a preallocated quotient bignum.
 (declaim (inline bignum-truncate-single-digit-to))
 (defun bignum-truncate-single-digit-to (x y q len)
-  (declare (muffle-conditions compiler-note)
-           (type bignum x q)
+  (declare (type bignum x q)
            (type word y)
            (bignum-index len)
            (optimize speed (safety 0)))
@@ -2298,6 +2310,11 @@
                `(defun ,(symbolicate 'unary-truncate- type '-to-bignum-div) (quot number divisor)
                   (declare (inline ,decode))
                   (if (zerop divisor)
+                      ;; Considering that this whole file silences compiler notes, it seems like a
+                      ;; DECLARE shouldn't be needed here. But I think block compilation causes
+                      ;; MAYBE-EMIT-COERCE-EFFICIENCY-NOTE to occur at a time when some specials
+                      ;; aren't bound as they are during earlier phases, resulting in
+                      ;; get-handled-conditions doing the wrong thing.
                       (locally (declare (muffle-conditions compiler-note))
                         (error 'division-by-zero :operation 'truncate
                                                  :operands (list number divisor)))
@@ -2325,7 +2342,7 @@
 (defun truncate-double-float-to-bignum-truncating-div (quot number divisor)
   (declare (inline sb-kernel:integer-decode-double-float))
   (if (zerop divisor)
-      (locally (declare (muffle-conditions compiler-note)) (error 'division-by-zero :operation 'truncate :operands (list number divisor)))
+      (error 'division-by-zero :operation 'truncate :operands (list number divisor))
       (multiple-value-bind (bits exp sign)
           (sb-kernel:integer-decode-double-float quot)
         (let ((truncated

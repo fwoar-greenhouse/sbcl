@@ -55,7 +55,7 @@
                        do (progn #+host-quirks-ccl label) ; shut up the host
                        when (eq category :jump-table) sum (length data))))
             (emit (asmstream-data-section asmstream)
-                  `(.lispword ,(+ n-extra-words n-data-words 1))
+                  `(.lispwords (,(+ n-extra-words n-data-words 1)))
                   `(.skip ,(* n-extra-words sb-vm:n-word-bytes))))
           (emit-inline-constants)
           ;; Ensure alignment to double-Lispword in case a raw constant
@@ -105,7 +105,11 @@
       (car (reg-spec-scs spec))))
 
 (defun parse-reg-spec (kind name sc offset)
-  (let ((reg (make-reg-spec :kind kind :name name :scs sc :offset offset)))
+  (let* ((actual-offset
+          (cond ((and (consp offset) (eq (car offset) :lisp-reg))
+                 (nth (cadr offset) sb-vm::*register-arg-offsets*))
+                (t offset)))
+         (reg (make-reg-spec :kind kind :name name :scs sc :offset actual-offset)))
     (ecase kind
       (:temp)
       ((:arg :res)
@@ -136,7 +140,7 @@
     ;; We also output some raw words using fixups; I'm not sure if they should be
     ;; changed to labels. For now, restrict to control transfers.
     (binding* ((patch
-                (when (member (stmt-mnemonic statement)
+                (when (member (stmt-op statement)
                               '("B" "BEQ" "JMP" "CALL" "CBZ" "CBNZ" "TBZ" "TBNZ") ; KLUDGE
                               :test 'string=)
                   (member-if (lambda (x)

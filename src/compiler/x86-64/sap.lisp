@@ -85,7 +85,6 @@
   (:results (int :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate sap-int)
-  (:policy :fast-safe)
   (:generator 1
     (move int sap)))
 (define-vop (int-sap)
@@ -94,7 +93,6 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate int-sap)
-  (:policy :fast-safe)
   (:generator 1
     (move sap int)))
 
@@ -109,7 +107,6 @@
   (:vop-var vop)
   (:result-types system-area-pointer)
   (:temporary (:sc signed-reg) temp) ; TODO: add an :unused-if on this
-  (:policy :fast-safe)
   (:generator 1
     (emit-inline-add-sub 'add ptr offset res temp vop 'identity)))
 
@@ -118,7 +115,6 @@
   (:args (ptr1 :scs (sap-reg) :target res)
          (ptr2 :scs (sap-reg)))
   (:arg-types system-area-pointer system-area-pointer)
-  (:policy :fast-safe)
   (:results (res :scs (signed-reg) :from (:argument 0)))
   (:result-types signed-num)
   (:generator 1
@@ -158,7 +154,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
     (ea disp sap index)))
 
 (defun emit-sap-ref (size insn modifier result sap offset node vop temp)
-  (declare (ignorable node size vop temp))
+  (declare (ignorable node size vop))
   (cond
    ;; MSAN as implemented can't correctly interact with the C sanitizer because
    ;; C msan shadow memory indicates bit-for-bit whether the user-visible memory
@@ -188,7 +184,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
       ;; shadow bits under the mask.
       (cond ((not mask)
              (inst cmp size (ea temp) 0))
-            ((or (neq size :qword) (plausible-signed-imm32-operand-p mask))
+            ((or (neq size :qword) (imm32-p mask))
              (inst test size (ea temp)
                    (ldb (byte (* 8 nbytes) 0) mask)))
             (t
@@ -219,7 +215,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
     (inst mov size (ea temp) 0))
   (when (sc-is value constant immediate)
     (setq value
-          (cond ((plausible-signed-imm32-operand-p (tn-value value))
+          (cond ((imm32-p (tn-value value))
                  (tn-value value))
                 ((null (tn-value value))
                  null-tn)
@@ -268,7 +264,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                   ,@(when (implements-cas-sap-ref ref-name)
                       `((define-vop (,(symbolicate "CAS-" ref-name))
                           (:translate (cas ,ref-name))
-                          (:policy :fast-safe)
                           (:args (oldval :scs ,value-scs :target rax)
                                  (newval :scs ,(remove 'immediate value-scs))
                                  (sap :scs (sap-reg))
@@ -284,7 +279,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                                               sap offset oldval newval result rax temp)))))
                   (define-vop (,ref-name)
                     (:translate ,ref-name)
-                    (:policy :fast-safe)
                     (:args (sap :scs (sap-reg))
                            (offset :scs (signed-reg immediate)))
                     (:arg-types system-area-pointer signed-num)
@@ -302,7 +296,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                   ,@(unless (eq ref-name 'sap-ref-lispobj)
                 `((define-vop (,set-name)
                     (:translate ,set-name)
-                    (:policy :fast-safe)
                     (:args (value :scs ,value-scs)
                            (sap :scs (sap-reg))
                            (offset :scs (signed-reg immediate)))
@@ -338,7 +331,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
 ;;; but SETF does
 (define-vop (%set-sap-ref-lispobj)
    (:translate %set-sap-ref-lispobj)
-   (:policy :fast-safe)
    (:args (value :scs (descriptor-reg immediate))
           (sap :scs (sap-reg))
           (offset :scs (signed-reg immediate)))
@@ -356,7 +348,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
              `(progn
                 (define-vop (,ref-fun)
                   (:translate ,ref-fun)
-                  (:policy :fast-safe)
                   (:args (sap :scs (sap-reg))
                          (offset :scs (signed-reg immediate)))
                   (:arg-types system-area-pointer signed-num)
@@ -365,7 +356,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                   (:generator 1 (inst ,insn result (sap+offset-to-ea sap offset nil))))
                 (define-vop (,set-fun)
                   (:translate ,set-fun)
-                  (:policy :fast-safe)
                   (:args (value :scs (,res-sc immediate))
                          (sap :scs (sap-reg))
                          (offset :scs (signed-reg immediate)))
@@ -373,7 +363,6 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                   (:generator 1 (inst ,insn (sap+offset-to-ea sap offset nil) value)))
                 (define-vop (,(symbolicate "CAS-" ref-fun))
                   (:translate (cas ,ref-fun))
-                  (:policy :fast-safe)
                   ;; old and new could directly accept descriptor-reg
                   ;; but I doubt that CAS on floats sees enough usage to care.
                   (:args (oldval :scs (,res-sc))
@@ -396,12 +385,46 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
      (inst movq newval-temp newval)
      (inst cmpxchg :lock (sap+offset-to-ea sap offset nil) newval-temp)
      (inst movq result rax))))
+
+(define-vop (%sap-ref-indexed)
+  (:translate %sap-ref-16-indexed %sap-ref-32-indexed %sap-ref-64-indexed)
+  (:args (sap :scs (sap-reg))
+         (index :scs (any-reg signed-reg unsigned-reg)))
+  (:arg-types system-area-pointer tagged-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:node-var node)
+  (:generator 1
+    (ecase (sb-c::combination-fun-source-name node)
+      (%sap-ref-16-indexed
+       (inst movzx '(:word :qword) result (ea sap index (index-scale 2 index))))
+      (%sap-ref-32-indexed
+       (inst mov :dword result (ea sap index (index-scale 4 index))))
+      (%sap-ref-64-indexed
+       (inst mov :qword result (ea sap index (index-scale 8 index)))))))
+
+(define-vop (%signed-sap-ref-indexed)
+  (:translate %signed-sap-ref-16-indexed %signed-sap-ref-32-indexed
+              %signed-sap-ref-64-indexed)
+  (:args (sap :scs (sap-reg))
+         (index :scs (any-reg signed-reg unsigned-reg)))
+  (:arg-types system-area-pointer tagged-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:node-var node)
+  (:generator 1
+    (ecase (sb-c::combination-fun-source-name node)
+      (%signed-sap-ref-16-indexed
+       (inst movsx '(:word :qword) result (ea sap index (index-scale 2 index))))
+      (%signed-sap-ref-32-indexed
+       (inst movsx '(:dword :qword) result (ea sap index (index-scale 4 index))))
+      (%signed-sap-ref-64-indexed
+       (inst mov :qword result (ea sap index (index-scale 8 index)))))))
 
 ;;; noise to convert normal lisp data objects into SAPs
 
 (define-vop (vector-sap)
   (:translate vector-sap)
-  (:policy :fast-safe)
   (:args (vector :scs (descriptor-reg) :target sap))
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)

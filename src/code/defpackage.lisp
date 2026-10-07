@@ -217,21 +217,25 @@ implementation it is ~S." *!default-package-use-list*)
 (defmacro defpackage (package &rest options)
   #.(format nil
      "Defines a new package called PACKAGE. Each of OPTIONS should be one of the
-   following: ~{~&~4T~A~}
-   All options except ~{~A, ~}and :DOCUMENTATION can be used multiple
-   times."
-     '((:use "{package-name}*")
-       (:export "{symbol-name}*")
-       (:import-from "<package-name> {symbol-name}*")
-       (:shadow "{symbol-name}*")
-       (:shadowing-import-from "<package-name> {symbol-name}*")
-       (:local-nicknames "{(local-nickname actual-package-name)}*")
-       (:lock "boolean")
-       (:implement "{package-name}*")
-       (:documentation "doc-string")
-       (:intern "{symbol-name}*")
-       (:size "<integer>")
-       (:nicknames "{package-name}*"))
+following:~% ~{~%~4T(~S ~A)~}~%
+All options except ~{~S, ~}and :DOCUMENTATION can be used multiple
+times.
+
+For the non-standard options LOCK and IMPLEMENT, see
+SB-MANUAL:@PACKAGE-LOCKS. For LOCAL-NICKNAMES, see
+SB-MANUAL:@PACKAGE-LOCAL-NICKNAMES."
+     '(:use "{package-name}*"
+       :export "{symbol-name}*"
+       :import-from "<package-name> {symbol-name}*"
+       :shadow "{symbol-name}*"
+       :shadowing-import-from "<package-name> {symbol-name}*"
+       :local-nicknames "{(local-nickname actual-package-name)}*"
+       :lock "boolean"
+       :implement "{package-name}*"
+       :documentation "doc-string"
+       :intern "{symbol-name}*"
+       :size "<integer>"
+       :nicknames "{package-name}*")
      '(:size :lock))
   (let ((nicknames nil)
         (local-nicknames nil)
@@ -447,21 +451,25 @@ definition is in variance with the current state of the package.
 
 The value should be of the form:
 
-  (:WARN [T | packages-names] :ERROR [T | package-names])
+    (:warn [t | packages-names] :error [t | package-names])
 
-specifying which packages get which behaviour -- with T signifying the default unless
-otherwise specified. If default is not specified, :WARN is used.
+specifying which packages get which behaviour -- with T signifying the
+default unless otherwise specified. If default is not specified, :WARN
+is used.
 
-:WARN keeps as much state as possible and causes SBCL to signal a full warning.
+- :WARN keeps as much state as possible and causes SBCL to signal a
+  full warning.
 
-:ERROR causes SBCL to signal an error when the variant DEFPACKAGE form is executed,
-with restarts provided for user to specify what action should be taken.
+- :ERROR causes SBCL to signal an error when the variant DEFPACKAGE
+  form is executed, with restarts provided for user to specify what
+  action should be taken.
 
 Example:
 
-  (setf *on-package-variance* '(:warn (:swank :swank-backend) :error t))
+    (setf *on-package-variance* '(:warn (:swank :swank-backend) :error t))
 
-specifies to signal a warning if SWANK package is in variance, and an error otherwise.")
+specifies to signal a warning if SWANK package is in variance, and an
+error otherwise.")
 
 (defun note-package-variance (&rest args &key package &allow-other-keys)
   (let ((pname (package-name package)))

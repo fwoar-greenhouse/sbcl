@@ -244,11 +244,11 @@
 
 (defun print-xmmreg (value stream dstate)
   (let* ((reg (get-fpr :xmm
-                           ;; FIXME: why are we seeing a value from the GPR
-                           ;; prefilter instead of XMM prefilter here sometimes?
-                           (etypecase value
-                             ((unsigned-byte 4) value)
-                             (reg (reg-num value)))))
+                       ;; FIXME: why are we seeing a value from the GPR
+                       ;; prefilter instead of XMM prefilter here sometimes?
+                       (etypecase value
+                         ((mod 32) value)
+                         (reg (reg-num value)))))
          (name (reg-name reg)))
     (if stream
         (write-string name stream)
@@ -325,13 +325,13 @@
         (return-from found thing))))) |#
   (awhen (and (typep value 'word)
               (sb-disassem::find-code-constant-from-interior-pointer value dstate))
-    (note (lambda (stream) (princ it stream)) dstate)))
+    (note (lambda (stream) (prin1 it stream)) dstate)))
 
 ;;; Return an instance of REG or MACHINE-EA.
 ;;; MOD and R/M are the extracted bits from the instruction's ModRM byte.
 ;;; Depending on MOD and R/M, a SIB byte and/or displacement may be read.
 ;;; The REX.B and REX.X from dstate are appropriately consumed.
-(defun decode-mod-r/m (dstate mod r/m regclass)
+(defun decode-mod-r/m (dstate mod r/m regclass &key (disp-n 1))
   (declare (type disassem-state dstate)
            (type (unsigned-byte 2) mod)
            (type (unsigned-byte 3) r/m))
@@ -345,7 +345,12 @@
              ea))
          (displacement ()
            (case mod
-             (#b01 (read-signed-suffix 8 dstate))
+             (#b01
+              (let ((disp8 (read-signed-suffix 8 dstate)))
+                ;; EVEX compressed displacement: with mod=01, the effective
+                ;; displacement is disp8 * N, where N is the instruction's tuple
+                ;; size.
+                (* disp8 disp-n)))
              (#b10 (read-signed-suffix 32 dstate))))
          (extend (bit-name reg)
            (logior (if (dstate-getprop dstate bit-name) 8 0) reg)))
@@ -354,7 +359,11 @@
       (cond ((= mod #b11) ; register direct mode
              (case regclass
               (gpr (get-gpr :qword full-reg)) ; size is not really known here
-              (fpr (get-fpr :xmm full-reg))))
+              (fpr (get-fpr :xmm
+              (if (and (dstate-getprop dstate +evex+)
+                       (dstate-getprop dstate +rex-x+))
+                  (+ full-reg 16)
+                  full-reg)))))
             ((= r/m #b100) ; SIB byte - rex.b is "don't care"
              (let* ((sib (the (unsigned-byte 8) (read-suffix 8 dstate)))
                     (index-reg (extend +rex-x+ (ldb (byte 3 3) sib)))

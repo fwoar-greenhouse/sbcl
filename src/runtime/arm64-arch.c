@@ -88,20 +88,35 @@ condition_holds(os_context_t *context, unsigned int cond)
 {
     int flags = *os_context_flags_addr(context);
     bool result;
-    // Evaluate base condition.
-    switch (cond) {
-    case 0b000: result = ((flags >> Z_BIT) & 1);
-    case 0b001: result = ((flags >> C_BIT) & 1);
-    case 0b010: result = ((flags >> N_BIT) & 1);
-    case 0b011: result = ((flags >> V_BIT) & 1);
-    case 0b100: result = ((flags >> V_BIT) & 1) && ~((flags >> Z_BIT) & 1);
-    case 0b101: result = ((flags >> N_BIT) == (flags >> V_BIT));
-    case 0b110: result = ((flags >> N_BIT) == (flags >> V_BIT)) && !((flags >> Z_BIT) & 1);
-    case 0b111: result = 1;
+    // Evaluate base condition (ignoring the inversion bit).
+    switch (cond >> 1) {
+    case 0b000:
+      result = (flags >> Z_BIT) & 1;
+      break;
+    case 0b001:
+      result = (flags >> C_BIT) & 1;
+      break;
+    case 0b010:
+      result = (flags >> N_BIT) & 1;
+      break;
+    case 0b011: result = (flags >> V_BIT) & 1;
+      break;
+    case 0b100:
+      result = ((flags >> C_BIT) & 1) && !((flags >> Z_BIT) & 1);
+      break;
+    case 0b101:
+      result = ((flags >> N_BIT) & 1) == ((flags >> V_BIT) & 1);
+      break;
+    case 0b110:
+      result = ((flags >> N_BIT) & 1) == ((flags >> V_BIT) & 1) && !((flags >> Z_BIT) & 1);
+      break;
+    default:
+      result = 1;
+      break;
     }
 
-    // Condition flag values in the set '111x' indicate always true
-    // Otherwise, invert condition if necessary.
+    // Condition flag values in the set '111x' indicate always true.
+    // Otherwise, invert condition if the low bit is set.
     if ((cond & 0b1) && (cond != 0b1111))
         result = !result;
 
@@ -132,20 +147,27 @@ void arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     if ((orig_inst >> 24) == 0b01010100) {
         // Cond branch
         if (condition_holds(context, orig_inst & 0b1111))
-            next_pc += sign_extend((orig_inst >> 5) & ~(1 << 19), 19);
+            next_pc += sign_extend((orig_inst >> 5) & ((1 << 19)-1), 19);
         else
             next_pc += 1;
     }
-    else if (((orig_inst >> 26) & 0b11111) == 0b000101)
+    else if (((orig_inst >> 26) & 0b11111) == 0b000101) {
         // Uncond branch: B, BL
-        next_pc += sign_extend(orig_inst & ~(1 << 26), 26);
+        if ((orig_inst >> 31) & 1) { // BL
+            *os_context_register_addr(context, reg_LR) = (uword_t)(pc + 1);
+        }
+        next_pc += sign_extend(orig_inst & ((1 << 26)-1), 26);
+    }
     else if (((orig_inst >> 25) & 0b1111111) == 0b1101011) {
         int rt;
         // Uncond branch register
         switch ((orig_inst >> 21) & 0b1111) {
         case 0b00: // BR
+            rt = (orig_inst >> 5) & 0b11111;
+            break;
         case 0b01: // BLR
             rt = (orig_inst >> 5) & 0b11111;
+            *os_context_register_addr(context, reg_LR) = (uword_t)(pc + 1);
             break;
         case 0b10: // RET
             rt = reg_LR;
@@ -157,48 +179,78 @@ void arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
         next_pc = (unsigned int*)*os_context_register_addr(context, rt);
     }
     else if (((orig_inst >> 25) & 0b111111) == 0b011010) {
-        // Compare branch imm
-        bool size_is_64 = (orig_inst >> 31) & 0b1;
+        // CBZ
         bool op = (orig_inst >> 24) & 0b1;
-        int offset = sign_extend((orig_inst >> 5) & ~(1 << 19), 19);
+        int size = (orig_inst >> 31) & 0b1;
+        int offset = sign_extend((orig_inst >> 5) & ((1 << 19)-1), 19);
         int rt = orig_inst & 0b11111;
-        if (!size_is_64) lose("Size must be 64 bits.");
-        if (*os_context_register_addr(context, rt) ^ op)
+        uword_t val = (*os_context_register_addr(context, rt));
+        if (!size) {
+            val &= 0xFFFFFFFF;
+        }
+        if ((!val) ^ op)
             next_pc += offset;
         else
             next_pc += 1;
     }
     else if (((orig_inst >> 25) & 0b111111) == 0b011011) {
-        // Test branch imm
+        // TBZ
         bool b5 = (orig_inst >> 31) & 0b1;
         bool op = (orig_inst >> 24) & 0b1;
-        bool b40 = (orig_inst >> 19) & 0b11111;
-        int bit_pos = (b5 << 6) | b40;
-        int offset = sign_extend((orig_inst >> 5) & ~(1 << 14), 14);
+        int b40 = (orig_inst >> 19) & 0b11111;
+        int bit_pos = (b5 << 5) | b40;
+        int offset = sign_extend((orig_inst >> 5) & ((1 << 14)-1), 14);
         int rt = orig_inst & 0b11111;
-        if (!b5) lose("b5 must be 64 bits.");
         if (((*os_context_register_addr(context, rt) >> bit_pos) & 0b1) ^ op)
             next_pc += offset;
         else
             next_pc += 1;
     }
-    else if (((orig_inst >> 31) & 0b1) == 0b0) {
+    else if (((orig_inst >> 24) & 0b111111) == 0b011000) {
         // LDR (literal)
-        bool size_is_64 = (orig_inst >> 30) & 0b1;
+        int opc = (orig_inst >> 30) & 0b11;
         int rt = orig_inst & 0b11111;
-        int offset = sign_extend((orig_inst >> 5) & ~(1 << 19), 19);
-        if (!size_is_64) lose("Size must be 64 bits.");
-        *os_context_register_addr(context, rt) = *((lispobj*)(pc + offset));
+        int offset = sign_extend((orig_inst >> 5) & ((1 << 19)-1), 19);
+        unsigned int *new_pc = pc + offset;
+
+        if (opc == 0b01)
+            *os_context_register_addr(context, rt) = *((uint64_t *)new_pc);
+        else if (opc == 0b00)
+            *os_context_register_addr(context, rt) = *((uint32_t *)new_pc);
+        else if (opc == 0b10)
+            *os_context_register_addr(context, rt) = *((int32_t *)new_pc);
+
+        next_pc += 1;
+    }
+    else if (((orig_inst >> 24) & 0b111111) == 0b011100) {
+        // SIMD LDR (literal)
+        int opc = (orig_inst >> 30) & 0b11;
+        int rt = orig_inst & 0b11111;
+        int offset = sign_extend((orig_inst >> 5) & ((1 << 19)-1), 19);
+        unsigned int *new_pc = pc + offset;
+
+        if (opc == 0b00) {
+            *os_context_float_register_addr(context, rt) = *((uint32_t *)new_pc);
+        }
+        else if (opc == 0b01) {
+            *os_context_float_register_addr(context, rt) = *((uint64_t *)new_pc);
+        }
+        else if (opc == 0b10) {
+            memcpy(os_context_float_register_addr(context, rt), new_pc, 16);
+        }
+        else {
+            lose("Unsupported SIMD/FP LDR (literal) variant: %x", orig_inst);
+        }
+
         next_pc += 1;
     }
     else if (((orig_inst >> 24) & 0b11111) == 0b10000) {
         // ADR(P)
         bool op = (orig_inst >> 31) & 0b1;
         int rd = orig_inst & 0b11111;
-        int imm = sign_extend(((orig_inst >> 5) & ~(1 << 19)) |
-                              ((orig_inst >> 29) & ~(1 << 2)), 21);
+        int imm = sign_extend(((orig_inst >> 3) & 0x1FFFFC) | ((orig_inst >> 29) & 3), 21);
         if (op) // ADRP
-            *os_context_register_addr(context, rd) = ((uword_t)pc & ~(1 << 12)) + (imm << 12);
+            *os_context_register_addr(context, rd) = ((uword_t)pc & ~(uword_t)0xFFF) + ((sword_t)imm << 12);
         else // ADR
             *os_context_register_addr(context, rd) = (uword_t)pc + imm;
         next_pc += 1;

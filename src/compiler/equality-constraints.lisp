@@ -353,6 +353,31 @@
                                           (constraint-not-p con)
                                           (equality-constraint-amount con)))))))
 
+(defun inherit-equality-constraints-excluding (vars from-var exclude constraints target)
+  (do-conset-constraints-intersection
+      (con (constraints (lambda-var-equality-constraints from-var)))
+    (let ((replace-x (if (eq from-var (constraint-var (constraint-x con)))
+                         t
+                         (aver (eq from-var (constraint-var (constraint-y con)))))))
+      (dolist (var vars)
+        (flet ((replace-var (var with)
+                 (if (vector-length-constraint-p var)
+                     (make-vector-length-constraint with)
+                     with)))
+          (multiple-value-bind (x y)
+              (if replace-x
+                  (values (replace-var (constraint-x con) var) (constraint-y con))
+                  (values (constraint-x con) (replace-var (constraint-y con) var)))
+            (unless (member-if (lambda (c)
+                                 (and (not (eq var c))
+                                      (or (eq c (constraint-var x))
+                                          (eq c (constraint-var y)))))
+                               exclude)
+              (conset-add-equality-constraint target (equality-constraint-operator con)
+                                              x y
+                                              (constraint-not-p con)
+                                              (equality-constraint-amount con)))))))))
+
 ;;; Ignore AMOUNT
 (defun join-equality-constraints (var block in pred-outs all-previous-outs-computed)
   (let* ((constraints (make-hash-table :test #'equal))
@@ -646,7 +671,7 @@
   (add-equality-constraint '< index dimension gen gen nil)
   (let ((var (ok-lvar-lambda-var index gen))
         (type (if (constant-lvar-p dimension)
-                  (specifier-type `(integer 0 (,(lvar-value dimension))))
+                  (make-numeric-type 'mod (lvar-value dimension))
                   (specifier-type 'index))))
     (when var
       (list (list 'typep var type nil)))))
@@ -799,13 +824,10 @@
       (when vector-length
         (add-equality-constraint 'eq var vector-length constraints target nil)))))
 
-(defun add-mv-let-result-constraints (call fun constraints &optional (target constraints))
-  (let ((vars (lambda-vars fun))
-        (lvars (basic-combination-args call)))
-    (when (= (length lvars) 1)
-      (loop for (nth-value operator second min-amount max-amount) in (nth-value 1 (lvar-result-constraints (car lvars) constraints))
-            do
-            (add-equality-constraint operator (elt vars nth-value) second constraints target nil min-amount max-amount)))))
+(defun add-mv-let-result-constraints (vars lvars constraints &optional (target constraints))
+  (when (= (length lvars) 1)
+    (loop for (nth-value operator second min-amount max-amount) in (nth-value 1 (lvar-result-constraints (car lvars) constraints))
+          do (add-equality-constraint operator (elt vars nth-value) second constraints target nil min-amount max-amount))))
 
 ;;; Need a separate function because a set clears the constraints of the var
 (defun add-set-constraints (var lvar constraints)
@@ -967,7 +989,7 @@
     (multiple-value-bind (l h) (subseq-bounds sequence start end gen)
       (when (or h
                 (> l 0))
-        (push (list 'vector-length (specifier-type `(integer ,l ,(or h '*))))
+        (push (list 'vector-length (make-numeric-type 'integer l h))
               c)))
     c))
 
@@ -1021,11 +1043,11 @@
                               (t
                                (setf max nil))))))))
     (when (plusp min-sum)
-      (push (list 'vector-length>= (specifier-type `(eql ,min-sum)))
+      (push (list 'vector-length>= (make-numeric-type 'eql min-sum))
             r))
     (when (and max
                (plusp max-sum))
-      (push (list 'vector-length<= (specifier-type `(eql ,max-sum)))
+      (push (list 'vector-length<= (make-numeric-type 'eql max-sum))
             r))
     r))
 

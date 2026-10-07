@@ -56,8 +56,7 @@
                         #+win32 (arg-state-register-args state))))
     (cond ((< xmm-args max-xmm-args)
            (setf (arg-state-xmm-args state) (1+ xmm-args))
-           (make-wired-tn* prim-type reg-sc
-                             (nth xmm-args *float-regs*)))
+           (make-wired-tn* prim-type reg-sc xmm-args))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
@@ -159,9 +158,9 @@
 
    Walks fields recursively, descending into nested records and arrays
    so each leaf scalar contributes to the eightbyte it lands in."
-  (let* ((bits (sb-alien::alien-type-bits record-type))
+  (let* ((bits (alien-type-bits record-type))
          (byte-size (ceiling bits 8))
-         (alignment (sb-alien::alien-type-alignment record-type)))
+         (alignment (alien-type-alignment record-type)))
     ;; Rule: Structs > 16 bytes always use memory (hidden pointer)
     (when (> byte-size 16)
       (return-from classify-struct
@@ -171,72 +170,78 @@
          :alignment alignment
          :memory-p t)))
 
-    (let* ((num-eightbytes (max 1 (ceiling byte-size 8)))
+    (let* ((num-eightbytes (ceiling byte-size 8))
            (eightbytes (make-list num-eightbytes :initial-element :no-class)))
-      (labels ((merge-leaf (offset-bytes size-bytes class)
-                 (loop for byte-offset from offset-bytes
-                       below (+ offset-bytes size-bytes)
-                       by 8
-                       for eb = (floor byte-offset 8)
-                       when (< eb num-eightbytes)
-                       do (setf (nth eb eightbytes)
-                                (merge-classes (nth eb eightbytes) class))))
+      (labels ((merge-leaf (offset-bytes size-bytes class align-bytes)
+                 (if (and (> align-bytes 0)
+                          (plusp (mod offset-bytes align-bytes)))
+                     ;; Unaligned fields go to memory
+                     (setf (first eightbytes) :memory)
+                     (loop for byte-offset from offset-bytes
+                           below (+ offset-bytes size-bytes)
+                           by 8
+                           for eb = (floor byte-offset 8)
+                           when (< eb num-eightbytes)
+                           do (setf (nth eb eightbytes)
+                                    (merge-classes (nth eb eightbytes) class)))))
                (walk (type offset-bytes)
                  (cond
-                   ((sb-alien::alien-record-type-p type)
-                    (dolist (field (sb-alien::alien-record-type-fields type))
-                      (walk (sb-alien::alien-record-field-type field)
+                   ((alien-record-type-p type)
+                    (dolist (field (alien-record-type-fields type))
+                      (walk (alien-record-field-type field)
                             (+ offset-bytes
-                               (floor (sb-alien::alien-record-field-offset field) 8)))))
-                   ((sb-alien::alien-array-type-p type)
-                    (let* ((elt (sb-alien::alien-array-type-element-type type))
-                           (elt-bytes (ceiling (sb-alien::alien-type-bits elt) 8))
-                           (n (or (first (sb-alien::alien-array-type-dimensions type)) 0)))
+                               (floor (alien-record-field-offset field) 8)))))
+                   ((alien-array-type-p type)
+                    (let* ((elt (alien-array-type-element-type type))
+                           (elt-bytes (ceiling (alien-type-bits elt) 8))
+                           (n (or (first (alien-array-type-dimensions type)) 0)))
                       (dotimes (i n)
                         (walk elt (+ offset-bytes (* i elt-bytes))))))
                    ;; Leaf scalar
                    (t
                     (merge-leaf offset-bytes
-                                (ceiling (sb-alien::alien-type-bits type) 8)
-                                (classify-field-sysv-amd64 type))))))
+                                (ceiling (alien-type-bits type) 8)
+                                (classify-field-sysv-amd64 type)
+                                (floor (alien-type-alignment type) 8))))))
         (walk record-type 0))
-
-      ;; Post-merge cleanup per ABI: if second eightbyte is MEMORY, first must be too
-      (when (and (> num-eightbytes 1)
-                 (eq (second eightbytes) :memory))
-        (setf (first eightbytes) :memory))
-
-      ;; Convert remaining :no-class to :integer (padding bytes are treated as integer)
-      (setf eightbytes
-            (mapcar (lambda (c) (if (eq c :no-class) :integer c)) eightbytes))
-
+      (cond ((member :memory eightbytes)
+             ;; If anything goes to memory then everything goes too
+          (setf eightbytes '(:memory)))
+            (t
+             ;; Convert remaining :no-class to :integer (padding bytes are treated as integer)
+             (setf eightbytes
+                   (mapcar (lambda (c) (if (eq c :no-class) :integer c)) eightbytes))
+             ;; The last byte might be single
+             (when (and (eq (car (last eightbytes)) :double)
+                        (<= (- byte-size (* 8 (1- num-eightbytes))) 4))
+               (setf (car (last eightbytes)) :single))))
       (sb-alien::make-struct-classification
        :register-slots eightbytes
        :size byte-size
        :alignment alignment
-       :memory-p (member :memory eightbytes)))))
+       :memory-p (and (member :memory eightbytes) t)))))
 
 #+win32
 (defun classify-struct (record-type)
   "Classify struct for Windows AMD64 ABI.
 Size-based only: <=8 bytes in single integer register, >8 bytes via pointer.
 Floats are passed in integer registers."
-  (let* ((bits (sb-alien::alien-type-bits record-type))
+  (let* ((bits (alien-type-bits record-type))
          (byte-size (ceiling bits 8))
-         (alignment (sb-alien::alien-type-alignment record-type)))
-    (if (> byte-size 8)
+         (alignment (alien-type-alignment record-type)))
+    (if (member byte-size '(1 2 4 8))
+        ;; Small aligned struct: single integer
+        (sb-alien::make-struct-classification
+         :register-slots '(:integer)
+         :size byte-size
+         :alignment alignment
+         :memory-p nil)
         ;; Large struct: hidden pointer
         (sb-alien::make-struct-classification
          :register-slots '(:memory)
          :size byte-size
          :alignment alignment
-         :memory-p t)
-        ;; Small struct: single integer
-        (sb-alien::make-struct-classification
-         :register-slots '(:integer)
-         :size byte-size
-         :alignment alignment
-         :memory-p nil))))
+         :memory-p t))))
 
 ;;; Result TN generation for record types
 ;;; Called from src/code/c-call.lisp
@@ -266,7 +271,7 @@ Floats are passed in integer registers."
               (int-results 0)
               (sse-results 0))
           (dolist (class (sb-alien::struct-classification-register-slots classification))
-            (case class
+            (ecase class
               (:integer
                (push (make-wired-tn* 'unsigned-byte-64
                                      unsigned-reg-sc-number
@@ -276,6 +281,12 @@ Floats are passed in integer registers."
               (:double
                (push (make-wired-tn* 'double-float
                                      double-reg-sc-number
+                                     sse-results)
+                     result-tns)
+               (incf sse-results))
+              (:single
+               (push (make-wired-tn* 'single-float
+                                     single-reg-sc-number
                                      sse-results)
                      result-tns)
                (incf sse-results))))
@@ -415,7 +426,7 @@ Floats are passed in integer registers."
               (offsets nil)
               (offset 0))
           (dolist (class slots)
-            (case class
+            (ecase class
               (:integer
                (push (int-arg state 'unsigned-byte-64
                               unsigned-reg-sc-number
@@ -427,7 +438,13 @@ Floats are passed in integer registers."
                                 double-reg-sc-number
                                 double-stack-sc-number)
                      arg-tns)
-               (push (cons offset :double) offsets)))
+               (push (cons offset :double) offsets))
+              (:single
+               (push (float-arg state 'single-float
+                                single-reg-sc-number
+                                single-stack-sc-number)
+                     arg-tns)
+               (push (cons offset :single) offsets)))
             (incf offset 8))
           (setf arg-tns (nreverse arg-tns))
           (setf offsets (nreverse offsets))
@@ -442,7 +459,7 @@ Floats are passed in integer registers."
                      for load-size = (min 8 (- struct-size off))
                      do (let ((vop (ecase class
                                      (:integer 'load-struct-int-arg)
-                                     (:double 'load-struct-sse-arg))))
+                                     ((:single :double) 'load-struct-sse-arg))))
                           (sb-c::emit-and-insert-vop
                            call block
                            (sb-c::template-or-lose vop)
@@ -585,7 +602,6 @@ Floats are passed in integer registers."
 
 (define-vop (sign-extend)
   (:translate sign-extend)
-  (:policy :fast-safe)
   (:args (val :scs (signed-reg)))
   (:arg-types signed-num (:constant fixnum))
   (:info size)
@@ -604,7 +620,6 @@ Floats are passed in integer registers."
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
-  (:policy :fast-safe)
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
@@ -622,7 +637,6 @@ Floats are passed in integer registers."
 
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
-  (:policy :fast-safe)
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
@@ -653,14 +667,26 @@ Floats are passed in integer registers."
                       '#:r8 '#:r9 '#:r10 '#:r11))
           (vars))
       (append
+       ;; Caller-saved GPRs.
        (loop for gpr in gprs
-             for offset = (symbol-value (intern (concatenate 'string (symbol-name gpr) "-OFFSET") "SB-VM"))
-             collect `(:temporary (:sc any-reg :offset ,offset :from :eval :to :result)
-                                  ,(car (push gpr vars))))
-       (loop for float to 15
+             for offset = (symbol-value
+                           (intern (concatenate 'string
+                                                (symbol-name gpr)
+                                                "-OFFSET")
+                                   "SB-VM"))
+             collect `(:temporary
+                       (:sc any-reg :offset ,offset :from :eval :to :result)
+                       ,(car (push gpr vars))))
+
+       ;; Low 16 vector registers, XMM0-15.
+       ;; These also cover the low halves of YMM0-15 and ZMM0-15.
+       (loop for float below 16
              for varname = (format nil "FLOAT~D" float)
-             collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
-                                  ,(car (push (make-symbol varname) vars))))
+             collect `(:temporary
+                       (:sc single-reg :offset ,float :from :eval :to :result)
+                       ,(car (push (make-symbol varname) vars))))
+       #+sb-simd-pack-512
+       '((:save-p :avx512))
        `((:ignore ,@vars))))))
 
 (define-vop (call-out)
@@ -712,7 +738,8 @@ Floats are passed in integer registers."
 
 ;;; Remember when changing this to check that these work:
 ;;; - disassembly, undefined alien, and conversion to ELF core
-(defun emit-c-call (vop rax fun args varargsp #+sb-safepoint pc-save #+win32 rbx)
+(defun emit-c-call (vop rax fun args varargsp #+sb-safepoint pc-save #+win32 rbx
+                    &aux (pseudo-atomic (call-out-pseudo-atomic-p vop)))
   (declare (ignorable varargsp))
   ;; Current PC - don't rely on function to keep it in a form that
   ;; GC understands
@@ -742,9 +769,10 @@ Floats are passed in integer registers."
   ;; Store SP in thread struct, unless the enclosing block says not to
 
   #+(or sb-safepoint nonstop-foreign-call)
-  (when (and #+sb-safepoint
-             (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0)))
-    (inst mov (thread-slot-ea thread-saved-csp-offset) rsp-tn))
+  (unless pseudo-atomic
+    (when (and #+sb-safepoint
+               (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0)))
+      (inst mov (thread-slot-ea thread-saved-csp-offset) rsp-tn)))
 
   #+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
 
@@ -754,7 +782,7 @@ Floats are passed in integer registers."
   ;; the UNDEFINED-ALIEN-TRAMP lisp asm routine to recognize the various shapes
   ;; this instruction sequence can take.
   #-win32
-  (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+  (pseudo-atomic (:elide-if (not pseudo-atomic))
     (inst call
           #-immobile-space ; always call via RBX
           (cond ((stringp fun) (inst lea rbx-tn (ea (make-fixup fun :foreign) null-tn)) rbx-tn)
@@ -790,11 +818,12 @@ Floats are passed in integer registers."
   #+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
 
   ;; Zero the saved CSP, unless this code shouldn't ever stop for GC
-  #+sb-safepoint
-  (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
-    (inst xor (thread-slot-ea thread-saved-csp-offset) rsp-tn))
-  #+nonstop-foreign-call
-  (inst mov :qword (thread-slot-ea thread-saved-csp-offset) 0))
+  (unless pseudo-atomic
+    #+sb-safepoint
+    (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
+      (inst xor (thread-slot-ea thread-saved-csp-offset) rsp-tn))
+    #+nonstop-foreign-call
+    (inst mov :qword (thread-slot-ea thread-saved-csp-offset) 0)))
 
 (define-vop (alloc-number-stack-space)
   (:info amount)
@@ -818,10 +847,10 @@ Floats are passed in integer registers."
     (:result-types system-area-pointer)
     (:generator 0
       (aver (not (location= result rsp-tn)))
+      (inst mov result (alien-stack-ptr))
       (unless (zerop amount)
-        (let ((delta (align-up amount 8)))
-          (inst sub :qword (alien-stack-ptr) delta)))
-      (inst mov result (alien-stack-ptr)))))
+        (inst sub result (align-up amount 8))
+        (inst mov (alien-stack-ptr) result)))))
 
 ;;; Callbacks
 
@@ -864,9 +893,8 @@ Floats are passed in integer registers."
   ;;   2. Struct arguments <=8 bytes: passed in integer register as value
   ;;   3. Struct returns >8 bytes: hidden pointer in RCX (first arg register)
   ;;   4. Struct returns <=8 bytes: returned in RAX
-  (labels ((make-tn-maker (sc-name)
-             (lambda (offset)
-               (make-random-tn (sc-or-lose sc-name) offset)))
+  (labels ((make-tn (sc-name offset)
+             (make-random-tn (sc-or-lose sc-name) offset))
            (argument-byte-size (type)
              "Return the number of bytes this argument occupies in the callback vector."
              (ceiling (sb-alien::alien-type-bits type) n-byte-bits))
@@ -889,9 +917,9 @@ Floats are passed in integer registers."
            (rsp rsp-tn)
            #+(and win32 sb-thread) (r8 r8-tn)
            #+win32 (r11 r11-tn)  ; scratch register for struct copy (not an arg register)
-           (xmm0 float0-tn)
+           (xmm0 (make-tn 'double-reg 0))
            #-win32
-           (xmm1 float1-tn)
+           (xmm1 (make-tn 'double-reg 1))
            ([rsp] (ea rsp))
            ;; Calculate total argument vector size in bytes
            (total-arg-bytes
@@ -906,14 +934,16 @@ Floats are passed in integer registers."
            ;; For large struct returns, the hidden pointer is in the first arg register
            ;; (RCX on Windows, RDI on SysV). Skip it in the GPR list.
            ;; On Windows, this also consumes argument slot 0, so skip XMM0 too.
-           (gprs (let ((all-gprs (mapcar (make-tn-maker 'any-reg) *c-call-register-arg-offsets*)))
+           (gprs (let ((all-gprs (mapcar (lambda (offset)
+                                           (make-tn 'any-reg offset))
+                                         *c-call-register-arg-offsets*)))
                    (if large-struct-return-p
                        (rest all-gprs)  ; Skip RCX (win32) or RDI (SysV)
                        all-gprs)))
-           (fprs (let ((all-fprs (mapcar (make-tn-maker 'double-reg)
-                                         ;; Only 8 first XMM registers are used for
-                                         ;; passing arguments
-                                         (subseq *float-regs* 0 #-win32 8 #+win32 4))))
+           (fprs (let ((all-fprs ;; Only 8 first XMM registers are used for
+                         ;; passing arguments
+                         (loop for i to (+ 7 #+win32 -4)
+                               collect (make-tn 'double-reg i))))
                    ;; On Windows, when there's a hidden return pointer in RCX (slot 0),
                    ;; the float arguments shift: XMM0 is "consumed" by slot 0, so
                    ;; actual float args start at XMM1.
@@ -967,7 +997,7 @@ Floats are passed in integer registers."
                         (struct-size (sb-alien::struct-classification-size classification))
                         (slots (sb-alien::struct-classification-register-slots classification))
                         (n-int (count :integer slots))
-                        (n-fp (count :double slots))
+                        (n-fp (count-if (lambda (x) (member x '(:single :double))) slots))
                         ;; Don't mix stack/registers
                         (use-registers (and (<= n-int (length gprs))
                                             (<= n-fp (length fprs)))))
@@ -1026,7 +1056,7 @@ Floats are passed in integer registers."
                                       (setf gpr rax)
                                       (inst mov gpr (ea (- stack-args-offset n-word-bytes) rsp)))
                                     (inst mov (ea slot-offset rsp) gpr)))
-                                 (:double
+                                 ((:double :single)
                                   (let ((fpr (and use-registers
                                                   (pop fprs))))
                                     (cond (fpr
@@ -1082,13 +1112,13 @@ Floats are passed in integer registers."
             #-sb-thread
             (progn
               ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
-              (inst mov rdx (fixnumize index))
+              (inst mov rdi (fixnumize index))
               ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
-              (inst mov rdi rsp)
+              (inst mov rsi rsp)
               ;; add room on stack for return value
               (inst sub rsp (* return-slot-count-aligned n-word-bytes))
               ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
-              (inst mov rsi rsp)
+              (inst mov rdx rsp)
 
               ;; Make new frame
               (inst push rbp)
@@ -1168,7 +1198,7 @@ Floats are passed in integer registers."
                                               (1 rdx))))
                                 (inst mov target (ea offset rsp)))
                               (incf int-reg-idx))
-                             (:double
+                             ((:single :double)
                               (let ((target (case sse-reg-idx
                                               (0 xmm0)
                                               (1 xmm1))))

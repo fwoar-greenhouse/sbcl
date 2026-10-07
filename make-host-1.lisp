@@ -9,10 +9,7 @@
         (when val
           (format t "~&target ~S = ~S~%" sym  val))))))
 (in-package "SB-COLD")
-#+sbcl
-(declaim (sb-ext:muffle-conditions
-          sb-ext:compiler-note
-          (satisfies optional+key-style-warning-p)))
+#+sbcl (declaim (sb-ext:muffle-conditions sb-ext:compiler-note))
 (progn
   (setf *host-obj-prefix* (if (boundp 'cl-user::*sbcl-host-obj-prefix*)
                               (symbol-value 'cl-user::*sbcl-host-obj-prefix*)
@@ -34,19 +31,23 @@
     ;; UNDEFINED-VARIABLE does not cause COMPILE-FILE to return warnings-p
     ;; unless outside a compilation unit. You find out about it only upon
     ;; exit of SUMMARIZE-COMPILATION-UNIT. So we set up a handler for that.
-    `(let (warnp style-warnp)
+    `(let (warnp style-warnp
+           last-form)
        (handler-bind ((style-warning
-                       ;; Any unmuffled STYLE-WARNING should fail
-                       ;; These would typically be from undefined functions,
-                       ;; or optional-and-key when that was visible.
-                       (lambda (c)
-                         (signal c) ; won't do SETQ if MUFFLE-WARNING is invoked
-                         (setq style-warnp 'style-warning)))
+                        ;; Any unmuffled STYLE-WARNING should fail
+                        ;; These would typically be from undefined functions,
+                        ;; or optional-and-key when that was visible.
+                        (lambda (c)
+                          (signal c) ; won't do SETQ if MUFFLE-WARNING is invoked
+                          (when last-form
+                            (setf style-warnp (type-of c)))))
                       (simple-warning
                         (lambda (c)
-                          (declare (ignore c))
-                          (setq warnp 'warning))))
-         (with-compilation-unit () ,@forms))
+                          (when last-form
+                            (setf warnp (type-of c))))))
+         (with-compilation-unit () ,@forms (setf last-form t)))
+       ;; Catch only the warnings from with-compilation-unit, the others will be handled in
+       ;; host-cload-stem
        (when (and (string>= (cl:lisp-implementation-version) "2.1")
                   (or warnp style-warnp) *fail-on-warnings*)
          (cerror "Proceed anyway"

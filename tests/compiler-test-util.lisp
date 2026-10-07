@@ -28,6 +28,7 @@
            #:inspect-ir
            #:ir1-named-calls
            #:ir1-funargs
+           #:ir2-vops
            #:disassembly-lines
            #:do-blocks
            #:do-nodes
@@ -35,11 +36,16 @@
 
 (cl:in-package :ctu)
 
+;;; Report the type the compiler ended up with for X.
 (unless (fboundp 'compiler-derived-type)
   (defknown compiler-derived-type (t) (values t t) (flushable))
-  (deftransform compiler-derived-type ((x) * * :node node)
-    (sb-c::delay-ir1-transform node :ir1-phases)
-    `(values ',(type-specifier (sb-c::lvar-type x)) t))
+  (sb-c::defoptimizer (compiler-derived-type sb-c::ir2-convert) ((x) node block)
+    (let ((lvar (sb-c::node-lvar node)))
+      (sb-c::move-lvar-result
+       node block
+       (list (sb-c::emit-constant (type-specifier (sb-c::lvar-type x)))
+             (sb-c::emit-constant t))
+       lvar)))
   (defun compiler-derived-type (x)
     (declare (ignore x))
     (values t nil)))
@@ -105,6 +111,18 @@
                     (sb-c::ir2-block-next ,block-var)))
        ((null ,block-var) ,result)
      ,@forms))
+
+(defun ir2-vops (form)
+  (let (vops)
+    (inspect-ir
+     form
+     (lambda (component)
+       (ctu:do-ir2-blocks (block component)
+         (do ((vop (sb-c::ir2-block-start-vop block)
+                   (sb-c:vop-next vop)))
+             ((null vop))
+           (push (sb-c:vop-name vop) vops)))))
+    vops))
 
 (defun ir1-named-calls (lambda-expression &optional (full t))
   (declare (ignorable lambda-expression full))

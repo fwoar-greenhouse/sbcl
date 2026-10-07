@@ -280,9 +280,6 @@
   ;; access to slot-definitions and locations by name, etc.
   ;; See MAKE-SLOT-TABLE in pcl/slots-boot.lisp for further details.
   (slot-table #(1 nil) :type simple-vector)
-  ;; In lieu of card-marking, this should maintain a so-called intrusive
-  ;; linked list of layouts touched since last GC
-  ; (chain 0 :type sb-vm:word) ; not yet
   (id-word0 0 :type word)
   (id-word1 0 :type word)
   (id-word2 0 :type word)
@@ -668,6 +665,8 @@
         (simd-pack-type (!alloc-simd-pack-type bits (simd-pack-type-tag-mask x)))
         #+sb-simd-pack-256
         (simd-pack-256-type (!alloc-simd-pack-256-type bits (simd-pack-256-type-tag-mask x)))
+        #+sb-simd-pack-512
+        (simd-pack-512-type (!alloc-simd-pack-512-type bits (simd-pack-512-type-tag-mask x)))
         (alien-type-type (!alloc-alien-type-type bits (alien-type-type-alien-type x)))))))
 ) ; end  MACROLET
 
@@ -707,7 +706,9 @@
                             (get-lisp-obj-address instance)))))))
         (etypecase instance
           ((or numeric-union-type member-type character-set-type ; nothing extra to do
-           #+sb-simd-pack simd-pack-type #+sb-simd-pack-256 simd-pack-256-type
+           #+sb-simd-pack simd-pack-type
+           #+sb-simd-pack-256 simd-pack-256-type
+           #+sb-simd-pack-512 simd-pack-512-type
            hairy-type))
           (args-type
            (ensure-interned-list (args-type-required instance) *ctype-list-hashset*)

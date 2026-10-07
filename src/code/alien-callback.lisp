@@ -274,15 +274,15 @@ Create new alien callable (old alien callable gets freed)."))
 (defmacro define-alien-callable (name result-type typed-lambda-list
                                  &body body
                                  &environment env)
-  "(define-alien-callable NAME RESULT-TYPE {(ARG-NAME ARG-TYPE)}*
-     {doc-string} {decls}* {FORM}*)
-
-Define an alien function which can be called by alien code. The alien
-function returned by (alien-callable-function NAME) expects alien
-arguments of the specified ARG-TYPEs and returns an alien of type
+  "Define an alien function which can be called by alien code. The alien
+function returned by (ALIEN-CALLABLE-FUNCTION NAME) expects alien
+arguments of the specified `ARG-TYPE`s and returns an alien of type
 RESULT-TYPE.
 
-If (alien-callable-function NAME) already exists, its value is not
+TYPED-LAMBDA-LIST is a list of `(ARG-NAME ARG-TYPE)` elements, and
+BODY is `{DOC-STRING} {DECL}* {FORM}*`.
+
+If (ALIEN-CALLABLE-FUNCTION NAME) already exists, its value is not
 changed (though it is arranged that an updated version of the Lisp
 callable function will be called, provided that the new type and the
 existing type are compatible). This feature allows for incremental
@@ -301,11 +301,12 @@ redefinition of callable functions."
 (defmacro with-alien-callable (definitions
                                &body body
                                &environment env)
-    "Establish some local alien functions. Each DEFINITION is of the form:
-     NAME RESULT-TYPE {(ARG-NAME ARG-TYPE)}*
-       {doc-string} {decls}* {FORM}*
+  "Establish some local alien functions.
+  Each element of DEFINITIONS is of the form:
 
-     The resulting alien callable value has dynamic extent."
+      NAME RESULT-TYPE {(ARG-NAME ARG-TYPE)}* {DOC-STRING} {DECL}* {FORM}*
+
+  The resulting alien callable value has dynamic extent."
   (collect ((bindings)
             (declarations)
             (cleanup))
@@ -352,6 +353,33 @@ function value."
                         0
                         (make-alien-pointer-type))
           (cast (alien-callable-function lisp-name) (* t)))))
+
+;;; Changing the entry point of an alien linkage table entry allows testing without
+;;; the foreign library, or mocking of foreign routines. This is more powerful than
+;;; encapsulatig a function defined via DEFINE-ALIEN-ROUTINE because it catches uses
+;;; from bare (ALIEN-FUNCALL (EXTERN-ALIEN "f" ...)) and WITH-ALIEN.
+;;; Note also that a nonexistent foreign function can be "overridden".
+#+(or arm64 x86-64)
+(progn
+;; Not officially part of SB-ALIEN: interface, but need to protect from tree-shaker.
+(export 'sb-alien-internals::override-alien-linkage-entrypoint 'sb-alien-internals)
+(defun sb-alien-internals::override-alien-linkage-entrypoint (c-name new-value)
+  (let* ((linkage-index (sb-impl::ensure-alien-linkage-index c-name nil))
+         (new-jump-address
+          (etypecase new-value
+            (string (int-sap (find-foreign-symbol-address new-value)))
+            (symbol (alien-sap (gethash new-value sb-alien::*alien-callables*)))
+            (integer (int-sap new-value))))
+         (address-of-jump-address
+          #+arm64 (sap+ (int-sap (sb-vm::alien-linkage-index-to-addr linkage-index nil)) 8)
+          #+x86-64
+          ;; Access the linkage index as if data, even though it's a function- this computes
+          ;; the address of the word in the linkage space which needs to get overwritten.
+          ;; Computing as a function would get the immutable address within the space.
+          (int-sap (sb-vm::alien-linkage-index-to-addr linkage-index t))) ; datap = T
+         (original-jump-address (sap-ref-word address-of-jump-address 0)))
+    (setf (sap-ref-sap address-of-jump-address 0) new-jump-address)
+    (cons address-of-jump-address original-jump-address))))
 
 (in-package "SB-THREAD")
 #+sb-thread

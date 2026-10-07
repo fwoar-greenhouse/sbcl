@@ -919,3 +919,15 @@ fractional bits."
                  (declare ((single-float 5.0) x))
                  (imagpart (complex x)))
                single-float))
+
+(with-test (:name :constant-complex)
+  (checked-compile-and-assert
+   ()
+   `(lambda (d)
+      (- #c(1d0 3d0) (the double-float d)))
+   ((4d0) #C(-3d0 3d0)))
+  (checked-compile-and-assert
+   ()
+   `(lambda (c)
+      (- 5 (the (complex double-float) c)))
+   ((#c(1d0 3)) #C(4d0 -3))))

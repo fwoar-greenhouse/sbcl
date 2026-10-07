@@ -21,7 +21,6 @@
            #:stat-rdev
            #:termios-iflag #:termios-oflag #:termios-cflag
            #:termios-lflag #:termios-cc
-           #:termios-ispeed #:termios-ospeed
            #:timeval-sec #:timeval-usec
            #:flock-type #:flock-whence #:flock-start #:flock-len
            #:flock-pid

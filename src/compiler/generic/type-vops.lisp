@@ -187,12 +187,15 @@
 (define-type-vop simd-pack-p (simd-pack-widetag))
 #+sb-simd-pack-256
 (define-type-vop simd-pack-256-p (simd-pack-256-widetag))
+#+sb-simd-pack-512
+(progn
+  (define-type-vop simd-pack-512-p (simd-pack-512-widetag))
+  (define-type-vop simd-pack-512-mask-p (simd-pack-512-mask-widetag)))
 
 ;;; Not type vops, but generic over all backends
 (macrolet ((def (name lowtag)
              `(define-vop ()
                 (:translate ,name)
-                (:policy :fast-safe)
                 (:args (x :scs (descriptor-reg)))
                 (:results (res :scs (unsigned-reg)))
                 (:result-types unsigned-num)

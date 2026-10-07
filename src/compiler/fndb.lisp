@@ -131,7 +131,11 @@
 ;;; represented by a call to VALUES.
 (defknown values (&rest t) * (movable flushable))
 (defknown values-list (list) * (movable foldable unsafely-flushable))
-(defknown reverse-values-list (list index) * (movable foldable unsafely-flushable))
+(defknown reverse-values-list ((read-only list) index) *
+    (movable foldable unsafely-flushable)
+  :folder (lambda (list length)
+            (aver (= (length list) length))
+            (values-list (reverse list))))
 
 ;;;; from the "Macros" chapter:
 
@@ -230,6 +234,9 @@
 (defknown (< > <= >=) (real &rest real) boolean
   (movable foldable flushable))
 (defknown (max min) (real &rest real) real
+  (movable foldable flushable))
+
+(defknown (quiet= quiet<) (real real) boolean
   (movable foldable flushable))
 
 (defknown (+ *) (&rest number) number
@@ -591,7 +598,7 @@
     (character character) boolean
   (movable foldable flushable no-verify-arg-count))
 
-(defknown character ((or character (string 1) symbol))
+(defknown character ((or character (simple-string 1) (and string (not simple-string)) symbol))
     character
     (movable foldable unsafely-flushable))
 (defknown char-code (character) %char-code (movable foldable flushable))
@@ -617,9 +624,15 @@
 ;;;; from the "Sequences" chapter:
 
 (defknown elt ((read-only proper-sequence) index) t (foldable unsafely-flushable))
+(defknown elt-list ((read-only proper-list) index) t (foldable unsafely-flushable))
+
+(defknown %setelt ((modifying sequence) index t) t ()
+  :derive-type #'result-type-last-arg)
+(defknown %setelt-list ((modifying sequence) index t) t ()
+  :derive-type #'result-type-last-arg)
 
 (defknown subseq ((read-only proper-sequence) index &optional sequence-end) consed-sequence
-  (flushable foldable-read-only))
+    (flushable foldable-read-only))
 
 (defknown vector-subseq ((read-only vector) index sequence-end) (simple-array * (*))
   (flushable foldable-read-only no-verify-arg-count))
@@ -642,19 +655,24 @@
 
 (defknown nreverse ((modifying sequence)) sequence (important-result)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t
-                                          :preserve-vector-type t))
+                                          :preserve-vector-type t)
+  :result-arg 0)
 
 (defknown (list-reverse-into-vector list-reverse-into-vector-cddr)
     (proper-list) simple-vector
   (flushable no-verify-arg-count))
 (defknown sb-impl::vector-nreverse (vector) vector (important-result no-verify-arg-count)
   :result-arg 0)
+(defknown sb-impl::list-nreverse (list) list (important-result no-verify-arg-count)
+  :result-arg 0)
+(defknown sb-impl::vector-reverse (vector) vector (no-verify-arg-count))
+(defknown sb-impl::list-reverse (list) list (no-verify-arg-count))
 
 (defknown make-sequence (type-specifier index
                                         &key
                                         (:initial-element t))
-  consed-sequence
-  (movable foldable-read-only)
+    consed-sequence
+    (movable foldable-read-only)
   :derive-type (creation-result-type-specifier-nth-arg 0))
 
 (defknown concatenate (type-specifier &rest (read-only proper-sequence)) consed-sequence
@@ -1233,8 +1251,39 @@
   list
   (foldable flushable call))
 
-(defknown (nunion nintersection nset-difference nset-exclusive-or)
+(defknown sb-impl::length-intersection
+    (proper-list proper-list &key (:key (function-designator ((or (nth-arg 0 :sequence t)
+                                                                  (nth-arg 1 :sequence t)))))
+                 (:test (function-designator ((nth-arg 0 :sequence t :key :key)
+                                              (nth-arg 1 :sequence t :key :key))))
+                 (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
+                                                  (nth-arg 1 :sequence t :key :key)))))
+    index
+    (foldable flushable call))
+
+(defknown sb-impl::intersection-p
+  (proper-list proper-list &key (:key (function-designator ((or (nth-arg 0 :sequence t)
+                                                  (nth-arg 1 :sequence t)))))
+                  (:test (function-designator ((nth-arg 0 :sequence t :key :key)
+                                               (nth-arg 1 :sequence t :key :key))))
+                  (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
+                                                   (nth-arg 1 :sequence t :key :key)))))
+  boolean
+  (foldable flushable call))
+
+(defknown (nunion nset-exclusive-or)
   ((modifying list) (modifying list)
+   &key (:key (function-designator ((or (nth-arg 0 :sequence t)
+                                        (nth-arg 1 :sequence t)))))
+   (:test (function-designator ((nth-arg 0 :sequence t :key :key)
+                                (nth-arg 1 :sequence t :key :key))))
+   (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
+                                    (nth-arg 1 :sequence t :key :key)))))
+  list
+  (foldable flushable call important-result))
+
+(defknown (nintersection nset-difference)
+  ((modifying list) proper-list
    &key (:key (function-designator ((or (nth-arg 0 :sequence t)
                                         (nth-arg 1 :sequence t)))))
    (:test (function-designator ((nth-arg 0 :sequence t :key :key)
@@ -1624,6 +1673,10 @@
 (defknown stream-external-format (stream) t (flushable))
 (defknown (output-stream-p input-stream-p) (stream) boolean
   (movable foldable flushable))
+(defknown (binary-input-stream-p binary-output-stream-p) (stream) boolean
+  (movable foldable flushable))
+(defknown (character-input-stream-p character-output-stream-p) (stream) boolean
+  (movable foldable flushable))
 (defknown open-stream-p (stream) boolean (flushable))
 (defknown close (stream &key (:abort t)) (eql t) ())
 (defknown file-string-length (stream (or string character))
@@ -1714,7 +1767,7 @@
 (defknown read-delimited-list (character &optional stream-designator t) list ())
 ;; FIXME: add a type-deriver => (values (or string eof-value) boolean)
 (defknown read-line (&optional stream-designator t t t) (values t boolean) ())
-(defknown unread-char (character &optional stream-designator) t ())
+(defknown unread-char (character &optional stream-designator) null ())
 (defknown peek-char (&optional (or character (member nil t))
                                stream-designator t t t) t
   ()
@@ -1750,6 +1803,9 @@
 
 (defknown read-byte (stream &optional t t) t ()
   :derive-type (read-elt-type-deriver nil 'integer nil))
+
+(defknown fast-read-byte-refill (stream t t) t ()
+  :derive-type (read-elt-type-deriver nil '(unsigned-byte 8) nil))
 
 (defknown (prin1 print princ) (t &optional stream-designator)
   t
@@ -2078,6 +2134,8 @@
 
 (defknown call-with-timing (function-designator function-designator &rest t) *
   (call))
+(defknown sb-unix::with-deferrable-signals-unblocked (function t) *
+  (call))
 
 ;;; Even though ANSI defines LISP-IMPLEMENTATION-TYPE and
 ;;; LISP-IMPLEMENTATION-VERSION to possibly punt and return NIL, we
@@ -2135,6 +2193,7 @@
 
 (defknown %rest-values (t t t t) * (always-translatable))
 (defknown %rest-ref (t t t t &optional boolean) * (always-translatable))
+(defknown %rest-elt (t t t t &optional boolean) * (always-translatable))
 (defknown %rest-length (t t t) * (always-translatable))
 (defknown %rest-null (t t t t) * (always-translatable))
 (defknown %rest-true (t t t) * (always-translatable))
@@ -2256,10 +2315,11 @@
     function (flushable no-verify-arg-count))
 (defknown array-bounding-indices-bad-error (t t t) nil (no-verify-arg-count))
 (defknown sequence-bounding-indices-bad-error (t t t) nil (no-verify-arg-count))
+(defknown sb-impl::signal-index-too-large-error (sequence index &optional t) nil)
 (defknown %find-position
     (t sequence t index sequence-end (function (t)) (function (t t)))
-  (values t (or index null))
-  (flushable foldable call no-verify-arg-count))
+    (values t (or index null))
+    (flushable foldable call no-verify-arg-count))
 (defknown (%find-position-if %find-position-if-not)
   ((function ((nth-arg 1 :sequence t :key (nth-arg 5))))
    sequence t index sequence-end (function ((nth-arg 1 :sequence t))))
@@ -2350,8 +2410,6 @@
 (defknown (%rplaca %rplacd) ((modifying cons) t) t ()
   :derive-type #'result-type-last-arg)
 (defknown %put (symbol t t) t (no-verify-arg-count))
-(defknown %setelt ((modifying sequence) index t) t ()
-  :derive-type #'result-type-last-arg)
 (defknown %svset ((modifying simple-vector) index t) t ())
 (defknown (setf bit) (bit (modifying (array bit)) &rest index) bit ())
 (defknown (setf sbit) (bit (modifying (simple-array bit)) &rest index) bit ())
@@ -2372,6 +2430,8 @@
 ;;;; ALIEN and call-out-to-C stuff
 
 (defknown %alien-funcall ((or string system-area-pointer) alien-type &rest t) *)
+#+64-bit
+(defknown sb-alien-internals:%naturalize-base-string/word (sb-vm:word) simple-base-string)
 
 ;; Used by WITH-PINNED-OBJECTS
 (defknown sb-vm::touch-object (t) (values)
@@ -2569,3 +2629,21 @@
 
 (defknown sb-kernel::single-float-invalid-operation (t single-float) nil (fixed-args))
 (defknown sb-kernel::double-float-invalid-operation (t double-float) nil (fixed-args))
+
+
+(defknown sb-impl::read-from-c-string/utf-8/lf (system-area-pointer t) simple-string
+    (movable flushable fixed-args))
+
+(defknown sb-vm::utf8-strlen (system-area-pointer) (values (or null index) index t)
+    (movable flushable fixed-args))
+
+(defknown (sb-vm::utf8-sap-to-character-string
+           sb-vm::ascii-sap-to-character-string)
+    (system-area-pointer (simple-array character (*)) index)
+    t
+    (movable fixed-args))
+
+(defknown sb-impl::find-bad-utf8
+    (system-area-pointer)
+    nil
+    (movable fixed-args))

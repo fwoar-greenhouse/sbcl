@@ -98,6 +98,20 @@
   ;; flushed in some circumstances.
   (flushable nil :type list))
 
+#+sb-devel
+(defprinter (lexenv)
+  vars
+  blocks
+  tags
+  (type-restrictions :test type-restrictions)
+  (lambda :test lambda)
+  (cleanup :test cleanup)
+  (handled-conditions :test handled-conditions)
+  (disabled-package-locks :test disabled-package-locks)
+  (%policy :test %policy)
+  (user-data :test user-data)
+  (flushable :test flushable))
+
 #+sb-eval
 (defstruct (sb-eval::eval-lexenv
             (:include lexenv)
@@ -227,6 +241,7 @@
   lexenv
   fired)
 
+#+sb-devel
 (defprinter (lvar-annotation)
   fired)
 
@@ -272,6 +287,11 @@
             (:copier nil))
   type
   context)
+
+#+sb-devel
+(defprinter (lvar-type-annotation)
+  fired
+  (type :princ (type-specifier type)))
 
 (defstruct (lvar-function-annotation
             (:include lvar-type-annotation)
@@ -517,6 +537,9 @@
   ;; Cache the environment of a block during lifetime analysis. :NONE
   ;; if no cached value has been stored yet.
   (environment-cache :none :type (or null environment (member :none)))
+  ;; this flag is used specifically to determine if this block must
+  ;; still be processed as part of a worklist algorithm.
+  (worklist-flag nil :type boolean)
   ;; A table for keeping track of which source-paths have already had
   ;; a %MARK-COVERAGE function converted for them.
   (source-path-marks nil :type (or null hash-table)))
@@ -560,31 +583,18 @@
   (%mem-space nil :type (member nil :dynamic :immobile :auto))
   ;; the kind of component
   ;;
-  ;; (The terminology here is left over from before
-  ;; sbcl-0.pre7.34.flaky5.2, when there was no such thing as
-  ;; FUNCTIONAL-HAS-EXTERNAL-REFERENCES-P, so that Python was
-  ;; incapable of building standalone :EXTERNAL functions, but instead
-  ;; had to implement things like #'CL:COMPILE as FUNCALL of a little
-  ;; toplevel stub whose sole purpose was to return an :EXTERNAL
-  ;; function.)
-  ;;
   ;; The possibilities are:
   ;;   NIL
   ;;     an ordinary component, containing non-top-level code
   ;;   :TOPLEVEL
   ;;     a component containing only load-time code
   ;;   :COMPLEX-TOPLEVEL
-  ;;     In the old system, before FUNCTIONAL-HAS-EXTERNAL-REFERENCES-P
-  ;;     was defined, this was necessarily a component containing both
-  ;;     top level and run-time code. Now this state is also used for
-  ;;     a component with HAS-EXTERNAL-REFERENCES-P functionals in it.
+  ;;     a component containing both top-level and run-time code
   ;;   :INITIAL
   ;;     the result of initial IR1 conversion, on which component
   ;;     analysis has not been done
   ;;   :DELETED
   ;;     debris left over from component analysis
-  ;;
-  ;; See also COMPONENT-TOPLEVELISH-P.
   (kind nil :type (member nil :toplevel :complex-toplevel :initial :deleted))
   ;; the blocks that are the dummy head and tail of the DFO
   ;;
@@ -709,6 +719,10 @@
   ;; a list of NLX-INFO structures describing all the non-local exits
   ;; into this environment
   (nlx-info nil :type list)
+  ;; whether this environment has a closure and the function that
+  ;; allocates this environment escapes through any other escaping
+  ;; environments.
+  (escapes-elsewhere-p nil :type boolean)
   ;; some kind of info used by the back end
   (info nil :type (or ir2-environment null)))
 (defprinter (environment :identity t)
@@ -819,8 +833,7 @@
                 ;; I guess we state the type this way to avoid calling
                 ;; LEGAL-FUN-NAME-P unless absolutely necessary,
                 ;; but this seems a bit of a premature optimization.
-                :type (or symbol (and cons #-host-quirks-cmu (satisfies legal-fun-name-p)))
-                :read-only t)
+                :type (or symbol (and cons #-host-quirks-cmu (satisfies legal-fun-name-p))))
   ;; the type which values of this leaf must have
   (type *universal-type* :type ctype)
   ;; the type which values of this leaf have last been defined to have
@@ -927,7 +940,7 @@
                          (where-from :defined)
                          (kind :global-function))
                (:constructor make-defined-fun
-                   (%source-name type &optional where-from
+                   (%source-name type where-from
                     &key kind
                          inline-expansion inlinep
                          same-block-p functional))
@@ -1034,8 +1047,7 @@
   ;;   %SOURCE-NAME=FOO (or maybe .ANONYMOUS.?)
   ;;   %DEBUG-NAME=(MACRO-FUNCTION FOO)
   (%debug-name nil
-   :type (or null (not (satisfies legal-fun-name-p)))
-   :read-only t)
+   :type (or null (not (satisfies legal-fun-name-p))))
   ;; some information about how this function is used. These values
   ;; are meaningful:
   ;;
@@ -1097,14 +1109,6 @@
   ;;    :ZOMBIE
   ;;    Effectless [MV-]LET; has no BIND node.
   (kind #.(functional-kind-attributes nil) :type attributes)
-  ;; Is this a function that some external entity (e.g. the fasl dumper)
-  ;; refers to, so that even when it appears to have no references, it
-  ;; shouldn't be deleted? In the old days (before
-  ;; sbcl-0.pre7.37.flaky5.2) this was sort of implicitly true when
-  ;; KIND was :TOPLEVEL. Now it must be set explicitly, both for
-  ;; :TOPLEVEL functions and for any other kind of functions that we
-  ;; want to dump or return from #'CL:COMPILE or whatever.
-  (has-external-references-p nil)
   ;; In a normal function, this is the external entry point (XEP)
   ;; lambda for this function, if any. Each function that is used
   ;; other than in a local call has an XEP, and all of the
@@ -1151,7 +1155,7 @@
 (defun pretty-print-functional (functional stream)
   (let ((name (functional-debug-name functional)))
     (prin1 `(function
-             ,(if (typep name '(cons (member xep tl-xep)))
+             ,(if (typep name '(cons (eql xep)))
                   (cadr name)
                   name))
            stream)))
@@ -1238,6 +1242,9 @@
   ;; all the lambdas that have been LET-substituted in this lambda.
   ;; This is only non-null in lambdas that aren't LETs.
   (lets nil :type list)
+  ;; True if any of this lambdas variables are still in the process of
+  ;; having their optimistic types reach fixpoint.
+  (optimistic-pending nil :type boolean)
   ;; all the ENTRY nodes in this function and its LETs, or null in a LET
   (entries nil :type list)
   ;; all the DYNAMIC-EXTENT nodes in this function and its LETs, or
@@ -1251,7 +1258,7 @@
   ;; the TAIL-SET that this LAMBDA is in. This is null during creation
   ;; and in let lambdas.
   (tail-set nil :type (or tail-set null))
-  ;; the structure which represents the phsical environment that this
+  ;; the structure which represents the environment that this
   ;; function's variables are allocated in. This is filled in by
   ;; environment analysis. In a LET, this is EQ to our home's
   ;; environment.
@@ -1270,25 +1277,6 @@
   (type :test (not (eq type *universal-type*)))
   (where-from :test (not (eq where-from :assumed)))
   (vars :prin1 (mapcar #'leaf-source-name vars)))
-
-;;; Before sbcl-0.7.0, there were :TOPLEVEL things which were magical
-;;; in multiple ways. That's since been refactored into the orthogonal
-;;; properties "optimized for locall with no arguments" and "externally
-;;; visible/referenced (so don't delete it)". The code <0.7.0 did a lot
-;;; of tests a la (EQ KIND :TOP_LEVEL) in the "don't delete it?" sense;
-;;; this function is a sort of literal translation of those tests into
-;;; the new world.
-;;;
-;;; FIXME: After things settle down, bare :TOPLEVEL might go away, at
-;;; which time it might be possible to replace the COMPONENT-KIND
-;;; :TOPLEVEL mess with a flag COMPONENT-HAS-EXTERNAL-REFERENCES-P
-;;; along the lines of FUNCTIONAL-HAS-EXTERNAL-REFERENCES-P.
-(defun lambda-toplevelish-p (clambda)
-  (or (functional-kind-eq clambda toplevel)
-      (lambda-has-external-references-p clambda)))
-(defun component-toplevelish-p (component)
-  (member (component-kind component)
-          '(:toplevel :complex-toplevel)))
 
 ;;; The OPTIONAL-DISPATCH leaf is used to represent hairy lambdas. It
 ;;; is a FUNCTIONAL, like LAMBDA. Each legal number of arguments has a
@@ -1466,6 +1454,14 @@
   (equality-constraints    nil :type (or null (vector t)))
   (equality-constraints-hash nil :type (or null hash-table))
   (vector-length-constraint nil)
+  ;; The type we are assuming for this variable while doing local call
+  ;; argument type propagation. This is an under-approximation
+  ;; starting from the empty type which local call propagation
+  ;; steadily accumulates into until fixpoint and must not be used
+  ;; anywhere else during the process. Only once fixpoint is reached
+  ;; do we publish the type. Null if there is no need to do a fixpoint
+  ;; analysis.
+  (optimistic-type nil :type (or null ctype))
   source-form)
 
 (defprinter (lambda-var :identity t)
@@ -1559,6 +1555,11 @@
   index
   targets)
 
+(defstruct (vop-jumper (:include multiple-successors-node)
+                       (:constructor make-vop-jumper ())
+                       (:copier nil))
+  (default nil))
+
 (defstruct (cset (:include valued-node
                            (derived-type (make-single-value-type *universal-type*)))
                  (:conc-name set-)
@@ -1615,7 +1616,7 @@
   (step-info nil)
   ;; A plist of inline expansions
   (inline-expansions *inline-expansions* :type list :read-only t)
-  ;; Current COMPONENT-REOPTIMIZE-COUNTER set when calling delay-ir1-transform.
+  ;; Current COMPONENT-REOPTIMIZE-COUNTER + -PHASE-COUNTER set in delay-ir1-transform
   (delay-to -1 :type fixnum)
   (constraints-in)
   #+() (constraints-out))
@@ -1656,7 +1657,10 @@
                  (:constructor make-bind ()))
   ;; the lambda we are binding variables for. Null when we are
   ;; creating the LAMBDA during IR1 translation.
-  (lambda nil :type (or clambda null)))
+  (lambda nil :type (or clambda null))
+  ;; The dynamic extent for this bind if any of its variables are
+  ;; declared dynamic extent.
+  (dynamic-extent nil :type (or null cdynamic-extent)))
 (defprinter (bind)
   lambda)
 

@@ -2,18 +2,42 @@
 
 (defmacro define-protocol-class
     (name alien-type superclasses slots &rest options)
-  (let ((to-protocol (intern (format nil "ALIEN-TO-~A" name)))
-        (to-alien (intern (format nil "~A-TO-ALIEN" name))))
+  (let* ((to-protocol (intern (format nil "ALIEN-TO-~A" name)))
+         (to-alien (intern (format nil "~A-TO-ALIEN" name)))
+         (remaining-field-size sb-vm:n-word-bytes)
+         (remaining-fields (loop for field in (sb-alien::alien-record-type-fields
+                                               (sb-alien-internals:parse-alien-type alien-type nil))
+                                 for name = (sb-alien-internals:alien-record-field-name field)
+                                 for offset = (/ (sb-alien-internals:alien-record-field-offset field)
+                                                       8)
+                                 for size = (/ (sb-alien-internals:alien-type-bits (sb-alien-internals:alien-record-field-type field))
+                                                     8)
+                                 when (eql (search "PADDING-" (string name)) 0)
+                                 collect (cons offset size)
+                                 and do (cond ((not (and (zerop (rem offset 4))
+                                                         (zerop (rem size 4))))
+                                               (setf remaining-field-size 1))
+                                              ((not (and (zerop (rem offset sb-vm:n-word-bytes))
+                                                         (zerop (rem size sb-vm:n-word-bytes))))
+                                               (setf remaining-field-size
+                                                     (min remaining-field-size 4))))))
+         (remaining-fields-length (/ (reduce #'+ remaining-fields :key #'cdr)
+                                     remaining-field-size))
+         (remaining-fields-type `(simple-array (unsigned-byte ,(* remaining-field-size 8))
+                                               (,remaining-fields-length))))
     `(progn
       (export ',name :sb-posix)
       (defclass ,name ,superclasses
          ;; KLUDGE: Splice out some slot options (they're
          ;; for the conversion functions, not for DEFCLASS).
-        ,(loop for slotd in slots
-               collect
-               (let ((slotd (copy-list slotd)))
-                 (dolist (keyword '(:array-length :from-alien) slotd)
-                   (remf (cdr slotd) keyword))))
+        (,@(loop for slotd in slots
+                collect
+                (let ((slotd (copy-list slotd)))
+                  (dolist (keyword '(:array-length :from-alien) slotd)
+                    (remf (cdr slotd) keyword))))
+         ,@(when remaining-fields
+             `((remaining-fields :initform (make-sequence ',remaining-fields-type ,remaining-fields-length
+                                                          :initial-element 0)))))
         ,@options)
       ;; TODO (maybe): there's no reason to define to-alien routines
       ;; struct stat, passwd, or group: OS interfaces only ever write
@@ -50,6 +74,18 @@
                                      (,from-alien (sb-alien:slot alien ',(car slotd))))
                               `(setf (slot-value instance ',(car slotd))
                                      (sb-alien:slot alien ',(car slotd)))))
+        ,@(when remaining-fields
+            `((let ((vector (the ,remaining-fields-type
+                                 (slot-value instance 'remaining-fields))))
+                ,@(loop with array-offset = 0
+                        for (offset . size) in remaining-fields
+                        append (loop repeat (/ size remaining-field-size)
+                                     for i from (/ offset remaining-field-size)
+                                     collect `(setf (aref vector ,array-offset)
+                                                    (deref (sb-alien:cast alien (* (unsigned ,(* remaining-field-size 8))))
+                                                           ,i))
+                                     do
+                                     (incf array-offset))))))
         instance)
       (defun ,to-alien (instance &optional alien)
         (declare (type (or null (sb-alien:alien (* ,alien-type))) alien)
@@ -70,7 +106,19 @@
                 ;; counterpart of :FROM-ALIEN so far.
                 else
                   collect `(setf (sb-alien:slot alien ',(car slotd))
-                                 (slot-value instance ',(car slotd)))))
+                                 (slot-value instance ',(car slotd))))
+        ,@(when remaining-fields
+            `((let ((vector (the ,remaining-fields-type
+                                 (slot-value instance 'remaining-fields))))
+                ,@(loop with array-offset = 0
+                        for (offset . size) in remaining-fields
+                        append (loop repeat (/ size remaining-field-size)
+                                     for i from (/ offset remaining-field-size)
+                                     collect `(setf (deref (sb-alien:cast alien (* (unsigned ,(* remaining-field-size 8))))
+                                                           ,i)
+                                                    (aref vector ,array-offset))
+                                     do
+                                     (incf array-offset)))))))
       (find-class ',name))))
 
 (define-condition sb-posix:syscall-error (error)
@@ -274,7 +322,8 @@
                           (arg alien-pointer-to-anything-or-nil))
   (define-protocol-class flock alien-flock ()
    ((type :initarg :type :accessor flock-type
-          :documentation "Type of lock; F_RDLCK, F_WRLCK, F_UNLCK.")
+          :documentation "Type of lock; `\\\\F_RDLCK`, `\\\\F_WRLCK`,
+`\\\\F_UNLCK`.")
     (whence :initarg :whence :accessor flock-whence
             :documentation "Flag for starting offset.")
     (start :initarg :start :accessor flock-start
@@ -286,8 +335,9 @@
     ;; so we initialize it to 0.
     (pid :initform 0 :reader flock-pid
          :documentation
-         "Process ID of the process holding the lock; returned with F_GETLK."))
-   (:documentation "Class representing locks used in fcntl(2)."))
+         "Process ID of the process holding the lock;
+         returned with `\\\\F_GETLK`."))
+   (:documentation "Class representing locks used in `\\fcntl(2)`."))
   (define-entry-point "fcntl" (fd cmd &optional (arg nil argp))
     (if argp
         (etypecase arg
@@ -509,6 +559,8 @@ not supported."
 
  (define-call "munmap" int minusp
    (start sb-sys:system-area-pointer) (length unsigned))
+ (define-call "mprotect" int minusp
+   (addr system-area-pointer) (length size-t) (prot unsigned))
 
  (define-call "msync" int minusp
    (addr sb-sys:system-area-pointer) (length unsigned) (flags int)))
@@ -824,11 +876,7 @@ not supported."
    (lflag :initarg :lflag :accessor termios-lflag
           :documentation "Local modes.")
    (cc :initarg :cc :accessor termios-cc :array-length nccs
-       :documentation "Control characters.")
-   (ispeed :initarg :ispeed :accessor termios-ispeed
-           :documentation "Input speed.")
-   (ospeed :initarg :ospeed :accessor termios-ospeed
-           :documentation "Output speed."))
+       :documentation "Control characters."))
   (:documentation
    "Instances of this class represent I/O characteristics of the terminal."))
 
@@ -1028,7 +1076,7 @@ not supported."
   (defun syslog (priority format &rest args)
     "Send a message to the syslog facility, with severity level
 PRIORITY.  The message will be formatted as by CL:FORMAT (rather
-than C's printf) with format string FORMAT and arguments ARGS."
+than C's `printf`) with format string FORMAT and arguments ARGS."
     (flet ((syslog1 (priority message)
              (alien-funcall (extern-alien
                              "syslog" (function void int

@@ -57,7 +57,9 @@
            #:opaque-identity
            #:runtime #:split-string #:integer-sequence #:shuffle
            #:compile-so
-           :vop-existsp))
+           #:vop-existsp
+           #:push-package
+           #:pop-package))
 
 (in-package :test-util)
 
@@ -347,13 +349,19 @@
       (really-invoke-debugger condition))))
 
 (defun vop-existsp (name &optional (query :translate))
-  (ecase query
-    (:named
-     (gethash name sb-c::*backend-template-names*))
-    (:translate
-     (let ((info (sb-int:info :function :info name)))
-       (when info
-         (sb-c::fun-info-templates info))))))
+  (let ((name (if (stringp name)
+                  (let ((colon (position #\: name)))
+                    (find-symbol (subseq name (1+ colon))
+                                 (subseq name 0 colon)))
+                  name)))
+    (when name
+      (ecase query
+        (:named
+         (gethash name sb-c::*backend-template-names*))
+        (:translate
+         (let ((info (sb-int:info :function :info name)))
+           (when info
+             (sb-c::fun-info-templates info))))))))
 
 (defun skipped-p (x)
   (typecase x
@@ -837,7 +845,9 @@
                                          form &body cases)
   (flet ((make-case-form (case)
            (if (typep case '(cons (member :return-type)))
-               `',case
+               `',(if (typep (cadr case) '(cons (eql values)))
+                      case
+                      `(,(car case) (values ,(cadr case) &optional)))
                (destructuring-bind (args values &key (test ''equal testp)
                                                      allow-conditions)
                    case
@@ -1142,3 +1152,13 @@
                               "-o" ,solib ,file)
                             :output t :error :output)
         (sb-alien:load-shared-object solib))))
+
+(defvar *packages* nil)
+
+(defmacro push-package ()
+  (push *package* *packages*)
+  nil)
+
+(defmacro pop-package ()
+  `(in-package ,(package-name (pop *packages*))))
+

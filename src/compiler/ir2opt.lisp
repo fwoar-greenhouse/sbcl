@@ -1,4 +1,4 @@
-;;;; This file implements some optimisations at the IR2 level.
+;;; This file implements some optimisations at the IR2 level.
 ;;;; Currently, the pass converts branches to conditional moves,
 ;;;; deletes subsequently dead blocks and then reoptimizes jumps.
 
@@ -184,10 +184,9 @@
               (x-tn (tn-ref-tn args))
               (test (tn-ref-tn (tn-ref-across args))))
          (when (and (constant-tn-p test)
-                    (equal (tn-value value-if)
-                           (tn-value test))
-                    (eq (tn-primitive-type x-tn)
-                        (tn-primitive-type res)))
+                    (equal (tn-value value-if) (tn-value test))
+                    (eq (tn-primitive-type x-tn) (tn-primitive-type res))
+                    (eq (tn-sc x-tn) (tn-sc res)))
            (setf value-if x-tn))))
      (flet ((coerce-tn (tn move)
               (if (or (eq tn res)
@@ -265,7 +264,6 @@
                  (return-from mark-2block))
                (setf (gethash 2block live-2blocks) t)
                (map nil #'mark-2block (cdr (gethash 2block *2block-info*)))))
-      (declare (dynamic-extent #'mark-2block))
       (mark-2block (block-info (component-head component))))
 
     (flet ((delete-2block (2block)
@@ -337,6 +335,12 @@
               (let ((transferred (eq (tn-sc x) (tn-sc y))))
                 (when transferred
                   (loop with ref = (tn-writes x)
+                        while ref
+                        do
+                        (let ((next (tn-ref-next ref)))
+                          (change-tn-ref-tn ref y)
+                          (setf ref next)))
+                  (loop with ref = (tn-reads x)
                         while ref
                         do
                         (let ((next (tn-ref-next ref)))
@@ -732,11 +736,11 @@
          plusp)
     (when (and branch
                (or
-                (eq (vop-name next) #+x86-64 'sb-vm::fast-if-eq-fixnum/c
-                                    #+arm64 'sb-vm::fast-if-eq-integer/c)
+                (eq (vop-name next) #+x86-64 'sb-vm::if-eq-fixnum/c
+                                    #+arm64 'sb-vm::if-eq-integer/c)
                 (and (eq (vop-name next)
-                         #-arm64 'sb-vm::fast-if->-c/fixnum
-                         #+arm64 'sb-vm::fast-if->-integer/c)
+                         #-arm64 'sb-vm::if->-c/fixnum
+                         #+arm64 'sb-vm::if->-integer/c)
                      (eql (car (vop-codegen-info next)) 0)
                      (setf plusp t)))
                (eq (vop-name branch)
@@ -1030,6 +1034,7 @@
         (when (> (length vops) 1)
           (let ((layout (make-representation-tn *backend-t-primitive-type*
                                                 sb-vm:descriptor-reg-sc-number))
+                (test-layouts (mapcar (lambda (v) (third (vop-codegen-info v))) vops))
                 (block (vop-block vop)))
             (setf (tn-type value)
                   (tn-ref-type (vop-args vop)))
@@ -1043,14 +1048,32 @@
             (update-block-succ block
                                (cons stop
                                      (ir2block-successors block)))
-            (let ((test-vop (template-or-lose 'sb-vm::structure-typep*)))
+            (let ((test-vop (template-or-lose 'sb-vm::structure-typep*))
+                  (test-arg layout)
+                  ;; not to be confused with "load-layout-id" in some */insts.lisp files
+                  (depthoid (and (vop-existsp :named sb-vm::get-layout-id)
+                                 (notany 'sb-vm::struct-typep-bit-test-p test-layouts)
+                                 (layout-depthoid (car test-layouts)))))
+              (when (and depthoid
+                         (<= 2 depthoid sb-kernel::layout-id-vector-fixed-capacity)
+                         (every (lambda (l) (eql (layout-depthoid l) depthoid)) test-layouts))
+                (let ((id-tn (make-representation-tn
+                              (primitive-type-or-lose 'sb-vm::signed-byte-64)
+                              sb-vm:signed-reg-sc-number))
+                      (offset (+ (sb-vm::id-bits-offset) (ash (- depthoid 2) 2))))
+                  (emit-and-insert-vop (vop-node vop) block
+                                       (template-or-lose 'sb-vm::get-layout-id)
+                                       (reference-tn layout nil) (reference-tn id-tn t)
+                                       vop (list offset))
+                  (setq test-vop (template-or-lose 'sb-vm::test-layout-id)
+                        test-arg id-tn)))
               (loop for vop in vops
                     for info = (vop-codegen-info vop)
                     do
                     (emit-and-insert-vop (vop-node vop)
                                          (vop-block vop)
                                          test-vop
-                                         (reference-tn layout nil)
+                                         (reference-tn test-arg nil)
                                          nil
                                          vop
                                          info)
@@ -1075,6 +1098,23 @@
    `(let* (,@(gen 'vop-args args)
            ,@(gen 'vop-results results))
       ,@(bind-info body))))
+
+(defmacro vop-bind-tn-refs (args results vop &body body)
+  (flet ((gen (accessor operands)
+           (loop for op in operands
+                 and tn-ref = `(,accessor ,vop) then `(tn-ref-across ,op)
+                 until (eq op :info)
+                 collect `(,op ,tn-ref)))
+         (bind-info (body)
+           (let ((info (cdr (member :info args))))
+             (if info
+                 `((loop named #:vop-bind
+                         with ,info = (vop-codegen-info ,vop)
+                         return (progn ,@body)))
+                 body))))
+    `(let* (,@(gen 'vop-args args)
+            ,@(gen 'vop-results results))
+       ,@(bind-info body))))
 
 (defun tn-reader (tn &key single-writer
                           single-reader)
@@ -1294,6 +1334,34 @@
                                       vop
                                       (list symbols))
             (mapc #'delete-vop binds)))))))
+
+#+arm64
+(defoptimizers vop-optimize (sb-vm::dpb-c/fixnum sb-vm::dpb-c/signed-unsigned) (vop)
+  ;; bfm usually has fewer execution units and might have higher
+  ;; latency, and might require a move or untagging, prefer ORR when
+  ;; possible
+  (vop-bind-tn-refs (new integer :info size posn) (res) vop
+    (let* ((new-type (tn-ref-type new))
+           (integer-type (tn-ref-type integer))
+           (new-width (unsigned-type-width new-type))
+           (integer-width (unsigned-type-width integer-type)))
+      (when (and size posn
+                 new-width integer-width
+                 (<= new-width size)
+                 (<= integer-width posn))
+        (emit-and-insert-vop (vop-node vop)
+                             (vop-block vop)
+                             (template-or-lose
+                              (if (and (csubtypep integer-type (specifier-type 'fixnum))
+                                       (csubtypep (tn-ref-type res) (specifier-type 'fixnum)))
+                                  'sb-vm::dpb-c/orr/any-reg
+                                  'sb-vm::dpb-c/orr/signed-reg))
+                             (reference-tn-refs new nil)
+                             (reference-tn-refs res t)
+                             vop
+                             (list posn))
+        (delete-vop vop)))
+    nil))
 
 (defun very-temporary-p (tn)
   (let ((writes (tn-writes tn))

@@ -117,7 +117,6 @@
 
 (define-vop (char-code)
   (:translate char-code)
-  (:policy :fast-safe)
   (:args #-sb-unicode (ch :scs (character-reg character-stack))
          #+sb-unicode (ch :scs (character-reg character-stack) :target res))
   (:arg-types character)
@@ -132,7 +131,6 @@
 #+sb-unicode
 (define-vop (code-char)
   (:translate code-char)
-  (:policy :fast-safe)
   (:args (code :scs (unsigned-reg unsigned-stack) :target res))
   (:arg-types positive-fixnum)
   (:results (res :scs (character-reg)))
@@ -142,7 +140,6 @@
 #-sb-unicode
 (define-vop (code-char)
   (:translate code-char)
-  (:policy :fast-safe)
   (:args (code :scs (unsigned-reg unsigned-stack) :target eax))
   (:arg-types positive-fixnum)
   (:temporary (:sc unsigned-reg :offset eax-offset :target res
@@ -161,20 +158,19 @@
             :load-if (not (and (sc-is x character-reg)
                                (sc-is y character-stack)))))
   (:arg-types character character)
-  (:policy :fast-safe)
   (:note "inline comparison")
   (:generator 3
     (inst cmp x y)))
 
-(define-vop (fast-char=/character character-compare)
+(define-vop (char=/character character-compare)
   (:translate char=)
   (:conditional :e))
 
-(define-vop (fast-char</character character-compare)
+(define-vop (char</character character-compare)
   (:translate char<)
   (:conditional :b))
 
-(define-vop (fast-char>/character character-compare)
+(define-vop (char>/character character-compare)
   (:translate char>)
   (:conditional :a))
 
@@ -182,19 +178,18 @@
   (:args (x :scs (character-reg character-stack)))
   (:arg-types character (:constant character))
   (:info y)
-  (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
     (inst cmp x (char-code y))))
 
-(define-vop (fast-char=/character/c character-compare/c)
+(define-vop (char=/character/c character-compare/c)
   (:translate char=)
   (:conditional :e))
 
-(define-vop (fast-char</character/c character-compare/c)
+(define-vop (char</character/c character-compare/c)
   (:translate char<)
   (:conditional :b))
 
-(define-vop (fast-char>/character/c character-compare/c)
+(define-vop (char>/character/c character-compare/c)
   (:translate char>)
   (:conditional :a))

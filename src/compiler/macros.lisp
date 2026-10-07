@@ -300,6 +300,13 @@
 ;;;             if the function returns T.
 ;;;   :BEFORE-VOP
 ;;;           - an ordinary transform placed before VOP transforms.
+(locally
+;; suppress the "optional & key" warning in our lambda lists
+#+(and sb-xc-host host-quirks-sbcl) (declare (host-sb-ext:muffle-conditions style-warning))
+;; This ought to be (MUFFLE-CONDITIONS SB-KERNEL:&OPTIONAL-AND-&KEY-IN-LAMBDA-LIST)
+;; for more finesse, however, the host lisp sees this condition class name, and honestly
+;; I can't explain that. We have to just say STYLE-WARNING. So it goes.
+#-sb-xc-host (declare (muffle-conditions style-warning))
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                                     (result-type '*)
                               &key result policy node defun-only
@@ -384,6 +391,7 @@
                      `(%deftransform ',name ,(if policy '#'policy-test) ',type
                                      #',transform-name ,important))
                    names)))))
+) ; end LOCALLY
 
 
 (defun make-optimizer-name (name)
@@ -483,16 +491,24 @@
                                      &optional (node (gensym))
                                      &rest vars)
                          &body body)
-  (let* ((name (list (car names) kind))
+  (let* ((name (if (eq kind 'vop-optimize)
+                   (list kind (car names))
+                   (list (car names) kind)))
          (optimizer-name (make-optimizer-name name)))
     `(progn
        (defoptimizer ,name
            (,lambda-list ,node ,@vars)
          ,@body)
-       ,@(loop for name in (cdr names)
-               collect `(setf (,(package-symbolicate #.(find-package "SB-C") "FUN-INFO-" kind)
-                               (fun-info-or-lose ',name))
-                              #',optimizer-name)))))
+       ,@(if (eq kind 'vop-optimize)
+             (loop for name in (cdr names)
+                   collect
+                   `(set-vop-optimizer (template-or-lose ',name)
+                                       #',optimizer-name))
+             (loop for name in (cdr names)
+                   collect
+                   `(setf (,(package-symbolicate #.(find-package "SB-C") "FUN-INFO-" kind)
+                           (fun-info-or-lose ',name))
+                          #',optimizer-name))))))
 
 ;;;; IR groveling macros
 
@@ -581,7 +597,10 @@
                               (cond
                                 ((not next)
                                  (return))
-                                ((eq (ctran-block next) ,n-block)
+                                ((and (eq (ctran-block next) ,n-block)
+                                      ;; unlink-node only resets node-prev, not node-next
+                                      ;; don't follow node-next if it's been just deleted.
+                                      (node-prev ,node-var))
                                  (ctran-next next))
                                 (t
                                  (let ((start (block-start ,n-block)))
@@ -593,10 +612,10 @@
                                     (ctran-next it))
                                    (t (return)))))
            ,@(when lvar-var
-                   `((,lvar-var (when (valued-node-p ,node-var)
-                                  (node-lvar ,node-var))
-                                (when (valued-node-p ,node-var)
-                                  (node-lvar ,node-var))))))
+               `((,lvar-var (when (valued-node-p ,node-var)
+                              (node-lvar ,node-var))
+                            (when (valued-node-p ,node-var)
+                              (node-lvar ,node-var))))))
           (nil)
        ,@body
        ,@(when restart-p
@@ -1002,18 +1021,18 @@
 ;;; We use WITH-SANE-IO-SYNTAX to provide safe defaults, and provide
 ;;; *COMPILER-PRINT-VARIABLE-ALIST* for user customization.
 (defvar *compiler-print-variable-alist* nil
-  "an association list describing new bindings for special variables
-to be used by the compiler for error-reporting, etc. Eg.
-
- ((*PRINT-LENGTH* . 10) (*PRINT-LEVEL* . 6) (*PRINT-PRETTY* . NIL))
+  "An association list describing new bindings for special variables
+to be used by the compiler for error-reporting, etc.
+E.g. ((*PRINT-LENGTH* . 10) (*PRINT-LEVEL* . 6) (*PRINT-PRETTY* .
+NIL)).
 
 The variables in the CAR positions are bound to the values in the CDR
 during the execution of some debug commands. When evaluating arbitrary
 expressions in the debugger, the normal values of the printer control
 variables are in effect.
 
-Initially empty, *COMPILER-PRINT-VARIABLE-ALIST* is Typically used to
-specify bindings for printer control variables.")
+Initially empty, `*COMPILER-PRINT-VARIABLE-ALIST*` is typically used
+to specify bindings for printer control variables.")
 
 (defmacro with-compiler-io-syntax (&body forms)
   `(with-sane-io-syntax

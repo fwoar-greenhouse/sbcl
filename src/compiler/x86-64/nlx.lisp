@@ -92,16 +92,15 @@
 
 (define-vop (%catch-breakup)
   (:args (current-block))
-  (:temporary (:sc unsigned-reg) block)
-  (:policy :fast-safe)
+  ;; picking RAX avoids touching result registers if this is a pass-through cleanup
+  (:temporary (:sc unsigned-reg :offset rax-offset) block)
   (:generator 17
     (inst mov block (catch-block-ea current-block catch-block-previous-catch-slot))
     (store-tl-symbol-value block *current-catch-block*)))
 
 (define-vop (%unwind-protect-breakup)
   (:args (current-block))
-  (:temporary (:sc unsigned-reg) block)
-  (:policy :fast-safe)
+  (:temporary (:sc unsigned-reg :offset rax-offset) block)
   (:generator 17
      (inst mov block (unwind-block-ea current-block unwind-block-uwp-slot))
      (store-tl-symbol-value block *current-unwind-protect-block*)))
@@ -143,7 +142,7 @@
                  (inst cmp count (fixnumize i))
                  (inst jmp :le default-lab)
                  (when first-stack-arg-p
-                   (storew rdx-tn rbx-tn -1))
+                   (storew (first *register-arg-tns*) rbx-tn -1))
                  (sc-case tn
                    ((descriptor-reg any-reg)
                     (loadw tn start (frame-word-offset (+ sp->fp-offset i))))
@@ -157,7 +156,7 @@
                  (dolist (default (defaults))
                    (emit-label (car default))
                    (when (cddr default)
-                     (inst push rdx-tn))
+                     (inst push (first *register-arg-tns*)))
                    (inst mov (second default) null-tn))
                  (inst jmp defaulting-done))))))
     (inst mov rsp-tn sp)))
@@ -216,6 +215,20 @@
     ;; Reset the CSP at last moved arg.
     (inst lea rsp-tn (ea result loop-index))))
 
+(define-vop (nlx-entry-pass-through)
+  (:args (source :to :save)
+         (count :to :save))
+  (:ignore count)
+  (:info label)
+  (:before-load
+    (emit-label label)
+    (note-this-location vop :non-local-entry))
+  (:temporary (:sc unsigned-reg :offset rsi-offset) rsi)
+  (:save-p :compute-only)
+  (:vop-var vop)
+  (:generator 30
+    (move rsi source)
+    (invoke-asm-routine 'jmp 'return-multiple vop)))
 
 ;;; This VOP is just to force the TNs used in the cleanup onto the stack.
 (define-vop (uwp-entry)

@@ -9,7 +9,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(enable-test-parallelism)
+;(enable-test-parallelism)
 
 
 (import '(sb-c::combination-fun-debug-name
@@ -22,7 +22,7 @@
           sb-c::%check-bound
           sb-kernel:%bit-pos-fwd/1))
 
-(import 'ctu:inspect-ir)
+(import '(ctu:inspect-ir ctu:ir2-vops))
 
 (defun ir-full-calls (form)
   (let (calls)
@@ -43,21 +43,10 @@
      (lambda (component)
        (ctu:do-blocks (block component)
          (ctu:do-nodes (node nil block)
-           (when (basic-combination-p node)
+           (when (and (basic-combination-p node)
+                      (not (eq (sb-c::basic-combination-kind node) :local)))
              (push node calls))))))
     calls))
-
-(defun ir2-vops (form)
-  (let (vops)
-    (inspect-ir
-     form
-     (lambda (component)
-       (ctu:do-ir2-blocks (block component)
-         (do ((vop (sb-c::ir2-block-start-vop block)
-                   (sb-c:vop-next vop)))
-             ((null vop))
-           (push (sb-c:vop-name vop) vops)))))
-    vops))
 
 (with-test (:name :%bit-pos-fwd/1-tail-called)
   (destructuring-bind (combination)
@@ -302,6 +291,210 @@
       (assert (eq (funcall fun 3) 'GOOD))
       (assert (eq (funcall fun -3) 'GOOD))
       (assert assignment))))
+
+;;; Check that we can convert a group of mutually tail recursive
+;;; lambdas entered by tail calls.
+#+sb-devel
+(with-test (:name (:assignment-convert :group-entered-by-tail-calls))
+  (let ((converted '()))
+    (let ((fun (inspect-ir
+                '(lambda (n)
+                  (labels ((my-even? (n)
+                             (if (zerop n) t (my-odd? (1- n))))
+                           (my-odd? (n)
+                             (if (zerop n) nil (my-even? (1- n)))))
+                    (if (plusp n)
+                        (my-even? n)
+                        (my-odd? n))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (push lambda-let converted))))))))
+      (assert (eq (funcall fun 4) t))
+      (assert (eq (funcall fun 7) nil))
+      (assert (eq (funcall fun 0) nil))
+      (assert (= (length converted) 2))))) ; MY-EVEN?, MY-ODD?
+
+;;; The example in 5.1 of Fluet and Weeks "Contification using
+;;; Dominators", which the A_cont analysis can handle, but A_call
+;;; cannot. In this case, FM, F, G and H all have the same
+;;; continuation.
+#+sb-devel
+(with-test (:name (:assignment-convert :fluet-weeks-5.1))
+  (let ((converted '()))
+    (let ((fun (inspect-ir
+                '(lambda (b x y flag)
+                  (labels ((fm (n x)
+                             (if flag
+                                 (f (1- n) (1+ x) t)
+                                 (g (1+ n) (1- x) t)))
+                           (f (n x flag1)
+                             (if flag1
+                                 (g (* 2 n) (- 2 x) nil)
+                                 (h (* n n))))
+                           (g (n x flag2)
+                             (if flag2
+                                 (f (1+ n) (+ x 2) nil)
+                                 (h (* n x))))
+                           (h (y)
+                             (* y y)))
+                    (+ 2
+                       (if (= b 5)
+                           (fm x x)
+                           (fm b y)))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (push lambda-let converted))))))))
+      (assert (= (funcall fun 1 2 3 t) 2))
+      (assert (= (funcall fun 1 2 3 nil) 83))
+      (assert (= (length converted) 4))))) ; F, G, FM, H
+
+;;; A modified version of the above test, but with an outside call for
+;;; H.
+#+sb-devel
+(with-test (:name (:assignment-convert :fluet-weeks-5.1-modified))
+  (let ((converted '()))
+    (let ((fun (inspect-ir
+                '(lambda (b x y flag)
+                  (labels ((fm (n x)
+                             (if flag
+                                 (f (1- n) (1+ x) t)
+                                 (g (1+ n) (1- x) t)))
+                           (f (n x flag1)
+                             (if flag1
+                                 (g (* 2 n) (- 2 x) nil)
+                                 (h (* n n))))
+                           (g (n x flag2)
+                             (if flag2
+                                 (f (1+ n) (+ x 2) nil)
+                                 (h (* n x))))
+                           (h (y)
+                             (* y y)))
+                    (+ 2
+                       (cond ((= b 5)
+                              (fm x x))
+                             ((= (mod b 10) 9)
+                              (h x))
+                             (t
+                              (fm b y))))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (push lambda-let converted))))))))
+      (assert (= (funcall fun 1 2 3 t) 2))
+      (assert (= (funcall fun 1 2 3 nil) 83))
+      (assert (= (length converted) 4))))) ; F, G, FM, H
+
+;;; The example in 5.2 of Fluet and Weeks "Contification via
+;;; Dominators", which both the A_cont analysis and A_call analyses
+;;; cannot handle. In light of this, they present the maximal A_dom
+;;; analysis. In this case, F, G1, G2 and H all have the same
+;;; continuation.
+#+sb-devel
+(with-test (:name (:assignment-convert :fluet-weeks-5.2))
+  (let ((converted '()))
+    (let ((fun (inspect-ir
+                '(lambda (b x y flag)
+                  (labels ((fm (n x flag1)
+                             (if flag1
+                                 (f (1- n) (1+ x))
+                                 (f (1+ n) (1- x))))
+                           (f (n x)
+                             (cond ((= flag 0)
+                                    (g1 (* 2 n) x))
+                                   ((= flag 1)
+                                    (g1 (* n x) x))
+                                   ((= flag 2)
+                                    (g2 (* 2 n) x))
+                                   ((= flag 3)
+                                    (g2 (* n x) x))))
+                           (g1 (n x)
+                             (h (* n x)))
+                           (g2 (n x)
+                             (h (- n x)))
+                           (h (y)
+                             (* y y)))
+                    (+ 2
+                       (fm x x t)
+                       (fm b y nil))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (push lambda-let converted))))))))
+      (assert (= (funcall fun 1 2 3 0) 102))
+      (assert (= (funcall fun 1 2 3 1) 147))
+      (assert (= (funcall fun 1 2 3 2) 7))
+      (assert (= (funcall fun 1 2 3 3) 6))
+      (assert (= (length converted) 4))))) ; F, G1, G2, H
+
+;;; A, B and C are mutually tail recursive, so all three return to the
+;;; continuation of the LIST call, which is where the A_dom analysis
+;;; contifies them. C is only ever called from A and B, that is, from
+;;; inside its own group of mutually tail recursive lambdas, so it has no
+;;; call from outside the group to be spliced in at until A and B have
+;;; been converted and the tail calls to C have become ordinary calls
+;;; returning to that continuation. C cannot be LET converted instead
+;;; either, as it has more than one reference.
+#+sb-devel
+(with-test (:name (:assignment-convert :no-call-from-outside-group))
+  (let ((converted '()))
+    (let ((fun (inspect-ir
+                '(lambda (n)
+                  (labels ((a (i)
+                             (if (<= i 0) :a (c (1- i))))
+                           (b (i)
+                             (if (<= i 0) :b (c (- i 2))))
+                           (c (i)
+                             (if (oddp i) (a (1- i)) (b (1- i)))))
+                    (list (if (plusp n)
+                              (a n)
+                              (b n)))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (push lambda-let converted))))))))
+      (assert (equal (funcall fun 6) '(:a)))
+      (assert (equal (funcall fun -3) '(:b)))
+      (assert (= (length converted) 3))))) ; A, B, C
+
+;;; Like the previous test, except that the members with no call from
+;;; outside the group form a cycle: D1 is called from A and D2 while D2 is
+;;; called from B and D1, and neither can be converted on its own
+;;; beforehand the way C is above, as their callers are in two different
+;;; environments. Converting a member only needs one of its callers to
+;;; have been converted already though, so D1 can follow A and D2 can
+;;; follow B, and the cycle between the two of them does not matter.
+#+sb-devel
+(with-test (:name (:assignment-convert :cycle-of-calls-from-inside-group))
+  (let ((converted '()))
+    (let ((fun (inspect-ir
+                '(lambda (n)
+                  (labels ((a (i)
+                             (if (<= i 0) :a (d1 (1- i))))
+                           (b (i)
+                             (if (<= i 0) :b (d2 (1- i))))
+                           (d1 (i)
+                             (if (oddp i) (d2 (1- i)) (a (1- i))))
+                           (d2 (i)
+                             (if (oddp i) (d1 (1- i)) (b (1- i)))))
+                    (list (if (plusp n)
+                              (a n)
+                              (b n)))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (push lambda-let converted))))))))
+      (assert (equal (funcall fun 7) '(:a)))
+      (assert (equal (funcall fun 6) '(:b)))
+      (assert (equal (funcall fun -2) '(:b)))
+      (assert (= (length converted) 4))))) ; A, B, D1, D2
 
 (with-test (:name :empty-special-bindings)
   (assert (not (find 'sb-c::%special-unbind
@@ -661,3 +854,63 @@
                     :key (lambda (x) (and (combination-p x)
                                           (combination-fun-source-name x nil))))
              0)))
+
+(with-test (:name :xep-calls-no-arg-count-checking)
+  (assert (= (count 'sb-c:verify-arg-count
+                    (ir2-vops '(lambda (n)
+                                (funcall (if n
+                                             (lambda (a) (+ a 2))
+                                             (lambda (b) (+ b 1)))
+                                 1))))
+             1)))
+
+(with-test (:name :complex-constants-to-locals)
+  (assert (= (count 'sb-vm::move-from-complex-double
+                    (ir2-vops '(lambda ()
+                                (flet ((f (p)
+                                         p))
+                                  (let ((p #c(1d0 2d0)))
+                                    (f p)
+                                    (f p))))))
+             0)))
+
+(defun check-no-list-consing (lexpr)
+  (let* ((calls (ir-calls lexpr))
+         (count (+ (count 'list calls
+                          :key (lambda (x) (combination-fun-source-name x nil)))
+                   (count 'list* calls
+                          :key (lambda (x) (combination-fun-source-name x nil))))))
+    (assert (zerop count))))
+
+(defglobal *thing* 0)
+(with-test (:name :member-as-boolean-quasiquoted-list)
+  (check-no-list-consing
+   '(lambda (x)
+     (not (null (member x (list* 1 2 3 (list 'foo 'bar)))))))
+  (check-no-list-consing
+   '(lambda (e w x y z)
+     (declare (symbol e))
+     (cond ((member e `(,w ,x)) 'this) ((member e `(,y ,z)) 'that))))
+  (check-no-list-consing
+   '(lambda (x a)
+     (if (member (the symbol x) `(,a ,*thing* :all :default :other)) 'yes 'no)))
+  (check-no-list-consing
+   '(lambda (x a)
+     (if (member x `(,a ,*thing* :other) :test 'eq) 'yes 'no)))
+  (check-no-list-consing
+   '(lambda (x a)
+     (if (member x `(,a ,*thing* -1) :test #'=) 'yes 'no)))
+  ;; try one of those to see that it works
+  (let ((f (compile nil
+                    '(lambda (x a)
+                      (if (member x `(,a ,*thing* :other) :test 'eq) 'yes 'no)))))
+    (assert (eq (funcall f 'foo 'foo) 'yes))
+    (assert (eq (funcall f  0 'whatever) 'yes))
+    (assert (eq (funcall f :other 'ignore) 'yes))
+    (assert (eq (funcall f 3 4) 'no))))
+
+(with-test (:name :aref-vector-fold)
+  (assert (null
+           (ir-calls
+            `(lambda (a)
+               (aref (vector a) 0))))))

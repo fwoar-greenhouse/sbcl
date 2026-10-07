@@ -56,11 +56,6 @@
 
 ;;; Array of decoded characters, when required.
 (define-load-time-global *available-char-buffers* ())
-;;; Array of element type (unsigned-byte 8) could serve two needs:
-;;; - storing length-in-octets of each character for maintaining char pos
-;;    vs. byte pos involving non-fixed-width EFs.
-;;; - holding data for streams of element type UB8 (not done)
-(define-load-time-global *available-ub8-buffers* ())
 
 (defconstant +bytes-per-buffer+ (* 32 1024)
   "Default number of bytes per buffer.")
@@ -126,7 +121,7 @@
   (original nil :type (or simple-string null))
   (delete-original nil)       ; for :if-exists :rename-and-delete
   ;;; the number of bytes per element
-  (element-size 1 :type index)
+  (element-size 1 :type (and (integer 1) index))
   ;; the type of element being transfered
   (element-type 'base-char)
   ;; coarse characterization of the element type. see description of
@@ -907,29 +902,33 @@
   (read-c-string-fun (missing-arg) :type function)
   (write-c-string-fun (missing-arg) :type function)
   (octets-to-string-fun (missing-arg) :type function)
-  (string-to-octets-fun (missing-arg) :type function))
+  (string-to-octets-fun (missing-arg) :type function)
+  (count-chars nil :type (or fixnum function)))
 (declaim (freeze-type external-format))
-
-(defun ef-char-size (ef-entry)
-  (if (variable-width-external-format-p ef-entry)
-      (bytes-for-char-fun ef-entry)
-      (funcall (bytes-for-char-fun ef-entry) #\x)))
 
 (defun sb-alien::string-to-c-string (string external-format)
   (declare (type simple-string string)
            (explicit-check :result))
-  (locally
-      (declare (optimize (speed 3) (safety 0)))
-    (let ((external-format (get-external-format-or-lose external-format)))
-      (funcall (ef-write-c-string-fun external-format) string))))
+  (if (eq external-format :utf-8)
+      (output-to-c-string/utf-8/lf string)
+      (locally
+          (declare (optimize (speed 3) (safety 0)))
+        (let ((external-format (get-external-format-or-lose external-format)))
+          (funcall (ef-write-c-string-fun external-format) string)))))
 
 (defun sb-alien::c-string-to-string (sap external-format element-type)
   (declare (type system-area-pointer sap)
            (explicit-check :result))
-  (locally
-      (declare (optimize (speed 3) (safety 0)))
-    (let ((external-format (get-external-format-or-lose external-format)))
-      (funcall (ef-read-c-string-fun external-format) sap element-type))))
+  (if (eq external-format :utf-8)
+      (read-from-c-string/utf-8/lf sap element-type)
+      (locally
+          (declare (optimize (speed 3) (safety 0))
+                   (muffle-conditions compiler-note))
+        (let ((external-format (get-external-format-or-lose external-format)))
+          (funcall (ef-read-c-string-fun external-format) sap element-type)))))
+
+(defun sb-alien::c-string-to-string-boxed-sap (sap external-format element-type)
+  (sb-alien::c-string-to-string sap external-format element-type))
 
 (defun get-external-format-or-lose (external-format)
   (or (get-external-format external-format)
@@ -963,7 +962,7 @@
               'character
               1
               (ef-write-n-bytes-fun entry)
-              (ef-char-size entry)
+              (ef-count-chars entry)
               (ef-replacement entry))))
   (dolist (entry *output-routines*)
     (when (and (subtypep type (first entry))
@@ -1331,7 +1330,7 @@
               'character
               1
               (ef-read-n-chars-fun entry)
-              (ef-char-size entry)
+              (ef-count-chars entry)
               (ef-replacement entry))))
   (dolist (entry *input-routines*)
     (when (and (subtypep type (first entry))
@@ -1383,10 +1382,9 @@
 ;;; Note that this blocks in UNIX-READ. It is generally used where
 ;;; there is a definite amount of reading to be done, so blocking
 ;;; isn't too problematical.
-(defun fd-stream-read-n-bytes (stream buffer sbuffer start end eof-error-p)
+(defun fd-stream-read-n-bytes (stream buffer start end eof-error-p)
   (declare (type fd-stream stream))
   (declare (type index start end))
-  (declare (ignore sbuffer))
   (aver (= (length (fd-stream-instead stream)) 0))
   (let* ((ibuf (fd-stream-ibuf stream))
          (sap (buffer-sap ibuf))
@@ -1504,13 +1502,6 @@
   (when external-format
     (get-external-format external-format)))
 
-(defun variable-width-external-format-p (ef-entry)
-  ;; TODO: I'm pretty sure this is always true
-  (and ef-entry (not (null (ef-resync-fun ef-entry)))))
-
-(defun bytes-for-char-fun (ef-entry)
-  (if ef-entry (ef-bytes-for-char-fun ef-entry) (constantly 1)))
-
 (defmacro define-unibyte-mapping-external-format
     (canonical-name (&rest other-names) &body exceptions)
   (let ((->code-name (symbolicate canonical-name '->code-mapper))
@@ -1557,7 +1548,10 @@
           fd-stream-read-n-characters
           write-n-bytes-fun
           (newline-variant :lf)
-          (char-encodable-p t))
+          (char-encodable-p t)
+          (read-c-string-function nil custom-read-c-string-function-p)
+          (output-c-string-function nil custom-output-c-string-function)
+          (count-chars nil count-chars-p))
   (let* ((name (first external-format))
          (suffix (symbolicate name '/ newline-variant))
          (out-function (or write-n-bytes-fun
@@ -1568,8 +1562,12 @@
          (in-char-function (symbolicate "INPUT-CHAR/" suffix))
          (resync-function (symbolicate "RESYNC/" suffix))
          (size-function (symbolicate "BYTES-FOR-CHAR/" suffix))
-         (read-c-string-function (symbolicate "READ-FROM-C-STRING/" suffix))
-         (output-c-string-function (symbolicate "OUTPUT-TO-C-STRING/" suffix))
+         (read-c-string-function (or read-c-string-function
+                                     (symbolicate "READ-FROM-C-STRING/" suffix)))
+         (output-c-string-function (or output-c-string-function
+                                       (symbolicate "OUTPUT-TO-C-STRING/" suffix)))
+         (count-chars-function (or count-chars
+                                   (symbolicate "COUNT-CHARS/" suffix)))
          (n-buffer (gensym "BUFFER")))
     `(progn
        (defun ,size-function (|ch|)
@@ -1647,11 +1645,10 @@
                (sap (buffer-sap obuf)))
            ,out-expr))
        ,@(unless fd-stream-read-n-characters
-           `((defun ,in-function (stream buffer sbuffer start end &aux (index start))
+           `((defun ,in-function (stream buffer start end &aux (index start))
                (declare (type fd-stream stream)
                         (type index index start end)
                         (type ansi-stream-cin-buffer buffer)
-                        (type ansi-stream-csize-buffer sbuffer)
                         (optimize (sb-c:verify-arg-count 0)))
                (when (fd-stream-eof-forced-p stream)
                  (setf (fd-stream-eof-forced-p stream) nil)
@@ -1660,7 +1657,6 @@
                    ((= (fill-pointer instead) 0)
                     (setf (fd-stream-listen stream) nil))
                  (setf (aref buffer index) (vector-pop instead))
-                 (setf (aref sbuffer index) 0)
                  (incf index)
                  (when (= index end)
                    (when (= (fill-pointer instead) 0)
@@ -1701,6 +1697,12 @@
                                          size-info))
                                    in-size-expr)))
                    (declare (type index head tail))
+                   ,(if (integerp in-size-expr)
+                        `(setf (ansi-stream-char-buffer-byte-position-start stream) head
+                               (ansi-stream-char-buffer-start stream) index)
+                        `(setf (ansi-stream-char-buffer-byte-position-start stream) head
+                               (ansi-stream-char-buffer-byte-position stream) head
+                               (ansi-stream-char-buffer-start stream) index))
                    ;; Copy data from stream buffer into user's buffer.
                    (do ((size nil nil))
                        ((or (= tail head)
@@ -1722,7 +1724,6 @@
                                (when (> size (- tail head))
                                  (return))
                                (setf (aref buffer index) ,in-expr)
-                               (setf (aref sbuffer index) size)
                                (incf index)
                                (incf head size))
                              nil))
@@ -1793,106 +1794,132 @@
                           ,in-expr)
                         nil)
                 (return))))))
-       (defun ,read-c-string-function (sap element-type)
-         (declare (type system-area-pointer sap)
-                  (optimize (sb-c:verify-arg-count 0)))
-         (locally
-             (declare (optimize (speed 3) (safety 0)))
-           (let* ((stream ,name)
-                  (size 0) (head 0) (tail (1- array-dimension-limit)) (byte 0) (|ch| nil)
-                  (decode-break-reason nil)
-                  (length (dotimes (count (1- array-dimension-limit) count)
-                            (setf decode-break-reason
-                                  (block decode-break-reason
-                                    (setf byte (sap-ref-8 sap head)
-                                          size ,(if (consp in-size-expr)
-                                                    (cadr in-size-expr)
-                                                    in-size-expr)
-                                          |ch| ,in-expr)
-                                    (incf head size)
-                                    nil))
-                            (when decode-break-reason
-                              (c-string-decoding-error
-                               ,name sap head decode-break-reason))
-                            (when (zerop (char-code |ch|))
-                              (return count))))
-                  (string (case element-type
-                            (base-char
-                             (make-string length :element-type 'base-char))
-                            (character
-                             (make-string length :element-type 'character))
-                            (t
-                             (make-string length :element-type element-type)))))
-             (declare (ignorable stream byte tail)
-                      (type index head length tail) ;; size
-                      (type (unsigned-byte 8) byte)
-                      (type (or null character) |ch|)
-                      (type string string))
-             (setf head 0)
-             (dotimes (index length string)
-               (setf decode-break-reason
-                     (block decode-break-reason
-                       (setf byte (sap-ref-8 sap head)
-                             size ,(if (consp in-size-expr)
-                                       (cadr in-size-expr)
-                                       in-size-expr)
-                             |ch| ,in-expr)
-                       (incf head size)
-                       nil))
-               (when decode-break-reason
-                 (c-string-decoding-error
-                  ,name sap head decode-break-reason))
-               (setf (aref string index) |ch|)))))
-
-       (defun ,output-c-string-function (string)
-         (declare (type simple-string string))
-         (cond ,@(and base-string-direct-mapping
-                      `(((simple-base-string-p string)
-                         string)))
-               (t
-                (locally
-                    (declare (optimize (speed 3) (safety 0)))
-                  (block output-nothing
-                    (let* ((length (length string))
-                           (null-size (let* ((|ch| (code-char 0))
-                                             (bits (char-code |ch|)))
-                                        (declare (ignorable |ch| bits))
-                                        (the index ,out-size-expr)))
-                           (buffer-length
-                             (+ (loop for i of-type index below length
+       ,@(unless custom-read-c-string-function-p
+           `((defun ,read-c-string-function (sap element-type)
+               (declare (type system-area-pointer sap)
+                        (optimize (sb-c:verify-arg-count 0)))
+               (locally
+                   (declare (optimize (speed 3) (safety 0)))
+                 (let* ((stream ,name)
+                        (size 0) (head 0) (tail (1- array-dimension-limit)) (byte 0) (|ch| nil)
+                        (decode-break-reason nil)
+                        (length (dotimes (count (1- array-dimension-limit) count)
+                                  (setf decode-break-reason
+                                        (block decode-break-reason
+                                          (setf byte (sap-ref-8 sap head)
+                                                size ,(if (consp in-size-expr)
+                                                          (cadr in-size-expr)
+                                                          in-size-expr)
+                                                |ch| ,in-expr)
+                                          (incf head size)
+                                          nil))
+                                  (when decode-break-reason
+                                    (c-string-decoding-error
+                                     ,name sap head decode-break-reason))
+                                  (when (zerop (char-code |ch|))
+                                    (return count))))
+                        (string (case element-type
+                                  (base-char
+                                   (make-string length :element-type 'base-char))
+                                  (character
+                                   (make-string length :element-type 'character))
+                                  (t
+                                   (make-string length :element-type element-type)))))
+                   (declare (ignorable stream byte tail)
+                            (type index head length tail) ;; size
+                            (type (unsigned-byte 8) byte)
+                            (type (or null character) |ch|)
+                            (type string string))
+                   (setf head 0)
+                   (dotimes (index length string)
+                     (setf decode-break-reason
+                           (block decode-break-reason
+                             (setf byte (sap-ref-8 sap head)
+                                   size ,(if (consp in-size-expr)
+                                             (cadr in-size-expr)
+                                             in-size-expr)
+                                   |ch| ,in-expr)
+                             (incf head size)
+                             nil))
+                     (when decode-break-reason
+                       (c-string-decoding-error
+                        ,name sap head decode-break-reason))
+                     (setf (aref string index) |ch|)))))))
+       ,@(unless custom-output-c-string-function
+           `((defun ,output-c-string-function (string)
+               (declare (type simple-string string))
+               (cond ,@(and base-string-direct-mapping
+                            `(((simple-base-string-p string)
+                               string)))
+                     (t
+                      (locally
+                          (declare (optimize (speed 3) (safety 0)))
+                        (block output-nothing
+                          (let* ((length (length string))
+                                 (null-size (let* ((|ch| (code-char 0))
+                                                   (bits (char-code |ch|)))
+                                              (declare (ignorable |ch| bits))
+                                              (the index ,out-size-expr)))
+                                 (buffer-length
+                                   (+ (loop for i of-type index below length
+                                            for |ch| of-type character = (aref string i)
+                                            for bits = (char-code |ch|)
+                                            sum (the index ,out-size-expr) of-type index)
+                                      null-size))
+                                 (tail 0)
+                                 (,n-buffer (make-array buffer-length
+                                                        :element-type '(unsigned-byte 8)))
+                                 ;; For external-format-encoding-error
+                                 (stream ',name))
+                            (declare (type index length buffer-length tail)
+                                     (ignorable stream))
+                            (with-pinned-objects (,n-buffer)
+                              (let ((sap (vector-sap ,n-buffer)))
+                                (declare (system-area-pointer sap))
+                                (loop for i of-type index below length
                                       for |ch| of-type character = (aref string i)
                                       for bits = (char-code |ch|)
-                                      sum (the index ,out-size-expr) of-type index)
-                                null-size))
-                           (tail 0)
-                           (,n-buffer (make-array buffer-length
-                                                  :element-type '(unsigned-byte 8)))
-                           ;; For external-format-encoding-error
-                           (stream ',name))
-                      (declare (type index length buffer-length tail)
-                               (ignorable stream))
-                      (with-pinned-objects (,n-buffer)
-                        (let ((sap (vector-sap ,n-buffer)))
-                          (declare (system-area-pointer sap))
-                          (loop for i of-type index below length
-                                for |ch| of-type character = (aref string i)
-                                for bits = (char-code |ch|)
-                                ,@(when handle-size
-                                    `(for size of-type index = ,out-size-expr))
-                                do (prog1
-                                       ,out-expr
-                                     ,@(when handle-size
-                                         `((incf tail size)))))
-                          (let* ((bits 0)
-                                 (|ch| (code-char bits))
-                                 ,@(when handle-size
-                                     `((size null-size))))
-                            (declare (ignorable bits |ch|
-                                                ,@(when handle-size
-                                                    `(size))))
-                            ,out-expr)))
-                      ,n-buffer))))))
+                                      ,@(when handle-size
+                                          `(for size of-type index = ,out-size-expr))
+                                      do (prog1
+                                             ,out-expr
+                                           ,@(when handle-size
+                                               `((incf tail size)))))
+                                (let* ((bits 0)
+                                       (|ch| (code-char bits))
+                                       ,@(when handle-size
+                                           `((size null-size))))
+                                  (declare (ignorable bits |ch|
+                                                      ,@(when handle-size
+                                                          `(size))))
+                                  ,out-expr)))
+                            ,n-buffer))))))))
 
+       ,@(unless (or count-chars-p
+                     (integerp in-size-expr))
+           `((defun ,count-chars-function (stream)
+               (let* ((ibuf (fd-stream-ibuf stream))
+                      (sap (buffer-sap ibuf))
+                      (tail (buffer-tail ibuf))
+                      (head (ansi-stream-char-buffer-byte-position stream))
+                      (codepoint (ansi-stream-char-buffer-byte-position-at stream))
+                      (target-codepoint (ansi-stream-in-index stream)))
+                 (declare (index head codepoint)
+                          (ignorable tail))
+                 (block decode-break-reason ;; shouldn't be reachable
+                   (loop
+                    (when (>= codepoint target-codepoint)
+                      (return head))
+                    (let (,@(if (member 1 (ensure-list
+                                           (if (consp in-size-expr)
+                                               (car in-size-expr)
+                                               in-size-expr)))
+                                `((byte (sap-ref-8 sap head)))))
+                      (incf head
+                            ,(if (consp in-size-expr)
+                                 (cadr in-size-expr)
+                                 in-size-expr)))
+                    (incf codepoint)))))))
        (register-external-format
         ',external-format
         :newline-variant ,newline-variant
@@ -1913,7 +1940,11 @@
                                 (apply ',octets-to-string-sym rest))
         :string-to-octets-fun (lambda (&rest rest)
                                 (declare (dynamic-extent rest))
-                                (apply ',string-to-octets-sym rest))))))
+                                (apply ',string-to-octets-sym rest))
+        :count-chars ,(if (integerp in-size-expr)
+                          in-size-expr
+                          `#',count-chars-function)))))
+
 
 ;;;; utility functions (misc routines, etc)
 
@@ -2024,11 +2055,7 @@
                    (setf (ansi-stream-cin-buffer fd-stream)
                          (or (atomic-pop *available-char-buffers*)
                              (make-array +ansi-stream-in-buffer-length+
-                                         :element-type 'character)))
-                   (setf (ansi-stream-csize-buffer fd-stream)
-                         (or (atomic-pop *available-ub8-buffers*)
-                             (make-array +ansi-stream-in-buffer-length+
-                                         :element-type '(unsigned-byte 8))))))
+                                         :element-type 'character)))))
                 ((equal target-type '(unsigned-byte 8))
                  (setf (ansi-stream-in-buffer fd-stream)
                        (make-array +ansi-stream-in-buffer-length+
@@ -2104,10 +2131,6 @@
 ;;; it as closed.
 (defun release-fd-stream-resources (fd-stream)
   (declare (sb-c::tlab :system)) ; so ATOMIC-PUSH goes to the heap
-  (let ((buffer (ansi-stream-csize-buffer fd-stream)))
-    (when buffer
-      (setf (ansi-stream-csize-buffer fd-stream) nil)
-      (atomic-push buffer *available-ub8-buffers*)))
   (let ((buffer (ansi-stream-cin-buffer fd-stream)))
     (when buffer
       (setf (ansi-stream-cin-buffer fd-stream) nil)

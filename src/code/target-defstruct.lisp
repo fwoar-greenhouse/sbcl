@@ -18,7 +18,8 @@
   #+permgen (%primitive sb-vm::gc-remember-layout layout)
   #-immobile-space (%instance-set layout index value)
   #+immobile-space
-  (sb-vm::with-pseudo-atomic-foreign-calls
+  (with-pinned-objects (layout value)
+   (sb-vm::with-pseudo-atomic-foreign-calls
     ;; This is pseudo-atomic because if you mark first and then GC occurs before storing,
     ;; then GC could (possibly) clear the mark, then you store, and now there's a violation
     ;; of the marking invariant. If you mark after the store, then you run the risk of an
@@ -29,16 +30,20 @@
     (alien-funcall (extern-alien "layout_slot_set" (function void unsigned unsigned int))
                    (get-lisp-obj-address layout) (get-lisp-obj-address value)
                    (truly-the (mod 32) index)))
-  value)
+  value))
 (defun %layout-slot-cas (layout index oldval newval)
   #-immobile-space (%instance-cas layout index oldval newval)
   #+immobile-space
-  (sb-vm::with-pseudo-atomic-foreign-calls
+  (with-pinned-objects (layout oldval newval)
+   (sb-vm::with-pseudo-atomic-foreign-calls
+    ;; This code is barely correct. We need the entire call including coercion
+    ;; of the unsigned word to a lispobj to be within pseudo-atomic.
+    ;; It's ok for x86-64 but technically incorrect for arm64. It needs a vop really.
     (%make-lisp-obj
      (alien-funcall (extern-alien "layout_slot_cas"
                                   (function unsigned unsigned unsigned unsigned int))
                     (get-lisp-obj-address layout) (get-lisp-obj-address oldval)
-                    (get-lisp-obj-address newval) (truly-the (mod 32) index)))))
+                    (get-lisp-obj-address newval) (truly-the (mod 32) index))))))
 
 ;;; For lack of any better to place to write up some detail surrounding
 ;;; layout creation for structure types, I'm putting here.
@@ -100,7 +105,7 @@
     ;; - only subtypes of STRUCTURE-OBJECT need an ID for TYPEP, and structures
     ;;   are not redefinable, so you'd have to define 2^32 different structure
     ;;   types to exhaust the space of IDS.
-    (set-layout-inherits layout inherits (logtest flags +structure-layout-flag+) 0)
+    (set-layout-inherits layout inherits (logtest flags +structure-layout-flag+) nil)
     (let ((bitmap-base (+ fixed-words extra-id-words)))
       (dotimes (i bitmap-words)
         (%raw-instance-set/word layout (+ bitmap-base i)
@@ -197,32 +202,30 @@
                         layout (+ (get-dsd-index layout id-word0) index))
              ;; use SAP-ref, for lack of half-sized slots
              #+64-bit `(signed-sap-ref-32 (id-bits-sap) (ash index 2))))
-(defun layout-id (layout &optional (assign t))
+(defun layout-id (layout)
   ;; If a structure type at depthoid >= 2, then fetch the INDEXth id
   ;; where INDEX is depthoid - 2. Otherwise fetch the 0th id.
   ;; There are a few non-structure types at positive depthoid; those do not store
   ;; their ancestors in the vector; they only store self-id at index 0.
   ;; This isn't performance-critical. If it were, then we should store self-ID
-  ;; at a fixed index. Using it for type-based dispatch remains a possibility.
-  (let* ((depth (- (sb-vm::layout-depthoid layout) 2))
-         (index (if (or (< depth 0) (not (logtest (layout-flags layout)
-                                                  +structure-layout-flag+)))
-                    0 depth))
-         (id (with-pinned-objects (layout)
-               (access-it))))
-    (truly-the
-     (or null layout-id)
-     (cond ((not (zerop id)) id)
-           (assign
-            (aver (logior +structure-layout-flag+ (layout-flags layout)))
-            (with-system-mutex (*layout-id-mutex*)
-              (let ((id (truly-the layout-id (access-it)))) ; double-check
-                (if (zerop id)
-                    (with-pinned-objects (layout)
-                      (setf (access-it)
-                            ;; doesn't really need ATOMIC- any moren
-                            (atomic-incf (car *layout-id-generator*))))
-                    id))))))))
+  ;; at a fixed index.
+  (let* ((index (max 0 (- (sb-vm::layout-depthoid layout) 2)))
+         (id (with-pinned-objects (layout) (access-it))))
+    (unless (zerop id) id)))
+
+(defun ensure-layout-id (layout)
+  (or (layout-id layout)
+      (progn
+        (aver (logtest (layout-flags layout) +structure-layout-flag+))
+        (with-system-mutex (*layout-id-mutex*)
+          (let* ((index (max 0 (- (sb-vm::layout-depthoid layout) 2)))
+                 (id (access-it))) ; double-check
+            (if (zerop id)
+                (with-pinned-objects (layout)
+                  (setf (access-it)
+                        ;; doesn't really need ATOMIC- any more
+                        (atomic-incf (car *layout-id-generator*))))
+                id))))))
 
 (defun set-layout-inherits (layout inherits structurep this-id)
   (setf (layout-inherits layout) inherits)
@@ -243,9 +246,11 @@
       (cond (structurep
              (loop for i from 0 by 4
                    for j from 2 below (length inherits) ; skip T and STRUCTURE-OBJECT
-                   do (setf (signed-sap-ref-32 sap i) (layout-id (svref inherits j)))
-                   finally (setf (signed-sap-ref-32 sap i) this-id)))
-            ((not (eql this-id 0))
+                   do (setf (signed-sap-ref-32 sap i) (ensure-layout-id (svref inherits j)))
+                   finally (setf (signed-sap-ref-32 sap i) (or this-id 0))))
+            (this-id ; it shold only be nonzero for a very restricted number
+             ;; of non-structures. Maybe should assert that we're not assigning
+             ;; numbers to every standard-object.
              (setf (signed-sap-ref-32 sap 0) this-id))))))
 ) ; end MACROLET
 
@@ -404,7 +409,33 @@
                   (%instance-set res i (%instance-ref structure i))
                   (%raw-instance-set/word
                    res i (%raw-instance-ref/word structure i))))
-            res)))))
+            res))))
+
+;;; Have to be compatible in some way
+(defun copy-struct-to-different-class (structure new-layout)
+  (let* ((layout (%instance-layout structure))
+         (new-layout (find-layout new-layout))
+         (len (dd-length (layout-dd new-layout)))
+         (parent (aref (layout-inherits new-layout) (1- (length (layout-inherits new-layout))))))
+    (aver (eq (aref (layout-inherits layout) (1- (length (layout-inherits layout))))
+              parent))
+    (aver (= (dd-length (layout-dd new-layout))
+             len))
+    #+(or x86 x86-64)
+    (let ((res (%new-instance* new-layout len)))
+      (fast-loop res))
+    #-(or x86 x86-64)
+    (if (logtest (layout-flags new-layout) sb-vm::+strictly-boxed-flag+)
+        (let ((res (%new-instance new-layout len)))
+          (fast-loop res))
+        (let ((res (%make-instance/mixed len)))
+          (%set-instance-layout res new-layout)
+          (do-layout-bitmap (i taggedp new-layout len)
+            (if taggedp
+                (%instance-set res i (%instance-ref structure i))
+                (%raw-instance-set/word
+                 res i (%raw-instance-ref/word structure i))))
+          res)))))
 
 ;;; Like above, but copy all slots (including the LAYOUT) as though boxed.
 ;;; If the structure might contain raw slots and the GC is precise,
@@ -614,6 +645,7 @@
                   (h (progn ,@body)))
              (if (< h ,nbuckets) ,resultform)))))))
 
+;;; Unclear why this is in SB-PCL package. It's used more from here.
 (declaim (inline sb-pcl::search-struct-slot-name-vector))
 (defun sb-pcl::search-struct-slot-name-vector (mapper slot-name)
   (declare (optimize (sb-c::insert-array-bounds-checks 0)))
@@ -665,6 +697,7 @@
 ;;; until the function is called (which may never occur), and secondly the caller
 ;;; is never delayed by waiting for the compiler.
 (defun install-struct-slot-mapper (layout)
+  (declare (sb-c::tlab :system))
   (let* ((dd (layout-dd layout))
          (slots (dd-slots dd))
          (keys (map 'vector #'dsd-name slots))
@@ -683,6 +716,7 @@
       (return-from install-struct-slot-mapper
         (setf (layout-slot-mapper layout) vector)))
     (let ((me (%make-slot-mapper-fn))
+          (name `(slot-mapper ,(dd-name dd)))
           (pairs (map 'list #'cons keys values)))
       (setf (sb-kernel:%funcallable-instance-fun me)
             (lambda (symbol)
@@ -692,13 +726,13 @@
               (let ((old (layout-slot-mapper layout)))
                 (if (neq old me) ; if it's not ME, then it's either the second stage mapper
                     ;; or else a compiled perfect-hash-based mapper. Either way, punt.
-                    (funcall old symbol)
-                    (let* ((new (make-second-stage-slot-mapper vector))
+                    (funcall (the function old) symbol)
+                    (let* ((new (lambda (symbol)
+                                  (sb-pcl::search-struct-slot-name-vector vector symbol)))
                            (actual-old
                             (%layout-slot-cas layout (get-dsd-index layout slot-mapper) me new)))
                       (when (eq actual-old me)
-                        (install-hash-based-slot-mapper
-                         layout pairs unique-hashes `(slot-mapper ,(dd-name dd))))
+                        (install-hash-based-slot-mapper layout pairs unique-hashes name))
                       (funcall new symbol))))))
       (setf (layout-slot-mapper layout) me))))
 

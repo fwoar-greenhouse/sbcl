@@ -214,15 +214,15 @@
 ;;; Primary composition information is stored in a hash table local to
 ;;; PRIMARY-COMPOSITION, with (+ (ash codepoint1 21) codepoint2) as
 ;;; keys and the composition as the value
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (sb-c:defknown misc-index (character) (integer 0 #.(- (length sb-unicode::+character-misc-database+) +misc-width+))
+      (sb-c:foldable sb-c:flushable sb-c::no-verify-arg-count)
+    :overwrite-fndb-silently t))
 
 (defun misc-index (char)
   (misc-index-from-char-code (char-code char)
                              sb-unicode::+character-high-pages+
                              sb-unicode::+character-low-pages+))
-
-(aver (csubtypep (global-ftype 'misc-index)
-                 (specifier-type '(sfunction (t) (unsigned-byte 16)))))
-(proclaim `(ftype ,(type-specifier (global-ftype 'misc-index)) misc-index))
 
 (declaim (ftype (sfunction (t) (unsigned-byte 8)) ucd-general-category)
          (inline ucd-general-category))
@@ -249,27 +249,32 @@ there are no character bits or fonts.)"
   "Return the character with the code CODE."
   (code-char code))
 
+(defun length-1-string-p (x)
+  (and (typep x 'string) (= (length x) 1)))
+(defun symbol-with-length-1-name-p (x)
+  (and (typep x 'symbol) (length-1-string-p (symbol-name x))))
+(deftype character-designator ()
+  '(or character (satisfies length-1-string-p) (satisfies symbol-with-length-1-name-p)))
+
 (defun character (object)
   "Coerce OBJECT into a CHARACTER if possible. Legal inputs are characters,
 strings and symbols of length 1."
-  (flet ((do-error (control args)
+  (declare (explicit-check))
+  (flet ((do-error (control)
            (error 'simple-type-error
                   :datum object
-                  ;;?? how to express "symbol with name of length 1"?
-                  :expected-type '(or character (string 1))
+                  :expected-type 'character-designator
                   :format-control control
-                  :format-arguments args)))
+                  :format-arguments (list object))))
     (typecase object
       (character object)
       (string (if (= 1 (length (the string object)))
                   (char object 0)
-                  (do-error
-                   "String is not of length one: ~S" (list object))))
+                  (do-error "String is not of length one: ~S")))
       (symbol (if (= 1 (length (symbol-name object)))
                   (schar (symbol-name object) 0)
-                  (do-error
-                   "Symbol name is not of length one: ~S" (list object))))
-      (t (do-error "~S cannot be coerced to a character." (list object))))))
+                  (do-error "Symbol name is not of length one: ~S")))
+      (t (do-error "~S cannot be coerced to a character.")))))
 
 ;;;; predicates
 
@@ -535,7 +540,7 @@ that digit stands, else returns NIL."
                  (let ((weight (logior #x20 code))) ;; downcase ASCII characters.
                    (when (and (>= (decf weight (- (char-code #\a) 10)) 10)
                               (< weight radix))
-                     weight) ))))
+                     weight)))))
         (let ((number (ucd-decimal-digit char)))
           (when (and number (< number radix))
             number)))))
@@ -547,7 +552,7 @@ character exists."
   (declare (explicit-check weight))
   (cond ((typep weight '(and unsigned-byte fixnum))
          (and (< weight radix)
-              (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight)))))
+              (code-char (+ weight (if (< weight 10) 48 55)))))
         (t
          (the unsigned-byte weight)
          nil)))

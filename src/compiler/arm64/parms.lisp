@@ -71,7 +71,7 @@
 
 (gc-space-setup #+(or linux openbsd netbsd freebsd win32)
                      #x2F0000000
-                     #+darwin #x300000000
+                     #+darwin #x7000000000
                      #-darwin :read-only-space-size #-darwin 0
                      :fixedobj-space-start 0
                      :fixedobj-space-size 0
@@ -79,7 +79,7 @@
                      :text-space-size #.(* 2 65536 1024)
                      :dynamic-space-start
                      #-darwin #x1000000000
-                     #+darwin #x7003000000)
+                     #+darwin #x8003000000)
 
 (defconstant alien-linkage-table-growth-direction :up)
 (defconstant alien-linkage-table-entry-size 16)
@@ -129,3 +129,21 @@
 ;;; The number of bits per element in the assemblers code vector.
 ;;;
 (defparameter *assembly-unit-length* 8)
+
+#+sb-simd-pack
+(progn
+  (defconstant-eqx +simd-pack-element-types+
+      (coerce
+       (hash-cons
+        '(single-float double-float
+          (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32) (unsigned-byte 64)
+          (signed-byte 8) (signed-byte 16) (signed-byte 32) (signed-byte 64)))
+       'vector)
+    #'equalp)
+  (defconstant sb-kernel::+simd-pack-wild+
+    (ldb (byte (length +simd-pack-element-types+) 0) -1))
+  (defconstant-eqx +simd-pack-128-primtypes+
+      #(simd-pack-single simd-pack-double
+        simd-pack-ub8 simd-pack-ub16 simd-pack-ub32 simd-pack-ub64
+        simd-pack-sb8 simd-pack-sb16 simd-pack-sb32 simd-pack-sb64)
+    #'equalp))

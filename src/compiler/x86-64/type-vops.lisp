@@ -293,8 +293,7 @@
 (define-vop (simple-type-predicate)
   (:args (value :scs (any-reg descriptor-reg control-stack)))
   (:conditional)
-  (:arg-refs args)
-  (:policy :fast-safe))
+  (:arg-refs args))
 
 (define-vop (fixnump/unsigned-byte-64 simple-type-predicate)
   (:args (value :scs (unsigned-reg)))
@@ -306,23 +305,6 @@
     (move tmp value)
     (inst shr tmp n-positive-fixnum-bits)))
 
-#-#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
-(define-vop (fixnump/signed-byte-64 simple-type-predicate)
-  (:args (value :scs (signed-reg)))
-  (:conditional :z)
-  (:temporary (:sc unsigned-reg) temp)
-  (:arg-types signed-num)
-  (:translate fixnump)
-  (:generator 3
-    ;; Hackers Delight, p. 53: signed
-    ;;    a <= x <= a + 2^n - 1
-    ;; is equivalent to unsigned
-    ;;    ((x-a) >> n) = 0
-    (inst mov temp #.(- most-negative-fixnum))
-    (inst add temp value)
-    (inst shr temp n-fixnum-bits)))
-
-#+#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (fixnump/signed-byte-64 simple-type-predicate)
   (:args (value :scs (signed-reg) :target temp))
   (:conditional :no)
@@ -334,6 +316,24 @@
     ;; The overflow flag will be set if the reg's sign bit changes.
     (inst shl temp 1)))
 
+(define-vop (fixnump/s128)
+  (:args ((lo hi) :scs (signed-128-reg)))
+  (:arg-types signed-byte-128)
+  (:translate fixnump)
+  (:info target not-p)
+  (:conditional)
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 5
+    (move temp lo)
+    (inst add temp temp)
+    (inst jmp :o (if not-p target DONE))
+
+    (inst  sbb temp temp)
+
+    (inst cmp temp hi)
+    (inst jmp (if not-p :ne :e) target)
+    DONE))
+
 ;;; A (SIGNED-BYTE 64) can be represented with either fixnum or a bignum with
 ;;; exactly one digit.
 
@@ -341,7 +341,6 @@
   (:args (value :scs (any-reg descriptor-reg)))
   (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
   (:conditional :z)
-  (:policy :fast-safe)
   (:translate pointerp)
   (:generator 3
     ;; Since TEST will examine only the low 2 bits, it doesn't matter if we flip just
@@ -398,7 +397,6 @@
   (:args (value :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:conditional :ns)
-  (:policy :fast-safe)
   (:translate signed-byte-64-p)
   (:generator 5
     (inst test value value)))
@@ -409,7 +407,6 @@
                 (:args (value :scs (signed-reg)))
                 (:arg-types signed-num)
                 (:conditional :z)
-                (:policy :fast-safe)
                 (:temporary (:sc unsigned-reg) temp)
                 (:generator 2
                   (inst movsx '(,src-size :qword) temp value)
@@ -423,7 +420,6 @@
   (:args (value :scs (any-reg descriptor-reg)))
   (:conditional :z)
   (:arg-refs arg-ref)
-  (:policy :fast-safe)
   (:temporary (:sc unsigned-reg) temp)
   (:generator 6
     (inst lea temp (ea (ash (expt 2 7) n-fixnum-tag-bits) value))
@@ -434,7 +430,6 @@
   (:args (value :scs (any-reg descriptor-reg)))
   (:conditional :z)
   (:arg-refs arg-ref)
-  (:policy :fast-safe)
   (:temporary (:sc unsigned-reg) temp)
   (:generator 6
     (inst lea temp (ea (ash (expt 2 15) n-fixnum-tag-bits) value))
@@ -445,7 +440,6 @@
   (:args (value :scs (any-reg descriptor-reg)))
   (:conditional :z)
   (:arg-refs arg-ref)
-  (:policy :fast-safe)
   (:temporary (:sc unsigned-reg) temp temp2)
   (:generator 6
     (move temp value)
@@ -845,7 +839,6 @@
                             (immediate (reg-or-legal-imm32-p tn)))))
   (:temporary (:sc unsigned-reg) temp)
   (:conditional :z)
-  (:policy :fast-safe)
   (:translate car-eq-if-listp)
   (:generator 3
     (inst lea temp (ea (- list-pointer-lowtag) value))
@@ -885,7 +878,6 @@
 
 (define-vop (widetag=)
   (:translate widetag=)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:info widetag)
   (:arg-types * (:constant t))
@@ -898,7 +890,6 @@
 (progn
  (define-vop ()
    (:translate %instance-layout)
-   (:policy :fast-safe)
    (:args (object :scs (descriptor-reg)))
    (:results (res :scs (descriptor-reg)))
    (:variant-vars lowtag)
@@ -907,7 +898,6 @@
     (inst mov :dword res (ea (- 4 lowtag) object))))
  (define-vop ()
    (:translate %set-instance-layout)
-   (:policy :fast-safe)
    (:args (object :scs (descriptor-reg))
           (value :scs (any-reg descriptor-reg)))
    (:vop-var vop)
@@ -925,7 +915,6 @@
      (inst mov :dword (ea (- 4 fun-pointer-lowtag) object) value)))
  (define-vop ()
   (:translate sb-c::layout-eq)
-  (:policy :fast-safe)
   (:conditional :e)
   (:args (object :scs (descriptor-reg))
          (layout :scs (descriptor-reg immediate)))
@@ -1036,7 +1025,6 @@
   (:conditional)
   (:info target not-p)
   (:arg-refs integer-ref)
-  (:policy :fast-safe)
   (:variant-vars comparison)
   (:variant :g)
   (:generator 8
@@ -1044,15 +1032,15 @@
            (fixnum (if (sc-is fixnum immediate)
                        (let* ((value (fixnumize (tn-value fixnum)))
                               (one (fixnumize 1)))
-                         (cond ((plausible-signed-imm32-operand-p value)
+                         (cond ((imm32-p value)
                                 value)
-                               ((and (plausible-signed-imm32-operand-p (+ value one))
+                               ((and (imm32-p (+ value one))
                                      (or (and (eql comparison :le)
                                               (setf comparison :l))
                                          (and (eql comparison :g)
                                               (setf comparison :ge))))
                                 (setf value (+ value one)))
-                               ((and (plausible-signed-imm32-operand-p (- value one))
+                               ((and (imm32-p (- value one))
                                      (or (and (eql comparison :ge)
                                               (setf comparison :g))
                                          (and (eql comparison :l)
@@ -1117,7 +1105,7 @@
                                         (setf comparison :le)))))
                       (inst test integer integer))
                      (t
-                      (inst cmp integer (if (plausible-signed-imm32-operand-p fixnum)
+                      (inst cmp integer (if (imm32-p fixnum)
                                             fixnum
                                             (progn
                                               (inst mov temp fixnum)
@@ -1220,7 +1208,6 @@
                   layout)))
   (define-vop ()
     (:translate layout-depthoid)
-    (:policy :fast-safe)
     (:args (layout :scs (descriptor-reg)))
     (:results (res :scs (any-reg)))
     (:result-types fixnum)
@@ -1228,7 +1215,6 @@
       (inst movsx '(:dword :qword) res (read-depthoid))))
   (define-vop ()
     (:translate sb-c::layout-depthoid-ge)
-    (:policy :fast-safe)
     (:args (layout :scs (descriptor-reg)))
     (:info k)
     (:arg-types * (:constant (unsigned-byte 16)))
@@ -1237,12 +1223,7 @@
       (inst cmp :dword (read-depthoid) (fixnumize k))))
 
   (defun structure-is-a (layout test-layout &optional target not-p done)
-    (let ((test-layout
-            (case (layout-classoid-name test-layout)
-                       (condition +condition-layout-flag+)
-                       (pathname  +pathname-layout-flag+)
-                       (structure-object +structure-layout-flag+)
-                       (t test-layout))))
+    (let ((test-layout (or (struct-typep-bit-test-p test-layout) test-layout)))
      (cond ((integerp test-layout)
             (inst test
                   (if (typep test-layout '(unsigned-byte 8))
@@ -1265,34 +1246,21 @@
             (inst cmp (emit-constant test-layout) layout))
 
            (t
-            (let* ((depthoid (layout-depthoid test-layout))
-                   (offset (+ (id-bits-offset)
-                              (ash (- depthoid 2) 2)
-                              (- instance-pointer-lowtag))))
+            (let ((depthoid (layout-depthoid test-layout)))
               (when (and target
                          (> depthoid sb-kernel::layout-id-vector-fixed-capacity))
                 (inst cmp :dword (read-depthoid) (fixnumize depthoid))
                 (inst jmp :l (if not-p target done)))
               (inst cmp :dword
-                    (ea offset layout)
-                    ;; Small layout-ids can only occur for layouts made in genesis.
-                    ;; Therefore if the compile-time value of the ID is small,
-                    ;; it is permanently assigned to that type.
-                    ;; Otherwise, we allow for the possibility that the compile-time ID
-                    ;; is not the same as the load-time ID.
-                    ;; I don't think layout-id 0 can get here, but be sure to exclude it.
-                    (cond ((or (typep (layout-id test-layout) '(and (signed-byte 8) (not (eql 0))))
-                               (not (sb-c::producing-fasl-file)))
-                           (layout-id test-layout))
-                          (t
-                           (make-fixup test-layout :layout-id))))))))))
+                    (ea (layout-id-offset test-layout) layout)
+                    (ensure-layout-id-fixup-or-imm test-layout)))))))
+) ; end MACROLET
 
 (define-vop ()
   (:translate sb-c::%structure-is-a)
   (:args (x :scs (descriptor-reg)))
   (:arg-types * (:constant t))
   (:info test)
-  (:policy :fast-safe)
   (:conditional :e)
   (:generator 1
     (structure-is-a x test)))
@@ -1302,7 +1270,6 @@
   (:args (object :scs (descriptor-reg)))
   (:arg-types * (:constant t))
   (:arg-refs args)
-  (:policy :fast-safe)
   (:conditional)
   (:info target not-p test-layout)
   (:temporary (:sc descriptor-reg) layout)
@@ -1310,8 +1277,7 @@
     (unless (instance-tn-ref-p args)
       (%test-lowtag object layout (if not-p target done) t instance-pointer-lowtag))
 
-    (cond ((and (not (memq (layout-classoid-name test-layout)
-                           '(condition pathname structure-object)))
+    (cond ((and (not (struct-typep-bit-test-p test-layout))
                 (let ((classoid (layout-classoid test-layout)))
                   (and (eq (classoid-state classoid) :sealed)
                        (not (classoid-subclasses classoid)))))
@@ -1330,24 +1296,19 @@
            #-compact-instance-header
            (loadw layout object instance-slots-offset instance-pointer-lowtag)
            (structure-is-a layout test-layout target not-p done)))
-    (inst jmp (if (if  (memq (layout-classoid-name test-layout)
-                             '(condition pathname structure-object))
-                      (not not-p)
-                      not-p)
+    ;; Flag sense: in layout tests that use the CMP instruction (most of them),
+    ;; the :E flag means "yes" though for 1-bit tests the :NE flag means "yes"
+    (inst jmp (if (if (struct-typep-bit-test-p test-layout) (not not-p) not-p)
                   :ne :e) target)
     done))
 
 (define-vop (structure-typep*)
   (:args (layout :scs (descriptor-reg)))
   (:arg-types * (:constant t))
-  (:policy :fast-safe)
   (:info target not-p test-layout)
   (:generator 4
     (structure-is-a layout test-layout target not-p done)
-    (inst jmp (if (if  (memq (layout-classoid-name test-layout)
-                             '(condition pathname structure-object))
-                      (not not-p)
-                      not-p)
+    (inst jmp (if (if (struct-typep-bit-test-p test-layout) (not not-p) not-p)
                   :ne :e) target)
     done))
 
@@ -1364,3 +1325,21 @@
     (inst mov :dword r (ea (- 4 instance-pointer-lowtag) object))
     #-compact-instance-header
     (loadw r object instance-slots-offset instance-pointer-lowtag)))
+
+(define-vop (get-layout-id)
+  (:args (layout :scs (descriptor-reg)))
+  (:info offset)
+  (:results (r :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 1
+    ;; Layout IDs are 32-bit (signed-byte 30) values. As long as GET-LAYOUT-ID and
+    ;; TEST-LAYOUT-ID both use :DWORD operand size, no sign-extension is needed.
+    (inst mov :dword r (ea (- offset instance-pointer-lowtag) layout))))
+
+(define-vop (test-layout-id)
+  (:args (id :scs (signed-reg)))
+  (:arg-types signed-num (:constant t))
+  (:info target not-p test-layout)
+  (:generator 1
+    (inst cmp :dword id (ensure-layout-id-fixup-or-imm test-layout))
+    (inst jmp (if not-p :ne :e) target)))

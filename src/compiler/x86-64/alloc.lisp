@@ -213,6 +213,9 @@
 (define-vop (sb-c::end-pseudo-atomic)
   (:generator 1 (emit-end-pseudo-atomic)))
 
+(defun avx512-tn-p (tn)
+  (sc-is tn int-avx512-reg double-avx512-reg single-avx512-reg mask-reg))
+
 ;;; Emit code to allocate an object with a size in bytes given by
 ;;; SIZE into ALLOC-TN. The size may be an integer of a TN.
 ;;; NODE may be used to make policy-based decisions.
@@ -248,12 +251,12 @@
            (free-pointer (thread-slot-ea
                           (if systemp
                               (if (eql type +cons-primtype+)
-                                   thread-sys-cons-tlab-slot
-                                   thread-sys-mixed-tlab-slot)
-                               (if (eql type +cons-primtype+)
-                                   thread-cons-tlab-slot
-                                   thread-mixed-tlab-slot))
-                           #+gs-seg thread-temp))
+                                  thread-sys-cons-tlab-slot
+                                  thread-sys-mixed-tlab-slot)
+                              (if (eql type +cons-primtype+)
+                                  thread-cons-tlab-slot
+                                  thread-mixed-tlab-slot))
+                          #+gs-seg thread-temp))
            (end-addr (ea (sb-x86-64-asm::ea-segment free-pointer)
                          (+ n-word-bytes (ea-disp free-pointer))
                          (ea-base free-pointer))))
@@ -326,7 +329,7 @@
 ;;; below the region's free pointer. Right now we can do the inits either inside or outside
 ;;; of pseudo-atomic because all pages except CONS are prezeroed.
 (defun emit-alloc-other (node thread-temp widetag nwords result-tn
-                         &optional alloc-temps init
+                         &key alloc-temps init
                          &aux (bytes (pad-data-block nwords)))
   (declare (dynamic-extent init))
   #+bignum-assertions
@@ -505,7 +508,6 @@
   (:vop-var vop)
   (:node-var node)
   (:translate acons)
-  (:policy :fast-safe)
   (:generator 10
     (cond
       ((node-stack-allocate-p node)
@@ -600,7 +602,6 @@
   (:args (car))
   (:results (result :scs (descriptor-reg)))
   (:ignore car)
-  (:policy :fast-safe)
   (:generator 0
     (inst push null-tn)
     (inst lea result (ea (- list-pointer-lowtag n-word-bytes) rsp-tn))))
@@ -731,7 +732,6 @@
     (:arg-types #+ubsan (:constant t)
                 positive-fixnum positive-fixnum positive-fixnum)
     (:temporary (:sc unsigned-reg) temp)
-    (:policy :fast-safe)
     (:generator 100
       #+ubsan
       (when (want-shadow-bits)
@@ -746,7 +746,7 @@
         (let ((nbytes (calc-shadow-bits-size result)))
           (allocating ()
             ;; Allocate the bits into RESULT
-            (allocation simple-bit-vector-widetag nbytes 0 result temp nil)
+            (allocation simple-bit-vector-widetag nbytes 0 result temp nil )
             (inst mov :byte (ea result) simple-bit-vector-widetag)
             (inst mov :dword (vector-len-ea result 0)
                   (if (sc-is length immediate) (fixnumize (tn-value length)) length))
@@ -812,7 +812,6 @@
     #+ubsan (:temporary (:sc any-reg :offset rax-offset) rax)
     #+ubsan (:temporary (:sc any-reg :offset rcx-offset) rcx)
     #+ubsan (:temporary (:sc any-reg :offset rdi-offset) rdi)
-    (:policy :fast-safe)
     (:generator 10
       #+ubsan
       (when (want-shadow-bits)
@@ -867,7 +866,6 @@
     (:temporary (:sc unsigned-reg) bytes)
     (:node-var node)
     (:vop-var vop)
-    (:policy :fast-safe)
     (:generator 10
       (let ((size (calc-size-in-bytes words bytes)))
         ;; Compute tagged pointer sooner than later since access off RSP
@@ -922,7 +920,6 @@
            (element :scs (any-reg descriptor-reg)))
     (:results (result :scs (descriptor-reg) :from :load))
     (:arg-types positive-fixnum *)
-    (:policy :fast-safe)
     (:node-var node)
     (:vop-var vop)
     (:temporary (:sc unsigned-reg) bytes)
@@ -953,7 +950,6 @@
            (element :scs (any-reg descriptor-reg)))
     (:results (result :scs (descriptor-reg) :from :load))
     (:arg-types positive-fixnum *)
-    (:policy :fast-safe)
     (:temporary (:sc descriptor-reg) tail next limit)
     (:generator 20
       (multiple-value-bind (size scale)
@@ -993,13 +989,13 @@
       done))) ; label needed by calc-size-in-bytes
 
 (define-allocator (make-fdefn)
-  (:policy :fast-safe)
   (:translate make-fdefn)
   (:args (name :scs (descriptor-reg) :to :eval))
   (:results (result :scs (descriptor-reg) :from :argument))
   (:generator 37
-    (alloc-other fdefn-widetag fdefn-size result nil
-      (lambda () (storew name result fdefn-name-slot other-pointer-lowtag)))))
+    (alloc-other fdefn-widetag fdefn-size result
+                 :init (lambda ()
+                         (storew name result fdefn-name-slot other-pointer-lowtag)))))
 
 (define-allocator (make-closure)
   (:info label length stack-allocate-p)
@@ -1048,10 +1044,11 @@
                 :load-if (not (reg-or-legal-imm32-p value))))
   (:results (result :scs (descriptor-reg) :from :eval))
   (:generator 10
-    (alloc-other value-cell-widetag value-cell-size result nil
-      (lambda ()
-        (storew (encode-value-if-immediate value)
-                result value-cell-value-slot other-pointer-lowtag)))))
+    (alloc-other value-cell-widetag value-cell-size result
+                 :init
+                 (lambda ()
+                   (storew (encode-value-if-immediate value)
+                           result value-cell-value-slot other-pointer-lowtag)))))
 
 ;;;; automatic allocators for primitive objects
 
@@ -1183,7 +1180,7 @@
 (define-vop (alloc-immobile-fixedobj)
   (:args (size-class :scs (any-reg) :target c-arg1)
          (nwords :scs (any-reg) :target c-arg2)
-         (header :scs (any-reg) :target c-arg3))
+         (header :scs (unsigned-reg) :target c-arg3))
   (:temporary (:sc unsigned-reg :from (:argument 0) :to :eval
                :offset #.(first *c-call-register-arg-offsets*)) c-arg1)
   (:temporary (:sc unsigned-reg :from (:argument 1) :to :eval
@@ -1222,6 +1219,7 @@
   (:temporary (:sc unsigned-reg :offset rbx-offset) rbx)
   (:temporary (:sc unsigned-reg :offset rcx-offset) rcx)
   (:temporary (:sc unsigned-reg) header)
+  (:save-p :avx512)
   (:generator 1
     ;; fixedobj_pages alien linkage entry: 1 PTE per page, 12-byte struct
     (inst mov rbx (rip-relative-ea (make-fixup "fixedobj_pages" :foreign-dataref)))
@@ -1237,36 +1235,36 @@
     ;; There is no way to inform GC that we are currently looking at a page
     ;; in anticipation of allocating to it.
     (allocating ()
-       (inst mov :dword rax (ea 4 rax)) ; rax := fixedobj_page_hint[1] (sizeclass=SYMBOL)
-       (inst test :dword rax rax)
-       (inst jmp :z FAIL) ; fail if hint page is 0
-       (inst lea rbx (ea rbx rax 8))  ; rbx := &fixedobj_pages[hint].free_index
-       ;; compute fixedobj_page_address(hint) into RAX
-       (inst mov rcx (rip-relative-ea (make-fixup "FIXEDOBJ_SPACE_START" :foreign-dataref)))
-       (inst shl rax (integer-length (1- immobile-card-bytes)))
-       (inst add rax (ea rcx))
-       ;; load the page's free pointer
-       (inst mov :dword rcx (ea rbx)) ; rcx := fixedobj_pages[hint].free_index
-       ;; fail if allocation would overrun the page
-       (inst cmp :dword rcx (- immobile-card-bytes (* symbol-size n-word-bytes)))
-       (inst jmp :a FAIL)
-       ;; compute address of the allegedly free memory block into RESULT
-       (inst lea result (ea rcx rax)) ; free_index + page_base
-       ;; read the potential symbol header
-       (inst mov rax (ea result))
-       (inst test :dword rax 1)
-       (inst jmp :nz FAIL) ; not a fixnum implies already taken
-       ;; try to claim this word of memory
-       (inst mov header (compute-object-header (1- symbol-size) symbol-widetag))
-       (inst cmpxchg :lock (ea result) header)
-       (inst jmp :ne FAIL) ; already taken
-       ;; compute new free_index = spacing + old header + free_index
-       (inst lea :dword rax (ea (* symbol-size n-word-bytes) rax rcx))
-       (inst mov :dword (ea rbx) rax) ; store new free_index
-       ;; set the low bit of the 'gens' field
-       (inst or :lock :byte (ea 7 rbx) 1) ; 7+rbx = &fixedobj_pages[i].attr.parts.gens_
-       (inst or :byte result other-pointer-lowtag) ; make_lispobj()
-       (inst jmp OUT)
-       FAIL
-       (inst mov result null-tn)
-       OUT)))
+      (inst mov :dword rax (ea 4 rax)) ; rax := fixedobj_page_hint[1] (sizeclass=SYMBOL)
+      (inst test :dword rax rax)
+      (inst jmp :z FAIL)             ; fail if hint page is 0
+      (inst lea rbx (ea rbx rax 8)) ; rbx := &fixedobj_pages[hint].free_index
+      ;; compute fixedobj_page_address(hint) into RAX
+      (inst mov rcx (rip-relative-ea (make-fixup "FIXEDOBJ_SPACE_START" :foreign-dataref)))
+      (inst shl rax (integer-length (1- immobile-card-bytes)))
+      (inst add rax (ea rcx))
+      ;; load the page's free pointer
+      (inst mov :dword rcx (ea rbx)) ; rcx := fixedobj_pages[hint].free_index
+      ;; fail if allocation would overrun the page
+      (inst cmp :dword rcx (- immobile-card-bytes (* symbol-size n-word-bytes)))
+      (inst jmp :a FAIL)
+      ;; compute address of the allegedly free memory block into RESULT
+      (inst lea result (ea rcx rax))    ; free_index + page_base
+      ;; read the potential symbol header
+      (inst mov rax (ea result))
+      (inst test :dword rax 1)
+      (inst jmp :nz FAIL)         ; not a fixnum implies already taken
+      ;; try to claim this word of memory
+      (inst mov header (compute-object-header (1- symbol-size) symbol-widetag))
+      (inst cmpxchg :lock (ea result) header)
+      (inst jmp :ne FAIL)               ; already taken
+      ;; compute new free_index = spacing + old header + free_index
+      (inst lea :dword rax (ea (* symbol-size n-word-bytes) rax rcx))
+      (inst mov :dword (ea rbx) rax)    ; store new free_index
+      ;; set the low bit of the 'gens' field
+      (inst or :lock :byte (ea 7 rbx) 1) ; 7+rbx = &fixedobj_pages[i].attr.parts.gens_
+      (inst or :byte result other-pointer-lowtag) ; make_lispobj()
+      (inst jmp OUT)
+      FAIL
+      (inst mov result null-tn)
+      OUT)))

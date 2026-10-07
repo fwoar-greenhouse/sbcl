@@ -135,7 +135,8 @@
        ;; But the empty (OR) should match nothing, so, what's up with that?
        ;; Maybe we can define host-side types named simd-pack-blah deftyped to NIL?
        ((or #+sb-simd-pack simd-pack-type
-            #+sb-simd-pack-256 simd-pack-256-type)
+            #+sb-simd-pack-256 simd-pack-256-type
+            #+sb-simd-pack-512 simd-pack-512-type)
         (values nil t))
        (character-set-type
         ;; provided that CHAR-CODE doesn't fail, the answer is certain
@@ -151,7 +152,8 @@
                      ;; probably not a function. What about FMT-CONTROL instances?
                      (values nil t)))
                 ((system-area-pointer stream fdefn weak-pointer file-stream
-                  code-component pathname logical-pathname)
+                  code-component pathname logical-pathname
+                  #+sb-simd-pack-512 simd-pack-512-mask)
                  (values nil t)))
               (cond ((eq name 'pathname)
                      (values (pathnamep obj) t))
@@ -381,3 +383,5 @@
 
 (defun sb-bignum:%bignum-length (x)
   (values (ceiling (1+ (integer-length x)) sb-vm:n-word-bits)))
+
+(defun ensure-layout-id (layout) (declare (ignore layout)) (error "Should not get here"))

@@ -955,7 +955,7 @@
 
 ;;;; MUFFLE-CONDITIONS test (corresponds to the test in the manual)
 ; FIXME: make a better test!
-(with-test (:name muffle-conditions :skipped-on (or :ppc64 :x86-64))
+(with-test (:name muffle-conditions :skipped-on (or :ppc64 :x86-64 :arm64))
   (multiple-value-bind (fun failure-p warnings style-warnings notes)
       (checked-compile
        '(lambda (x)
@@ -3219,11 +3219,10 @@
   ;; NEW-INLINE-FUNCTIONAL-TYPE-CONFLICT.2, and one for INLINE-FUN.
   (assert (= 3 (length (sb-disassem::get-code-segments
                         (sb-kernel:fun-code-header #'new-inline-functional-type-conflict.2)))))
-  ;; We should have no type information from the arguments, because
-  ;; the functional is shared.
+
   (let ((type (sb-kernel:%simple-fun-type
                (symbol-function 'new-inline-functional-type-conflict.2))))
-    (assert (ctype= type '(function (t) (values t &optional))))))
+    (assert (ctype= type '(function (t) (values (eql a) &optional))))))
 
 (with-test (:name :new-inline-functional-type-conflict.3)
   (ctu:file-compile

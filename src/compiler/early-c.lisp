@@ -31,7 +31,12 @@
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(defconstant multiple-values-limit call-arguments-limit
+(defconstant multiple-values-limit
+  #-tls-based-mv-return call-arguments-limit
+  ;; Careful: currently 1 byte of the thread state word stores the multiple-value count
+  ;; as a tagged fixnum. There is a small bit of headroom to raise this limit to 128
+  ;; (max count of 127) but any more needs a new thread slot.
+  #+tls-based-mv-return 65
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
@@ -211,11 +216,14 @@ possible.")
   ;; SXHASH requires symbols whose print-names are the same to hash the same.
   ;; That's not a requirement of the fun-name-hashset, so use SYMBOL-HASH here
   ;; which contains 10 pseudorandom bits if 64-bit word size, fewer if 32-bit.
-  ;; If someone using 32-bit SBCL complains, we can mix in PACKAGE-ID too.
+  ;; And mix in PACKAGE-ID for even more pseudorandness. It's stable across
+  ;; rename-package. User code which treats packages and their symbols as dynamically
+  ;; modifiable at compile-time is pretty irresponsible, so this seems fine to me
+  ;; even if it were not stable across renames.
   #-sb-xc-host
   (named-let recurse ((x list))
     (typecase x
-      (symbol (symbol-hash x))
+      (symbol (mix (symbol-hash x) (symbol-package-id x)))
       ;; sure this could be made iterative, but the lists in question are short
       (cons (mix (recurse (car x)) (recurse (cdr x))))
       (t (sxhash x))))) ; nonstandard function name, oh well (string?)

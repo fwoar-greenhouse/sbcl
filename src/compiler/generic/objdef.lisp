@@ -145,14 +145,13 @@ Code header representation:
   +---------------------------------+
   max total payload size in words = #x3fffff
 
-  |            total words          | gc_gen | 0 | 0 | widetag |
-  |            (4 bytes)            |        |   |   |         |
+  |         total words          | gc_gen | 0 | TLSF | widetag |
+  |         (4 bytes)            |        |   | bits |         |
   +------------------------------------------------------------+  [64-bit words]
-  |                                 |   N boxed header bytes   |
-  |                                 |        (4 bytes)         |
+  |                              |      N boxed header bytes   |
+  |                              |           (4 bytes)         |
   +------------------------------------------------------------+
 
-  the two zero bytes are reserved for future use
   max total payload size in words = uint_max
     (should probably made the same as for 32-bit word size for consistency)
 
@@ -452,6 +451,29 @@ during backtrace.
   (p2 :c-type "long" :type (unsigned-byte 64))
   (p3 :c-type "long" :type (unsigned-byte 64)))
 
+#+sb-simd-pack-512
+(define-primitive-object (simd-pack-512
+                          :lowtag other-pointer-lowtag
+                          :widetag simd-pack-512-widetag)
+  (tag :ref-trans %simd-pack-512-tag
+       :attributes (movable flushable)
+       :type (unsigned-byte 4))
+  (p0 :c-type "long" :type (unsigned-byte 64))
+  (p1 :c-type "long" :type (unsigned-byte 64))
+  (p2 :c-type "long" :type (unsigned-byte 64))
+  (p3 :c-type "long" :type (unsigned-byte 64))
+  (p4 :c-type "long" :type (unsigned-byte 64))
+  (p5 :c-type "long" :type (unsigned-byte 64))
+  (p6 :c-type "long" :type (unsigned-byte 64))
+  (p7 :c-type "long" :type (unsigned-byte 64)))
+
+#+sb-simd-pack-512
+(define-primitive-object (simd-pack-512-mask
+                          :lowtag other-pointer-lowtag
+                          :size simd-pack-512-mask-size
+                          :widetag simd-pack-512-mask-widetag)
+    (value :c-type "long" :type (unsigned-byte 64)))
+
 ;;; Define some slots that precede 'struct thread' so that each may be read
 ;;; using a small negative 1-byte displacement.
 (defconstant-eqx +thread-header-slot-names+ #()
@@ -579,6 +601,12 @@ during backtrace.
   (slow-path-allocs)
   (et-find-freeish-page)
   (et-bzeroing)
+  #+tls-based-mv-return ; An array of lispobj for multiple values
+  ;; HACK - SB-VM::REGISTER-ARG-COUNT is not defined yet (it's in the "vm" file
+  ;; but it could maybe be moved to the "parms" file). So our choices are to
+  ;; hardcode a 3 here or oversize the array and let confusion reign.
+  ;; Also remember, limit is an exclusive upper bound so "size" is 1 less.
+  (mv-return-values :length #.(- (1- sb-xc:multiple-values-limit) 3))
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
   (lisp-thread :pointer t :special sb-thread:*current-thread*))

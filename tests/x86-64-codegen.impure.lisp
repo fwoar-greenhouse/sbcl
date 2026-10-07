@@ -240,12 +240,11 @@
              (split-string
               (with-output-to-string (s)
                (let ((sb-disassem:*disassem-location-column-width* 0))
-                 (disassemble '(lambda (x) (logtest (the fixnum x) #x80))
+                 (disassemble '(lambda (x)
+                                (let ((q (the fixnum (truncate (the fixnum x) 3)))) (logtest q #x80)))
                               :stream s)))
               #\newline))
-      (when (search (format nil "TEST DH, ~D"
-                            (ash (ash #x80 sb-vm:n-fixnum-tag-bits) -8))
-                    line)
+      (when (search "TEST AH, 1" line)
         (setq success t)))
     (assert success)))
 
@@ -590,7 +589,7 @@
 
 (with-test (:name :char-code-is-single-shr)
   (assert-thereis-line '(lambda (x) (char-code (truly-the character x)))
-                       "SHR EDX, 7"))
+                       "SHR EDI, 7"))
 
 (import '(sb-x86-64-asm::get-gpr sb-x86-64-asm::machine-ea))
 ;; to make this pass on different configurations we'd have to add
@@ -1355,7 +1354,7 @@
     (assert
      (loop for line in lines
            thereis (and (search "CMP DWORD PTR" line)
-                        (search "#<LAYOUT" line)
+                        (search "#<SB-KERNEL:LAYOUT" line)
                         (search "for SB-THREAD:MUTEX" line))))))
 
 (with-test (:name :dx-list-push-imm :skipped-on (not :immobile-space))
@@ -1402,18 +1401,15 @@
       (assert (loop for line in lines
                     thereis (search "REPE STOSQ" line))))))
 
-(defconstant arb-qword-const-positive #xFFF0abcdabcd0000)
-(defconstant arb-qword-const-negative (sb-disassem::sign-extend arb-qword-const-positive 64))
-(pushnew :popcnt sb-c:*backend-subfeatures*)
-(defun same-constants-after-collapsing (uw sw)
-  (declare (sb-vm:word uw) (sb-vm:signed-word sw))
-  (values (logcount (logxor uw arb-qword-const-positive))
-          (logcount (logxor sw arb-qword-const-negative))))
+(defun same-constants-after-collapsing ()
+  sb-vm::(inline-vop (((x unsigned-reg))) ()
+           (inst xor x (constantize #xFFF0abcdabcd0000))
+           (inst xor x (constantize (sb-disassem::sign-extend #xFFF0abcdabcd0000 64)))))
 (compile 'same-constants-after-collapsing)
-(defun different-constants (uw sw)
-  (declare (sb-vm:word uw) (sb-vm:signed-word sw))
-  (values (logcount (logxor uw (logior arb-qword-const-positive 1)))
-          (logcount (logxor sw arb-qword-const-negative))))
+(defun different-constants ()
+  sb-vm::(inline-vop (((x unsigned-reg))) ()
+           (inst xor x (constantize #xFFF0abcdabcd0000))
+           (inst xor x (constantize #xFFF0abcdabcd0001))))
 (compile 'different-constants)
 
 (with-test (:name :constantize-equivalence)
@@ -1456,3 +1452,103 @@
               (assert (oddp index)))
           ;; No always-thread-local special clashes with *PACKAGE*'s indirection cell
           (assert (/= index (1- index-of-package))))))))
+
+(defstruct frozenthing)
+(defstruct (specialthing (:include frozenthing)))
+(defstruct (subspecialthing (:include specialthing)))
+(defstruct (otherspecialthing (:include frozenthing)))
+(declaim (freeze-type frozenthing))
+(with-test (:name :typep-layout-eq-one-type)
+  (let ((expr `(lambda (x)
+                 (declare (optimize (sb-c::verify-arg-count 0)))
+                 (the (and frozenthing (not (or specialthing otherspecialthing))) x)))
+        (comparisons 0)
+        (saw-layout))
+    ;; there should be exactly one CMP instruction comparing to #<LAYOUT for THING>
+    (dolist (line (disassembly-lines (compile nil expr)))
+      (when (search "CMP " line)
+        (incf comparisons)
+        (when (and (search "#<SB-KERNEL:LAYOUT" line)
+                   (search "FROZENTHING" line))
+          (setq saw-layout t))))
+    (assert (and saw-layout (eql comparisons 1)))))
+
+(with-test (:name :alien-deref-sign-extend-once-only)
+  (let ((lines (disassembly-lines
+                '(lambda ()
+                  (declare (optimize (debug 0)))
+                  (deref (alien-funcall (extern-alien "f" (function (* char)))) 0)))))
+    (assert (eql (loop for line in lines count (search "MOVSX" line)) 1))))
+
+(with-test (:name :alien-deref-indexed)
+  (let ((lines (disassembly-lines
+                '(lambda (i)
+                  (declare (optimize (debug 0)))
+                  (let ((a (alien-funcall (extern-alien "f" (function (* unsigned-int))))))
+                    (deref a (sb-ext:truly-the sb-int:index i)))))))
+    ;; some line should have a MOV instruction with a base and scaled index,
+    ;; it should have a #\+ and #\* operation in the effective address.
+    ;; Since the index is a tagged fixnum, the scale should be 2 which
+    ;; equates to 4 in bytes.
+    (assert
+     (some (lambda (line)
+             (and (search "MOV" line) (search "+R" line) (search "*2]" line)))
+           lines))))
+
+(defstruct test-struct-alpha)
+(defstruct test-struct-beta)
+(defstruct test-struct-gamma)
+
+(with-test (:name :hoist-typecase-layout-id)
+  (let* ((f (compile nil '(lambda (x)
+                           (declare (optimize speed))
+                           (typecase x
+                             (test-struct-alpha 1)
+                             (test-struct-beta 2)
+                             (test-struct-gamma 3)))))
+         (lines (disassembly-lines f))
+         (mem-cmps (loop for line in lines
+                         count (and (search "CMP" line)
+                                    (search "[" line))))
+         (reg-cmps (loop for line in lines
+                         count (and (search "CMP" line)
+                                    (not (search "[" line))))))
+    (assert (eql (funcall f (make-test-struct-alpha)) 1))
+    (assert (eql (funcall f (make-test-struct-beta)) 2))
+    (assert (eql (funcall f (make-test-struct-gamma)) 3))
+    (assert (eql (funcall f "other") nil))
+    (assert (>= reg-cmps 3))
+    (assert (<= mem-cmps 1))))
+
+(with-test (:name :single-struct-typep-fused-cmp)
+  (let* ((f (compile nil '(lambda (x)
+                           (declare (optimize speed))
+                           (if (typep x 'test-struct-alpha) 1 2))))
+         (lines (disassembly-lines f))
+         (mem-cmps (loop for line in lines
+                         count (and (search "CMP" line)
+                                    (search "[" line))))
+         (reg-cmps (loop for line in lines
+                         count (and (search "CMP" line)
+                                    (not (search "[" line))))))
+    (assert (eql (funcall f (make-test-struct-alpha)) 1))
+    (assert (eql (funcall f "other") 2))
+    ;; Must keep the single fused memory CMP and avoid separate register CMPs
+    (assert (= mem-cmps 1))
+    (assert (= reg-cmps 0))))
+
+(with-test (:name :specifically-sized-ea-disp)
+  (let* ((lines
+          (disassembly-lines
+           (compile
+            nil
+            '(lambda ()
+              sb-vm::(inline-vop (((x int-sse-reg))) ()
+               (inst movdqa (ea 0 rdx-tn) x)
+               (inst movdqa (ea :disp8 0 rdx-tn) x)
+               (inst movdqa (ea :disp32 0 rdx-tn) x))))))
+         (found (member "MOVDQA [RDX], XMM0" lines :test #'search))
+         (disp8 (cadr found))
+         (disp32 (caddr found)))
+    (assert (search "660F7F4200       MOVDQA [RDX], XMM0" disp8))
+    (assert (search "660F7F8200000000 MOVDQA [RDX], XMM0" disp32))))

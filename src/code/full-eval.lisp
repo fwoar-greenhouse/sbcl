@@ -622,12 +622,6 @@
                 (interpreted-apply function args)))
       function))
 
-(defmethod print-object ((obj interpreted-function) stream)
-  (print-unreadable-object (obj stream
-                            :identity (not (interpreted-function-name obj)))
-    (format stream "~A ~A" '#:interpreted-function
-            (interpreted-function-name obj))))
-
 ;;; Create an interpreted function from the lambda-form EXP evaluated
 ;;; in the environment ENV.
 (defun eval-lambda (exp env)
@@ -638,15 +632,15 @@
              (lambda-list (car rest))
              ((forms documentation declarations debug-lambda-list)
               (parse-lambda-headers (cdr rest) :doc-string-allowed t)))
-       (make-interpreted-function :name name
-                                  :lambda-list lambda-list
-                                  :debug-lambda-list
-                                  (if (eq debug-lambda-list :unspecified)
-                                      lambda-list debug-lambda-list)
-                                  :env env :body forms
-                                  :documentation documentation
-                                  :source-location (sb-c::make-definition-source-location)
-                                  :declarations declarations)))
+    (make-interpreted-function :name name
+                               :lambda-list (the list lambda-list)
+                               :debug-lambda-list
+                               (if (eq debug-lambda-list :unspecified)
+                                   lambda-list debug-lambda-list)
+                               :env env :body forms
+                               :documentation documentation
+                               :source-location (sb-c::make-definition-source-location)
+                               :declarations declarations)))
 
 (defun eval-progn (body env)
   (let ((previous-exp nil))
@@ -850,11 +844,17 @@
       (t (nth-value 0 (get-function name env))))))
 
 (defun eval-eval-when (body env)
-  (program-destructuring-bind ((&rest situation) &body body) body
-    ;; FIXME: check that SITUATION only contains valid situations
-    (if (or (member :execute situation)
-            (member 'eval situation))
-        (eval-progn body env))))
+  (program-destructuring-bind ((&rest situations) &body body) body
+    (let (execute)
+      (loop for situation in situations
+            do (case situation
+                 ((:execute eval)
+                  (setf execute t))
+                 ((:compile-toplevel compile :load-toplevel load))
+                 (t
+                  (ip-error "bad EVAL-WHEN situation list: ~S" situations))))
+      (if execute
+          (eval-progn body env)))))
 
 (defun eval-quote (body env)
   (declare (ignore env))

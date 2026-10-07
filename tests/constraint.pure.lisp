@@ -943,6 +943,43 @@
                      nil))
              0)))
 
+(with-test (:name :bounds-check-make-array.ssa)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (length)
+                        (declare (integer length))
+                        (let ((array (make-array length)))
+                          (labels ((loop-fn (i)
+                                     (when (< i length)
+                                       (setf (aref array i) i)
+                                       (loop-fn (1+ i)))))
+                            (loop-fn 0))))
+                     nil))
+             0))
+  #-sbcl
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (length)
+                        (let ((array (make-array length)))
+                          (labels ((loop-fn (i)
+                                     (when (< i length)
+                                       (setf (aref array i) i)
+                                       (loop-fn (1+ i)))))
+                            (loop-fn 0))))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (type length)
+                        (let ((array (make-sequence type length)))
+                          (labels ((loop-fn (i)
+                                     (when (< i length)
+                                       (setf (aref array i) i)
+                                       (loop-fn (1+ i)))))
+                            (loop-fn 0))))
+                     nil))
+             0)))
+
 (with-test (:name :bounds-check-down)
   (assert (= (count 'sb-kernel:%check-bound
                     (ctu:ir1-named-calls
@@ -976,6 +1013,50 @@
                         (declare (optimize (debug 2)))
                         (loop for i from (1- (length v)) downto 0
                               collect (svref v i)))
+                     nil))
+             0)))
+
+(with-test (:name :bounds-check-down.ssa)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (v)
+                        (let ((end (1- (length v))))
+                          (labels ((after-decf (end-1)
+                                     (when (>= end-1 0)
+                                       (svref v end-1))))
+                            (after-decf (1- end)))))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (v)
+                        (declare (optimize (debug 2)))
+                        (let ((end (1- (length v))))
+                          (labels ((after-decf (end-1)
+                                     (when (>= end-1 0)
+                                       (svref v end-1))))
+                            (after-decf (1- end)))))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (v)
+                        (labels ((loop-fn (i acc)
+                                   (if (>= i 0)
+                                       (loop-fn (1- i) (cons (svref v i) acc))
+                                       acc)))
+                          (loop-fn (1- (length v)) nil)))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (v)
+                        (declare (optimize (debug 2)))
+                        (labels ((loop-fn (i acc)
+                                   (if (>= i 0)
+                                       (loop-fn (1- i) (cons (svref v i) acc))
+                                       acc)))
+                          (loop-fn (1- (length v)) nil)))
                      nil))
              0)))
 
@@ -1191,6 +1272,39 @@
              (dotimes (i a)
                (incf bbb))
              (< bbb j))))
+    ((3) t)))
+
+(with-test (:name :constraint-amount.ssa)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (v)
+                        (labels ((loop-fn (i acc)
+                                   (if (< i (- (length v) 2))
+                                       (loop-fn (+ i 2) (+ acc (svref v (1+ i))))
+                                       acc)))
+                          (loop-fn 0 0)))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (v)
+                        (labels ((loop-fn (i acc)
+                                   (if (>= i 0)
+                                       (loop-fn (1- i) (cons (svref v (1+ i)) acc))
+                                       acc)))
+                          (loop-fn (- (length v) 2) nil)))
+                     nil))
+             0))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (declare (type fixnum a))
+         (let ((j (+ a most-positive-fixnum)))
+           (labels ((loop-fn (i bbb)
+                      (if (< i a)
+                          (loop-fn (1+ i) (1+ bbb))
+                          (< bbb j))))
+             (loop-fn 0 a))))
     ((3) t)))
 
 (with-test (:name :constraint-multiple-eql-variables)
@@ -2165,6 +2279,7 @@
                         (loop
                          (let ((new (+ v 1)))
                            (setf v new)))))))
+
 (with-test (:name :join-equality-constraints-loop)
   (checked-compile
    `(lambda (data n d j)
@@ -2190,3 +2305,48 @@
              (go g826)))
 
         (do ((index22 0 d)) ((or j index22)))))))
+
+(with-test (:name :delete-redundant-set-delay)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (let ((b 0))
+           (let ((c b))
+             (if (eql a 0)
+                 (setf b c))
+             a)))
+    ((0) 0)
+    ((1) 1)
+    ((2) 2)))
+
+
+(with-test (:name :constraint-bounds-preserve-correct.ssa)
+  (checked-compile-and-assert
+      ()
+      `(lambda (dst-start-word nwords)
+         (declare (type (mod 50) dst-start-word nwords))
+         (let ((count 0))
+           (when (plusp nwords)
+             (let ((dst-end-word (the (mod 100) (+ dst-start-word nwords))))
+               (labels ((rec (dst-index)
+                          (unless (>= dst-index dst-end-word)
+                            (incf count 1)
+                            (rec (the (mod 100) (1+ dst-index))))))
+                 (rec dst-start-word))))
+           count))
+    ((0 7) 7)))
+
+(with-test (:name :constraint-bounds-preserve-correct)
+  (checked-compile-and-assert
+   ()
+   `(lambda (dst-start-word nwords)
+      (declare (type (mod 50) dst-start-word nwords))
+      (let ((count 0))
+        (when (plusp nwords)
+          (let ((dst-end-word (the (mod 100) (+ dst-start-word nwords))))
+            (do ((dst-index dst-start-word (the (mod 100) (1+ dst-index))))
+                ((>= dst-index dst-end-word))
+              (declare (type (mod 100) dst-index))
+              (incf count 1))))
+        count))
+   ((0 7) 7)))

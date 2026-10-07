@@ -61,7 +61,7 @@
            signed-byte-32-p
            #+64-bit unsigned-byte-64-p
            #+64-bit signed-byte-64-p
-           weak-pointer-p code-component-p lra-p
+           weak-pointer-p code-component-p
            sb-int:unbound-marker-p
            pointerp
            simple-fun-p
@@ -240,7 +240,7 @@
 #+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
 (defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
   sb-vm:word ())
-#+(or arm64 loongarch64 riscv x86 x86-64)
+#+(or arm64 loongarch64 ppc ppc64 riscv x86 x86-64)
 (defknown %raw-instance-cas/signed-word (instance index sb-vm:signed-word sb-vm:signed-word)
   sb-vm:signed-word ())
 (defknown %raw-instance-xchg/word (instance index sb-vm:word) sb-vm:word ())
@@ -358,58 +358,14 @@
   (defknown (%simd-pack-low %simd-pack-high) (simd-pack)
       (unsigned-byte 64)
       (flushable movable foldable))
-  (defknown %simd-pack-ub8s (simd-pack)
-      (values (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8))
-      (flushable movable foldable))
-  (defknown %simd-pack-ub16s (simd-pack)
-      (values (unsigned-byte 16) (unsigned-byte 16)
-              (unsigned-byte 16) (unsigned-byte 16)
-              (unsigned-byte 16) (unsigned-byte 16)
-              (unsigned-byte 16) (unsigned-byte 16))
-      (flushable movable foldable))
-  (defknown %simd-pack-ub32s (simd-pack)
-      (values (unsigned-byte 32) (unsigned-byte 32)
-              (unsigned-byte 32) (unsigned-byte 32))
-      (flushable movable foldable))
-  (defknown %simd-pack-ub64s (simd-pack)
-      (values (unsigned-byte 64) (unsigned-byte 64))
-      (flushable movable foldable))
-  (defknown %simd-pack-sb8s (simd-pack)
-      (values (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8))
-      (flushable movable foldable))
-  (defknown %simd-pack-sb16s (simd-pack)
-      (values (signed-byte 16) (signed-byte 16)
-              (signed-byte 16) (signed-byte 16)
-              (signed-byte 16) (signed-byte 16)
-              (signed-byte 16) (signed-byte 16))
-      (flushable movable foldable))
-  (defknown %simd-pack-sb32s (simd-pack)
-      (values (signed-byte 32) (signed-byte 32)
-              (signed-byte 32) (signed-byte 32))
-      (flushable movable foldable))
-  (defknown %simd-pack-sb64s (simd-pack)
-      (values (signed-byte 64) (signed-byte 64))
-      (flushable movable foldable))
-  (defknown %simd-pack-singles (simd-pack)
-      (values single-float single-float single-float single-float)
-      (flushable movable foldable))
-  (defknown %simd-pack-doubles (simd-pack)
-      (values double-float double-float)
-      (flushable movable foldable)))
+
+  (defknown sb-vm::sap-ref-128 (system-area-pointer fixnum)
+      (simd-pack (unsigned-byte 64))
+      (flushable always-translatable))
+
+  (defknown (setf sb-vm::sap-ref-128) ((simd-pack (unsigned-byte 64)) system-area-pointer fixnum)
+      (simd-pack (unsigned-byte 64))
+      (always-translatable)))
 
 #+sb-simd-pack-256
 (progn
@@ -436,60 +392,65 @@
   (defknown (%simd-pack-256-0 %simd-pack-256-1 %simd-pack-256-2 %simd-pack-256-3) (simd-pack-256)
       (unsigned-byte 64)
       (flushable movable foldable))
-  (defknown %simd-pack-256-ub8s (simd-pack-256)
-      (values (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
-              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-ub16s (simd-pack-256)
-      (values (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16)
-              (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16)
-              (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16)
-              (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-ub32s (simd-pack-256)
-      (values (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
-              (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-ub64s (simd-pack-256)
-      (values (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-sb8s (simd-pack-256)
-      (values (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
-              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-sb16s (simd-pack-256)
-      (values (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16)
-              (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16)
-              (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16)
-              (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-sb32s (simd-pack-256)
-      (values (signed-byte 32) (signed-byte 32) (signed-byte 32) (signed-byte 32)
-              (signed-byte 32) (signed-byte 32) (signed-byte 32) (signed-byte 32))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-sb64s (simd-pack-256)
-      (values (signed-byte 64) (signed-byte 64) (signed-byte 64) (signed-byte 64))
-      (flushable movable foldable))
-  (defknown %simd-pack-256-singles (simd-pack-256)
-      (values single-float single-float single-float single-float
-              single-float single-float single-float single-float)
-      (flushable movable foldable))
-  (defknown %simd-pack-256-doubles (simd-pack-256)
-      (values double-float double-float double-float double-float)
-      (flushable movable foldable)))
 
+  (defknown sb-vm::sap-ref-256 (system-area-pointer fixnum)
+      (simd-pack-256 (unsigned-byte 64))
+      (flushable always-translatable))
+  (defknown (setf sb-vm::sap-ref-256) ((simd-pack-256 (unsigned-byte 64)) system-area-pointer fixnum)
+      (simd-pack-256 (unsigned-byte 64))
+      (always-translatable)))
+
+#+sb-simd-pack-512
+(progn
+  (defknown simd-pack-512-mask-p (t) boolean (foldable movable flushable))
+  (defknown %make-simd-pack-512-mask ((unsigned-byte 64))
+      simd-pack-512-mask
+      (flushable movable foldable))
+  (defknown %simd-pack-512-mask-value (simd-pack-512-mask)
+      (unsigned-byte 64)
+      (flushable movable foldable))
+  (defknown simd-pack-512-p (t) boolean (foldable movable flushable))
+  (defknown %simd-pack-512-tag (simd-pack-512) fixnum (movable flushable))
+  (defknown %make-simd-pack-512 (fixnum (unsigned-byte 64) (unsigned-byte 64)
+                                        (unsigned-byte 64) (unsigned-byte 64)
+                                        (unsigned-byte 64) (unsigned-byte 64)
+                                        (unsigned-byte 64) (unsigned-byte 64))
+      simd-pack-512
+      (flushable movable foldable))
+  (defknown %simd-pack-512-single-item (simd-pack-512 (integer 0 15)) single-float
+      (flushable movable foldable))
+  (defknown %simd-pack-512-double-item (simd-pack-512 (integer 0 7)) double-float
+      (flushable movable foldable))
+  (defknown %make-simd-pack-512-double (double-float double-float double-float double-float
+                                        double-float double-float double-float double-float)
+      (simd-pack-512 double-float)
+      (flushable movable foldable))
+  (defknown %make-simd-pack-512-single (single-float single-float single-float single-float
+                                        single-float single-float single-float single-float
+                                        single-float single-float single-float single-float
+                                        single-float single-float single-float single-float)
+      (simd-pack-512 single-float)
+      (flushable movable foldable))
+  (defknown %make-simd-pack-512-ub32 ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
+                                      (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
+                                      (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
+                                      (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
+      (simd-pack-512 (unsigned-byte 32))
+      (flushable movable foldable))
+  (defknown %make-simd-pack-512-ub64 ((unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64)
+                                      (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
+      (simd-pack-512 (unsigned-byte 64))
+      (flushable movable foldable))
+  (defknown (%simd-pack-512-0 %simd-pack-512-1 %simd-pack-512-2 %simd-pack-512-3
+             %simd-pack-512-4 %simd-pack-512-5 %simd-pack-512-6 %simd-pack-512-7) (simd-pack-512)
+      (unsigned-byte 64)
+      (flushable movable foldable))
+  (defknown sb-vm::sap-ref-512 (system-area-pointer fixnum)
+      (simd-pack-512 (unsigned-byte 64))
+      (flushable always-translatable))
+  (defknown (setf sb-vm::sap-ref-512) ((simd-pack-512 (unsigned-byte 64)) system-area-pointer fixnum)
+      (simd-pack-512 (unsigned-byte 64))
+      (always-translatable)))
 ;;;; threading
 
 (defknown (dynamic-space-free-pointer binding-stack-pointer-sap
@@ -742,6 +703,7 @@
     (values (simple-array * (*)) (or null index)))
 
 (defknown restart-point (t) t ())
+(defknown jump-target (t) t ())
 
 ;;; formerly in 'float-tran'
 
@@ -785,7 +747,7 @@
 (defknown double-float-low-bits (double-float) (unsigned-byte 32)
   (movable foldable flushable))
 
-(defknown (%tan %sinh %asinh %atanh %log %logb %log10 %log1p %log2 %tan-quick)
+(defknown (%tan %sinh %asinh %atanh %log %log10 %log1p %log2 %tan-quick)
           (double-float) double-float
   (movable foldable flushable))
 
@@ -793,7 +755,7 @@
           (single-float) single-float
   (movable foldable flushable))
 
-(defknown (%sin %cos %tanh %sin-quick %cos-quick)
+(defknown (%sin %cos %tanh)
   (double-float) (double-float -1.0d0 1.0d0)
   (movable foldable flushable))
 
@@ -868,14 +830,6 @@
     (single-float #.(coerce (sb-xc:- pi) 'single-float)
                   #.(coerce pi 'single-float))
     (movable foldable flushable))
-
-(defknown (%scalb)
-  (double-float double-float) double-float
-  (movable foldable flushable))
-
-(defknown (%scalbn)
-  (double-float (signed-byte 32)) double-float
-  (movable foldable flushable))
 
 (defknown (%unary-truncate %unary-round) (real) integer
   (movable foldable flushable no-verify-arg-count))

@@ -388,6 +388,7 @@
     (loop for x from 78 by 78 below 2048
           do (setf (aref string x) #\Newline))
     (setf (aref string 24) #\LATIN_SMALL_LETTER_E_WITH_ACUTE) ; 2-bytes in UTF-8
+    (setf (aref string 23) #\Nul)
     (with-open-file (s *test-path* :direction :output :external-format :utf-8 :if-exists :supersede)
       (write-sequence string s))
     (with-open-file (s *test-path* :external-format :utf-8)
@@ -409,6 +410,7 @@
   (let ((string (make-string 2048 :initial-element #\x)))
     (loop for x from 78 by 78 below 2048
           do (setf (aref string x) #\Newline))
+    (setf (aref string 23) #\Nul)
     (setf (aref string 24) #\LATIN_SMALL_LETTER_E_WITH_ACUTE) ; 2-bytes in UTF-8
     (with-open-file (s *test-path* :direction :output
                        :external-format '(:utf-8 :newline :crlf) :if-exists :supersede)
@@ -463,3 +465,52 @@
         (assert (string= string readback1))
         (assert (string= string readback2))
         (assert (string= string readback3))))))
+
+#+sb-unicode
+(with-test (:name :character-string-utf8-length)
+  (flet ((test (chars expected-length &optional expected-ascii-p)
+           (let ((string (map 'string #'code-char chars)))
+             (multiple-value-bind (length ascii-p)
+                 (sb-impl::character-string-utf8-length string)
+               (unless (and (eql expected-length length)
+                            (eql expected-ascii-p (and ascii-p t)))
+                 (error "(sb-impl::character-string-utf8-length ~a) => ~a, ~a; but ~a, ~a expected"
+                        string length ascii-p
+                        expected-length expected-ascii-p))))))
+    (test '(97 98 99 0) 4 t)
+    (test '(97 224 225 226 227 228 229 65) 14)
+    (test '(54620 0 24291 0 26085) 11)
+    (test '(97 128077 98 9989 65039 65039 65039 65039 65039 65039 65039) 30)
+    (test '(0 #xd800 1) nil)))
+
+#+sb-unicode
+(with-test (:name :output-to-c-string/utf-8/lf)
+  (flet ((test (chars expected &optional error-p)
+           (let ((string (map 'string #'code-char chars)))
+             (multiple-value-bind (result error)
+                 (ignore-errors (sb-impl::output-to-c-string/utf-8/lf string))
+               (if error-p
+                   (unless error
+                     (error "(sb-impl::output-to-c-string/utf-8/lf ~a) => ~a; but an error is expected"
+                            string result))
+                   (unless (and (typep result '(simple-array (unsigned-byte 8) (*)))
+                                (equalp result expected))
+                     (error "(sb-impl::output-to-c-string/utf-8/lf ~a) => ~a; but ~a is expected"
+                            chars result expected)))))))
+    (test '(97 98 99)
+          #(97 98 99 0))
+    (test '(97 224 225 226 227 228 229 65)
+          #(97 195 160 195 161 195 162 195 163 195 164 195 165 65 0))
+    (test '(54620 0 24291 0 26085)
+          #(237 149 156 0 229 187 163 0 230 151 165 0))
+    (test '(97 128077 98 9989 65039 65039 65039 65039 65039 65039 65039)
+          #(97 240 159 145 141 98 226 156 133 239 184 143 239 184 143 239 184 143 239 184 143 239 184 143 239 184 143 239 184 143 0))
+    (test '(0 #xd800 1) nil t)))
+
+#+sb-unicode
+(with-test (:name :string-to-octets-encoding-error)
+  (assert
+   (equalp
+    (handler-bind ((sb-int:character-encoding-error (lambda (c) (use-value #\a c))))
+      (string-to-octets (map 'string #'code-char '(233 233 55955 99))))
+    #(195 169 195 169 97 99))))

@@ -1,0 +1,350 @@
+;;;; NEON intrinsics support for arm64
+
+;;;; This software is part of the SBCL system. See the README file for
+;;;; more information.
+;;;;
+;;;; This software is derived from the CMU CL system, which was
+;;;; written at Carnegie Mellon University and released into the
+;;;; public domain. The software is in the public domain and is
+;;;; provided with absolutely no warranty. See the COPYING and CREDITS
+;;;; files for more information.
+
+(in-package "SB-VM")
+
+#+sb-xc-host
+(progn ; the host compiler will complain about absence of these
+  (defun %simd-pack-low (x) (error "Called %SIMD-PACK-LOW ~S" x))
+  (defun %simd-pack-high (x) (error "Called %SIMD-PACK-HIGH ~S" x)))
+
+(defun emit-movi-vector-imm (dst value)
+  (aver (typep value '(unsigned-byte 64)))
+  ;; We've got a few options here.
+  ;; movi can produce 1, 2, or 4 byte constants with one of the values
+  ;; filled in with an imm8. The other option is an 8 byte constant
+  ;; where each byte is populated from a single bit in the source imm8.
+  (let ((dwordp (= (ldb (byte 32 0) value) (ldb (byte 32 32) value)))
+        (wordp (= (ldb (byte 16 0) value) (ldb (byte 16 16) value)
+                  (ldb (byte 16 32) value) (ldb (byte 16 48) value)))
+        (bytep (= (ldb (byte 8 0) value) (ldb (byte 8 8) value)
+                  (ldb (byte 8 16) value) (ldb (byte 8 24) value)
+                  (ldb (byte 8 32) value) (ldb (byte 8 40) value)
+                  (ldb (byte 8 48) value) (ldb (byte 8 56) value))))
+    (cond
+      ((and dwordp
+            (or (zerop (dpb 0 (byte 8 0) (ldb (byte 32 0) value)))
+                (zerop (dpb 0 (byte 8 8) (ldb (byte 32 0) value)))
+                (zerop (dpb 0 (byte 8 16) (ldb (byte 32 0) value)))
+                (zerop (dpb 0 (byte 8 24) (ldb (byte 32 0) value)))))
+       (inst movi dst (ldb (byte 32 0) value) :4s))
+      ((and wordp
+            (or (zerop (dpb 0 (byte 8 0) (ldb (byte 16 0) value)))
+                (zerop (dpb 0 (byte 8 8) (ldb (byte 16 0) value)))))
+       (inst movi dst (ldb (byte 16 0) value) :8h))
+      (bytep
+       (inst movi dst (ldb (byte 8 0) value) :16b))
+      ((and (member (ldb (byte 8 0) value) '(0 #xFF))
+            (member (ldb (byte 8 8) value) '(0 #xFF))
+            (member (ldb (byte 8 16) value) '(0 #xFF))
+            (member (ldb (byte 8 24) value) '(0 #xFF))
+            (member (ldb (byte 8 32) value) '(0 #xFF))
+            (member (ldb (byte 8 40) value) '(0 #xFF))
+            (member (ldb (byte 8 48) value) '(0 #xFF))
+            (member (ldb (byte 8 56) value) '(0 #xFF)))
+       (inst movi dst value :2d))
+      ;; Can't do movi, try via the scalar regs.
+      (wordp
+       (inst movz tmp-tn (ldb (byte 16 0) value))
+       (inst dup dst tmp-tn :8h))
+      ((and dwordp
+            (zerop (ldb (byte 16 16) value)))
+       (inst movz tmp-tn (ldb (byte 16 0) value))
+       (inst dup dst tmp-tn :4s))
+      ((and dwordp
+            (encode-logical-immediate (ldb (byte 32 0) value)))
+       (inst orr tmp-tn zr-tn (ldb (byte 32 0) value))
+       (inst dup dst tmp-tn :4s))
+      (t nil))))
+
+(define-move-fun (load-neon-immediate 1) (vop x y)
+  ((fp-immediate)
+   (int-neon-reg single-neon-reg double-neon-reg))
+  (let* ((x  (tn-value x))
+         (lo (%simd-pack-low x))
+         (hi (%simd-pack-high x)))
+    (or (and (= lo hi) (emit-movi-vector-imm y lo))
+        (load-inline-constant y x))))
+
+(define-move-fun (load-int-neon 2) (vop x y)
+  ((int-neon-stack) (int-neon-reg))
+  (loadw y (current-nfp-tn vop) (tn-offset x)))
+
+(define-move-fun (load-float-neon 2) (vop x y)
+  ((single-neon-stack double-neon-stack) (single-neon-reg double-neon-reg))
+  (loadw y (current-nfp-tn vop) (tn-offset x)))
+
+(define-move-fun (store-int-neon 2) (vop x y)
+  ((int-neon-reg) (int-neon-stack))
+  (storew x (current-nfp-tn vop) (tn-offset y)))
+
+(define-move-fun (store-float-neon 2) (vop x y)
+  ((double-neon-reg single-neon-reg) (double-neon-stack single-neon-stack))
+  (storew x (current-nfp-tn vop) (tn-offset y)))
+
+(define-vop (neon-move)
+  (:args (x :scs (single-neon-reg double-neon-reg int-neon-reg)
+            :target y
+            :load-if (not (location= x y))))
+  (:results (y :scs (single-neon-reg double-neon-reg int-neon-reg)
+               :load-if (not (location= x y))))
+  (:note "NEON move")
+  (:generator 0
+    (unless (location= y x)
+      (inst mov y x :16b))))
+(define-move-vop neon-move :move
+  (int-neon-reg single-neon-reg double-neon-reg)
+  (int-neon-reg single-neon-reg double-neon-reg))
+
+
+(macrolet ((define-move-from-neon (type tag &rest scs)
+             (let ((name (symbolicate "MOVE-FROM-NEON/" type)))
+               `(progn
+                  (define-vop (,name)
+                    (:args (x :scs ,scs))
+                    (:results (y :scs (descriptor-reg)))
+                    (:arg-types ,type)
+                    (:temporary (:scs (non-descriptor-reg) :offset lr-offset) lr)
+                    (:temporary (:sc unsigned-reg) header)
+                    (:note "NEON to pointer coercion")
+                    (:generator 13
+                      (with-fixed-allocation (y lr
+                                              simd-pack-widetag
+                                              simd-pack-size
+                                              :store-type-code nil)
+                        (inst mov header (fixnumize ,tag))
+                        (storew-pair lr 0 header simd-pack-tag-slot tmp-tn)
+                        (storew x tmp-tn simd-pack-lo-value-slot))))
+                  (define-move-vop ,name :move
+                    ,scs (descriptor-reg))))))
+  ;; see +simd-pack-element-types+
+  (define-move-from-neon simd-pack-single 0 single-neon-reg)
+  (define-move-from-neon simd-pack-double 1 double-neon-reg)
+  (define-move-from-neon simd-pack-ub8 2 int-neon-reg)
+  (define-move-from-neon simd-pack-ub16 3 int-neon-reg)
+  (define-move-from-neon simd-pack-ub32 4 int-neon-reg)
+  (define-move-from-neon simd-pack-ub64 5 int-neon-reg)
+  (define-move-from-neon simd-pack-sb8 6 int-neon-reg)
+  (define-move-from-neon simd-pack-sb16 7 int-neon-reg)
+  (define-move-from-neon simd-pack-sb32 8 int-neon-reg)
+  (define-move-from-neon simd-pack-sb64 9 int-neon-reg))
+
+(define-vop (move-to-neon)
+  (:args (x :scs (descriptor-reg)))
+  (:results (y :scs (int-neon-reg double-neon-reg single-neon-reg)))
+  (:note "pointer to NEON coercion")
+  (:generator 2
+    (loadw y x simd-pack-lo-value-slot other-pointer-lowtag)))
+(define-move-vop move-to-neon :move
+  (descriptor-reg)
+  (int-neon-reg double-neon-reg single-neon-reg))
+
+(define-vop (move-neon-arg)
+  (:args (x :scs (int-neon-reg double-neon-reg single-neon-reg) :target y)
+         (fp :scs (any-reg)
+             :load-if (not (sc-is y int-neon-reg double-neon-reg single-neon-reg))))
+  (:results (y))
+  (:note "NEON argument move")
+  (:generator 4
+     (sc-case y
+       ((int-neon-reg double-neon-reg single-neon-reg)
+        (unless (location= y x)
+          (inst mov y x :16b)))
+       ((int-neon-stack double-neon-stack single-neon-stack)
+        (storew x fp (tn-offset y))))))
+(define-move-vop move-neon-arg :move-arg
+  (int-neon-reg double-neon-reg single-neon-reg descriptor-reg)
+  (int-neon-reg double-neon-reg single-neon-reg))
+
+(define-move-vop move-arg :move-arg
+  (int-neon-reg double-neon-reg single-neon-reg)
+  (descriptor-reg))
+
+
+(define-vop (%simd-pack-low)
+  (:translate %simd-pack-low)
+  (:args (x :scs (int-neon-reg double-neon-reg single-neon-reg)))
+  (:arg-types simd-pack)
+  (:results (dst :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 3
+    (inst umov dst x 0 :d)))
+
+(define-vop (%simd-pack-high)
+  (:translate %simd-pack-high)
+  (:args (x :scs (int-neon-reg double-neon-reg single-neon-reg)))
+  (:arg-types simd-pack)
+  (:results (dst :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 3
+    (inst umov dst x 1 :d)))
+
+(define-vop (%make-simd-pack)
+  (:translate %make-simd-pack)
+  (:args (tag :scs (any-reg))
+         (lo :scs (unsigned-reg))
+         (hi :scs (unsigned-reg)))
+  (:arg-types tagged-num unsigned-num unsigned-num)
+  (:temporary (:scs (non-descriptor-reg) :offset lr-offset) lr)
+  (:results (dst :scs (descriptor-reg) :from :load))
+  (:result-types t)
+  (:generator 13
+    (with-fixed-allocation (dst lr
+                            simd-pack-widetag
+                            simd-pack-size :store-type-code nil)
+      ;; see +simd-pack-element-types+
+      (storew-pair lr 0 tag simd-pack-tag-slot tmp-tn)
+      (storew-pair lo simd-pack-lo-value-slot hi simd-pack-hi-value-slot tmp-tn))))
+
+(define-vop (%make-simd-pack-ub64)
+  (:translate %make-simd-pack-ub64)
+  (:args (lo :scs (unsigned-reg))
+         (hi :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num)
+  (:results (dst :scs (int-neon-reg)))
+  (:result-types simd-pack-ub64)
+  (:generator 5
+    (inst ins dst 0 lo nil :d)
+    (inst ins dst 1 hi nil :d)))
+
+(defmacro simd-pack-dispatch (pack &body body)
+  (check-type pack symbol)
+  `(let ((,pack ,pack))
+     (etypecase ,pack
+       ,@(map 'list (lambda (eltype)
+                   `((simd-pack ,eltype) ,@body))
+          +simd-pack-element-types+))))
+
+#-sb-xc-host
+(macrolet ((def ()
+             `(progn
+                ,@(loop for width in '(8 16 32 64 double single)
+                        for step = (case width
+                                     (double 8)
+                                     (single 4)
+                                     (t (/ width 8)))
+                        append (loop for signed in (if (numberp width)
+                                                       '(t nil)
+                                                       '(nil))
+                                     for name = (symbolicate '%simd-pack- (if signed 'signed- "")
+                                                             'ref- width)
+                                     for ref = (symbolicate (if signed 'signed- "") 'sap-ref- width)
+                                     collect
+                                     `(defun ,name (pack n)
+                                        (declare (fixnum n))
+                                        (with-pinned-objects (pack)
+                                          (let ((sap (truly-the word (+ (- (get-lisp-obj-address pack) other-pointer-lowtag)
+                                                                        (* simd-pack-lo-value-slot n-word-bytes)))))
+                                            (,ref (int-sap sap) (truly-the fixnum (* n ,step)))))))))))
+  (def))
+
+#-sb-xc-host
+(progn
+  (declaim (inline %make-simd-pack-ub32))
+  (defun %make-simd-pack-ub32 (w x y z)
+    (declare (type (unsigned-byte 32) w x y z))
+    (%make-simd-pack
+     #.(position '(unsigned-byte 32) +simd-pack-element-types+ :test #'equal)
+     (logior w (ash x 32))
+     (logior y (ash z 32)))))
+
+(define-vop (%make-simd-pack-double)
+  (:translate %make-simd-pack-double)
+  (:args (lo :scs (double-reg))
+         (hi :scs (double-reg)))
+  (:arg-types double-float double-float)
+  (:results (dst :scs (double-neon-reg)))
+  (:result-types simd-pack-double)
+  (:generator 5
+    (inst zip1 dst lo hi :2d)))
+
+(define-vop (%make-simd-pack-single)
+  (:translate %make-simd-pack-single)
+  (:args (x :scs (single-reg) :target tmp)
+         (y :scs (single-reg))
+         (z :scs (single-reg))
+         (w :scs (single-reg)))
+  (:arg-types single-float single-float single-float single-float)
+  (:temporary (:sc single-neon-reg :from (:argument 2)) tmp)
+  (:results (dst :scs (single-neon-reg)))
+  (:result-types simd-pack-single)
+  (:generator 3
+    (inst zip1 tmp x y :2s)
+    (inst zip1 dst z w :2s)
+    (inst zip1 dst tmp dst :2d)))
+
+(defknown %simd-pack-single-item
+  (simd-pack (integer 0 3)) single-float (flushable))
+
+(define-vop (%simd-pack-single-item)
+  (:args (x :scs (int-neon-reg double-neon-reg single-neon-reg)))
+  (:translate %simd-pack-single-item)
+  (:arg-types simd-pack (:constant t))
+  (:info index)
+  (:results (dst :scs (single-reg)))
+  (:result-types single-float)
+  (:generator 1
+    (inst ins dst 0 x index :s)))
+
+(defknown %simd-pack-double-item
+  (simd-pack (integer 0 1)) double-float (flushable))
+
+(define-vop (%simd-pack-double-item)
+  (:translate %simd-pack-double-item)
+  (:args (x :scs (int-neon-reg double-neon-reg single-neon-reg)))
+  (:info index)
+  (:arg-types simd-pack (:constant t))
+  (:results (dst :scs (double-reg)))
+  (:result-types double-float)
+  (:generator 3
+    (inst ins dst 0 x index :d)))
+
+(define-vop ()
+   (:translate sap-ref-128)
+   (:args (sap :scs (sap-reg))
+          (offset :scs (signed-reg)))
+   (:arg-types system-area-pointer signed-num)
+   (:results (result :scs (int-neon-reg)))
+   (:result-types simd-pack-ub64)
+   (:generator 5
+     (inst ldr result (@ sap offset))))
+
+(define-vop (%set-sap-ref-128)
+   (:translate (setf sap-ref-128))
+   (:args (value :scs (int-neon-reg))
+          (sap :scs (sap-reg))
+          (offset :scs (signed-reg)))
+   (:arg-types simd-pack-ub64 system-area-pointer signed-num)
+   (:generator 5
+     (inst str value (@ sap offset))))
+
+(defknown %simd-pack-int-to-double
+    ((simd-pack (unsigned-byte 64))) (simd-pack double-float) (flushable))
+(defknown %simd-pack-int-to-single
+    ((simd-pack (unsigned-byte 64))) (simd-pack single-float) (flushable))
+
+(define-vop ()
+  (:translate %simd-pack-int-to-double)
+  (:args (x :scs (int-neon-reg)))
+  (:arg-types simd-pack-ub64)
+  (:results (y :scs (double-neon-reg)))
+  (:result-types simd-pack-double)
+  (:generator 2
+    (move x y :16b)))
+
+(define-vop ()
+  (:translate %simd-pack-int-to-single)
+  (:args (x :scs (int-neon-reg)))
+  (:arg-types simd-pack-ub64)
+  (:results (y :scs (single-neon-reg)))
+  (:result-types simd-pack-single)
+  (:generator 2
+    (move x y :16b)))

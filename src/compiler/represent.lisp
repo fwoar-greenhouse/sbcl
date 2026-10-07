@@ -472,22 +472,35 @@
                  (let ((res (find-move-vop op-tn write-p sc ptype
                                            #'sc-move-vops)))
                    (when res
-                     (let ((temp (make-representation-tn ptype scn)))
-                       (change-tn-ref-tn op temp)
-                       (cond
-                         ((not write-p)
-                          (or
-                           (coerce-from-constant op temp load-scs)
-                           (emit-move (or (maybe-move-from-fixnum+-1 op-tn temp
-                                                                     op)
-                                          res)
-                                      op-tn temp)))
-                         ((and (null (tn-reads op-tn))
-                               (eq (tn-kind op-tn) :normal)))
-                         (t
-                          (emit-move (or (maybe-move-from-fixnum+-1 temp op-tn op)
-                                         res)
-                                     temp op-tn))))
+                     (cond ((and write-p
+                                 (sc-is op-tn sb-vm::descriptor-reg)
+                                 (let ((boxing-vop (vop-info-boxing-variant (vop-info vop))))
+                                   (when boxing-vop
+                                     (emit-and-insert-vop node
+                                                          block
+                                                          boxing-vop
+                                                          (reference-tn-refs (vop-args vop) nil)
+                                                          (reference-tn-refs (vop-results vop) t)
+                                                          vop)
+                                     (delete-vop vop)
+                                     t))))
+                           (t
+                            (let ((temp (make-representation-tn ptype scn)))
+                              (change-tn-ref-tn op temp)
+                              (cond
+                                ((not write-p)
+                                 (or
+                                  (coerce-from-constant op-tn op temp load-scs)
+                                  (emit-move (or (maybe-move-from-fixnum+-1 op-tn temp
+                                                                            op)
+                                                 res)
+                                             op-tn temp)))
+                                ((and (null (tn-reads op-tn))
+                                      (eq (tn-kind op-tn) :normal)))
+                                (t
+                                 (emit-move (or (maybe-move-from-fixnum+-1 temp op-tn op)
+                                                res)
+                                            temp op-tn))))))
                      t)))))
       ;; Search the non-stack load SCs first.
       (dotimes (scn sb-vm:sc-number-limit)
@@ -628,10 +641,12 @@
                                                   ,most-positive-fixnum)))
              (template-or-lose 'sb-vm::move-from-fixnum-1))))))
 
-(defun coerce-from-constant (x-tn-ref y &optional load-scs)
+(defun coerce-from-constant (x x-tn-ref y &optional load-scs)
   (when (and (sc-is y sb-vm::descriptor-reg sb-vm::control-stack)
              (tn-ref-type x-tn-ref))
-    (multiple-value-bind (constantp value) (type-singleton-p (tn-ref-type x-tn-ref))
+    (multiple-value-bind (constantp value) (if (constant-tn-p x)
+                                               (values t (tn-value x))
+                                               (type-singleton-p (tn-ref-type x-tn-ref)))
       (when constantp
         (let ((constant (find-constant value)))
           (cond #+(or arm64 x86-64)
@@ -776,9 +791,11 @@
 
 ;;; If there's already a move VOP that does the same job
 ;;; jump to it instead.
-(defun reuse-move-coercion (vop coerce x y block)
+(defun reuse-move-coercion (vop coerce x-ref y-ref block)
   (when (>= (vop-info-cost coerce) *efficiency-note-cost-threshold*)
-    (let* ((branch (vop-next vop))
+    (let* ((x (tn-ref-tn x-ref))
+           (y (tn-ref-tn y-ref))
+           (branch (vop-next vop))
            (dest (cond ((not branch)
                         (ir2-block-%label (ir2-block-next block)))
                        ((eq (vop-name branch) 'branch)
@@ -798,6 +815,7 @@
                    (new-y (tn-ref-tn (vop-args existing-vop)))
                    move)
               (when (and (eq dest existing-dest)
+                         (eq (tn-primitive-type x) (tn-primitive-type new-y))
                          (setf move
                                (find-move-vop x nil (tn-sc new-y) (tn-primitive-type new-y) #'sc-move-vops)))
                 (let* ((temp-p (tn-ref-next (tn-reads new-y)))
@@ -809,6 +827,13 @@
                   (when temp-p
                     (emit-move-template (vop-node existing-vop) (vop-block existing-vop) move new-y temp existing-vop)
                     (change-tn-ref-tn (vop-args existing-vop) temp))
+                  (setf (tn-ref-type (vop-args existing-vop))
+                        (type-union (tn-ref-type (vop-args existing-vop))
+                                    (tn-ref-type x-ref)))
+                  (setf (tn-ref-type (vop-results existing-vop))
+                        (type-union (tn-ref-type (vop-results existing-vop))
+                                    (tn-ref-type y-ref)))
+
                   (let* ((new-block (split-ir2-block-before existing-vop))
                          (1block (ir2-block-block block)))
 
@@ -843,8 +868,10 @@
       (cond
         ((eq (vop-info-name info) 'move)
          (let* ((args (vop-args vop))
-                (x (tn-ref-tn args))
-                (y (tn-ref-tn (vop-results vop)))
+                (x-ref args)
+                (y-ref (vop-results vop))
+                (x (tn-ref-tn x-ref))
+                (y (tn-ref-tn y-ref))
                 (res (find-move-vop x nil (tn-sc y) (tn-primitive-type y)
                                     #'sc-move-vops)))
 
@@ -852,17 +879,16 @@
                        (eq (tn-kind y) :normal))
                   (delete-vop vop))
                  ((eq res info))
-                 ((coerce-from-constant args y))
+                 ((coerce-from-constant x x-ref y))
                  (res
                   (or
                    (jump-over-move-coercion vop x y block)
-                   (let ((res (or (maybe-move-from-fixnum+-1 x y
-                                                             args)
+                   (let ((res (or (maybe-move-from-fixnum+-1 x y x-ref)
                                   res)))
-                     (unless (reuse-move-coercion vop res x y block)
+                     (unless (reuse-move-coercion vop res x-ref y-ref block)
                        (when (>= (vop-info-cost res)
                                  *efficiency-note-cost-threshold*)
-                         (maybe-emit-coerce-efficiency-note res args y))
+                         (maybe-emit-coerce-efficiency-note res x-ref y))
 
                        (emit-move-template node (vop-block vop) res x y vop)
                        (delete-vop vop)))))

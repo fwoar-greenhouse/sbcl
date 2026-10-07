@@ -164,9 +164,7 @@ sb-kernel::
                              (or (search "src/pcl" stem)
                                  (search "src/code/aprof" stem)
                                  (search "src/code/ntrace" stem)))
-                            (sb-ext:*derive-function-types*
-                              (unless (search "/pcl/" stem)
-                                t)))
+                            (sb-ext:*derive-function-types* t))
                         (ensure-directories-exist output)
                         ;; Like PROCLAIM-TARGET-OPTIMIZATION in 'compile-cold-sbcl'
                         ;; We should probably stash a copy of the POLICY instance from
@@ -242,7 +240,8 @@ sb-kernel::
       (dolist (cell (sort list #'> :key #'car))
         (format output "~7d ~s~%" (car cell) (cdr cell))))))
 
-(when (sb-sys:find-dynamic-foreign-symbol-address "tot_gc_nsec")
+(when (and (sb-sys:find-dynamic-foreign-symbol-address "tot_gc_nsec")
+           (zerop (extern-alien "lisp_startup_options" char)))
   (let* ((run-sec (/ (get-internal-real-time) internal-time-units-per-second))
          (gc-nsec (extern-alien "tot_gc_nsec" unsigned))
          (gc-msec (/ (float gc-nsec) 1000000)))

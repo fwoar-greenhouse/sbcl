@@ -1834,6 +1834,8 @@
 
   (define-2-x-10-instructions extsb 31 954)
   (define-2-x-10-instructions extsh 31 922)
+  #+64-bit
+  (define-2-x-10-instructions extsw 31 986)
                                         ; Whew.
 
   (define-2-a-tab-instructions fdivs 59 18 :cost 17)
@@ -2383,7 +2385,7 @@
           `(.align ,(integer-length (1- size)))
           label
           (cond ((eq (car constant) :jump-table)
-                 `(.lispword ,@(coerce (cdr constant) 'list)))
+                 `(.lispwords ,(cdr constant)))
                 ((typep (cdr constant) '(cons (eql :layout-id)))
                  `(.layout-id ,(cddr constant)))
                 (t

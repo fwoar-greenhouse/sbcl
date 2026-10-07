@@ -590,7 +590,6 @@
 (define-vop (float-op)
   (:args (x) (y))
   (:results (r))
-  (:policy :fast-safe)
   (:note "inline float arithmetic")
   (:vop-var vop)
   (:save-p :compute-only))
@@ -639,7 +638,6 @@
                 (:args (x :scs (,sc)))
                 (:results (y :scs (,sc)))
                 (:translate ,translate)
-                (:policy :fast-safe)
                 (:arg-types ,type)
                 (:result-types ,type)
                 (:note "inline float arithmetic")
@@ -679,7 +677,6 @@
   (:args (x :scs (double-reg)))
   (:results (y :scs (double-reg)))
   (:translate abs)
-  (:policy :fast-safe)
   (:arg-types double-float)
   (:result-types double-float)
   (:note "inline float arithmetic")
@@ -693,7 +690,6 @@
   (:args (x :scs (double-reg)))
   (:results (y :scs (double-reg)))
   (:translate %negate)
-  (:policy :fast-safe)
   (:arg-types double-float)
   (:result-types double-float)
   (:note "inline float arithmetic")
@@ -708,7 +704,6 @@
   (:args (x :scs (long-reg)))
   (:results (y :scs (long-reg)))
   (:translate abs)
-  (:policy :fast-safe)
   (:arg-types long-float)
   (:result-types long-float)
   (:note "inline float arithmetic")
@@ -731,7 +726,6 @@
   (:args (x :scs (long-reg)))
   (:results (y :scs (long-reg)))
   (:translate %negate)
-  (:policy :fast-safe)
   (:arg-types long-float)
   (:result-types long-float)
   (:note "inline float arithmetic")
@@ -756,17 +750,22 @@
   (:args (x) (y))
   (:conditional)
   (:info target not-p)
-  (:variant-vars format yep nope)
-  (:policy :fast-safe)
+  (:variant-vars format yep nope quiet)
   (:note "inline float comparison")
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
     (note-this-location vop :internal-error)
     (ecase format
-      (:single (inst fcmps x y))
-      (:double (inst fcmpd x y))
-      (:long (inst fcmpq x y)))
+      (:single (if quiet
+                   (inst fcmps x y)
+                   (inst fcmpes x y)))
+      (:double (if quiet
+                   (inst fcmpd x y)
+                   (inst fcmped x y)))
+      (:long (if quiet
+                 (inst fcmpq x y)
+                 (inst fcmpeq x y))))
     ;; The SPARC V9 doesn't need an instruction between a
     ;; floating-point compare and a floating-point branch.
     (unless (member :sparc-v9 *backend-subfeatures*)
@@ -784,21 +783,23 @@
   #+long-float
   (frob long-float-compare long-reg long-float))
 
-(macrolet ((frob (translate yep nope sname dname #+long-float lname)
+(macrolet ((frob (translate yep nope sname dname #+long-float lname &optional quiet)
              `(progn
                 (define-vop (,sname single-float-compare)
                   (:translate ,translate)
-                  (:variant :single ,yep ,nope))
+                  (:variant :single ,yep ,nope ,quiet))
                 (define-vop (,dname double-float-compare)
                   (:translate ,translate)
-                  (:variant :double ,yep ,nope))
+                  (:variant :double ,yep ,nope ,quiet))
                 #+long-float
                 (define-vop (,lname long-float-compare)
                   (:translate ,translate)
-                  (:variant :long ,yep ,nope)))))
+                  (:variant :long ,yep ,nope ,quiet)))))
   (frob < :l :ge </single-float </double-float #+long-float </long-float)
+  (frob quiet< :l :ge quiet</single-float quiet</double-float #+long-float quiet</long-float t)
   (frob > :g :le >/single-float >/double-float #+long-float >/long-float)
-  (frob = :eq :ne =/single-float =/double-float #+long-float =/long-float))
+  (frob = :eq :ne =/single-float =/double-float #+long-float =/long-float)
+  (frob quiet= :eq :ne quiet=/single-float quiet=/double-float #+long-float quiet=/long-float t))
 
 #+long-float
 (deftransform eql ((x y) (long-float long-float))
@@ -819,7 +820,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types signed-num)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -850,7 +850,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types ,from-type)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -885,7 +884,6 @@
                 (:arg-types ,from-type)
                 (:result-types signed-num)
                 (:translate ,trans)
-                (:policy :fast-safe)
                 (:note "inline float truncate")
                 (:vop-var vop)
                 (:save-p :compute-only)
@@ -931,7 +929,6 @@
   (:arg-types signed-num)
   (:result-types single-float)
   (:translate make-single-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -966,7 +963,6 @@
   (:arg-types signed-num unsigned-num)
   (:result-types double-float)
   (:translate make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (let ((stack-tn (sc-case res
@@ -992,7 +988,6 @@
   (:arg-types signed-num unsigned-num unsigned-num unsigned-num)
   (:result-types long-float)
   (:translate make-long-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (let ((stack-tn (sc-case res
@@ -1020,7 +1015,6 @@
   (:arg-types single-float)
   (:result-types signed-num)
   (:translate single-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -1051,7 +1045,6 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-high-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -1075,7 +1068,6 @@
   (:arg-types double-float)
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -1100,7 +1092,6 @@
   (:arg-types long-float)
   (:result-types signed-num)
   (:translate long-float-exp-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -1126,7 +1117,6 @@
   (:arg-types long-float)
   (:result-types unsigned-num)
   (:translate long-float-high-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -1152,7 +1142,6 @@
   (:arg-types long-float)
   (:result-types unsigned-num)
   (:translate long-float-mid-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -1178,7 +1167,6 @@
   (:arg-types long-float)
   (:result-types unsigned-num)
   (:translate long-float-low-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -1207,7 +1195,6 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate floating-point-modes)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:temporary (:sc unsigned-stack) temp)
   (:generator 3
@@ -1221,7 +1208,6 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate floating-point-modes)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:temporary (:sc double-stack) temp)
   (:generator 3
@@ -1240,7 +1226,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:temporary (:sc unsigned-stack) temp)
   (:vop-var vop)
   (:generator 3
@@ -1256,7 +1241,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:temporary (:sc double-stack) temp)
   (:temporary (:sc unsigned-reg) my-fsr)
   (:vop-var vop)
@@ -1289,7 +1273,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:temporary (:sc double-stack) temp)
   (:temporary (:sc unsigned-reg) my-fsr)
   (:vop-var vop)
@@ -1308,7 +1291,6 @@
   (:args (x :scs (double-reg)))
   (:results (y :scs (double-reg)))
   (:translate %sqrt)
-  (:policy :fast-safe)
   (:guard (or (member :sparc-v7 *backend-subfeatures*)
               (member :sparc-v8 *backend-subfeatures*)
               (member :sparc-v9 *backend-subfeatures*)))
@@ -1326,7 +1308,6 @@
   (:args (x :scs (long-reg)))
   (:results (y :scs (long-reg)))
   (:translate %sqrt)
-  (:policy :fast-safe)
   (:arg-types long-float)
   (:result-types long-float)
   (:note "inline float arithmetic")
@@ -1349,7 +1330,6 @@
                :load-if (not (sc-is r complex-single-stack))))
   (:result-types complex-single-float)
   (:note "inline complex single-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -1377,7 +1357,6 @@
                :load-if (not (sc-is r complex-double-stack))))
   (:result-types complex-double-float)
   (:note "inline complex double-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -1406,7 +1385,6 @@
                :load-if (not (sc-is r complex-long-stack))))
   (:result-types complex-long-float)
   (:note "inline complex long-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -1431,7 +1409,6 @@
   (:results (r :scs (single-reg)))
   (:result-types single-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (sc-case x
@@ -1463,7 +1440,6 @@
   (:results (r :scs (double-reg)))
   (:result-types double-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (sc-case x
@@ -1496,7 +1472,6 @@
   (:results (r :scs (long-reg)))
   (:result-types long-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case x
@@ -1543,7 +1518,6 @@
             (:arg-types ,c-type)
             (:results (r :scs (,complex-reg)))
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float arithmetic")
             (:translate %negate)
             (:generator ,cost
@@ -1569,7 +1543,6 @@
            (:results (r :scs (,complex-reg)))
            (:arg-types ,c-type ,c-type)
            (:result-types ,c-type)
-           (:policy :fast-safe)
            (:note "inline complex float arithmetic")
            (:translate ,op)
            (:generator ,cost
@@ -1605,7 +1578,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,c-type ,r-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float/float arithmetic")
             (:translate ,op)
             (:generator ,cost
@@ -1639,7 +1611,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,r-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float/float arithmetic")
             (:translate +)
             (:generator ,cost
@@ -1669,7 +1640,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,r-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float/float arithmetic")
             (:translate -)
             (:generator ,cost
@@ -1701,7 +1671,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,c-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float multiplication")
             (:translate *)
             (:temporary (:scs (,real-reg)) prod-1 prod-2 prod-3 prod-4)
@@ -1738,7 +1707,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,c-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float multiplication")
             (:translate *)
             (:temporary (:scs (,real-reg)) p1 p2)
@@ -1801,7 +1769,6 @@
              (:results (r :scs (,complex-sc-type)))
              (:arg-types ,c-type ,r-type)
              (:result-types ,c-type)
-             (:policy :fast-safe)
              (:note "inline complex float arithmetic")
              (:translate *)
              (:temporary (:scs (,real-sc-type)) temp)
@@ -1824,7 +1791,6 @@
              (:results (r :scs (,complex-sc-type)))
              (:arg-types ,r-type ,c-type)
              (:result-types ,c-type)
-             (:policy :fast-safe)
              (:note "inline complex float arithmetic")
              (:translate *)
              (:temporary (:scs (,real-sc-type)) temp)
@@ -1896,7 +1862,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,c-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float division")
             (:translate /)
             (:temporary (:sc ,real-reg) ratio)
@@ -1971,7 +1936,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,c-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float division")
             (:translate /)
             (:temporary (:sc ,real-reg) ratio)
@@ -2043,7 +2007,6 @@
            (:results (r :scs (,complex-sc-type)))
            (:arg-types ,c-type ,r-type)
            (:result-types ,c-type)
-           (:policy :fast-safe)
            (:note "inline complex float arithmetic")
            (:translate /)
            (:generator ,cost
@@ -2074,7 +2037,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,r-type ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex float division")
             (:translate /)
             (:temporary (:sc ,real-reg) ratio)
@@ -2134,7 +2096,6 @@
             (:results (r :scs (,complex-reg)))
             (:arg-types ,c-type)
             (:result-types ,c-type)
-            (:policy :fast-safe)
             (:note "inline complex conjugate")
             (:translate conjugate)
             (:generator ,cost
@@ -2194,7 +2155,6 @@
               (:translate ,trans-1)
               (:conditional)
               (:info target not-p)
-              (:policy :fast-safe)
               (:note "inline complex float/float comparison")
               (:vop-var vop)
               (:save-p :compute-only)
@@ -2221,7 +2181,6 @@
               (:translate ,trans-2)
               (:conditional)
               (:info target not-p)
-              (:policy :fast-safe)
               (:note "inline complex float/float comparison")
               (:vop-var vop)
               (:save-p :compute-only)
@@ -2261,7 +2220,6 @@
             (:translate =)
             (:conditional)
             (:info target not-p)
-            (:policy :fast-safe)
             (:note "inline complex float comparison")
             (:vop-var vop)
             (:save-p :compute-only)
@@ -2297,7 +2255,6 @@
             (:translate =)
             (:conditional)
             (:info target not-p)
-            (:policy :fast-safe)
             (:note "inline complex float comparison")
             (:vop-var vop)
             (:save-p :compute-only)
@@ -2374,7 +2331,6 @@
             (:results (r :scs (,sc-type)))
             (:arg-types ,type ,type)
             (:result-types ,type)
-            (:policy :fast-safe)
             (:note ,note)
             (:translate ,trans-name)
             (:guard (member :sparc-v9 *backend-subfeatures*))
@@ -2430,7 +2386,6 @@
   (:results (r :scs (descriptor-reg)))
   (:arg-types double-float double-float)
   (:result-types double-float)
-  (:policy :fast-safe)
   (:note "inline float max/min")
   (:translate %max-double-float)
   (:temporary (:scs (double-reg)) xval)

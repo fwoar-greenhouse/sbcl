@@ -354,7 +354,7 @@
                                (opcode #b0010011)))
                   (:emitter
                    ,(if (eq name 'xori)
-                        ;; Use something like PLAUSIBLE-SIGNED-IMM32-OPERAND-P in the amd64 assembler.
+                        ;; Use something like IMM32-P in the amd64 assembler.
                         ;; This is totally ad-hoc and just enough to emit a logical NOT instruction.
                         `(flet ((cast-to-imm (x) (if (= x most-positive-word) -1 x)))
                            (emit-i-inst segment (cast-to-imm imm) rs ,funct3 rd #b0010011))
@@ -425,6 +425,14 @@
   (define-riscvi-arith-instruction sra #b0100000 #b101 sraw)
   (define-riscvi-arith-instruction or #b0000000 #b110)
   (define-riscvi-arith-instruction and #b0000000 #b111))
+
+;; Zba sh1add/sh2add/sh3add compute rd = rs2 + (rs1 << n) for n in
+;; {1,2,3}, fusing a shift and add into one instruction.  They let the
+;; array element VOPs derive a byte address from a tagged fixnum index
+;; without a separate slli+add pair.
+(define-register-arith-instruction sh1add #b0010000 #b010 #b0110011)
+(define-register-arith-instruction sh2add #b0010000 #b100 #b0110011)
+(define-register-arith-instruction sh3add #b0010000 #b110 #b0110011)
 
 (defun coerce-signed (unsigned-value width)
   (if (logbitp (1- width) unsigned-value)

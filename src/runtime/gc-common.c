@@ -298,11 +298,11 @@ int descriptors_scavenge(lispobj *start, lispobj* end,
 
 /* If 'fun' is provided, then call it on each livened object,
  * otherwise use scav1() */
-void scav_binding_stack(lispobj* where, lispobj* end, void (*fun)(lispobj))
+void bindingstack_vals_visit(lispobj* where, lispobj* end, void (*fun)(lispobj))
 {
     /* The binding stack consists of pairs of words, each holding a value and
      * either a TLS index (if threads), or symbol (if no threads).
-     * Here we scavenge only the entries' values.
+     * Here we scavenge only the 'value' half of a struct binding.
      *
      * Were the TLS index scavenged, it can never cause a symbol to move,
      * let alone be considered live. So we are bug-for-bug compatible regardless
@@ -332,13 +332,16 @@ void scav_binding_stack(lispobj* where, lispobj* end, void (*fun)(lispobj))
                 scav1(&binding->value, binding->value);
     }
 }
-void scan_binding_stack()
+/* Update the 'symbol' half of each binding: follow a forwarding pointer if the
+ * symbol moved, but never liven it. Must run after scavenge_newspace() reaches its
+ * fixpoint. With #+sb-thread, 'symbol' is a TLS index, so this is a no-op. */
+void bindingstack_syms_fix(void)
 {
 #ifndef LISP_FEATURE_SB_THREAD
     struct thread* th;
     for_each_thread(th) { /* 'all' is exactly one */
         struct binding *binding = (struct binding*)th->binding_stack_start;
-        lispobj *end = (lispobj*)get_binding_stack_pointer(th);
+        lispobj *end = get_binding_stack_pointer(th);
         for ( ; (lispobj*)binding < end; ++binding ) {
             if (is_lisp_pointer(binding->symbol) &&
                 forwarding_pointer_p(native_pointer(binding->symbol)))
@@ -3309,3 +3312,16 @@ char* vm_thread_name(struct thread* th)
     if (simple_base_string_p(name)) return vector_sap(name);
     return "?";
 }
+
+#ifdef LISP_FEATURE_TLS_BASED_MV_RETURN
+int thread_mv_cell_count(struct thread* th)
+{
+    int limit = (int)(sizeof th->mv_return_values / sizeof (lispobj));
+    int count = fixnum_value(th->state_word.mv_count) - REGISTER_ARG_COUNT;
+    if (count > limit) count = limit;
+    if (count < 0) count = 0;
+    // scrub unused cells
+    memset(&th->mv_return_values[count], 0, (limit-count)<<WORD_SHIFT);
+    return count;
+}
+#endif

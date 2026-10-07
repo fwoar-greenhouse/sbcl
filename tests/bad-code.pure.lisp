@@ -882,6 +882,11 @@
                      (checked-compile
                       '(lambda (n)
                         (setf (car (aref #((1) (2)) n)) 10))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (sort (if x (aref #((1) (4)) x)) #'>))
                       :allow-warnings t))))
 
 (with-test (:name :constant-modification-nil)
@@ -1080,3 +1085,95 @@
                          (compile nil `(lambda () #',sym)))))))
     (assert (search "special operator IF was found" (try 'if)))
     (assert (search "macro COND was found" (try 'cond)))))
+
+(with-test (:name :xep-fun-type-mismatch)
+  (assert
+   (nth-value 2
+              (checked-compile `(lambda (n)
+                                  (funcall (if n
+                                               (lambda (a) (+ a 2))
+                                               (lambda (a) (+ a 1)))
+                                           1 2))
+                               :allow-warnings t))))
+
+(with-test (:name :see-through-xep-call)
+  (assert (nth-value 3
+                     (checked-compile
+                      `(lambda (n l)
+                         (funcall (if n
+                                      (lambda (x key)
+                                        (member x l :key key))
+                                      #'list)
+                                  1 #'eq))
+                      :allow-style-warnings t))))
+
+(with-test (:name :concatenate-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (m)
+                         (concatenate 'string '(1 #\a) m))
+                      :allow-warnings t))))
+
+(with-test (:name :dont-stop-on-bad-type-declarations)
+  (multiple-value-bind (fun fail warn)
+      (checked-compile
+       `(lambda () (declare (list 1)) 2)
+       :allow-warnings t)
+    (assert (and fail warn))
+    (assert (eql (funcall fun) 2))))
+
+(with-test (:name :macro-argument-modification)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda ()
+                        (macrolet ((a (a)
+                                     (delete 2 (list* '- a))))
+                          (a (* 2 3))))
+                      :allow-warnings 'sb-kernel::macro-arg-modified))))
+
+(with-test (:name :constant-modification-partial-result)
+  (checked-compile
+   '(lambda (b n)
+     (delete 10 (nth n (list* b '(a b a))))))
+  (checked-compile
+   '(lambda (v)
+     (let ((x (cons v "b")))
+       (setf (car x) 10)
+       x))))
+
+(with-test (:name :bad-make-array-dimensions)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (declare (integer x))
+                        (make-array (list* 1 x)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (make-array (list* -1 x)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (make-array (cons x 1)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (make-array (list 'a x)))
+                      :allow-warnings t))))
+
+(with-test (:name :improper-list*)
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (declare (integer x))
+                        (remove 0 (list* 1 x)))
+                      :allow-warnings t)))
+  (assert (nth-value 2
+                     (checked-compile
+                      '(lambda (x)
+                        (declare (integer x))
+                        (remove 2 (cons x 1)))
+                      :allow-warnings t))))

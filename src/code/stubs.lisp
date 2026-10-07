@@ -158,6 +158,12 @@
         (%make-simd-pack-256-double (a b c d))
         (%make-simd-pack-256-ub64 (a b c d))
         (%simd-pack-256-tag))
+  #+sb-simd-pack-512
+  (def* (%make-simd-pack-512 (tag p0 p1 p2 p3 p4 p5 p6 p7))
+        (%make-simd-pack-512-single (a b c d e f g h i j k l m n p q))
+        (%make-simd-pack-512-double (a b c d e f g h))
+        (%make-simd-pack-512-ub64 (a b c d e f g h))
+        (%simd-pack-512-tag))
   #+(or sb-thread x86-64) (def sb-vm::current-thread-offset-sap)
   (def current-sp ())
   (def current-fp ())
@@ -176,6 +182,48 @@
   (def %numerator)
   (def %denominator))
 
+#+sb-simd-pack-512
+(progn
+  (defun %make-simd-pack-512-mask (mask)
+    (declare (type (unsigned-byte 64) mask))
+    (let ((obj
+            (sb-c::%primitive
+             sb-vm::fixed-alloc
+             '%make-simd-pack-512-mask
+             sb-vm:simd-pack-512-mask-size
+             sb-vm:simd-pack-512-mask-widetag
+             sb-vm:other-pointer-lowtag
+             nil)))
+      (with-pinned-objects (obj)
+        (let ((sap (int-sap
+                    (logandc2 (get-lisp-obj-address obj)
+                              sb-vm:lowtag-mask))))
+          (setf (sap-ref-word
+                 sap
+                 (* sb-vm::simd-pack-512-mask-value-slot
+                    sb-vm:n-word-bytes))
+                mask)))
+      obj))
+
+  (defun %simd-pack-512-mask-value (mask)
+    (declare (type sb-ext:simd-pack-512-mask mask))
+    (with-pinned-objects (mask)
+      (sap-ref-word
+       (int-sap
+        (logandc2 (get-lisp-obj-address mask)
+                  sb-vm:lowtag-mask))
+       (* sb-vm::simd-pack-512-mask-value-slot
+          sb-vm:n-word-bytes)))))
+
+;;; Document only those that SB-MANUAL:@UNTYPED-MEMORY singles out as
+;;; examples.
+(setf (documentation 'int-sap 'function)
+      "Creates a SAP pointing at the virtual address `X`.")
+(setf
+ (documentation 'sap-ref-32 'function)
+ "Access the value of the memory location at OFFSET bytes from SAP. SETFable.")
+(setf (documentation 'sap= 'function) "Compare the SAPs X and Y for equality.")
+
 #+sb-simd-pack
 (macrolet ((def (name)
              `(defun ,name (pack)
@@ -193,6 +241,20 @@
   (def %simd-pack-256-1)
   (def %simd-pack-256-2)
   (def %simd-pack-256-3))
+
+#+sb-simd-pack-512
+(macrolet ((def (name)
+             `(defun ,name (pack)
+                (sb-vm::simd-pack-512-dispatch pack
+                  (,name pack)))))
+  (def %simd-pack-512-0)
+  (def %simd-pack-512-1)
+  (def %simd-pack-512-2)
+  (def %simd-pack-512-3)
+  (def %simd-pack-512-4)
+  (def %simd-pack-512-5)
+  (def %simd-pack-512-6)
+  (def %simd-pack-512-7))
 
 (defun spin-loop-hint ()
   "Hints the processor that the current thread is spin-looping."

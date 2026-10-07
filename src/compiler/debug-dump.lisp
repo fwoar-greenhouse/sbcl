@@ -147,7 +147,7 @@
            (type hash-table var-locs) (type node node)
            (type (or vop null) vop)
            #-sb-xc-host (values simple-bit-vector))
-  (let ((res (make-array (logandc2 (+ (hash-table-count var-locs) 7) 7)
+  (let ((res (make-array (align-up (hash-table-count var-locs) 8)
                          :element-type 'bit
                          :initial-element 0))
         (spilled (gethash vop
@@ -413,11 +413,11 @@
 
 ;;; Return DEBUG-SOURCE structure containing information derived from
 ;;; INFO.
-(defun debug-source-for-info (info &key function)
+(defun debug-source-for-info (info &key core)
   (declare (type source-info info))
   (let ((file-info (get-toplevelish-file-info info)))
     (multiple-value-call
-        (if function 'sb-di::make-core-debug-source 'make-debug-source)
+        (if core 'sb-di::make-core-debug-source 'make-debug-source)
      :namestring (or *source-namestring*
                      (make-file-info-namestring
                       (let ((pathname
@@ -441,11 +441,10 @@
                          file-write-date))
       :start-positions (coerce-to-smallest-eltype
                         (file-info-positions file-info))
-     (if function
+     (if core
          (values :form (let ((direct-file-info (source-info-file-info info)))
                          (when (eq :lisp (file-info-%truename direct-file-info))
-                           (elt (file-info-forms direct-file-info) 0)))
-                 :function function)
+                           (elt (file-info-forms direct-file-info) 0))))
          (values)))))
 
 (defun smallest-element-type (integer negative)
@@ -539,6 +538,8 @@
   (make-sc+offset (sc-number (tn-sc tn))
                   (tn-offset tn)))
 
+(defvar *previous-package*)
+
 ;;; Dump info to represent VAR's location being TN. ID is an integer
 ;;; that makes VAR's name unique in the function. BUFFER is the vector
 ;;; we stick the result in. If MINIMAL, we suppress name dumping, and
@@ -548,6 +549,8 @@
 ;;; environment live and is an argument. If a :DEBUG-ENVIRONMENT TN,
 ;;; then we also exclude set variables, since the variable is not
 ;;; guaranteed to be live everywhere in that case.
+;;;
+;;; This is read by sb-di::parse-compiled-debug-vars
 (defun dump-1-var (fun var tn minimal buffer &optional name same-name-p)
   (declare (type lambda-var var) (type (or tn null) tn)
            (type clambda fun))
@@ -571,11 +574,21 @@
            (setq flags (logior flags compiled-debug-var-minimal-p))
            (unless (and tn (tn-offset tn))
              (setq flags (logior flags compiled-debug-var-deleted-p))))
-          (t
-           (unless package
-             (setq flags (logior flags compiled-debug-var-uninterned)))
-           (when package-p
-             (setq flags (logior flags compiled-debug-var-packaged)))))
+          (same-name-p
+           (setq flags (logior flags compiled-debug-var-same-name-p)))
+          ((not package)
+           (setq flags (logior flags compiled-debug-var-uninterned)))
+          (package-p
+           (setq flags (logior flags compiled-debug-var-packaged))
+           (cond ((eq package *previous-package*)
+                  (setf flags (logior flags compiled-debug-var-same-name-p)) ;; overloaded
+                  (setf package-p nil))
+                 ;; Write a packe-id integer
+                 ((or (eq package *cl-package*)
+                      (system-package-p package))
+                  (let ((id (sb-impl::package-id package)))
+                    (when (< id sb-impl::+last-stable-package-id+) ;; exclude contribs
+                      (setf package-p id)))))))
     (when (and (or (eq kind :environment)
                    (and (eq kind :debug-environment)
                         (null (basic-var-sets var))))
@@ -589,14 +602,16 @@
       (setq flags (logior flags compiled-debug-var-save-loc-p)))
     (when indirect
       (setq flags (logior flags compiled-debug-var-indirect-p)))
-    (when (and same-name-p (not minimal))
-      (setq flags (logior flags compiled-debug-var-same-name-p)))
+    (when (integerp package-p)
+      (setf flags (logior flags compiled-debug-var-uninterned)))
     (vector-push-extend flags buffer)
-    (unless minimal
-      (unless same-name-p
-        (write-var-string (symbol-name name) buffer))
+    (unless (or minimal same-name-p)
+      (write-var-string (symbol-name name) buffer)
       (when package-p
-        (write-var-string (sb-xc:package-name package) buffer)))
+        (if (integerp package-p)
+            (vector-push-extend package-p buffer)
+            (write-var-string (sb-xc:package-name package) buffer))
+        (setf *previous-package* package)))
 
     (cond (indirect
            ;; Indirect variables live in the parent frame, and are
@@ -654,13 +669,20 @@
           (frob-lambda let (>= level 2)))))
 
     (setf (fill-pointer *byte-buffer*) 0)
-    (let ((sorted (sort (vars) #'string<
-                        :key (lambda (x)
-                               (symbol-name (car x)))))
+    (let ((sorted (stable-sort
+                   (sort (vars) #'string<
+                         :key (lambda (x)
+                                (symbol-name (car x))))
+                   #'string<
+                   :key (lambda (x)
+                          (let ((package (sb-xc:symbol-package (car x))))
+                            (when package
+                              (sb-xc:package-name package))))))
           (prev-name nil)
           (i 0)
           ;; XEPs don't have any useful variables
-          (minimal (functional-kind-eq fun external)))
+          (minimal (functional-kind-eq fun external))
+          *previous-package*)
       (declare (type index i))
       (loop for (name var . tn) in sorted
             do
@@ -690,7 +712,7 @@
           (t
            (aver (or (null (leaf-refs var))
                      (not (tn-offset (leaf-info var)))))
-           'deleted))))
+           '%deleted))))
 
 ;;;; arguments/returns
 
@@ -723,16 +745,16 @@
                                             (return-from one-arg))
                                            (more
                                             (setf (arg-info-default info) t)))
-                                     (res 'rest-arg)))
+                                     (res '%rest)))
                                   (:more-context
-                                   (res 'more-arg))
+                                   (res '%more))
                                   (:optional
                                    (unless saw-optional
-                                     (res 'optional-args)
+                                     (res '%optional)
                                      (setq saw-optional t))))
                                 (res (debug-location-for actual var-locs))
                                 (when (arg-info-supplied-p info)
-                                  (res 'supplied-p)
+                                  (res '%supplied-p)
                                   (res (debug-location-for (pop actual-vars) var-locs))))
                                 (t
                                  (res (debug-location-for actual var-locs)))))))
@@ -768,7 +790,7 @@
          (name (leaf-debug-name fun))
          (name (if (consp name)
                    (case (car name)
-                     ((xep tl-xep)
+                     ((xep)
                       (aver (eql kind :external))
                       (second name))
                      (&optional-processor
@@ -924,19 +946,19 @@
           (dotimes (i len)
             (let ((argument (aref arguments i)))
               (case argument
-                (deleted
+                (%deleted
                  (write-var-integer packed-debug-fun-arg-deleted
                                     *byte-buffer*))
-                (supplied-p
+                (%supplied-p
                  (write-var-integer packed-debug-fun-arg-supplied-p
                                     *byte-buffer*))
-                (optional
+                (%optional
                  (write-var-integer packed-debug-fun-arg-optional
                                     *byte-buffer*))
-                (rest
+                (%rest
                  (write-var-integer packed-debug-fun-arg-rest
                                     *byte-buffer*))
-                (more
+                (%more
                  (write-var-integer packed-debug-fun-arg-more
                                     *byte-buffer*))
                 (otherwise

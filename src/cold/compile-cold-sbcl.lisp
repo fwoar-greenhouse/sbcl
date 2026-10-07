@@ -13,6 +13,24 @@
 
 (in-package "SB-COLD")
 
+#+(or sbcl ecl ccl clisp cmucl)
+(when (probe-file (perfect-hash-generator-program))
+  (pushnew :use-host-hash-generator cl:*features*)
+  (setq *perfect-hash-generator-mode* :RECORD))
+
+(defun maybe-save-perfect-hashfuns-for-playback ()
+  ;; Check again for corruption
+  (let ((uniqueness-checker (make-hash-table :test 'equalp)))
+    (dolist (entry *perfect-hash-generator-memo*)
+      (let ((array (cdar entry)))
+        (assert (not (gethash array uniqueness-checker)))
+        (setf (gethash array uniqueness-checker) t))))
+  #+(and use-host-hash-generator sbcl)
+  (when (eq *perfect-hash-generator-mode* :record)
+    (save-perfect-hashfuns (perfect-hash-generator-journal :output)
+                           *perfect-hash-generator-memo*))
+  t)
+
 ;;; FIXME: I think it's a mistake that we load muffler twice in
 ;;; make-host-2 (once for the host, once for XC), because the host
 ;;; should produce no new warnings, and because it's really hard
@@ -182,7 +200,7 @@
             (sb-cold::exit-process 1))))
       (values))))
 
-(sb-kernel::show-ctype-ctor-cache-metrics)
+#+nil (sb-kernel::show-ctype-ctor-cache-metrics)
 
 (defun write-sxhash-xcheck-data (pathname)
   (with-open-file (stream pathname :direction :output
@@ -200,15 +218,38 @@
 ;;; See whether we're in individual file mode
 (cond
   ((boundp 'cl-user::*compile-files*)
-   (let ((files
-          (mapcar (lambda (x) (concatenate 'string "src/" x))
-                  (symbol-value 'cl-user::*compile-files*))))
-     (with-compilation-unit ()
-       (do-stems-and-flags (stem flags 2)
-         (unless (position :not-target flags)
-           (let* ((*compile-for-effect-only* (not (member stem files :test #'string=)))
-                  (sb-xc:*compile-print* (not *compile-for-effect-only*)))
-             (target-compile-stem stem flags)))))))
+   (let ((spec (symbol-value 'cl-user::*compile-files*)))
+     (etypecase spec
+       (string
+        ;; Compile exactly 1 file by preloading (via compile-for-effect-only) all preceding files
+        ;; and then compiling. This is doing the same thing as the parallel build, but the division
+        ;; of labor is controlled by an external driver rather than by forking child processes
+        ;; which works better if you have as many (virtual) execution machines as there are files,
+        ;; but each machine appears to have not that many CPU cores.
+        (flet ((stem= (a b) (string= a (stem-remap-target b))))
+          (let* ((full-list (remove-if (lambda (x) (find :not-target (cdr x)))
+                                       (get-stems-and-flags 2)))
+                 (found (the (not null) (member spec full-list :key #'car :test #'stem=)))
+                 (prereq (ldiff full-list found)))
+            (sb-xc:proclaim '(sb-ext:muffle-conditions style-warning))
+            (let ((sb-xc:*compile-verbose* nil)
+                  (sb-xc:*compile-print* nil))
+              (let ((*compile-for-effect-only* t))
+                (dolist (x prereq)
+                  (target-compile-stem (car x) (cdr x))))
+              (let ((x (car found)))
+                (target-compile-stem (car x) (cdr x))))
+            (when (null (cdr found))
+              (sb-kernel::write-structure-definitions-as-text
+               (sb-cold:find-bootstrap-file "output/defstructs.lisp-expr" t))))))
+       (list
+        (let ((files (mapcar (lambda (x) (concatenate 'string "src/" x)) spec)))
+          (with-compilation-unit ()
+            (do-stems-and-flags (stem flags 2)
+              (unless (position :not-target flags)
+                (let* ((*compile-for-effect-only* (not (member stem files :test #'string=)))
+                       (sb-xc:*compile-print* (not *compile-for-effect-only*)))
+                  (target-compile-stem stem flags))))))))))
   (t
    ;; Actually compile
    (let ((sb-xc:*compile-print* nil))
@@ -250,7 +291,7 @@
       (sb-cold:find-bootstrap-file "output/sxhash-calls.lisp-expr" t))
      (sb-kernel::write-structure-definitions-as-text
       (sb-cold:find-bootstrap-file "output/defstructs.lisp-expr" t)))))
-(sb-kernel::show-ctype-ctor-cache-metrics)
+#+nil (sb-kernel::show-ctype-ctor-cache-metrics)
 
 (let ((s (find-symbol "*RAW-CONST-HISTOGRAM*" "SB-VM")))
   (when (and s (boundp s) (not (null (symbol-value s))))

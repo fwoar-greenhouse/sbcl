@@ -145,6 +145,7 @@ SB-C::LVAR-MODIFIED-ANNOTATION
 SB-DI::BOGUS-DEBUG-FUN
 #+sb-simd-pack SB-KERNEL:SIMD-PACK-TYPE
 #+sb-simd-pack-256 SB-KERNEL:SIMD-PACK-256-TYPE
+#+sb-simd-pack-512 SB-KERNEL:SIMD-PACK-512-TYPE
 #+sb-fasteval SB-INTERPRETER::SEXPR
 SB-C::MODULAR-CLASS
 SB-DI:DEBUG-BLOCK
@@ -270,7 +271,7 @@ SB-C::DXABLE-ARGS
 #-sb-xc
 (defun choose-layout-id (name conditionp)
   (case name
-    ((t) 0)
+    ((t) nil)
     (structure-object 1)
     (sb-impl::buffer 2)
     (layout 3)

@@ -1,3 +1,6 @@
+###################################################
+### THIS FILE IS MACHINE-GENERATED. DO NOT EDIT ###
+###################################################
 SBCL=src/runtime/sbcl
 ARGS=--core output/sbcl.core --noinform --disable-debugger --noprint --no-userinit --no-sysinit
 SCRIPT1=crossbuild-runner/pass-1.lisp
@@ -10,9 +13,14 @@ obj/xbuild/arm.core: obj/xbuild/arm/xc.core
 	$(SBCL) $(ARGS) arm < $(SCRIPT2)
 
 obj/xbuild/arm64/xc.core: $(DEPS1)
-	$(SBCL) $(ARGS) arm64 arm64 "(:UNIX :LINUX :ELF :OS-PROVIDES-CLOCK-GETTIME :LITTLE-ENDIAN :SB-THREAD)" < $(SCRIPT1)
+	$(SBCL) $(ARGS) arm64 arm64 "(:UNIX :LINUX :ELF :OS-PROVIDES-CLOCK-GETTIME :LITTLE-ENDIAN :SB-THREAD :TLS-BASED-MV-RETURN)" < $(SCRIPT1)
 obj/xbuild/arm64.core: obj/xbuild/arm64/xc.core
 	$(SBCL) $(ARGS) arm64 < $(SCRIPT2)
+
+obj/xbuild/arm64+simd/xc.core: $(DEPS1)
+	$(SBCL) $(ARGS) arm64+simd arm64 "(:UNIX :LINUX :ELF :OS-PROVIDES-CLOCK-GETTIME :LITTLE-ENDIAN :SB-THREAD :SB-SIMD-PACK)" < $(SCRIPT1)
+obj/xbuild/arm64+simd.core: obj/xbuild/arm64+simd/xc.core
+	$(SBCL) $(ARGS) arm64+simd < $(SCRIPT2)
 
 obj/xbuild/arm64-darwin/xc.core: $(DEPS1)
 	$(SBCL) $(ARGS) arm64-darwin arm64 "(:DARWIN :BSD :UNIX :MACH-O :LITTLE-ENDIAN :SB-THREAD :DARWIN-JIT :OS-PROVIDES-CLOCK-GETTIME)" < $(SCRIPT1)
@@ -90,26 +98,26 @@ obj/xbuild/x86-linux.core: obj/xbuild/x86-linux/xc.core
 	$(SBCL) $(ARGS) x86-linux < $(SCRIPT2)
 
 obj/xbuild/x86-64/xc.core: $(DEPS1)
-	$(SBCL) $(ARGS) x86-64 x86-64 "(:WIN32 :SB-THREAD :SB-SAFEPOINT :LITTLE-ENDIAN :AVX2 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256)" < $(SCRIPT1)
+	$(SBCL) $(ARGS) x86-64 x86-64 "(:WIN32 :SB-THREAD :SB-SAFEPOINT :LITTLE-ENDIAN :AVX2 :AVX512 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :SB-SIMD-PACK-512)" < $(SCRIPT1)
 obj/xbuild/x86-64.core: obj/xbuild/x86-64/xc.core
 	$(SBCL) $(ARGS) x86-64 < $(SCRIPT2)
 
 obj/xbuild/x86-64-linux/xc.core: $(DEPS1)
-	$(SBCL) $(ARGS) x86-64-linux x86-64 "(:LINUX :UNIX :ELF :LITTLE-ENDIAN :AVX2 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 (NOT :SB-EVAL) :SB-FASTEVAL :OS-PROVIDES-CLOCK-GETTIME)" < $(SCRIPT1)
+	$(SBCL) $(ARGS) x86-64-linux x86-64 "(:LINUX :UNIX :ELF :LITTLE-ENDIAN :AVX2 :AVX512 :GENCGC :TLS-BASED-MV-RETURN :SB-SIMD-PACK :SB-SIMD-PACK-256 :SB-SIMD-PACK-512 (NOT :SB-EVAL) :SB-FASTEVAL :OS-PROVIDES-CLOCK-GETTIME)" < $(SCRIPT1)
 obj/xbuild/x86-64-linux.core: obj/xbuild/x86-64-linux/xc.core
 	$(SBCL) $(ARGS) x86-64-linux < $(SCRIPT2)
 
 obj/xbuild/x86-64-darwin/xc.core: $(DEPS1)
-	$(SBCL) $(ARGS) x86-64-darwin x86-64 "(:DARWIN :BSD :UNIX :MACH-O :LITTLE-ENDIAN :AVX2 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :OS-PROVIDES-CLOCK-GETTIME)" < $(SCRIPT1)
+	$(SBCL) $(ARGS) x86-64-darwin x86-64 "(:DARWIN :BSD :UNIX :MACH-O :LITTLE-ENDIAN :AVX2 :AVX512 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :SB-SIMD-PACK-512 :OS-PROVIDES-CLOCK-GETTIME)" < $(SCRIPT1)
 obj/xbuild/x86-64-darwin.core: obj/xbuild/x86-64-darwin/xc.core
 	$(SBCL) $(ARGS) x86-64-darwin < $(SCRIPT2)
 
 obj/xbuild/x86-64-imm/xc.core: $(DEPS1)
-	$(SBCL) $(ARGS) x86-64-imm x86-64 "(:WIN32 :SB-THREAD :SB-SAFEPOINT :LITTLE-ENDIAN :AVX2 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :IMMOBILE-SPACE (NOT :SB-UNICODE))" < $(SCRIPT1)
+	$(SBCL) $(ARGS) x86-64-imm x86-64 "(:WIN32 :SB-THREAD :SB-SAFEPOINT :LITTLE-ENDIAN :AVX2 :AVX512 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :SB-SIMD-PACK-512 :IMMOBILE-SPACE (NOT :SB-UNICODE))" < $(SCRIPT1)
 obj/xbuild/x86-64-imm.core: obj/xbuild/x86-64-imm/xc.core
 	$(SBCL) $(ARGS) x86-64-imm < $(SCRIPT2)
 
 obj/xbuild/x86-64-permgen/xc.core: $(DEPS1)
-	$(SBCL) $(ARGS) x86-64-permgen x86-64 "(:WIN32 :SB-THREAD :SB-SAFEPOINT :LITTLE-ENDIAN :AVX2 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :PERMGEN)" < $(SCRIPT1)
+	$(SBCL) $(ARGS) x86-64-permgen x86-64 "(:WIN32 :SB-THREAD :SB-SAFEPOINT :LITTLE-ENDIAN :AVX2 :AVX512 :GENCGC :SB-SIMD-PACK :SB-SIMD-PACK-256 :SB-SIMD-PACK-512 :PERMGEN)" < $(SCRIPT1)
 obj/xbuild/x86-64-permgen.core: obj/xbuild/x86-64-permgen/xc.core
 	$(SBCL) $(ARGS) x86-64-permgen < $(SCRIPT2)

@@ -380,7 +380,6 @@
 (define-vop (float-op)
   (:args (x) (y))
   (:results (r))
-  (:policy :fast-safe)
   (:note "inline float arithmetic")
   (:vop-var vop)
   (:save-p :compute-only))
@@ -415,7 +414,6 @@
                 (:args (x :scs (,sc)))
                 (:results (y :scs (,sc)))
                 (:translate ,translate)
-                (:policy :fast-safe)
                 (:arg-types ,type)
                 (:result-types ,type)
                 (:note "inline float arithmetic")
@@ -442,8 +440,7 @@
   (:args (x) (y))
   (:conditional)
   (:info target not-p)
-  (:variant-vars format yep nope)
-  (:policy :fast-safe)
+  (:variant-vars format yep nope quiet)
   (:note "inline float comparison")
   (:vop-var vop)
   (:save-p :compute-only)
@@ -451,7 +448,9 @@
     (note-this-location vop :internal-error)
     (ecase format
       ((:single :double)
-       (inst fcmpo :cr1 x y)))
+       (if quiet
+           (inst fcmpu :cr1 x y)
+           (inst fcmpo :cr1 x y))))
     (inst b?  :cr1 (if not-p nope yep) target)))
 
 (macrolet ((frob (name sc ptype)
@@ -462,17 +461,19 @@
   (frob single-float-compare single-reg single-float)
   (frob double-float-compare double-reg double-float))
 
-(macrolet ((frob (translate yep nope sname dname)
+(macrolet ((frob (translate yep nope sname dname &optional quiet)
              `(progn
                 (define-vop (,sname single-float-compare)
                   (:translate ,translate)
-                  (:variant :single ,yep ,nope))
+                  (:variant :single ,yep ,nope ,quiet))
                 (define-vop (,dname double-float-compare)
                   (:translate ,translate)
-                  (:variant :double ,yep ,nope)))))
+                  (:variant :double ,yep ,nope ,quiet)))))
   (frob < :lt :ge </single-float </double-float)
+  (frob quiet< :lt :ge quiet</single-float quiet</double-float t)
   (frob > :gt :le >/single-float >/double-float)
-  (frob = :eq :ne =/single-float =/double-float))
+  (frob = :eq :ne =/single-float =/double-float)
+  (frob quiet= :eq :ne quiet=/single-float quiet=/double-float t))
 
 
 ;;;; Conversion:
@@ -484,7 +485,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types signed-num)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -508,7 +508,6 @@
                (:results (y :scs (,to-sc)))
                (:arg-types unsigned-num)
                (:result-types ,to-type)
-               (:policy :fast-safe)
                (:note "inline float coercion")
                (:translate ,translate)
                (:vop-var vop)
@@ -528,7 +527,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types ,from-type)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -550,7 +548,6 @@
                 (:arg-types ,from-type)
                 (:result-types signed-num)
                 (:translate ,trans)
-                (:policy :fast-safe)
                 (:note "inline float truncate")
                 (:vop-var vop)
                 (:save-p :compute-only)
@@ -575,7 +572,6 @@
   (:arg-types signed-num)
   (:result-types single-float)
   (:translate make-single-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -605,7 +601,6 @@
   (:arg-types signed-num)
   (:result-types double-float)
   (:translate %make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -636,7 +631,6 @@
   (:arg-types single-float)
   (:result-types signed-num)
   (:translate single-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -660,7 +654,6 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (let ((base (current-nfp-tn vop))
@@ -693,7 +686,6 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate floating-point-modes)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:temporary (:sc double-stack) temp)
   (:temporary (:sc single-reg) fp-temp)
@@ -709,7 +701,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:temporary (:sc double-stack) temp)
   (:temporary (:sc single-reg) fp-temp)
   (:vop-var vop)
@@ -733,7 +724,6 @@
                :load-if (not (sc-is r complex-single-stack))))
   (:result-types complex-single-float)
   (:note "inline complex single-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -761,7 +751,6 @@
                :load-if (not (sc-is r complex-double-stack))))
   (:result-types complex-double-float)
   (:note "inline complex double-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
@@ -789,7 +778,6 @@
                 (:arg-types ,(symbolicate "COMPLEX-" fmt "-FLOAT"))
                 (:results (r :scs (,(symbolicate fmt "-REG"))))
                 (:result-types ,(symbolicate fmt "-FLOAT"))
-                (:policy :fast-safe)
                 (:vop-var vop)
                 (:translate ,name)
                 (:note ,(format nil "complex ~(~a~) float ~(~a~)" fmt name))

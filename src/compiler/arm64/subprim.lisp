@@ -21,27 +21,30 @@
   (:temporary (:scs (any-reg) :to (:result 0) :target result)
               count)
   (:results (result :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
+  (:node-var node)
   (:save-p :compute-only)
   (:generator 50
-      (move ptr object)
-      (inst mov count 0)
+    (let ((safe (policy node (> sb-c::type-check 0))))
+      (assemble ()
+        (move ptr object)
+        (inst mov count 0)
 
-      LOOP
+        LOOP
 
-      (inst cmp ptr null-tn)
-      (inst b :eq done)
+        (inst cmp ptr null-tn)
+        (inst b :eq done)
 
-      (test-type ptr temp not-list t (list-pointer-lowtag))
+        (when safe
+          (test-type ptr temp not-list t (list-pointer-lowtag)))
 
-      (loadw ptr ptr cons-cdr-slot list-pointer-lowtag)
-      (inst add count count (fixnumize 1))
-      (inst b loop)
+        (loadw ptr ptr cons-cdr-slot list-pointer-lowtag)
+        (inst add count count (fixnumize 1))
+        (inst b loop)
 
-      NOT-LIST
+        NOT-LIST
+        (when safe
+          (error-call vop 'object-not-list-error ptr))
 
-      (error-call vop 'object-not-list-error ptr)
-
-      DONE
-      (move result count)))
+        DONE
+        (move result count)))))

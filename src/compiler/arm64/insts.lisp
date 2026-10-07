@@ -18,9 +18,17 @@
             add-sub-immediate-p fixnum-add-sub-immediate-p
             negative-add-sub-immediate-p
             encode-logical-immediate fixnum-encode-logical-immediate
-            ldr-str-offset-encodable ldp-stp-offset-p
-            bic-mask extend lsl lsr asr ror @ encode-fp-immediate) "SB-VM")
+            movi-immediate-p
+            ldr-str-offset-encodable ldr-str-8-offset-encodable
+            ldr-str-16-offset-encodable ldr-str-32-offset-encodable
+            ldp-stp-offset-p
+            extend lsl lsr asr ror @ encode-fp-immediate) "SB-VM")
   ;; Imports from SB-VM into this package
+  #+sb-simd-pack
+  (import '(sb-vm::neon-reg
+            sb-vm::int-neon-reg
+            sb-vm::double-neon-reg
+            sb-vm::single-neon-reg))
   (import '(sb-vm::*register-names*
             sb-vm::add-sub-immediate
             sb-vm::32-bit-reg sb-vm::single-reg sb-vm::double-reg
@@ -67,19 +75,19 @@
 
   (define-arg-type shift :printer #'print-shift)
 
-  (define-arg-type 2-bit-shift :printer #'print-2-bit-shift)
-
   (define-arg-type wide-shift :printer #'print-wide-shift)
 
   (define-arg-type extend :printer #'print-extend)
 
   (define-arg-type ldr-str-extend :printer #'print-ldr-str-extend)
+  (define-arg-type prfop :printer #'print-prfop)
 
   (define-arg-type scaled-immediate :printer #'print-scaled-immediate)
 
   (define-arg-type immediate :sign-extend t :printer #'print-immediate)
 
   (define-arg-type unsigned-immediate :printer #'print-immediate)
+  (define-arg-type shifted-immediate :printer #'print-shifted-immediate)
 
   (define-arg-type logical-immediate :printer #'print-logical-immediate)
 
@@ -109,20 +117,30 @@
   (define-arg-type vx.t :printer #'print-vx.t)
 
   (define-arg-type simd-reg :printer #'print-simd-reg)
+  (define-arg-type simd-reg-d :printer #'print-simd-reg-d)
+  (define-arg-type simd-reg-2x :printer #'print-simd-reg-2x)
 
   (define-arg-type simd-copy-reg :printer #'print-simd-copy-reg)
   (define-arg-type simd-dup-reg :printer #'print-simd-dup-reg)
   (define-arg-type simd-float-reg :printer #'print-simd-float-reg)
+  (define-arg-type simd-float-pair-reg :printer #'print-simd-float-pair-reg)
+  (define-arg-type simd-dup-float-reg :printer #'print-simd-dup-float-reg)
 
   (define-arg-type simd-immh-reg :printer #'print-simd-immh-reg)
   (define-arg-type simd-immh-shift-left :printer #'print-simd-immh-shift-left)
   (define-arg-type simd-immh-shift-right :printer #'print-simd-immh-shift-right)
   (define-arg-type simd-modified-imm :printer #'print-simd-modified-imm)
+  (define-arg-type 64-bit-modified-imm :printer #'print-64-bit-modified-imm)
   (define-arg-type simd-reg-cmode :printer #'print-simd-reg-cmode)
+  (define-arg-type simd-fp-imm :printer #'print-simd-fp-imm)
+  (define-arg-type simd-fmov-imm-reg :printer #'print-simd-fmov-imm-reg)
   (define-arg-type simd-table-regs :printer #'print-simd-table-regs)
   (define-arg-type simd-b-reg :printer #'print-simd-b-reg)
-
+  (define-arg-type simd-high-vector :printer #'print-simd-high-vector)
+  (define-arg-type simd-ld-st-n-regs :printer #'print-simd-ld-st-n-regs)
+  (define-arg-type struct-imm-writeback :printer #'print-struct-imm-writeback)
   (define-arg-type fp-imm :printer #'print-fp-imm)
+  (define-arg-type simd-element-reg :printer #'print-simd-element-reg)
 
   (define-arg-type sys-reg :printer #'print-sys-reg)
 
@@ -156,6 +174,23 @@
 (defun fp-register-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'sb-vm::float-registers)))
+
+(defun single-register-p (thing)
+  (and (tn-p thing)
+       (eq (sc-name (tn-sc thing)) 'sb-vm::single-reg)))
+
+(defun double-register-p (thing)
+  (and (tn-p thing)
+       (eq (sc-name (tn-sc thing)) 'sb-vm::double-reg)))
+
+(defun vector-register-p (thing)
+  (declare (ignorable thing))
+  #+sb-simd-pack
+  (and (tn-p thing)
+       (member (sc-name (tn-sc thing))
+               '(sb-vm::neon-reg sb-vm::int-neon-reg
+                 sb-vm::single-neon-reg sb-vm::double-neon-reg)
+               :test #'eq)))
 
 (defun reg-size (tn)
   (if (sc-is tn 32-bit-reg)
@@ -308,7 +343,11 @@
     (aver (integerp offset)))
 
   (when (shifter-operand-p offset)
-    (aver (integerp (shifter-operand-operand offset))))
+    (aver (integerp (shifter-operand-operand offset)))
+    (when (eq (shifter-operand-function-code offset) 0)
+      (setf offset (extend (shifter-operand-register offset)
+                           :lsl
+                           (shifter-operand-operand offset)))))
 
   (make-memory-operand base offset mode))
 
@@ -412,20 +451,15 @@
 
 (define-instruction-format
     (add-sub-imm 32
-     :default-printer '(:name :tab rd ", " rn ", " imm shift
+     :default-printer '(:name :tab rd ", " rn ", " shifted-imm
                         add-sub-imm-annotation)
      :include add-sub)
   (op2 :field (byte 5 24) :value #b10001)
-  (shift :field (byte 2 22) :type '2-bit-shift)
+  (shift :field (byte 2 22))
+  (shifted-imm :fields (list (byte 12 10) (byte 2 22)) :type 'shifted-immediate)
   (imm :field (byte 12 10) :type 'unsigned-immediate)
   (add-sub-imm-annotation :fields (list (byte 5 5) (byte 2 22) (byte 12 10))
                           :type 'add-sub-imm-annotation))
-
-(define-instruction-format
-    (adds-subs-imm 32
-     :include add-sub-imm
-     :default-printer '(:name :tab rd ", " rn ", " imm shift))
-  (rd :type 'reg))
 
 (define-instruction-format
     (add-sub-shift-reg 32
@@ -523,39 +557,112 @@
                 (emit-add-sub-imm segment size ,op shift imm
                                   (gpr-offset rn) (gpr-offset rd)))))))))
 
-(def-add-sub add #b00
-  (:printer add-sub-imm ((op #b00)))
-  (:printer add-sub-imm ((op #b00) (rd #.nsp-offset) (imm 0))
-            '('mov :tab rd ", " rn))
-  (:printer add-sub-imm ((op #b00) (rn #.nsp-offset) (imm 0))
-            '('mov :tab rd ", " rn))
-  (:printer add-sub-ext-reg ((op #b00)))
-  (:printer add-sub-shift-reg ((op #b00))))
+(defmacro def-add-sub+simd (name op printers
+                            simd-u simd-op)
+  `(define-instruction ,name (segment rd rn rm &optional vector-size)
+     ,@printers
+     (:printer simd-three-same-sized ((u ,simd-u) (op ,simd-op)))
+     (:printer simd-three-same-scalar-d ((u ,simd-u) (op ,simd-op)))
+     (:emitter
+      (if vector-size
+          (multiple-value-bind (q size scalar) (encode-vector-size/scalar vector-size)
+            (emit-simd-three-same segment
+                                  q
+                                  ,simd-u
+                                  scalar
+                                  size
+                                  (fpr-offset rm)
+                                  ,simd-op
+                                  (fpr-offset rn)
+                                  (fpr-offset rd)))
+          (let ((size (reg-size rn)))
+            (cond ((or (register-p rm)
+                       (shifter-operand-p rm))
+                   (multiple-value-bind (shift amount rm) (encode-shifted-register rm)
+                     (emit-add-sub-shift-reg segment size ,op shift (gpr-offset rm)
+                                             amount (gpr-offset rn) (gpr-offset rd))))
+                  ((extend-p rm)
+                   (let* ((shift (extend-operand rm))
+                          (extend (ecase (extend-kind rm)
+                                    (:uxtb #b00)
+                                    (:uxth #b001)
+                                    (:uxtw #b010)
+                                    ((:lsl :uxtx) #b011)
+                                    (:sxtb #b100)
+                                    (:sxth #b101)
+                                    (:sxtw #b110)
+                                    (:sxtx #b111)))
+                          (rm (extend-register rm)))
+                     (emit-add-sub-ext-reg segment size ,op
+                                           (gpr-offset rm)
+                                           extend shift (gpr-offset rn) (gpr-offset rd))))
+                  (t
+                   (let ((imm rm)
+                         (shift 0))
+                     (when (and (typep imm '(unsigned-byte 24))
+                                (not (zerop imm))
+                                (not (ldb-test (byte 12 0) imm)))
+                       (setf imm (ash imm -12)
+                             shift 1))
+                     (emit-add-sub-imm segment size ,op shift imm
+                                       (gpr-offset rn) (gpr-offset rd))))))))))
+
+(def-add-sub+simd add #b00
+  ((:printer add-sub-imm ((op #b00)))
+   (:printer add-sub-imm ((op #b00) (rd #.nsp-offset) (imm 0))
+             '('mov :tab rd ", " rn))
+   (:printer add-sub-imm ((op #b00) (rn #.nsp-offset) (imm 0))
+             '('mov :tab rd ", " rn))
+   (:printer add-sub-ext-reg ((op #b00)))
+   (:printer add-sub-shift-reg ((op #b00))))
+  #b0 #b10000)
 
 (def-add-sub adds #b01
   (:printer add-sub-imm ((op #b01) (rd nil :type 'reg)))
   (:printer add-sub-ext-reg ((op #b01) (rd nil :type 'reg)))
   (:printer add-sub-shift-reg ((op #b01)))
   (:printer add-sub-imm ((op #b01) (rd #b11111))
-            '('cmn :tab rn ", " imm shift))
+            '('cmn :tab rn ", " shifted-imm))
   (:printer add-sub-ext-reg ((op #b01) (rd #b11111))
             '('cmn :tab rn ", " rm extend))
   (:printer add-sub-shift-reg ((op #b01) (rd #b11111))
             '('cmn :tab rn ", " rm shift)))
 
-(def-add-sub sub #b10
-  (:printer add-sub-imm ((op #b10)))
-  (:printer add-sub-ext-reg ((op #b10)))
-  (:printer add-sub-shift-reg ((op #b10)))
-  (:printer add-sub-shift-reg ((op #b10) (rn #b11111))
-            '('neg :tab rd ", " rm shift)))
+(def-add-sub+simd sub #b10
+  ((:printer add-sub-imm ((op #b10)))
+   (:printer add-sub-ext-reg ((op #b10)))
+   (:printer add-sub-shift-reg ((op #b10)))
+   (:printer add-sub-shift-reg ((op #b10) (rn #b11111))
+             '('neg :tab rd ", " rm shift)))
+  #b1 #b10000)
+
+
+(define-instruction neg (segment rd rm &optional vector-size)
+  (:printer simd-two-misc ((u 1) (op #b01011)))
+  (:printer simd-two-misc-scalar-d ((u 1) (op #b01011)))
+  (:emitter
+   (if vector-size
+       (multiple-value-bind (q size scalar) (encode-vector-size/scalar vector-size)
+         (emit-simd-two-misc segment
+                               q
+                               1
+                               scalar
+                               size
+                               #b01011
+                               (fpr-offset rm)
+                               (fpr-offset rd)))
+       (assemble (segment)
+         (inst sub rd (if (sc-is rd 32-bit-reg)
+                          wzr-tn
+                          zr-tn)
+               rm)))))
 
 (def-add-sub subs #b11
   (:printer add-sub-imm ((op #b11)))
   (:printer add-sub-ext-reg ((op #b11)))
   (:printer add-sub-shift-reg ((op #b11)))
   (:printer add-sub-imm ((op #b11) (rd #b11111))
-            '('cmp :tab rn ", " imm shift))
+            '('cmp :tab rn ", " shifted-imm))
   (:printer add-sub-ext-reg ((op #b11) (rd #b11111))
             '('cmp :tab rn ", " rm extend))
   (:printer add-sub-shift-reg ((op #b11) (rd #b11111))
@@ -580,14 +687,6 @@
                     wzr-tn
                     zr-tn)
            rn rm)))
-
-(define-instruction-macro neg (rd rm)
-  `(let ((rd ,rd)
-         (rm ,rm))
-     (inst sub rd (if (sc-is rd 32-bit-reg)
-                      wzr-tn
-                      zr-tn)
-           rm)))
 
 (define-instruction-macro negs (rd rm)
   `(let ((rd ,rd)
@@ -696,13 +795,14 @@
            (type (member 32 64) width)
            (optimize speed))
   (loop with pattern = integer
-        for size of-type (integer 0 32) = (truncate width 2) then (truncate size 2)
-        for try-pattern of-type (unsigned-byte 32) = (ldb (byte size 0) integer)
+        for prev-size = width then size
+        for size of-type (integer 0 32) = (truncate prev-size 2)
+        for try-pattern = (ldb (byte size 0) integer)
         while (and (= try-pattern
-                      (the (unsigned-byte 32) (ldb (byte size size) integer)))
+                      (ldb (byte size size) integer))
                    (> size 1))
         do (setf pattern try-pattern)
-        finally (return (values (* size 2) pattern))))
+        finally (return (values prev-size pattern))))
 
 (defun fixnum-encode-logical-immediate (integer)
   (and (fixnump integer)
@@ -732,23 +832,10 @@
                              ;; Set unused bits to 1 so that the size can be calcuted correctly.
                              (ldb (byte 6 0) (ash -1 (integer-length size))))))))))
 
-(defun rotate-byte (count size pos integer)
-  ;; Taken from sb-rotate-byte
-  (let ((count (nth-value 1 (round count size)))
-        (mask (1- (ash 1 size))))
-    (logior (logand integer (lognot (ash mask pos)))
-            (let ((field (logand (ash mask pos) integer)))
-              (logand (ash mask pos)
-                      (if (> count 0)
-                          (logior (ash field count)
-                                  (ash field (- count size)))
-                          (logior (ash field count)
-                                  (ash field (+ count size)))))))))
-
 (defun decode-logical-immediate (n immr imms)
   ;; DecodeBitMasks() From the ARM manual
   (declare (type bit n)
-           (type (unsigned-byte 6) imms imms))
+           (type (unsigned-byte 6) immr imms))
   (let* ((length (if (zerop n)
                      (1- (integer-length (ldb (byte 6 0) (lognot imms))))
                      6))
@@ -756,12 +843,15 @@
          (s (logand imms levels))
          (r (logand immr levels))
          (bits (ldb (byte (1+ s) 0) -1))
-         (pattern (rotate-byte (- r) (ash 1 length) 0 bits))
+         (size (1+ levels))
+         ;; Rotate right
+         (pattern (logand (ldb (byte size 0) -1)
+                          (logior (ash bits (- r))
+                                  (ash bits (- size r)))))
          (result 0))
     (declare (type (unsigned-byte 64) result))
-    (loop for i below 64 by (1+ levels)
-          do (setf (ldb (byte (1+ levels) i) result)
-                   pattern))
+    (loop for i below 64 by size
+          do (setf (ldb (byte size i) result) pattern))
     result))
 
 (defun emit-logical-reg-inst (segment opc n rd rn rm)
@@ -796,19 +886,57 @@
                (error 'cannot-encode-immediate-operand :value rm))
              (emit-logical-imm segment size ,opc n immr imms (gpr-offset rn) (gpr-offset rd))))))))
 
-(def-logical-imm-and-reg and #b00
-  (:printer logical-imm ((op #b00) (n 0)))
-  (:printer logical-reg ((op #b00) (n 0))))
-(def-logical-imm-and-reg orr #b01
-  (:printer logical-imm ((op #b01)))
-  (:printer logical-reg ((op #b01)))
-  (:printer logical-imm ((op #b01) (rn 31))
-            '('mov :tab rd  ", " imm))
-  (:printer logical-reg ((op #b01) (rn 31))
-                        '('mov :tab rd ", " rm shift)))
-(def-logical-imm-and-reg eor #b10
-  (:printer logical-imm ((op #b10)))
-  (:printer logical-reg ((op #b10))))
+(defmacro def-logical-imm-and-reg+simd (name opc printers simd-u simd-size simd-op &rest simd-printer)
+  `(define-instruction ,name (segment rd rn rm &optional vector-size)
+     (:printer simd-three-same ((u ,simd-u) (size ,simd-size) (op ,simd-op))
+               ,@simd-printer)
+     ,@printers
+     (:emitter
+      (if vector-size
+          (emit-simd-three-same segment
+                                (encode-vector-size vector-size)
+                                ,simd-u
+                                0
+                                ,simd-size
+                                (fpr-offset rm)
+                                ,simd-op
+                                (fpr-offset rn)
+                                (fpr-offset rd))
+          (if (or (register-p rm)
+                  (shifter-operand-p rm))
+              (emit-logical-reg-inst segment ,opc 0 rd rn rm)
+              (let ((size (reg-size rd)))
+                (multiple-value-bind (n immr imms)
+                    (encode-logical-immediate rm (if (= size 1)
+                                                     64
+                                                     32))
+                  (unless n
+                    (error 'cannot-encode-immediate-operand :value rm))
+                  (emit-logical-imm segment size ,opc n immr imms (gpr-offset rn) (gpr-offset rd)))))))))
+
+(def-logical-imm-and-reg+simd and #b00
+  ((:printer logical-imm ((op #b00) (n 0)))
+   (:printer logical-reg ((op #b00) (n 0))))
+  #b0 #b00 #b00011)
+
+(def-logical-imm-and-reg+simd orr #b01
+  ((:printer logical-imm ((op #b01)))
+   (:printer logical-reg ((op #b01)))
+   (:printer logical-imm ((op #b01) (rn 31))
+             '('mov :tab rd  ", " imm))
+   (:printer logical-reg ((op #b01) (rn 31))
+             '('mov :tab rd ", " rm shift)))
+  #b0 #b10 #b00011
+  '((:cond
+      ((rn :same-as rm) 'mov)
+      (t 'orr))
+    :tab rd  ", " rn (:unless (:same-as rn) ", " rm)))
+
+(def-logical-imm-and-reg+simd eor #b10
+  ((:printer logical-imm ((op #b10)))
+   (:printer logical-reg ((op #b10))))
+  #b1 #b00 #b00011)
+
 (def-logical-imm-and-reg ands #b11
   (:printer logical-imm ((op #b11)))
   (:printer logical-reg ((op #b11)))
@@ -826,15 +954,30 @@
      (:emitter
       (emit-logical-reg-inst segment ,opc 1 rd rn rm))))
 
-(defun bic-mask (x)
-  (ldb (byte 64 0) (lognot x)))
+(defmacro def-logical-reg+simd (name opc printers
+                                simd-u simd-size simd-op)
+  `(define-instruction ,name (segment rd rn rm &optional vector-size)
+     ,@printers
+     (:printer simd-three-same ((u ,simd-u) (size ,simd-size) (op ,simd-op)))
+     (:emitter
+      (if vector-size
+          (emit-simd-three-same segment
+                                (encode-vector-size vector-size)
+                                ,simd-u
+                                0
+                                ,simd-size
+                                (fpr-offset rm)
+                                ,simd-op
+                                (fpr-offset rn)
+                                (fpr-offset rd))
+          (emit-logical-reg-inst segment ,opc 1 rd rn rm)))))
 
-(def-logical-reg bic #b00
-  (:printer logical-reg ((op #b00) (n 1))))
-(def-logical-reg orn #b01
-  (:printer logical-reg ((op #b01) (n 1)))
-  (:printer logical-reg ((op #b01) (n 1) (rn 31))
-            '('mvn :tab rd ", " rm shift)))
+(def-logical-reg+simd orn #b01
+  ((:printer logical-reg ((op #b01) (n 1)))
+   (:printer logical-reg ((op #b01) (n 1) (rn 31))
+             '('mvn :tab rd ", " rm shift)))
+  #b0 #b11 #b00011)
+
 (def-logical-reg eon #b10
   (:printer logical-reg ((op #b10) (n 1))))
 (def-logical-reg bics #b11
@@ -941,6 +1084,19 @@
 
 (define-instruction-macro sxtw (rd rn)
   `(inst sbfm ,rd ,rn 0 31))
+
+(define-instruction-macro sxtb (rd rn)
+  `(inst sbfm ,rd ,rn 0 7))
+
+(define-instruction-macro ubfiz (rd rn lsb width)
+  `(let ((rd ,rd))
+     (inst ubfm rd ,rn (let ((lsb (- ,lsb)))
+                         (sc-case rd
+                           (32-bit-reg
+                            (mod lsb 32))
+                           (t
+                            (mod lsb 64))))
+           (1- ,width))))
 ;;;
 
 (def-emitter extract
@@ -996,12 +1152,14 @@
 (define-instruction-macro mov-sp (rd rm)
   `(inst add ,rd ,rm 0))
 
-(define-instruction-macro mov (rd rm)
+(define-instruction-macro mov (rd rm &optional vector-size)
   `(let ((rd ,rd)
          (rm ,rm))
      (if (integerp rm)
          (sb-vm::load-immediate-word rd rm)
-         (inst orr rd zr-tn rm))))
+         ,(if vector-size
+              `(inst orr rd rm rm ,vector-size)
+              `(inst orr rd zr-tn rm)))))
 
 (define-instruction movn (segment rd imm &optional (shift 0))
   (:printer move-wide ((op #b00)))
@@ -1076,6 +1234,11 @@
 
 (define-instruction-macro csetm (rd cond)
   `(inst csinv ,rd zr-tn zr-tn (negate-condition ,cond)))
+
+(define-instruction-macro cinc (rd rn cond)
+  `(let ((rd ,rd)
+         (rn ,rn))
+     (inst csinc rd rn rn (negate-condition ,cond))))
 ;;;
 
 (def-emitter cond-compare
@@ -1139,35 +1302,49 @@
   (rn :field (byte 5 5) :type 'reg)
   (rd :field (byte 5 0) :type 'reg))
 
-(defmacro def-data-processing-1 (name opc &optional 32-bit-opcode)
-  `(define-instruction ,name (segment rd rn)
+(defmacro def-data-processing-1+simd (name opc simd-u simd-op &optional simd-size)
+  `(define-instruction ,name (segment rd rn &optional vector-size)
      (:printer data-processing-1 ((op ,opc)))
+     (:printer simd-two-misc ((u ,simd-u) (op ,simd-op)
+                                          ,@(if simd-size
+                                                `((size ,simd-size)))))
      (:emitter
-      (emit-data-processing-1 segment
-                              (reg-size rd)
-                              ,(if 32-bit-opcode
-                                   `(sc-case rd
-                                     (32-bit-reg
-                                      ,32-bit-opcode)
-                                      (t
-                                       ,opc))
-                                   opc)
-                              (gpr-offset rn)
-                              (gpr-offset rd)))))
+      (if vector-size
+          (multiple-value-bind (q ,@(unless simd-size `(size)))
+              (encode-vector-size vector-size)
+            (emit-simd-two-misc segment q ,simd-u
+                                0
+                                ,(or simd-size 'size)
+                                ,simd-op
+                                (fpr-offset rn) (fpr-offset rd)))
+          (emit-data-processing-1 segment
+                                  (reg-size rd)
+                                  ,opc
+                                  (gpr-offset rn)
+                                  (gpr-offset rd))))))
 
-(def-data-processing-1 rbit #b000)
-(def-data-processing-1 rev16 #b001)
-(def-data-processing-1 clz #b100)
-(def-data-processing-1 cls #b101)
+(def-data-processing-1+simd rbit #b000
+  1 #b00101 #b01)
+(def-data-processing-1+simd clz #b100
+  1 #b00100)
+(def-data-processing-1+simd cls #b101
+  0 #b00100)
+(def-data-processing-1+simd rev16 #b001
+  0 #b00001)
 
-(define-instruction rev32 (segment rd rn)
+(define-instruction rev32 (segment rd rn &optional vector-size)
   (:printer data-processing-1 ((size 1) (op #b10)))
+  (:printer simd-two-misc ((u 1) (op 0)))
   (:emitter
-   (emit-data-processing-1 segment
-                           (reg-size rd)
-                           #b10
-                           (gpr-offset rn)
-                           (gpr-offset rd))))
+   (if vector-size
+       (multiple-value-bind (q size) (encode-vector-size (the (member :8b :16b :4h :8h) vector-size))
+         (emit-simd-two-misc segment q #b1 0 size #b00000
+                             (fpr-offset rn) (fpr-offset rd)))
+       (emit-data-processing-1 segment
+                               1
+                               #b10
+                               (gpr-offset rn)
+                               (gpr-offset rd)))))
 
 (define-instruction rev (segment rd rn)
   (:printer data-processing-1 ((size #b1) (op #b11)))
@@ -1267,8 +1444,30 @@
 (def-data-processing-3 smsubl #b001 1)
 (def-data-processing-3 umsubl #b101 1)
 
-(define-instruction-macro mul (rd rn rm)
-  `(inst madd ,rd ,rn ,rm zr-tn))
+(define-instruction mul (segment rd rn rm &optional vector-size)
+  (:printer simd-three-same-sized ((u #b0) (op #b10011)))
+  (:emitter
+   (if vector-size
+       (multiple-value-bind (q size)
+           (encode-vector-size vector-size)
+         (emit-simd-three-same segment
+                               q
+                               #b0
+                               0
+                               size
+                               (fpr-offset rm)
+                               #b10011
+                               (fpr-offset rn)
+                               (fpr-offset rd)))
+       ;; madd
+       (emit-data-processing-3 segment
+                               (reg-size rd)
+                               #b000
+                               (gpr-offset rm)
+                               0
+                               (gpr-offset zr-tn)
+                               (gpr-offset rn)
+                               (gpr-offset rd)))))
 
 (define-instruction smulh (segment rd rn rm)
   (:printer data-processing-3 ((op31 #b010) (o0 0) (ra 31))
@@ -1356,7 +1555,7 @@
      :include ldr-str)
   (op4 :field (byte 1 21) :value 1)
   (rm :field (byte 5 16) :type 'x-reg)
-  (option :fields (list (byte 3 13) (byte 1 12)) :type 'ldr-str-extend)
+  (option :fields (list (byte 2 30) (byte 1 26) (byte 1 23) (byte 3 13) (byte 1 12)) :type 'ldr-str-extend)
   (op5 :field (byte 2 10) :value #b10)
   (ldr-str-annotation :field (byte 5 16) :type 'ldr-str-reg-annotation))
 
@@ -1381,8 +1580,12 @@
       (multiple-value-bind (qout rem) (truncate offset (truncate size 8))
         (and (zerop rem)
              (typep qout '(unsigned-byte 12))))))
+;; kludge for SATISFIES types in sap.lisp
+(defun ldr-str-8-offset-encodable (offset) (ldr-str-offset-encodable offset 8))
+(defun ldr-str-16-offset-encodable (offset) (ldr-str-offset-encodable offset 16))
+(defun ldr-str-32-offset-encodable (offset) (ldr-str-offset-encodable offset 32))
 
-(defun emit-load-store (size opc segment dst address)
+(defun emit-load-store (size opc segment dst address &optional vector-size)
   (let* ((base (memory-operand-base address))
          (offset (memory-operand-offset address))
          (mode (memory-operand-mode address))
@@ -1392,23 +1595,32 @@
          (v  (if fp
                  1
                  0))
-         (size (cond (fp
+         (size (cond (vector-size
+                      (position vector-size '(:b :h :s :d)))
+                     (fp
                       (sc-case dst
-                        (complex-double-reg
+                        ((#+sb-simd-pack neon-reg
+                          #+sb-simd-pack sb-vm::int-neon-reg
+                          #+sb-simd-pack sb-vm::double-neon-reg
+                          #+sb-simd-pack sb-vm::single-neon-reg
+                          complex-double-reg)
                          (setf opc (logior #b10 opc))
                          #b00)
                         (t
                          (logior #b10
                                  (fp-reg-type dst)))))
                      (size)
-                     ((sc-is dst 32-bit-reg)
+                     ((and (not (integerp dst))
+                           (sc-is dst 32-bit-reg))
                       #b10)
                      (t #b11)))
          (scale (if fp
                     (logior (ash (ldb (byte 1 1) opc) 2)
                             size)
                     size))
-         (dst (reg-offset dst)))
+         (dst (if (integerp dst)
+                  dst
+                  (reg-offset dst))))
     (cond ((and (or
                  (and (fixup-p offset)
                       (eq (fixup-flavor offset) :symbol-tls-index))
@@ -1433,9 +1645,16 @@
                  (register shift extend)
                (if (extend-p offset)
                    (values (extend-register offset)
-                           (if (> (extend-operand offset) 0)
-                               1
-                               0)
+                           (cond ((> (extend-operand offset) 0)
+                                  (let ((allowed-offset (if (and fp
+                                                                 (not vector-size))
+                                                            4
+                                                            size)))
+                                   (unless (= (extend-operand offset) allowed-offset)
+                                     (error "Offset can only be 0 or ~a, not ~a" allowed-offset (extend-operand offset))))
+                                  1)
+                                 (t
+                                  0))
                            (ecase (extend-kind offset)
                              (:uxtw #b010)
                              (:lsl #b011)
@@ -1458,20 +1677,27 @@
            (error "Invalid STR/LDR arguments: ~s ~s" dst address)))))
 
 (defmacro def-load-store (name size opc &rest printers)
-  `(define-instruction ,name (segment dst address)
+  `(define-instruction ,name (segment dst address &optional vector-size)
      (:printer ldr-str-unsigned-imm ((size ,size) (op ,opc) (v 0)))
      (:printer ldr-str-reg ((size ,size) (op ,opc) (v 0)))
      (:printer ldr-str-unscaled-imm ((size ,size) (op ,opc) (v 0)))
      ,@printers
      (:emitter
-      (emit-load-store ,size ,opc segment dst address))))
+      (emit-load-store ,size ,opc segment dst address vector-size))))
 
 (def-load-store strb 0 #b00)
 (def-load-store ldrb 0 #b01)
-(def-load-store ldrsb 0 #b10)
 (def-load-store strh 1 #b00)
 (def-load-store ldrh 1 #b01)
-(def-load-store ldrsh 1 #b10)
+;; The sign-extending load instructions use 'size' to convey the size
+;; of the data being loaded, and 'opc' to indicate whether the destination
+;; is an X register or W register. So these instructions suffer from two bugs:
+;; 1) Because we've hardwired the opc to #b10 we can only target the
+;;    full-sized register, which is typically what we want anyway
+;; 2) because Rt is printed using PRINT-REG-FLOAT-REG it incorrectly
+;;    interprets the size field as the W register size
+(def-load-store ldrsb #b00 #b10)
+(def-load-store ldrsh #b01 #b10)
 (def-load-store ldrsw #b10 #b10)
 
 (def-load-store str nil #b00
@@ -1483,7 +1709,7 @@
   (:printer ldr-str-reg ((size #b00) (op #b10) (v 1)))
   (:printer ldr-str-unscaled-imm ((size #b00) (op #b10) (v 1))))
 
-(define-instruction ldr (segment dst address)
+(define-instruction ldr (segment dst address &optional vector-size)
   (:printer ldr-str-unsigned-imm ((op #b01)))
   (:printer ldr-str-reg ((op #b01)))
   (:printer ldr-str-unscaled-imm ((op #b01)))
@@ -1510,7 +1736,36 @@
                                            (ash (- (label-position address) posn) -2)
                                            (reg-offset dst)))))
      (t
-      (emit-load-store nil 1 segment dst address)))))
+      (emit-load-store nil 1 segment dst address vector-size)))))
+
+(define-instruction prfm (segment type address)
+  (:printer ldr-str-unsigned-imm ((op #b10)
+                                  (rt nil :type 'prfop)))
+  (:printer ldr-str-reg ((op #b10)
+                         (rt nil :type 'prfop)))
+  (:printer ldr-str-unscaled-imm ((op #b10)
+                                  (rt nil :type 'prfop)))
+  (:emitter
+   (let ((rt (getf '(:pldl1keep #b00000
+                     :pldl1strm #b00001
+                     :pldl2keep #b00010
+                     :pldl2strm #b00011
+                     :pldl3keep #b00100
+                     :pldl3strm #b00101
+                     :plil1keep #b01000
+                     :plil1strm #b01001
+                     :plil2keep #b01010
+                     :plil2strm #b01011
+                     :plil3keep #b01100
+                     :plil3strm #b01101
+                     :pstl1keep #b10000
+                     :pstl1strm #b10001
+                     :pstl2keep #b10010
+                     :pstl2strm #b10011
+                     :pstl3keep #b10100
+                     :pstl3strm #b10101)
+                   type)))
+     (emit-load-store nil #b10 segment rt address))))
 
 (def-emitter ldr-str-pair
   (opc 2 30)
@@ -1539,7 +1794,7 @@
   (rt :fields (list (byte 2 30) (byte 5 0)))
   (ldr-str-annotation :fields (list (byte 5 5) (byte 7 15)) :type 'ldr-str-pair-annotation))
 
-(defun ldp-stp-offset-p (offset size)
+(defun ldp-stp-offset-p (offset &optional (size 64))
   (multiple-value-bind (quot rem) (truncate offset (ecase size
                                                      (32 4)
                                                      (64 8)
@@ -1807,6 +2062,11 @@
 (def-ldatomic ldseta #b001100 1 0)
 (def-ldatomic ldsetal #b001100 1 1)
 
+(def-ldatomic swp #b100000 0 0)
+(def-ldatomic swpa #b100000 1 0)
+(def-ldatomic swpal #b100000 1 1)
+(def-ldatomic swpl #b100000 0 1)
+
 (define-instruction-format (ldaddb 32)
   (size :field (byte 2 30))
   (op2 :field (byte 6 24) :value #b111000)
@@ -1838,6 +2098,115 @@
 (def-ldaddb ldaddh 1 0 0)
 (def-ldaddb ldaddah 1 1 0)
 (def-ldaddb ldaddalh 1 1 1)
+
+(def-emitter ld-st-simd
+  (#b0 1 31)
+  (q 1 30)
+  (o2 6 24)
+  (writeback 1 23)
+  (l 1 22)
+  (r 1 21)
+  (rm 5 16)
+  (op 4 12)
+  (size 2 10)
+  (rn 5 5)
+  (rt 5 0))
+
+(define-instruction-format
+    (ld-st-n-simd 32
+     :default-printer '(:name :tab rt ", [" rn imm-writeback))
+  (op1 :field (byte 1 31) :value #b0)
+  (q :field (byte 1 30))
+  (op2 :field (byte 6 24))
+  (l :field (byte 1 22))
+  (r :field (byte 1 21))
+  (op :field (byte 4 12))
+  (size :field (byte 2 10))
+  (imm-writeback :fields (list (byte 1 30) (byte 1 23) (byte 5 16) (byte 4 12))
+                 :type 'struct-imm-writeback)
+  (rn :field (byte 5 5) :type 'x-reg-sp)
+  (rt :fields (list (byte 1 30) ; q
+                    (byte 2 10) ; size
+                    (byte 4 12) ; op
+                    (byte 1 21) ; r
+                    (byte 5 0)) ; rt
+      :type 'simd-ld-st-n-regs)
+  (ldr-str-annotation :fields (list (byte 5 5)) :type 'ldr-str-annotation))
+
+(defmacro def-ldst-struct (name op op2 l r &optional registers)
+  `(define-instruction ,name (segment registers address size)
+     ,@(loop for op in (ensure-list op)
+             collect
+             `(:printer ld-st-n-simd ((op2 ,op2) (l ,l) (r ,r) (op ,op))))
+     (:emitter
+      (let ((n (length registers)))
+       ,@(when registers
+           `((assert (= n ,registers))))
+       (let ((first (pop registers))
+             (op ,(if (listp op)
+                      `(nth (length registers) ',op)
+                      op)))
+         (assert first)
+         (unless (loop for reg in registers
+                       for i from (1+ (fpr-offset first))
+                       always (= (fpr-offset reg) i))
+           (error "Registers must be consecutive"))
+         (multiple-value-bind (q size) (encode-vector-size size)
+           (let ((base (memory-operand-base address))
+                 (offset (memory-operand-offset address))
+                 (mode (memory-operand-mode address)))
+             (unless (eql offset 0)
+               (assert (eq mode :post-index))
+               (when (integerp offset)
+                 (assert (= offset
+                            (ash (* n 8) q)))))
+             (when (eq mode :post-index)
+               (assert (or (register-p offset)
+                           (integerp offset))))
+             (emit-ld-st-simd segment
+                              q
+                              ,op2
+                              (if (eq mode :post-index)
+                                  1
+                                  0)
+                              ,l
+                              ,r
+                              (if (eq mode :post-index)
+                                  (if (integerp offset)
+                                      #b11111
+                                      (gpr-offset offset))
+                                  0)
+                              op
+                              size
+                              (gpr-offset base)
+                              (fpr-offset first)))))))))
+
+(def-ldst-struct ld1 (#b0111 #b1010 #b0110 #b0010) #b001100 1 0)
+(def-ldst-struct ld2 #b1000 #b001100 1 0 2)
+(def-ldst-struct ld3 #b0100 #b001100 1 0 3)
+(def-ldst-struct ld4 #b0000 #b001100 1 0 4)
+
+(def-ldst-struct st1 (#b0111 #b1010 #b0110 #b0010) #b001100 0 0)
+(def-ldst-struct st2 #b1000 #b001100 0 0 2)
+(def-ldst-struct st3 #b0100 #b001100 0 0 3)
+(def-ldst-struct st4 #b0000 #b001100 0 0 4)
+
+
+
+;; (def-ldst-struct ld1r #b1100 #b001101 1 0 1)
+;; (def-ldst-struct ld2r #b1100 #b001101 1 1 2)
+
+;; (def-ldst-struct ld3r #b1110 #b001101 1 0 3)
+
+;; (def-ldst-struct ld4r #b1110 #b001101 1 1 4)
+
+
+;; (def-ldst-struct st1r #b1100 #b0011010 0 0 1)
+;; (def-ldst-struct st2r #b1100 #b001101 0 1 2)
+;; (def-ldst-struct st3r #b1110 #b001101 0 0 3)
+;; (def-ldst-struct st4r #b1110 #b001101 0 1 4)
+
+
 
 ;;;
 
@@ -2286,7 +2655,11 @@
      0)
     ((double-reg complex-single-reg)
      1)
-    (complex-double-reg
+    ((#+sb-simd-pack neon-reg
+      #+sb-simd-pack int-neon-reg
+      #+sb-simd-pack double-neon-reg
+      #+sb-simd-pack single-neon-reg
+      complex-double-reg)
      #b10)))
 
 (def-emitter fp-compare
@@ -2402,8 +2775,8 @@
 
 (def-emitter fp-conversion
   (size 1 31)
-  (#b00111100 8 23)
-  (type 1 22)
+  (#b0011110 7 24)
+  (type 2 22)
   (#b1 1 21)
   (opcode 5 16)
   (#b00000 6 10)
@@ -2413,8 +2786,8 @@
 (define-instruction-format (fp-conversion 32
                             :include fp-data-processing
                             :default-printer '(:name :tab rd ", " rn))
-  (op2 :field (byte 8 23) :value #b00111100)
-  (type :field (byte 1 22))
+  (op2 :field (byte 7 24) :value #b0011110)
+  (type :field (byte 2 22))
   (op1 :field (byte 1 21) :value #b1)
   (op :field (byte 5 16))
   (op3 :field (byte 6 10) :value #b0))
@@ -2433,9 +2806,43 @@
                                  (fpr-offset rn)
                                  (fpr-offset rd)))))
 
-(def-fp-data-processing-1 fabs #b0001)
-(def-fp-data-processing-1 fneg #b0010)
-(def-fp-data-processing-1 fsqrt #b0011)
+(defmacro def-fp-data-processing-1+simd (name op
+                                         simd-u simd-neg simd-op6 simd-op)
+  `(define-instruction ,name (segment rd rn &optional vector-size)
+     (:printer fp-data-processing-1 ((op ,op)))
+     (:printer simd-two-same-float ((u ,simd-u) (neg ,simd-neg) (op6 ,simd-op6)
+                                    (op ,simd-op)))
+     (:emitter
+      (assert (and (eq (tn-sc rd)
+                       (tn-sc rn)))
+              (rd rn)
+              "Arguments should have the same FP storage class: ~s ~s." rd rn)
+      (cond (vector-size
+             (aver (member vector-size '(:2s :4s :2d)))
+             (multiple-value-bind (q size) (encode-vector-size vector-size)
+               (emit-simd-two-same-float
+                segment
+                q
+                ,simd-u
+                ,simd-neg
+                (logand 1 size)
+                ,simd-op6
+                ,simd-op
+                (fpr-offset rn)
+                (fpr-offset rd))))
+            (t
+             (emit-fp-data-processing-1 segment
+                                        (fp-reg-type rn)
+                                        ,op
+                                        (fpr-offset rn)
+                                        (fpr-offset rd)))))))
+
+(def-fp-data-processing-1+simd fabs #b0001
+  #b0 #b1 #b00000 #b11111)
+(def-fp-data-processing-1+simd fneg #b0010
+  #b1 #b1 #b00000 #b11111)
+(def-fp-data-processing-1+simd fsqrt #b0011
+  #b1 #b1 #b00001 #b11111)
 (def-fp-data-processing-1 frintn #b1000)
 (def-fp-data-processing-1 frintp #b1001)
 (def-fp-data-processing-1 frintm #b1010)
@@ -2460,6 +2867,39 @@
                               (fpr-offset rn)
                               (fpr-offset rd))))
 
+(def-emitter simd-scalar-x-indexed
+  (#b0 1 31)
+  (q 1 30)
+  (#b0 1 29)
+  (#b01111 5 24)
+  (size 2 22)
+  (l 1 21)
+  (m 1 20)
+  (rm 4 16)
+  (opcode 4 12)
+  (h 1 11)
+  (#b0 1 10)
+  (rn 5 5)
+  (rd 5 0))
+
+(define-instruction-format (simd-scalar-x-indexed 32
+                            :default-printer '(:name :tab rd ", " rn ", " rm))
+  (op1 :field (byte 1 31) :value #b0)
+  (q :field (byte 1 30))
+  (op2 :field (byte 1 29) :value #b0)
+  (op3 :field (byte 5 24) :value #b01111)
+  (size :field (byte 2 22))
+  (l :field (byte 1 21))
+  (m :field (byte 1 20))
+  (rm4 :field (byte 4 16))
+  (op :field (byte 4 12))
+  (h :field (byte 1 11))
+  (op4 :field (byte 1 10) :value #b0)
+  (rm :fields (list (byte 2 22) (byte 1 21) (byte 1 20) (byte 4 16) (byte 1 11))
+      :type 'simd-element-reg)
+  (rn :fields (list (byte 1 30) (byte 2 22) (byte 5 5)) :type 'simd-float-reg)
+  (rd :fields (list (byte 1 30) (byte 2 22) (byte 5 0)) :type 'simd-float-reg))
+
 (defmacro def-fp-data-processing-2 (name op)
   `(define-instruction ,name (segment rd rn rm)
      (:printer fp-data-processing-2 ((op ,op)))
@@ -2477,15 +2917,97 @@
                                  (fpr-offset rn)
                                  (fpr-offset rd)))))
 
-(def-fp-data-processing-2 fmul #b0000)
-(def-fp-data-processing-2 fdiv #b0001)
-(def-fp-data-processing-2 fadd #b0010)
-(def-fp-data-processing-2 fsub #b0011)
-(def-fp-data-processing-2 fmax #b0100)
-(def-fp-data-processing-2 fmin #b0101)
-(def-fp-data-processing-2 fmaxnm #b0110)
-(def-fp-data-processing-2 fminnm #b0111)
+(defmacro def-fp-data-processing-2+simd (name op simd-u simd-neg simd-op)
+  `(define-instruction ,name (segment rd rn rm &optional vector-size)
+     (:printer fp-data-processing-2 ((op ,op)))
+     (:printer simd-three-same-float ((u ,simd-u) (neg ,simd-neg) (op ,simd-op)))
+     (:emitter
+      (cond (vector-size
+             (aver (member vector-size '(:2s :4s :2d)))
+             (multiple-value-bind (q size) (encode-vector-size vector-size)
+               (emit-simd-three-same-float
+                segment
+                q
+                ,simd-u
+                ,simd-neg
+                (logand 1 size)
+                (fpr-offset rm)
+                ,simd-op
+                (fpr-offset rn)
+                (fpr-offset rd))))
+            (t
+             (emit-fp-data-processing-2 segment
+                                        (fp-reg-type rn)
+                                        (fpr-offset rm)
+                                        ,op
+                                        (fpr-offset rn)
+                                        (fpr-offset rd)))))))
+
+(def-fp-data-processing-2+simd fdiv #b0001
+  #b1 #b0 #b11111)
+(def-fp-data-processing-2+simd fadd #b0010
+  #b0 #b0 #b11010)
+(def-fp-data-processing-2+simd fsub #b0011
+  #b0 #b1 #b11010)
+(def-fp-data-processing-2+simd fmax #b0100
+  #b0 #b0 #b11110)
+(def-fp-data-processing-2+simd fmin #b0101
+  #b0 #b1 #b11110)
+(def-fp-data-processing-2+simd fmaxnm #b0110
+  #b0 #b0 #b11000)
+(def-fp-data-processing-2+simd fminnm #b0111
+  #b0 #b1 #b11000)
 (def-fp-data-processing-2 fnmul #b1000)
+
+(defun encode-simd-x-element (vector-size rm index)
+  (let ((offset (fpr-offset rm)))
+    (multiple-value-bind (q size l h)
+        (ecase vector-size
+          (:2s
+           (the (integer 0 1) index)
+           (values 0 #b10 (logand index 1) 0))
+          (:4s
+           (the (integer 0 3) index)
+           (values 1 #b10 (logand index 1) (ldb (byte 1 1) index)))
+          (:2d
+           (the (integer 0 1) index)
+           (values 1 #b11 0 (logand index 1))))
+      (values q
+              size
+              l
+              h
+              (ldb (byte 1 4) offset)
+              (ldb (byte 4 0) offset)))))
+
+(define-instruction fmul
+    (segment rd rn rm &optional vector-size index)
+  (:printer fp-data-processing-2 ((op #b0)))
+  (:printer simd-three-same-float ((u #b1) (neg #b0) (op #b11011)))
+  (:printer simd-scalar-x-indexed ((op #b1001)))
+  (:emitter
+   (cond
+     (index
+      (multiple-value-bind (q size l h m rm4)
+          (encode-simd-x-element vector-size rm index)
+        (emit-simd-scalar-x-indexed segment
+                                    q
+                                    size
+                                    l
+                                    m
+                                    rm4
+                                    #b1001
+                                    h
+                                    (fpr-offset rn)
+                                    (fpr-offset rd))))
+     (vector-size (aver (member vector-size '(:2s :4s :2d)))
+                  (multiple-value-bind (q size)
+                      (encode-vector-size vector-size)
+                    (emit-simd-three-same-float segment q #b1 #b0 (logand #b1 size)
+                                                (fpr-offset rm) #b11011 (fpr-offset rn)
+                                                (fpr-offset rd))))
+     (t
+      (emit-fp-data-processing-2 segment (fp-reg-type rn) (fpr-offset rm) #b0
+                                 (fpr-offset rn) (fpr-offset rd))))))
 
 (defmacro def-fp-data-processing-3 (name o1 o2)
   `(define-instruction ,name (segment rd rn rm ra)
@@ -2544,10 +3066,52 @@
                          (reg-offset rn)
                          (reg-offset rd)))))
 
-(def-fp-conversion fcvtns #b00000)
-(def-fp-conversion fcvtnu #b00001)
-(def-fp-conversion scvtf #b00010 t)
-(def-fp-conversion ucvtf #b00011 t)
+(defmacro def-fp-conversion+simd (name op &optional from-int simd-u simd-op)
+  `(define-instruction ,name (segment rd rn &optional vector-size)
+     (:printer fp-conversion ((op ,op) (,(if from-int
+                                               'rn
+                                               'rd)
+                                          nil :type 'reg)))
+     (:printer simd-two-misc ((u ,simd-u) (op ,simd-op)))
+     (:emitter
+      (if vector-size
+          (multiple-value-bind (q size)
+              (encode-vector-float-size vector-size)
+            (emit-simd-two-misc segment
+                                q
+                                ,simd-u
+                                0
+                                size
+                                ,simd-op
+                                (fpr-offset rn)
+                                (fpr-offset rd)))
+          (progn
+            ,@(if from-int
+                  `((assert (fp-register-p rd)
+                            (rd)
+                            "Destination ~d should be an FP register." rd)
+                    (assert (register-p rn)
+                            (rn)
+                            "Source ~d should be an integer register." rn))
+                  `((assert (register-p rd)
+                            (rd)
+                            "Destination ~d should be an integer register." rn)
+                    (assert (fp-register-p rn)
+                            (rn)
+                            "Source ~d should be an FP register." rn)))
+            (emit-fp-conversion segment
+                                +64-bit-size+
+                                (fp-reg-type ,(if from-int
+                                                  'rd
+                                                  'rn))
+                                ,op
+                                (reg-offset rn)
+                                (reg-offset rd)))))))
+
+(def-fp-conversion+simd fcvtns #b00000 nil #b0 #b11100)
+(def-fp-conversion+simd fcvtnu #b00001 nil #b1 #b11100)
+(def-fp-conversion+simd scvtf #b00010 t #b0 #b11101)
+(def-fp-conversion+simd ucvtf #b00011 t #b1 #b11101)
 (def-fp-conversion fcvtas #b00100)
 (def-fp-conversion fcvtau #b00101)
 (def-fp-conversion fcvtps #b01000)
@@ -2613,58 +3177,222 @@
   (#b0 :field (byte 5 5))
   (rd :field (byte 5 0) :type 'float-reg))
 
-(define-instruction fmov (segment rd rn)
-  (:printer fp-conversion ((op #b110) (rd nil :type 'reg)))
-  (:printer fp-conversion ((op #b111) (rn nil :type 'reg)))
+(define-instruction-format (simd-modified-imm 32
+                            :default-printer '(:name :tab rd ", #" imm))
+  (o1 :field (byte 1 31) :value #b0)
+  (q :field (byte 1 30))
+  (op :field (byte 1 29))
+  (op2 :field (byte 10 19) :value #b0111100000)
+  (cmode :field (byte 4 12))
+  (o2 :field (byte 1 11))
+  (op3 :field (byte 1 10) :value #b1)
+  (imm :fields (list (byte 3 16) (byte 5 5) (byte 4 12)) :type 'simd-modified-imm)
+  (rd :fields (list (byte 1 30) (byte 4 12) (byte 5 0) (byte 1 29)) :type 'simd-reg-cmode))
+
+(define-instruction-format (simd-modified-fp-imm 32
+                            :include simd-modified-imm
+                            :default-printer '(:name :tab rd ", #" imm))
+  (imm :fields (list (byte 1 29) (byte 3 16) (byte 5 5)) :type 'simd-fp-imm)
+  (cmode :value #b1111)
+  (o2 :value 0)
+  (rd :fields (list (byte 1 30)  (byte 1 29) (byte 5 0)) :type 'simd-fmov-imm-reg))
+
+(define-instruction fmov (segment rd rn &optional vector-index)
+  (:printer fp-conversion ((op #b00110) (rd nil :type 'reg)))
+  (:printer fp-conversion ((op #b00111) (rn nil :type 'reg)))
+  (:printer fp-conversion ((op #b01110) (rd nil :type 'reg)
+                                        (rn nil :type 'simd-high-vector)))
+  (:printer fp-conversion ((op #b01111) (rn nil :type 'reg)
+                                        (rd nil :type 'simd-high-vector)))
   (:printer fp-data-processing-1 ((op #b0)))
   (:printer fp-immediate ())
+  (:printer simd-modified-fp-imm ())
   (:emitter
-   (cond ((double-float-p rn)
-          (aver (sc-is rd double-reg))
-          (emit-fp-immediate segment 0 0 #b01
-                             (encode-fp-immediate rn)
-                             0
-                             (fpr-offset rd)))
-         ((single-float-p rn)
-          (aver (sc-is rd single-reg))
-          (emit-fp-immediate segment 0 0 #b00
-                             (encode-fp-immediate rn)
-                             0
-                             (fpr-offset rd)))
-         ((or (sc-is rd complex-double-reg)
-              (sc-is rn complex-double-reg))
-          (bug "Implement"))
+   (cond ((floatp rn)
+          (sc-case rd
+            ((complex-single-reg complex-double-reg)
+             (if vector-index
+                 (let* ((imm (encode-fp-immediate rn))
+                        (abc (ldb (byte 3 5) imm))
+                        (defgh (ldb (byte 5 0) imm)))
+                   (emit-simd-modified-imm segment
+                                           (encode-vector-size vector-index)
+                                           (ecase vector-index
+                                             ((:4s :2s) 0)
+                                             (:2d 1))
+                                           abc
+                                           #b1111
+                                           0
+                                           defgh
+                                           (fpr-offset rd)))
+                 (sc-case rd
+                   (complex-double-reg
+                    (emit-fp-immediate segment 0 0 #b01
+                                       (encode-fp-immediate rn)
+                                       0
+                                       (fpr-offset rd)))
+                   (complex-single-reg
+                    (emit-fp-immediate segment 0 0 #b00
+                                       (encode-fp-immediate rn)
+                                       0
+                                       (fpr-offset rd))))))
+            (double-reg
+             (emit-fp-immediate segment 0 0 #b01
+                                (encode-fp-immediate rn)
+                                0
+                                (fpr-offset rd)))
+            (single-reg
+             (emit-fp-immediate segment 0 0 #b00
+                                (encode-fp-immediate rn)
+                                0
+                                (fpr-offset rd)))))
          ((and (fp-register-p rd)
                (fp-register-p rn))
-          (assert (and (eq (tn-sc rd) (tn-sc rn))) (rd rn)
-                  "Arguments should have the same fp storage class: ~s ~s."
-                  rd rn)
-          (emit-fp-data-processing-1 segment (fp-reg-type rn) 0
+          (emit-fp-data-processing-1 segment (fp-reg-type rd) 0
                                      (fpr-offset rn) (fpr-offset rd)))
          ((and (register-p rd)
                (fp-register-p rn))
-          (let* ((type (fp-reg-type rn))
+          (let* ((type (if (sc-is rd 32-bit-reg)
+                           0
+                           (fp-reg-type rn)))
                  (128-p (= type #b10)))
-            (emit-fp-conversion segment (if 128-p
-                                            1
-                                            type)
+            (when (and 128-p
+                       (not (eql vector-index 1)))
+              (setf 128-p nil
+                    type 1))
+            (emit-fp-conversion segment (min type 1)
                                 type
                                 (if 128-p
-                                    #b01111
-                                    #b110)
+                                    #b01110
+                                    #b00110)
                                 (fpr-offset rn) (gpr-offset rd))))
          ((and (register-p rn)
                (fp-register-p rd))
-          (let* ((type (fp-reg-type rd))
+          (let* ((type (if (sc-is rn 32-bit-reg)
+                           0
+                           (fp-reg-type rd)))
                  (128-p (= type #b10)))
-            (emit-fp-conversion segment (if 128-p
-                                            1
-                                            type)
+            (when (and 128-p
+                       (not (eql vector-index 1)))
+              (setf 128-p nil
+                    type 1))
+            (emit-fp-conversion segment (min type 1)
                                 type
                                 (if 128-p
                                     #b01111
-                                    #b111)
+                                    #b00111)
                                 (gpr-offset rn) (fpr-offset rd)))))))
+
+(defun emit-simd-orr/bic-imm (segment op rd imm vector-size)
+  (let (cmode)
+    (ecase vector-size
+      ((:4h :8h)
+       (cond ((typep imm '(unsigned-byte 8))
+              (setf cmode #b1001))
+             ((and (typep imm '(unsigned-byte 16))
+                   (zerop (ldb (byte 8 0) imm)))
+              (setf imm (ldb (byte 8 8) imm)
+                    cmode #b1011))
+             (t
+              (error "~x bad immediate" imm))))
+      ((:2s :4s)
+       (cond ((typep imm '(unsigned-byte 8))
+              (setf cmode #b0001))
+             ((and (typep imm '(unsigned-byte 16))
+                   (zerop (ldb (byte 8 0) imm)))
+              (setf imm (ldb (byte 8 8) imm)
+                    cmode #b0011))
+             ((and (typep imm '(unsigned-byte 24))
+                   (zerop (ldb (byte 16 0) imm)))
+              (setf imm (ldb (byte 8 16) imm)
+                    cmode #b0101))
+             ((and (typep imm '(unsigned-byte 32))
+                   (zerop (ldb (byte 24 0) imm)))
+              (setf imm (ldb (byte 8 24) imm)
+                    cmode #b0111))
+             (t
+              (error "~x bad immediate" imm)))))
+    (emit-simd-modified-imm segment
+                            (encode-vector-size vector-size)
+                            op
+                            (ldb (byte 3 5) imm)
+                            cmode
+                            0
+                            (ldb (byte 5 0) imm)
+                            (fpr-offset rd))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun simd-modified-imm-printer (op cmodes)
+    (loop for cmode in cmodes
+          for fields = (loop for bit in cmode
+                             for i downfrom 15
+                             unless (eq bit 'x)
+                             collect `(byte 1 ,i))
+          for bits = (remove 'x cmode)
+          collect `(:printer simd-modified-imm ((o2 0)
+                                                (op ,op)
+                                                (cmodes ',bits
+                                                        :fields (list ,@fields)))))))
+
+(macrolet ((def (name simd-op cmodes)
+             `(define-instruction ,name (segment rd &rest args)
+                (:printer logical-reg ((op 0) (n 1)))
+                (:printer simd-three-same ((u 0) (size 1) (op 3)))
+                ,@(simd-modified-imm-printer simd-op cmodes)
+                (:emitter
+                 (if (and (keywordp (car (last args)))
+                          (= (length args) 2))
+                     (destructuring-bind (imm vector-size) args
+                       (emit-simd-orr/bic-imm segment ,simd-op rd imm vector-size))
+                     (destructuring-bind (rn rm &optional vector-size) args
+                       (if vector-size
+                           (emit-simd-three-same segment
+                                                 (encode-vector-size vector-size)
+                                                 0 0 1 (fpr-offset rm) 3
+                                                 (fpr-offset rn) (fpr-offset rd))
+                           (emit-logical-reg-inst segment 0 1 rd rn rm))))))))
+  (def bic 1 ((1 0 x 1)
+              (0 x x 1))))
+
+(macrolet ((def (name simd-op cmodes)
+             `(define-instruction ,name (segment rd &rest args)
+                (:printer simd-three-same ((u 0) (size 2) (op 3))
+                          '((:cond ((rn :same-as rm) 'mov) (t 'orr)) :tab rd ", " rn
+                            (:unless (:same-as rn) ", " rm)))
+                (:printer logical-imm ((op 1)))
+                (:printer logical-reg ((op 1)))
+                (:printer logical-imm ((op 1) (rn 31))
+                          '('mov :tab rd ", " imm))
+                (:printer logical-reg ((op 1) (rn 31))
+                          '('mov :tab rd ", " rm shift))
+                ,@(simd-modified-imm-printer simd-op cmodes)
+                (:emitter
+                 (if (and (keywordp (car (last args)))
+                          (= (length args) 2))
+                     (destructuring-bind (imm vector-size) args
+                       (emit-simd-orr/bic-imm segment ,simd-op rd imm vector-size))
+                     (destructuring-bind (rn rm &optional vector-size) args
+                       (if vector-size
+                           (emit-simd-three-same segment
+                                                 (encode-vector-size vector-size)
+                                                 0 0 2 (fpr-offset rm) 3
+                                                 (fpr-offset rn) (fpr-offset rd))
+                           (if (or (register-p rm) (shifter-operand-p rm))
+                               (emit-logical-reg-inst segment 1 0 rd rn rm)
+                               (let ((size (reg-size rd)))
+                                 (multiple-value-bind (n immr imms)
+                                     (encode-logical-immediate rm
+                                                               (if (= size 1)
+                                                                   64
+                                                                   32))
+                                   (unless n
+                                     (error 'cannot-encode-immediate-operand
+                                            :value rm))
+                                   (emit-logical-imm segment size 1 n immr imms
+                                                     (gpr-offset rn)
+                                                     (gpr-offset rd))))))))))))
+  (def orr 0 ((1 0 x 1)
+              (0 x x 1))))
+
 
 (define-instruction load-from-label (segment dest label &optional lip)
   (:vop-var vop)
@@ -2694,7 +3422,12 @@
               (emit-ldr-literal segment
                                 (sc-case dest
                                   ((32-bit-reg single-reg) #b00)
-                                  (complex-double-reg #b10)
+                                  ((#+sb-simd-pack neon-reg
+                                    #+sb-simd-pack sb-vm::int-neon-reg
+                                    #+sb-simd-pack sb-vm::double-neon-reg
+                                    #+sb-simd-pack sb-vm::single-neon-reg
+                                    complex-double-reg)
+                                   #b10)
                                   (t #b01))
                                 (if (fp-register-p dest)
                                     1
@@ -2781,11 +3514,26 @@
   (rn 5 5)
   (rd 5 0))
 
+(define-instruction-format (simd-three-diff 32
+                            :default-printer '(:name :tab rd ", " rn ", " rm))
+  (op3 :field (byte 1 31) :value #b0)
+  (q :field (byte 1 30))
+  (u :field (byte 1 29))
+  (op4 :field (byte 5 24) :value #b01110)
+  (size :field (byte 2 22))
+  (op5 :field (byte 1 21) :value #b1)
+  (rm :fields (list (byte 1 30) (byte 2 22) (byte 5 16)) :type 'simd-reg)
+  (op :field (byte 4 12))
+  (op6 :field (byte 2 10) :value #b00)
+  (rn :fields (list (byte 1 30) (byte 2 22) (byte 5 5)) :type 'simd-reg)
+  (rd :fields (list (byte 1 30) (byte 2 22) (byte 5 0)) :type 'simd-reg))
+
 (def-emitter simd-three-same
   (#b0 1 31)
   (q 1 30)
   (u 1 29)
-  (#b01110 5 24)
+  (scalar 1 28)
+  (#b1110 4 24)
   (size 2 22)
   (#b1 1 21)
   (rm 5 16)
@@ -2816,8 +3564,8 @@
   (neg 1 23)
   (size 1 22)
   (#b1 1 21)
-  (#b00000 5 16)
-  (opc 5 11)
+  (op6 5 16)
+  (op 5 11)
   (#b0 1 10)
   (rn 5 5)
   (rd 5 0))
@@ -2842,6 +3590,15 @@
   (rn :fields (list (byte 1 30) (byte 2 22) (byte 5 5)) :type 'simd-reg)
   (rd :fields (list (byte 1 30) (byte 2 22) (byte 5 0)) :type 'simd-reg))
 
+(define-instruction-format (simd-three-same-scalar-d 32
+                            :include simd-three-same
+                            :default-printer '(:name :tab rd ", " rn ", " rm))
+  (q :field (byte 1 30) :value #b1)
+  (op4 :field (byte 5 24) :value #b11110)
+  (rm :field (byte 5 16) :type 'simd-reg-d)
+  (rn :field (byte 5 5) :type 'simd-reg-d)
+  (rd :field (byte 5 0) :type 'simd-reg-d))
+
 (define-instruction-format (simd-three-same-float 32
                             :default-printer '(:name :tab rd ", " rn ", " rm))
   (op3 :field (byte 1 31) :value #b0)
@@ -2861,10 +3618,10 @@
   (op3 :field (byte 1 31) :value #b0)
   (u :field (byte 1 29))
   (op4 :field (byte 5 24) :value #b01110)
-  (neg :field (byte 1 23))
+  (neg :field (byte 1 23) :value #b1)
   (size :field (byte 1 22))
   (op5 :field (byte 1 21) :value #b1)
-  (op6 :field (byte 5 16) :value #b00000)
+  (op6 :field (byte 5 16))
   (op :field (byte 5 11))
   (op7 :field (byte 1 10) :value #b0)
   (rn :fields (list (byte 1 30) (byte 1 22) (byte 5 5)) :type 'simd-float-reg)
@@ -2878,103 +3635,173 @@
     (:8h (values 1 #b01))
     (:2s (values 0 #b10))
     (:4s (values 1 #b10))
+    (:1d (values 0 #b11))
     (:2d (values 1 #b11))))
 
-(define-instruction-macro s-mov (rd rn &optional (size :16b))
-  `(let ((rd ,rd)
-         (rn ,rn)
-         (size ,size))
-     (inst s-orr rd rn rn size)))
+(defun encode-vector-size/scalar (size)
+  (ecase size
+    (:8b (values 0 0 0))
+    (:16b (values 1 0 0))
+    (:4h (values 0 #b01 0))
+    (:8h (values 1 #b01 0))
+    (:2s (values 0 #b10 0))
+    (:4s (values 1 #b10 0))
+    (:1d (values 0 #b11 0))
+    (:2d (values 1 #b11 0))
+    (:d (values 1 #b11 1))))
+
+(defun encode-vector-float-size (size)
+  (ecase size
+    (:2s (values 0 0))
+    (:4s (values 1 0))
+    (:2d (values 1 1))))
+
+(macrolet ((def (name q u opc)
+             `(define-instruction ,name (segment rd rn rm &optional (size :16b))
+                (:printer simd-three-diff ((q ,q) (u ,u) (op ,opc)))
+                (:emitter
+                 (emit-simd-three-diff segment
+                                       ,q
+                                       ,u
+                                       (if (zerop ,q)
+                                           (ecase size
+                                             (:8b #b00)
+                                             (:4h #b01)
+                                             (:2s #b10))
+                                           (ecase size
+                                             (:16b #b00)
+                                             (:8h #b01)
+                                             (:4s #b10)))
+                                       (fpr-offset rm)
+                                       ,opc
+                                       (fpr-offset rn)
+                                       (fpr-offset rd))))))
+  (def umull 0 1 #b1100)
+  (def umull2 1 1 #b1100))
 
 (macrolet ((def (name u size op &rest printer)
-             `(define-instruction ,name (segment rd rn rm &optional (size :16b))
+             `(define-instruction ,name (segment rd rn rm size)
                 (:printer simd-three-same ((u ,u) (size ,size) (op ,op))
                           ,@printer)
                 (:emitter
                  (emit-simd-three-same segment
-                                       (encode-vector-size size)
+                                       (encode-vector-size (the (member :16b :8b) size))
                                        ,u
+                                       0
                                        ,size
                                        (fpr-offset rm)
                                        ,op
                                        (fpr-offset rn)
                                        (fpr-offset rd))))))
-  (def s-and #b0 #b00 #b00011)
-  (def s-bic #b0 #b01 #b00011)
-  (def s-orr #b0 #b10 #b00011
-    '((:cond
-        ((rn :same-as rm) 'mov)
-        (t 'orr))
-      :tab rd  ", " rn (:unless (:same-as rn) ", " rm)))
-  (def s-orn #b0 #b11 #b00011)
-
-  (def s-eor #b1 #b00 #b00011)
   (def bsl #b1 #b01 #b00011)
   (def bit #b1 #b10 #b00011)
   (def bif #b1 #b11 #b00011))
 
-(macrolet ((def (name u op)
-             `(define-instruction ,name (segment rd rn rm &optional (size :16b))
-                (:printer simd-three-same-sized ((u ,u) (op ,op)))
+(macrolet ((def (name u op &optional
+                              (2d t)
+                              zero-u zero)
+             `(define-instruction ,name (segment rd rn rm size)
+                ,@(when op
+                    `((:printer simd-three-same-sized ((u ,u) (op ,op)))))
+                ,@(when zero
+                    `((:printer simd-two-misc ((u ,zero-u) (op ,zero))
+                                '(:name :tab rd ", " rn ", " "#0"))))
                 (:emitter
+                 (aver (member size ',(if 2d
+                                          '(:8b :16b :4h :8h :2s :4s :2d)
+                                          '(:8b :16b :4h :8h :2s :4s))))
                  (multiple-value-bind (q size) (encode-vector-size size)
-                   (emit-simd-three-same segment
-                                         q
-                                         ,u
-                                         size
-                                         (fpr-offset rm)
-                                         ,op
-                                         (fpr-offset rn)
-                                         (fpr-offset rd)))))))
-  (def s-add #b0 #b10000)
-  (def s-sub #b1 #b10000)
-  (def cmeq #b1 #b10001)
-  (def cmgt #b0 #b00110)
-  (def cmge #b0 #b00111)
+                   (cond ,@(when zero
+                             `(((eql rm 0)
+                                (emit-simd-two-misc segment
+                                                    q
+                                                    ,zero-u
+                                                    0
+                                                    size
+                                                    ,zero
+                                                    (fpr-offset rn)
+                                                    (fpr-offset rd)))))
+                         (t
+                          ,(if op
+                               `(emit-simd-three-same segment
+                                                      q
+                                                      ,u
+                                                      0
+                                                      size
+                                                      (fpr-offset rm)
+                                                      ,op
+                                                      (fpr-offset rn)
+                                                      (fpr-offset rd))
+                               `(error "Can be compared only with zero, not ~s" rm)))))))))
+  (def cmtst #b0 #b10001)
+  (def cmeq #b1 #b10001 t 0 #b01001)
+  (def cmgt #b0 #b00110 t 0 #b01000)
+  (def cmge #b0 #b00111 t 1 #b01000)
+  (def cmlt nil nil t 0 #b01010)
+  (def cmle nil nil t 1 #b01001)
   (def cmhi #b1 #b00110)
   (def cmhs #b1 #b00111)
-  (def umin #b1 #b01101)
-  (def umax #b1 #b01100)
-  (def smin #b0 #b01101)
-  (def smax #b0 #b01100))
+  (def umin #b1 #b01101 nil)
+  (def umax #b1 #b01100 nil)
+  (def smin #b0 #b01101 nil)
+  (def smax #b0 #b01100 nil)
+  (def uhadd #b1 #b00000 nil)
+  (def uqadd #b1 #b00001)
+  (def urhadd #b1 #b00010 nil)
+  (def uhsub #b1 #b00100 nil)
+  (def uqsub #b1 #b00101)
+  (def addp #b0 #b10111)
+  (def shadd #b0 #b00000 nil)
+  (def sqadd #b0 #b00001)
+  (def srhadd #b0 #b00010 nil)
+  (def shsub #b0 #b00100 nil)
+  (def sqsub #b0 #b00101)
+  (def uminp #b1 #b10101 nil)
+  (def umaxp #b1 #b10100 nil)
+  (def sminp #b0 #b10101 nil)
+  (def smaxp #b0 #b10100 nil)
+  (def sshl #b0 #b01001)
+  (def ushl #b1 #b01001))
 
-(macrolet ((def (name u neg op)
-             `(define-instruction ,name (segment rd rn rm &optional (size :16b))
-                (:printer simd-three-same-float ((u ,u) (neg ,neg) (op ,op)))
+(macrolet ((def (name u neg op &optional zero-u zero)
+             `(define-instruction ,name (segment rd rn rm size)
+                ,@(when op
+                    `((:printer simd-three-same-float ((u ,u) (neg ,neg) (op ,op)))))
+                ,@(when zero
+                    `((:printer simd-two-misc ((u ,zero-u) (op ,zero))
+                                '(:name :tab rd ", " rn ", " "#0.0"))))
                 (:emitter
+                 (aver (member size '(:2s :4s :2d)))
                  (multiple-value-bind (q size) (encode-vector-size size)
-                   (emit-simd-three-same-float
-                    segment
-                    q
-                    ,u
-                    ,neg
-                    (logand 1 size)
-                    (fpr-offset rm)
-                    ,op
-                    (fpr-offset rn)
-                    (fpr-offset rd)))))))
-  (def s-fadd #b0 #b0 #b11010)
-  (def s-fsub #b0 #b1 #b11010)
-  (def s-fmul #b1 #b0 #b11011)
-  (def s-fdiv #b1 #b0 #b11111)
-  (def fcmeq #b0 #b0 #b11100))
-
-(macrolet ((def (name u neg op)
-             `(define-instruction ,name (segment rd rn &optional (size :16b))
-                (:printer simd-two-same-float ((u ,u) (neg ,neg) (op ,op)))
-                (:emitter
-                 (multiple-value-bind (q size) (encode-vector-size size)
-                   (emit-simd-two-same-float
-                    segment
-                    q
-                    ,u
-                    ,neg
-                    (logand 1 size)
-                    ,op
-                    (fpr-offset rn)
-                    (fpr-offset rd)))))))
-  (def s-fabs #b0 #b1 #b11111)
-  (def s-fneg #b1 #b1 #b11111))
+                   (cond ,@(when zero
+                             `(((and (numberp rm) (zerop rm))
+                                (emit-simd-two-misc segment
+                                                    q
+                                                    ,zero-u
+                                                    0
+                                                    size
+                                                    ,zero
+                                                    (fpr-offset rn)
+                                                    (fpr-offset rd)))))
+                         (t
+                          ,(if op
+                               `(emit-simd-three-same-float segment
+                                                            q
+                                                            ,u
+                                                            ,neg
+                                                            (logand 1 size)
+                                                            (fpr-offset rm)
+                                                            ,op
+                                                            (fpr-offset rn)
+                                                            (fpr-offset rd))
+                               `(error "Can be compared only with 0.0")))))))))
+  (def fcmeq #b0 #b0 #b11100 0 #b01101)
+  (def fcmge #b1 #b0 #b11100 1 #b01100)
+  (def fcmgt #b1 #b1 #b11100 0 #b01100)
+  (def fcmle nil nil nil     1 #b01101)
+  (def fcmlt nil nil nil     0 #b01110)
+  (def facge #b1 #b0 #b11101)
+  (def facgt #b1 #b1 #b11101))
 
 (def-emitter simd-scalar-three-same
     (#b01 2 30)
@@ -3001,6 +3828,64 @@
   (rn :fields (list (byte 1 30) (byte 5 5)) :type 'simd-reg)
   (rd :fields (list (byte 1 30) (byte 5 0)) :type 'simd-reg))
 
+(def-emitter simd-scalar-and-vector-two
+    (#b01 2 30)
+  (u 1 29)
+  (#b11110 5 24)
+  (sz2 1 23)
+  (size 1 22)
+  (#b11000 5 17)
+  (opc 5 12)
+  (#b10 2 10)
+  (rn 5 5)
+  (rd 5 0))
+
+(define-instruction-format (simd-scalar-and-vector-two 32
+                            :default-printer '(:name :tab rd ", " rn))
+  (op3 :field (byte 2 30) :value #b01)
+  (u :field (byte 1 29))
+  (op4 :field (byte 5 24) :value #b11110)
+  (op2 :field (byte 1 23) :value #b0)
+  (size :field (byte 1 22))
+  (op5 :field (byte 5 17) :value #b11000)
+  (op :field (byte 5 12))
+  (op6 :field (byte 2 10) :value #b10)
+  (rn :fields (list (byte 1 22) (byte 5 5)) :type 'float-reg)
+  (rd :fields (list (byte 1 30) (byte 5 0)) :type 'simd-float-pair-reg))
+
+(macrolet ((def (name u sz2 opc simd-o1 simd-opc)
+             `(define-instruction ,name (segment rd rn rm-or-scalar-size &optional vector-size)
+                (:printer simd-scalar-and-vector-two ((u ,u) (op2 ,sz2) (op ,opc)))
+                (:printer simd-three-same-float ((u ,u) (neg ,simd-o1) (op ,simd-opc)))
+                (:emitter
+                 (cond ((member rm-or-scalar-size '(:2s :2d))
+                        (aver (null vector-size))
+                        (emit-simd-scalar-and-vector-two segment
+                                                         ,u
+                                                         ,sz2
+                                                         (ecase rm-or-scalar-size
+                                                           (:2s 0)
+                                                           (:2d 1))
+                                                         ,opc
+                                                         (fpr-offset rn)
+                                                         (fpr-offset rd)))
+                       (t
+                        (aver (member vector-size '(:2s :4s :2d)))
+                        (multiple-value-bind (q size) (encode-vector-size vector-size)
+                          (emit-simd-three-same-float
+                           segment
+                           q
+                           ,u
+                           ,simd-o1
+                           (logand 1 size)
+                           (fpr-offset rm-or-scalar-size)
+                           ,simd-opc
+                           (fpr-offset rn)
+                           (fpr-offset rd)))))))))
+  (def faddp 1 0 #b01101 0 #b11010)
+  (def fminp 1 1 #b01111 1 #b11110)
+  (def fmaxp 1 0 #b01111 0 #b11110))
+
 ;;;
 
 (def-emitter simd-extract
@@ -3024,9 +3909,12 @@
   (rn :fields (list (byte 1 30) (byte 5 5)) :type 'simd-reg)
   (rd :fields (list (byte 1 30) (byte 5 0)) :type 'simd-reg))
 
-(define-instruction ext (segment rd rn rm index &optional (size :16b))
+(define-instruction ext (segment rd rn rm index size)
   (:printer simd-extract ())
   (:emitter
+   (ecase size
+     (:8b (the (mod 8) index))
+     (:16b (the (mod 16) index)))
    (emit-simd-extract segment
                       (encode-vector-size size)
                       (fpr-offset rm)
@@ -3061,18 +3949,34 @@
   (rn :fields (list (byte 5 5) (byte 5 16) (byte 4 11)) :type 'simd-copy-reg)
   (rd :fields (list (byte 5 0) (byte 5 16)) :type 'simd-copy-reg))
 
+(define-instruction-format (simd-copy-from-general 32
+                            :include simd-copy
+                            :default-printer '(:name :tab rd ", " rn))
+  (rn :fields (list (byte 1 30) (byte 5 5)) :type 'sized-reg)
+  (rd :fields (list (byte 5 0) (byte 5 16)) :type 'simd-copy-reg))
+
 (define-instruction ins (segment rd index1 rn index2 size)
   (:printer simd-copy ((q 1) (op 1)))
+  (:printer simd-copy-from-general ((q 1) (op 0) (imm4 #b0011)))
   (:emitter
    (let ((size (position size '(:B :H :S :D))))
-     (emit-simd-copy segment
-                     1
-                     1
-                     (logior (ash index1 (1+ size))
-                             (ash 1 size))
-                     (ash index2 size)
-                     (fpr-offset rn)
-                     (fpr-offset rd)))))
+     (if index2
+         (emit-simd-copy segment
+                         1
+                         1
+                         (logior (ash index1 (1+ size))
+                                 (ash 1 size))
+                         (ash index2 size)
+                         (fpr-offset rn)
+                         (fpr-offset rd))
+         (emit-simd-copy segment
+                         1
+                         0
+                         (logior (ash index1 (1+ size))
+                                 (ash 1 size))
+                         #b0011
+                         (gpr-offset rn)
+                         (fpr-offset rd))))))
 
 (define-instruction-format (simd-copy-to-general 32
                             :include simd-copy
@@ -3080,47 +3984,120 @@
   (rn :fields (list (byte 5 5) (byte 5 16)) :type 'simd-copy-reg)
   (rd :fields (list (byte 1 30) (byte 5 0)) :type 'sized-reg))
 
-(macrolet ((def (name op imm4 q)
-             `(define-instruction ,name (segment rd rn index size)
-                (:printer simd-copy-to-general ((op ,op) (imm4 ,imm4)))
-                (:emitter
-                 (let ((isize (position size '(:B :H :S :D))))
-                   (emit-simd-copy segment
-                                   (case size
-                                     (,q 1)
-                                     (t 0))
-                                   ,op
-                                   (logior (ash index (1+ isize))
-                                           (ash 1 isize))
-                                   ,imm4
-                                   (fpr-offset rn)
-                                   (gpr-offset rd)))))))
-  (def umov 0 #b0111 (:d))
-  (def smov 0 #b0101 (:d :s)))
-
-(define-instruction dup (segment rd rn size)
-  (:printer simd-copy-to-general
-            ((op 0) (imm4 1)
-                    (rn nil :fields (list (byte 5 5) (byte 1 30) (byte 5 16))
-                            :type 'simd-dup-reg))
-            '(:name :tab rn ", " rd))
+(define-instruction umov (segment rd rn index size)
+  (:printer simd-copy-to-general ((op 0) (imm4 #b0111)))
   (:emitter
-   (multiple-value-bind (q imm)
-       (ecase size
-         (:8b (values 0 #b1))
-         (:16b (values 1 #b1))
-         (:4h (values 0 #b10))
-         (:8h (values 1 #b10))
-         (:2s (values 0 #b100))
-         (:4s (values 1 #b100))
-         (:2d (values 1 #b1000)))
+   (if (sc-is rd 32-bit-reg)
+       (aver (member size '(:b :h :s)))
+       (aver (member size '(:b :h :s :d))))
+   (let ((isize (position size '(:b :h :s :d))))
      (emit-simd-copy segment
-                     q
+                     (if (eq size :d) 1 0)
                      0
-                     imm
-                     1
-                     (gpr-offset rn)
-                     (fpr-offset rd)))))
+                     (logior (ash index (1+ isize))
+                             (ash 1 isize))
+                     #b0111
+                     (fpr-offset rn)
+                     (gpr-offset rd)))))
+
+(define-instruction smov (segment rd rn index size)
+  (:printer simd-copy-to-general ((op 0) (imm4 #b0101)))
+  (:emitter
+   (if (sc-is rd 32-bit-reg)
+       (aver (member size '(:b :h)))
+       (aver (member size '(:b :h :s))))
+   (let ((isize (position size '(:b :h :s))))
+     (emit-simd-copy segment
+                     (reg-size rd)
+                     0
+                     (logior (ash index (1+ isize))
+                             (ash 1 isize))
+                     #b0101
+                     (fpr-offset rn)
+                     (gpr-offset rd)))))
+
+(define-instruction-format (simd-dup-from-general 32
+                            :include simd-copy
+                            :default-printer '(:name :tab rd ", " rn))
+  (rn :fields (list (byte 1 30) (byte 5 5)) :type 'sized-reg)
+  (rd :fields (list (byte 5 0) (byte 1 30) (byte 5 16)) :type 'simd-dup-reg))
+
+(define-instruction-format (simd-dup 32
+                            :include simd-copy
+                            :default-printer '(:name :tab rd ", " rn))
+  (rn :fields (list (byte 5 5) (byte 5 16)) :type 'simd-copy-reg)
+  (rd :fields (list (byte 5 0) (byte 1 30) (byte 5 16)) :type 'simd-dup-reg))
+
+(define-instruction-format (simd-dup-extract 32
+                            :include simd-copy
+                            :default-printer '(:name :tab rd ", " rn))
+  (op4 :field (byte 8 21) :value #b11110000)
+  (rn :fields (list (byte 5 5) (byte 5 16)) :type 'simd-copy-reg)
+  (rd :fields (list (byte 5 0) (byte 5 16)) :type 'simd-dup-float-reg))
+
+(def-emitter simd-dup-extract
+  (#b0 1 31)
+  (q 1 30)
+  (op 1 29)
+  (#b11110000 8 21)
+  (imm5 5 16)
+  (#b0 1 15)
+  (imm4 4 11)
+  (#b1 1 10)
+  (rn 5 5)
+  (rd 5 0))
+
+;; DUP (general):         DUP <Vd>.<T>, <R><n>
+;; DUP (element, vector): DUP <Vd>.<T>, <Vn>.<Ts>[<index>]
+;; DUP (element, scalar): DUP <V><d>, <Vn>.<Ts>[<index>]
+(define-instruction dup (segment rd rn size &optional lane)
+  (:printer simd-dup-from-general ((op 0) (imm4 1)))
+  (:printer simd-dup ((op 0) (imm4 0)))
+  (:printer simd-dup-extract ((op 0) (imm4 0)))
+  (:emitter
+   (cond ((or (vector-register-p rd)
+              (sc-is rd complex-double-reg))
+          (multiple-value-bind (q imm shift)
+              (ecase size
+                (:8b (values 0 #b1 1))
+                (:16b (values 1 #b1 1))
+                (:4h (values 0 #b10 2))
+                (:8h (values 1 #b10 2))
+                (:2s (values 0 #b100 3))
+                (:4s (values 1 #b100 3))
+                (:2d (values 1 #b1000 4)))
+            (cond ((register-p rn)
+                   (assert (null lane))
+                   (emit-simd-copy segment
+                                   q
+                                   0
+                                   imm
+                                   1
+                                   (gpr-offset rn)
+                                   (fpr-offset rd)))
+                  (t
+                   (emit-simd-copy segment
+                                   q
+                                   0
+                                   (logior imm (ash (or lane 0) shift))
+                                   0
+                                   (fpr-offset rn)
+                                   (fpr-offset rd))))))
+         (t
+          (the (member nil :d :s) size)
+          (multiple-value-bind (imm shift)
+              (cond ((single-register-p rd)
+                     (values #b00100 3))
+                    ((double-register-p rd)
+                     (values #b01000 4))
+                    (t (error "Unsupported dup dest ~a" rn)))
+            (emit-simd-dup-extract segment
+                                   1 ; q
+                                   0 ; op
+                                   (logior imm (ash (or lane 0) shift))
+                                   0 ; imm4
+                                   (fpr-offset rn)
+                                   (fpr-offset rd)))))))
 
 (def-emitter simd-across-lanes
     (#b0 1 31)
@@ -3147,18 +4124,6 @@
   (rn :fields (list (byte 1 30) (byte 2 22) (byte 5 5)) :type 'vx.t)
   (rd :fields (list (byte 2 22) (byte 5 0)) :type 'vbhs))
 
-
-(def-emitter simd-two-misc
-    (#b0 1 31)
-  (q 1 30)
-  (u 1 29)
-  (#b01110 5 24)
-  (size 2 22)
-  (#b10000 5 17)
-  (op 5 12)
-  (#b10 2 10)
-  (rn 5 5)
-  (rd 5 0))
 
 (define-instruction addv (segment rd rn size)
   (:printer simd-across-lanes  ((u 0) (op #b11011)))
@@ -3200,11 +4165,36 @@
     (fpr-offset rn)
     (fpr-offset rd))))
 
+(define-instruction fminv (segment rd rn)
+  (:printer simd-across-lanes  ((u 0) (size #b10) (op #b01111)))
+  (:emitter
+   (emit-simd-across-lanes
+    segment
+    1
+    1
+    #b10
+    #b01111
+    (fpr-offset rn)
+    (fpr-offset rd))))
+
+(define-instruction fmaxv (segment rd rn)
+  (:printer simd-across-lanes  ((u 0) (size #b00) (op #b01111)))
+  (:emitter
+   (emit-simd-across-lanes
+    segment
+    1
+    1
+    #b00
+    #b01111
+    (fpr-offset rn)
+    (fpr-offset rd))))
+
 (macrolet ((def (name u op)
              `(define-instruction ,name (segment rd rn size)
                 (:printer simd-across-lanes  ((u ,u) (op ,op)
-                                              (rd nil :type 'vhsd)))
+                                              (rd nil :type 'vbhs)))
                 (:emitter
+                 (aver (member size '(:8b :16b :4h :8h :2s :4s)))
                  (multiple-value-bind (q size) (encode-vector-size size)
                    (emit-simd-across-lanes
                     segment
@@ -3219,6 +4209,19 @@
   (def sminv 0 #b11010)
   (def smaxv 0 #b01010))
 
+(def-emitter simd-two-misc
+    (#b0 1 31)
+  (q 1 30)
+  (u 1 29)
+  (scalar 1 28)
+  (#b1110 4 24)
+  (size 2 22)
+  (#b10000 5 17)
+  (op 5 12)
+  (#b10 2 10)
+  (rn 5 5)
+  (rd 5 0))
+
 (define-instruction-format (simd-two-misc 32
                             :default-printer '(:name :tab rd ", " rn))
   (o1 :field (byte 1 31) :value #b0)
@@ -3227,14 +4230,21 @@
   (op2 :field (byte 5 24) :value #b01110)
   (size :field (byte 2 22))
   (op3 :field (byte 5 17) :value #b10000)
-  (op :field (byte 4 12))
+  (op :field (byte 5 12))
   (op4 :field (byte 2 10) :value #b10)
   (rn :fields (list (byte 1 30) (byte 2 22) (byte 5 5)) :type 'simd-reg)
   (rd :fields (list (byte 1 30) (byte 2 22) (byte 5 0)) :type 'simd-reg))
 
+(define-instruction-format (simd-two-misc-scalar-d 32
+                            :include simd-two-misc)
+  (q :field (byte 1 30) :value 1)
+  (op2 :field (byte 5 24) :value #b11110)
+  (rn :field (byte 5 5) :type 'simd-reg-d)
+  (rd :field (byte 5 0) :type 'simd-reg-d))
+
 (macrolet
     ((def (name u op &optional (sizes '(:8b :16b)))
-       `(define-instruction ,name (segment rd rn &optional (size :16b))
+       `(define-instruction ,name (segment rd rn size)
           (:printer simd-two-misc ((u ,u) (op ,op)))
           (:emitter
            (check-type size (member ,@sizes))
@@ -3242,19 +4252,56 @@
              (emit-simd-two-misc segment
                                  q
                                  ,u
+                                 0
                                  size
                                  ,op
                                  (fpr-offset rn)
                                  (fpr-offset rd)))))))
   (def cnt #b0 #b00101)
-  (def s-rev16 #b0 #b00001)
-  (def s-rev32 #b1 #b00000 (:8b :16b :4h :8h))
   (def rev64 #b0 #b00000 (:8b :16b :4h :8h :2s :4s))
   (def not #b1 #b00101))
 
 (macrolet
+    ((def (name q op)
+       `(define-instruction ,name (segment rd rn)
+          (:printer simd-two-misc ((q ,q) (u #b0) (op ,op)))
+          (:emitter
+           (emit-simd-two-misc segment
+                               ,q
+                               #b0
+                               0
+                               #b01
+                               ,op
+                               (fpr-offset rn)
+                               (fpr-offset rd))))))
+  (def fcvtl 0 #b10111)
+  (def fcvtl2 1 #b10111)
+  (def fcvtn 0 #b10110)
+  (def fcvtn2 1 #b10110))
+
+(macrolet
+    ((def (name u op)
+       `(define-instruction ,name (segment rd rn size)
+          (:printer simd-two-misc ((u ,u) (op ,op) (rd nil :type 'simd-reg-2x)))
+          (:emitter
+           (aver (member size '(:8b :16b :4h :8h :2s :4s)))
+           (multiple-value-bind (q size) (encode-vector-size size)
+             (emit-simd-two-misc segment
+                                 q
+                                 ,u
+                                 0
+                                 size
+                                 ,op
+                                 (fpr-offset rn)
+                                 (fpr-offset rd)))))))
+  (def saddlp #b0 #b00010)
+  (def uaddlp #b1 #b00010)
+  (def sadalp #b0 #b00110)
+  (def uadalp #b1 #b00110))
+
+(macrolet
     ((def (name u op q &optional sizes)
-       `(define-instruction ,name (segment rd rn &optional (size ,(car sizes)))
+       `(define-instruction ,name (segment rd rn size)
           (:printer simd-two-misc ((q ,q) (u ,u) (op ,op)))
           (:emitter
            (check-type size (member ,@sizes))
@@ -3263,10 +4310,15 @@
              (emit-simd-two-misc segment
                                  ,q
                                  ,u
+                                 0
                                  size
                                  ,op
                                  (fpr-offset rn)
                                  (fpr-offset rd)))))))
+  (def sqxtn #b0 #b10100 0 (:8b :4h :2s))
+  (def sqxtn2 #b0 #b10100 1 (:16b :8h :4s))
+  (def uqxtn #b1 #b10100 0 (:8b :4h :2s))
+  (def uqxtn2 #b1 #b10100 1 (:16b :8h :4s))
   (def xtn #b0 #b10010 0 (:8b :4h :2s))
   (def xtn2 #b0 #b10010 1 (:16b :8h :4s)))
 
@@ -3274,7 +4326,8 @@
   (#b0 1 31)
   (q 1 30)
   (u 1 29)
-  (#b011110 6 23)
+  (scalar 1 28)
+  (#b11110 5 23)
   (immh 4 19)
   (immb 3 16)
   (op 5 11)
@@ -3293,6 +4346,13 @@
   (op3 :field (byte 1 10) :value #b1)
   (rn :fields (list (byte 1 30) (byte 4 19) (byte 5 5)) :type 'simd-immh-reg)
   (rd :fields (list (byte 4 19) (byte 5 0)) :type 'simd-immh-reg))
+
+(define-instruction-format (simd-shift-by-imm-scalar-d 32
+                            :include simd-shift-by-imm)
+  (q :field (byte 1 30) :value 1)
+  (op2 :field (byte 6 23) :value #b111110)
+  (rn :field (byte 5 5) :type 'simd-reg-d)
+  (rd :field (byte 5 0) :type 'simd-reg-d))
 
 (macrolet
     ((def (name q u op)
@@ -3334,69 +4394,115 @@
              (emit-simd-shift-by-imm segment
                                      ,q
                                      ,u
+                                     0
                                      immh
                                      immb
                                      ,op
                                      (fpr-offset rn)
                                      (fpr-offset rd)))))))
+  (def sshll #b0 #b0 #b10100)
+  (def sshll2 #b1 #b0 #b10100)
   (def ushll #b0 #b1 #b10100)
   (def ushll2 #b1 #b1 #b10100))
 
 (macrolet
-    ((def (name u op &optional right)
-       `(define-instruction ,name (segment rd rn size shift)
+    ((def (name u op &optional right 2d q)
+       `(define-instruction ,name (segment rd rn shift size)
           ;; Conflicts with simd-modified-imm where immh=0
           ,@(loop for (size pos) in '((4 19)
                                       (3 20)
                                       (2 21)
                                       (1 22))
-                  collect
-                  `(:printer simd-shift-by-imm ((u ,u) (op ,op)
-                                                (immh #b1 :field (byte ,size ,pos))
-                                                ,@(if right
-                                                      `((shift nil :type 'simd-immh-shift-right)))
-                                                (rd nil :fields (list (byte 1 30) (byte 4 19) (byte 5 0))
-                                                        :type 'simd-immh-reg))))
+                  append
+                  `((:printer simd-shift-by-imm
+                              ((u ,u) (op ,op)
+                                      ,@(and q `((q ,q)))
+                                      (immh #b1 :field (byte ,size ,pos))
+                                      ,@(if right
+                                            `((shift nil :type 'simd-immh-shift-right)))
+                                      (rd nil :fields (list (byte 1 30) (byte 4 19) (byte 5 0))
+                                              :type 'simd-immh-reg)))
+                    ,@(unless q
+                        `((:printer simd-shift-by-imm-scalar-d
+                                    ((u ,u) (op ,op)
+                                            (immh #b1 :field (byte ,size ,pos))
+                                            ,@(if right
+                                                  `((shift nil :type 'simd-immh-shift-right)))))))))
           (:emitter
            (let ((immh 0)
                  (immb 0)
                  (q 0)
                  (shift ,(if right
                              `(ldb (byte 6 0) (- shift))
-                             `shift)))
+                             `shift))
+                 (scalar 0))
              (ecase size
-               (:8b
-                (setf immh #b1
-                      q 0))
-               (:16b
-                (setf immh #b1
-                      q 1))
-               (:4h
-                (setf immh #b10
-                      q 0))
-               (:8h
-                (setf immh #b10
-                      q 1))
-               (:2s
-                (setf immh #b100
-                      q 0))
-               (:4s
-                (setf immh #b100
-                      q 1)))
+               ,@(remove-if (lambda (x)
+                              (member (car x)
+                                      (case q
+                                        (1 '(:8b :4h :2s :d))
+                                        (0 '(:16b :8h :4s :2d)))))
+                  `((:8b
+                     (setf immh #b1
+                           q 0))
+                    (:16b
+                     (setf immh #b1
+                           q 1))
+                    (:4h
+                     (setf immh #b10
+                           q 0))
+                    (:8h
+                     (setf immh #b10
+                           q 1))
+                    (:2s
+                     (setf immh #b100
+                           q 0))
+                    (:4s
+                     (setf immh #b100
+                           q 1))
+                    (:d
+                     (setf immh #b1000
+                           q 1
+                           scalar 1))
+                    ,@(when 2d
+                        `((:2d
+                           (setf immh #b1000
+                                 q 1)))))))
              (setf immh (logior immh (ldb (byte (1- (integer-length immh)) 3) shift))
                    immb (ldb (byte 3 0) shift))
              (emit-simd-shift-by-imm segment
                                      q
                                      ,u
+                                     scalar
                                      immh
                                      immb
                                      ,op
                                      (fpr-offset rn)
                                      (fpr-offset rd)))))))
-  (def sli #b1 #b01010)
-  (def sri #b1 #b01000 t)
-  (def ushr #b1 #b00000 t)
-  (def shrn #b0 #b10000 t))
+  (def shl #b0 #b01010 nil t)
+  (def sli #b1 #b01010 nil t)
+  (def sri #b1 #b01000 t t)
+  (def sshr #b0 #b00000 t t)
+  (def shrn #b0 #b10000 t)
+  (def ssra #b0 #b00010 t t)
+  (def srshr #b0 #b00100 t t)
+  (def srsra #b0 #b00110 t t)
+  (def ushr #b1 #b00000 t t)
+  (def usra #b1 #b00010 t t)
+  (def urshr #b1 #b00100 t t)
+  (def ursra #b1 #b00110 t t)
+  (def sqshlu #b1 #b01100 nil t)
+  (def uqshrn #b1 #b10010 t t)
+  (def sqshrn #b0 #b10010 t t 0)
+  (def sqshrn2 #b0 #b10010 t t 1)
+  (def sqrshrn #b0 #b10011 t t 0)
+  (def sqrshrn2 #b0 #b10011 t t 1)
+  (def sqshrun #b1 #b10000 t t 0)
+  (def sqshrun2 #b1 #b10000 t t 1)
+  (def sqrshrun #b1 #b10001 t t 0)
+  (def sqrshrun2 #b1 #b10001 t t 1)
+  (def uqrshrn #b1 #b10011 t t 0)
+  (def uqrshrn2 #b1 #b10011 t t 1))
 
 (def-emitter simd-modified-imm
   (#b0 1 31)
@@ -3410,28 +4516,41 @@
   (defgh 5 5)
   (rd 5 0))
 
-(define-instruction-format (simd-modified-imm 32
-                            :default-printer '(:name :tab rd ", #" imm))
-  (o1 :field (byte 1 31) :value #b0)
-  (q :field (byte 1 30))
-  (op :field (byte 1 29))
-  (op2 :field (byte 10 19) :value #b0111100000)
-  (cmode :field (byte 4 12))
-  (o2 :field (byte 1 11))
-  (op3 :field (byte 1 10) :value #b1)
-  (imm :fields (list (byte 3 16) (byte 4 12) (byte 5 5)) :type 'simd-modified-imm)
-  (rd :fields (list (byte 1 30) (byte 4 12) (byte 5 0) (byte 1 29)) :type 'simd-reg-cmode))
+(defun movi-immediate-p (value &optional size)
+  (ecase size
+    ((:8b :16b :4h :8h)
+     (typep value '(unsigned-byte 8)))
+    ((:4s :2s)
+     (cond ((typep value '(unsigned-byte 8)))
+           ((typep value '(unsigned-byte 16))
+            (let ((low (ldb (byte 8 0) value)))
+              (or (zerop low)
+                  (= low #xFF))))
+           ((typep value '(unsigned-byte 24))
+            (let ((low (ldb (byte 16 0) value)))
+              (or (zerop low)
+                  (= low #xFFFF))))
+           ((typep value '(unsigned-byte 32))
+            (zerop (ldb (byte 24 0) value)))))
+    ((nil :2d)
+     (and
+      (typep (ldb (byte 8 56) value) '(member 255 0))
+      (typep (ldb (byte 8 48) value) '(member 255 0))
+      (typep (ldb (byte 8 32) value) '(member 255 0))
+      (typep (ldb (byte 8 24) value) '(member 255 0))
+      (typep (ldb (byte 8 16) value) '(member 255 0))
+      (typep (ldb (byte 8 8) value) '(member 255 0))
+      (typep (ldb (byte 8 0) value) '(member 255 0))))))
 
 (macrolet
-    ((def (name o2 op)
-       `(define-instruction ,name (segment rd imm size &optional (shift 0))
-          (:printer simd-modified-imm ((o2 ,o2)
-                                       (op ,op)))
+    ((def (name op cmodes)
+       `(define-instruction ,name (segment rd imm &optional size)
+          ,@(simd-modified-imm-printer op cmodes)
           ,@(when (eq name 'movi)
-              `((:printer simd-modified-imm ((o2 ,o2)
+              `((:printer simd-modified-imm ((o2 0)
                                              (op 1)
-                                             (cmode #b1110))
-                          '('movi :tab rd ", #" imm))))
+                                             (cmode #b1110)
+                                             (imm nil :type '64-bit-modified-imm)))))
           (:emitter
            (let ((abc 0)
                  (defgh 0)
@@ -3440,33 +4559,82 @@
              (setf abc (ldb (byte 3 5) imm)
                    defgh (ldb (byte 5 0) imm))
              (ecase size
-               ((:8b :16b)
-                (setf cmode #b1110))
+               ,@(when (eq name 'movi)
+                   `(((:8b :16b)
+                      (setf cmode #b1110))))
                ((:4h :8h)
-                (setf cmode (ecase shift
-                              (8 #b1010)
-                              (0 #b1000))))
+                (cond ((typep imm '(unsigned-byte 8))
+                       (setf cmode #b1000))
+                      ((and (typep imm '(unsigned-byte 16))
+                            (zerop (ldb (byte 8 0) imm)))
+                       (setf abc (ldb (byte 3 (+ 8 5)) imm)
+                             defgh (ldb (byte 5 8) imm))
+                       (setf cmode #b1010))
+                      (t
+                       (error "~x bad immediate" imm))))
                ((:2s :4s)
-                (setf cmode
-                      (ash (ecase shift
-                             (0 0)
-                             (8 1)
-                             (16 2)
-                             (24 3))
-                           1)))
-               ((:2d)
-                (setf op 1
-                      cmode #b1110)))
+                (or (cond ((typep imm '(unsigned-byte 8))
+                           (setf cmode #b0000))
+                          ((typep imm '(unsigned-byte 16))
+                           (let ((low (ldb (byte 8 0) imm)))
+                             (when (cond ((zerop low)
+                                          (setf cmode #b0010))
+                                         ((= low #xFF)
+                                          (setf cmode #b1100)))
+                               (setf abc (ldb (byte 3 (+ 8 5)) imm)
+                                     defgh (ldb (byte 5 8) imm)))))
+                          ((typep imm '(unsigned-byte 24))
+                           (let ((low (ldb (byte 16 0) imm)))
+                             (when (cond ((zerop low)
+                                          (setf cmode #b0100))
+                                         ((= low #xFFFF)
+                                          (setf cmode #b1101)))
+                               (setf abc (ldb (byte 3 (+ 16 5)) imm)
+                                     defgh (ldb (byte 5 16) imm)))))
+                          ((typep imm '(unsigned-byte 32))
+                           (when (zerop (ldb (byte 24 0) imm))
+                             (setf abc (ldb (byte 3 (+ 24 5)) imm)
+                                   defgh (ldb (byte 5 24) imm)
+                                   cmode #b0110))))
+                    (error "~x bad immediate" imm)))
+               ,@(when (eq name 'movi)
+                   `(((nil :2d)
+                      (let ((a (the (member 255 0) (ldb (byte 8 56) imm)))
+                            (b (the (member 255 0) (ldb (byte 8 48) imm)))
+                            (c (the (member 255 0) (ldb (byte 8 40) imm)))
+                            (d (the (member 255 0) (ldb (byte 8 32) imm)))
+                            (e (the (member 255 0) (ldb (byte 8 24) imm)))
+                            (f (the (member 255 0) (ldb (byte 8 16) imm)))
+                            (g (the (member 255 0) (ldb (byte 8 8) imm)))
+                            (h (the (member 255 0) (ldb (byte 8 0) imm))))
+                        (setf (ldb (byte 1 2) abc) a
+                              (ldb (byte 1 1) abc) b
+                              (ldb (byte 1 0) abc) c
+                              (ldb (byte 1 4) defgh) d
+                              (ldb (byte 1 3) defgh) e
+                              (ldb (byte 1 2) defgh) f
+                              (ldb (byte 1 1) defgh) g
+                              (ldb (byte 1 0) defgh) h)
+                        (setf op 1
+                              cmode #b1110))))))
              (emit-simd-modified-imm segment
-                                     (encode-vector-size size)
+                                     (if size
+                                         (encode-vector-size size)
+                                         0)
                                      op
                                      abc
                                      cmode
-                                     ,o2
+                                     0
                                      defgh
                                      (fpr-offset rd)))))))
-  (def movi 0 0)
-  (def mvni 0 1))
+
+  (def movi 0 ((0 x x 0)
+               (1 0 x 0)
+               (1 1 0 x)
+               (1 1 1 0)))
+  (def mvni 1 ((0 x x 0)
+               (1 0 x 0)
+               (1 1 0 x))))
 
 (def-emitter fp-cond-select
   (0 1 31)
@@ -3535,7 +4703,7 @@
 
 
 
-(define-instruction fcadd (segment rd rn rm &optional size (rot 90))
+(define-instruction fcadd (segment rd rn rm rot size)
   (:printer simd-three-extension ((op #b1100) (u 1))
             '(:name :tab rd ", " rn ", " rm ", #90"))
   (:printer simd-three-extension ((op #b1110) (u 1))
@@ -3552,7 +4720,7 @@
                            (fpr-offset rn)
                            (fpr-offset rd)))))
 
-(define-instruction fcmla (segment rd rn rm &optional size (rot 90))
+(define-instruction fcmla (segment rd rn rm rot size)
   (:printer simd-three-extension ((op #b1000) (u 1))
             '(:name :tab rd ", " rn ", " rm ", #0"))
   (:printer simd-three-extension ((op #b1001) (u 1))
@@ -3574,6 +4742,21 @@
                                   (270 #b1011))
                                 (fpr-offset rn)
                                 (fpr-offset rd)))))
+
+(macrolet ((def (name op u)
+             `(define-instruction ,name (segment rd rn rm size)
+                (:printer simd-three-extension ((op ,op) (u ,u)))
+                (:emitter
+                 (emit-simd-three-extension segment
+                                            (encode-vector-size size)
+                                            ,u
+                                            #b10
+                                            (fpr-offset rm)
+                                            ,op
+                                            (fpr-offset rn)
+                                            (fpr-offset rd))))))
+  (def sdot #b0010 0)
+  (def udot #b0010 1))
 
 (def-emitter simd-table
   (#b0 1 31)
@@ -3602,7 +4785,7 @@
 
 (macrolet
     ((def (name op)
-       `(define-instruction ,name (segment rd rns rm &optional (size :16b))
+       `(define-instruction ,name (segment rd rns rm size)
           (:printer simd-table ((op ,op)))
           (:emitter
            (assert (<= 1 (length rns) 4))
@@ -3652,7 +4835,7 @@
 
 (macrolet
     ((def (name op)
-       `(define-instruction ,name (segment rd rn rm &optional (size :16b))
+       `(define-instruction ,name (segment rd rn rm size)
           (:printer simd-permute ((op ,op)))
           (:emitter
            (multiple-value-bind (q size) (encode-vector-size size)
@@ -3684,6 +4867,13 @@
        (setf constant (list :fixup (cdr first))))
       (single-float (setf constant (list :single-float first)))
       (double-float (setf constant (list :double-float first)))
+      #+(and sb-simd-pack (not sb-xc-host))
+      (simd-pack
+       (setq constant
+             (list :oword (logior (%simd-pack-low first)
+                                  (ash (%simd-pack-high first) 64)))))
+      ((simple-array (unsigned-byte 8) (*))
+       (setf constant (list :byte-array first)))
       .
       #+sb-xc-host
       ((complex
@@ -3727,7 +4917,7 @@
          (cons :oword
                (logior (ash (ldb (byte 64 0) (double-float-bits (imagpart value))) 64)
                        (ldb (byte 64 0) (double-float-bits (realpart value))))))
-        ((:fixup :jump-table)
+        ((:fixup :jump-table :byte-array)
          (cons type value))))))
 
 (defun inline-constant-value (constant)
@@ -3735,11 +4925,12 @@
         (size  (ecase (car constant)
                  ((:byte :word :dword :qword) (car constant))
                  ((:fixup :jump-table) :qword)
+                 (:byte-array (length (cdr constant)))
                  ((:oword) :oword))))
     (values label (cons size label))))
 
-(defun size-nbyte (size)
-  (ecase size
+(defun size-nbyte (constant)
+  (ecase (car constant)
     (:byte  1)
     ;; These keywords are completely wrong for AARCH64 but I don't want to touch them.
     ;; The correct definitions would have :HWORD (halfword) for 2 bytes, :WORD for 4,
@@ -3747,11 +4938,12 @@
     (:word  2)
     (:dword 4)
     ((:qword :fixup :jump-table) 8)
-    (:oword 16)))
+    (:oword 16)
+    (:byte-array
+     (length (cdr constant)))))
 
 (defun sort-inline-constants (constants)
-  (stable-sort constants #'> :key (lambda (constant)
-                                    (size-nbyte (caar constant)))))
+  (stable-sort constants #'> :key (lambda (c) (size-nbyte (car c)))))
 
 (sb-assem::%def-inst-encoder
  '.layout-id
@@ -3762,9 +4954,11 @@
 (defun emit-inline-constant (section constant label)
   (let* ((type (car constant))
          (val (cdr constant))
-         (size (size-nbyte type)))
+         (size (size-nbyte constant)))
     (emit section
-          `(.align ,(integer-length (1- size)))
+          `(.align ,(if (eq type :byte-array)
+                        4
+                        (integer-length (1- size))))
           label
           (cond ((typep val '(cons (eql :layout-id)))
                  `(.layout-id ,(cadr val)))
@@ -3773,7 +4967,9 @@
                  ;; Use the DWORD emitter which knows how to emit fixups
                  `(dword ,(apply #'make-fixup val)))
                 ((eq type :jump-table)
-                 `(.lispword ,@(coerce val 'list)))
+                 `(.lispwords ,val))
+                ((eq type :byte-array)
+                 `(.bytes ,val))
                 (t
                  ;; Could add pseudo-ops for .WORD, .INT, .QUAD, .OCTA just like gcc has.
                  ;; But it works fine to emit as a sequence of bytes
@@ -3871,7 +5067,7 @@
        (inst* segment 'strb sb-vm::null-tn addr)))))
 
 (defun conditional-branch-p (stmt)
-  (and (eq (stmt-mnemonic stmt) 'b)
+  (and (eq (stmt-op stmt) 'b)
        (= (length (stmt-operands stmt)) 2)))
 
 (defpattern "cmp 0 + branch" ((subs) (b)) (stmt next)
@@ -3885,22 +5081,10 @@
           (destructuring-bind (flag label) (stmt-operands next)
             (unless (eq (sb-assem::label-comment label) :merged-ifs)
               (when (case flag
-                      (:eq
-                       (setf (stmt-mnemonic stmt) 'cbz
-                             (stmt-operands stmt)
-                             (list value label)))
-                      (:ne
-                       (setf (stmt-mnemonic stmt) 'cbnz
-                             (stmt-operands stmt)
-                             (list value label)))
-                      (:ge
-                       (setf (stmt-mnemonic stmt) 'tbz*
-                             (stmt-operands stmt)
-                             (list value (1- n-word-bits) label)))
-                      (:lt
-                       (setf (stmt-mnemonic stmt) 'tbnz*
-                             (stmt-operands stmt)
-                             (list value (1- n-word-bits) label))))
+                      (:eq (replace-stmt stmt 'cbz value label))
+                      (:ne (replace-stmt stmt 'cbnz value label))
+                      (:ge (replace-stmt stmt 'tbz* value (1- n-word-bits) label))
+                      (:lt (replace-stmt stmt 'tbnz* value (1- n-word-bits) label)))
                 (delete-stmt next)
                 next-next))))))))
 
@@ -3915,14 +5099,8 @@
                    (eq target zr-tn))
           (destructuring-bind (flag label) (stmt-operands next)
             (when (case flag
-                    (:eq
-                     (setf (stmt-mnemonic stmt) 'tbz*
-                           (stmt-operands stmt)
-                           (list value (1- (integer-length mask)) label)))
-                    (:ne
-                     (setf (stmt-mnemonic stmt) 'tbnz*
-                           (stmt-operands stmt)
-                           (list value (1- (integer-length mask)) label))))
+                    (:eq (replace-stmt stmt 'tbz* value (1- (integer-length mask)) label))
+                    (:ne (replace-stmt stmt 'tbnz* value (1- (integer-length mask)) label)))
               (delete-stmt next)
               next-next)))))))
 
@@ -3961,96 +5139,95 @@
 ;;; Tagging and applying a tagged mask can be done in one step.
 (defpattern "lsl + and -> ubfiz" ((ubfm) (and)) (stmt next)
   (destructuring-bind (dst1 src1 immr imms) (stmt-operands stmt)
-    (destructuring-bind (dst2 src2 mask) (stmt-operands next)
-      (let (tagged)
-        (when (and (location= dst1 src2)
-                   (or (setf tagged (tagged-mask-p mask))
-                       (untagged-mask-p mask))
-                   (= immr 63)
-                   (= imms 62)
-                   (stmt-delete-safe-p dst1 dst2 '(logand)))
-          (setf (stmt-mnemonic next) 'ubfm
-                (stmt-operands next) (list dst2 src1 63 (+ (logcount mask)
-                                                           (if tagged
-                                                               -1
-                                                               -2))))
-          (add-stmt-labels next (stmt-labels stmt))
-          (delete-stmt stmt)
-          next)))))
+    (destructuring-bind (dst2 src2 mask &optional vector-size) (stmt-operands next)
+      (unless vector-size
+        (let (tagged)
+          (when (and (location= dst1 src2)
+                     (or (setf tagged (tagged-mask-p mask))
+                         (untagged-mask-p mask))
+                     (= immr 63)
+                     (= imms 62)
+                     (stmt-delete-safe-p dst1 dst2 '(logand)))
+            (replace-stmt next 'ubfm dst2 src1 63 (+ (logcount mask) (if tagged -1 -2)))
+            (add-stmt-labels next (stmt-labels stmt))
+            (delete-stmt stmt)
+            next))))))
 
 ;;; Helps with SBIT
 (defpattern "and + lsl -> ubfiz" ((and) (ubfm)) (stmt next)
-  (destructuring-bind (dst1 src1 mask) (stmt-operands stmt)
-    (destructuring-bind (dst2 src2 immr imms) (stmt-operands next)
-      (when (and (location= dst1 src2)
-                 (untagged-mask-p mask)
-                 (= immr 63)
-                 (= imms 62)
-                 (stmt-delete-safe-p dst1 dst2 nil '(sb-vm::move-from-word/fixnum)))
-        (setf (stmt-mnemonic next) 'ubfm
-              (stmt-operands next) (list dst2 src1 63 (1- (logcount mask))))
-        (add-stmt-labels next (stmt-labels stmt))
-        (delete-stmt stmt)
-        next))))
+  (destructuring-bind (dst1 src1 mask &optional vector-size) (stmt-operands stmt)
+    (unless vector-size
+     (destructuring-bind (dst2 src2 immr imms) (stmt-operands next)
+       (when (and (location= dst1 src2)
+                  (untagged-mask-p mask)
+                  (= immr 63)
+                  (= imms 62)
+                  (stmt-delete-safe-p dst1 dst2 nil '(sb-vm::move-from-word/fixnum)))
+         (replace-stmt next 'ubfm dst2 src1 63 (1- (logcount mask)))
+         (add-stmt-labels next (stmt-labels stmt))
+         (delete-stmt stmt)
+         next)))))
 
 ;;; If the sign bit gets cut off it can be done with just a logical shift.
 (defpattern "asr + and -> lsr" ((sbfm) (and)) (stmt next)
   (destructuring-bind (dst1 src1 immr imms) (stmt-operands stmt)
-    (destructuring-bind (dst2 src2 mask) (stmt-operands next)
-      (when (and (location= dst1 src2)
-                 (untagged-mask-p mask)
-                 (= (integer-length mask) 63)
-                 (= immr 1)
-                 (= imms 63)
-                 (stmt-delete-safe-p dst1 dst2 '(logand)))
-        (setf (stmt-mnemonic next) 'ubfm
-              (stmt-operands next) (list dst2 src1 immr imms))
-        (add-stmt-labels next (stmt-labels stmt))
-        (delete-stmt stmt)
-        next))))
+    (destructuring-bind (dst2 src2 mask &optional vector-size) (stmt-operands next)
+      (unless vector-size
+        (when (and (location= dst1 src2)
+                   (untagged-mask-p mask)
+                   (= (integer-length mask) 63)
+                   (= immr 1)
+                   (= imms 63)
+                   (stmt-delete-safe-p dst1 dst2 '(logand)))
+          (replace-stmt next 'ubfm dst2 src1 immr imms)
+          (add-stmt-labels next (stmt-labels stmt))
+          (delete-stmt stmt)
+          next)))))
 
 ;;; Applying a tagged mask and untagging
 (defpattern "and + asr -> ubfx" ((and) (sbfm)) (stmt next)
-  (destructuring-bind (dst1 src1 mask) (stmt-operands stmt)
-    (destructuring-bind (dst2 src2 immr imms) (stmt-operands next)
-      (when (and (location= dst1 src2)
-                 (tagged-mask-p mask)
-                 (= immr 1)
-                 (= imms 63)
-                 (stmt-delete-safe-p dst1 dst2 nil '(sb-vm::move-to-word/fixnum)))
-        ;; Leave the ASR if the sign bit is left,
-        ;; but the AND is not needed.
-        (if (= (integer-length mask) 64)
-            (setf (stmt-operands next) (list dst2 src1 immr imms))
-            (setf (stmt-mnemonic next) 'ubfm
-                  (stmt-operands next) (list dst2 src1 1 (logcount mask))))
-        (add-stmt-labels next (stmt-labels stmt))
-        (delete-stmt stmt)
-        next))))
+  (destructuring-bind (dst1 src1 mask &optional vector-size) (stmt-operands stmt)
+    (unless vector-size
+      (destructuring-bind (dst2 src2 immr imms) (stmt-operands next)
+        (when (and (location= dst1 src2)
+                   (tagged-mask-p mask)
+                   (= immr 1)
+                   (= imms 63)
+                   (stmt-delete-safe-p dst1 dst2 nil '(sb-vm::move-to-word/fixnum)))
+          ;; Leave the ASR if the sign bit is left,
+          ;; but the AND is not needed.
+          (if (= (integer-length mask) 64)
+              (replace-operands next dst2 src1 immr imms)
+              (replace-stmt next 'ubfm dst2 src1 1 (logcount mask)))
+          (add-stmt-labels next (stmt-labels stmt))
+          (delete-stmt stmt)
+          next)))))
 
 (defpattern "and + and -> and" ((and) (and)) (stmt next)
-  (destructuring-bind (dst1 src1 mask1) (stmt-operands stmt)
-    (destructuring-bind (dst2 src2 mask2) (stmt-operands next)
-      (when
-          (and (location= dst1 src2)
-               (integerp mask1)
-               (integerp mask2)
-               (stmt-delete-safe-p dst1 dst2 '(logand)))
-        (let ((mask (logand mask1 mask2)))
-          (when (or (zerop mask)
-                    (encode-logical-immediate mask))
-           (if (zerop mask)
-               (setf (stmt-mnemonic next) 'orr
-                     (stmt-operands next) (list dst2 zr-tn zr-tn))
-               (setf (stmt-operands next) (list dst2 src1 mask)))
-           (add-stmt-labels next (stmt-labels stmt))
-           (delete-stmt stmt)
-           next))))))
+  (destructuring-bind (dst1 src1 mask1 &optional vector-size) (stmt-operands stmt)
+    (unless vector-size
+     (destructuring-bind (dst2 src2 mask2 &optional vector-size) (stmt-operands next)
+       (unless vector-size
+        (when
+            (and (location= dst1 src2)
+                 (integerp mask1)
+                 (integerp mask2)
+                 (stmt-delete-safe-p dst1 dst2 '(logand)))
+          (let ((mask (logand mask1 mask2)))
+            (when (or (zerop mask)
+                      (encode-logical-immediate mask))
+              (if (zerop mask)
+                  (replace-stmt next 'orr dst2 zr-tn zr-tn)
+                  (replace-operands next dst2 src1 mask))
+              (add-stmt-labels next (stmt-labels stmt))
+              (delete-stmt stmt)
+              next))))))))
 
 (defpattern "lsl + arith -> arith" ((ubfm) (add and orr eor)) (stmt next)
   (destructuring-bind (dst1 src1 immr imms) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn srcm) (stmt-operands next)
-      (when (and (/= imms 63)
+    (destructuring-bind (dst2 srcn srcm &optional vector-size) (stmt-operands next)
+      (when (and (not vector-size)
+                 (/= imms 63)
                  (= (1+ imms) immr)
                  (tn-p srcm)
                  (or
@@ -4060,18 +5237,16 @@
                  (stmt-delete-safe-p dst1 dst2
                                      '(+ sb-vm::+-mod64 sb-vm::+-modfx
                                        logand logior logxor)))
-        (setf (stmt-operands next) (list dst2 (if (location= dst1 srcm)
-                                                  srcn
-                                                  srcm)
-                                         (lsl src1 (- 63 imms))))
+        (replace-operands next dst2 (if (location= dst1 srcm) srcn srcm) (lsl src1 (- 63 imms)))
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
 
 (defpattern "asr + arith -> arith" ((sbfm) (add and orr eor)) (stmt next)
   (destructuring-bind (dst1 src1 immr imms) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn srcm) (stmt-operands next)
-      (when (and (= imms 63)
+    (destructuring-bind (dst2 srcn srcm &optional vector-size) (stmt-operands next)
+      (when (and (not vector-size)
+                 (= imms 63)
                  (tn-p srcm)
                  (or
                   (location= dst1 srcm)
@@ -4080,18 +5255,16 @@
                  (stmt-delete-safe-p dst1 dst2
                                      '(+ sb-vm::+-mod64 sb-vm::+-modfx
                                        logand logior logxor)))
-        (setf (stmt-operands next) (list dst2 (if (location= dst1 srcm)
-                                                  srcn
-                                                  srcm)
-                                         (asr src1 immr)))
+        (replace-operands next dst2 (if (location= dst1 srcm) srcn srcm) (asr src1 immr))
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
 
 (defpattern "lsl + sub -> sub" ((ubfm) (sub)) (stmt next)
   (destructuring-bind (dst1 src1 immr imms) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn srcm) (stmt-operands next)
-      (when (and (/= imms 63)
+    (destructuring-bind (dst2 srcn srcm &optional vector-size) (stmt-operands next)
+      (when (and (not vector-size)
+                 (/= imms 63)
                  (= (1+ imms) immr)
                  (tn-p srcm)
                  (location= dst1 srcm)
@@ -4099,22 +5272,23 @@
                  (stmt-delete-safe-p dst1 dst2
                                      '(- sb-vm::--mod64 sb-vm::--modfx
                                        %negate)))
-        (setf (stmt-operands next) (list dst2 srcn (lsl src1 (- 63 imms))))
+        (replace-operands next dst2 srcn (lsl src1 (- 63 imms)))
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
 
 (defpattern "asr + sub -> sub" ((sbfm) (sub)) (stmt next)
   (destructuring-bind (dst1 src1 immr imms) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn srcm) (stmt-operands next)
-      (when (and (= imms 63)
+    (destructuring-bind (dst2 srcn srcm &optional vector-size) (stmt-operands next)
+      (when (and (not vector-size)
+                 (= imms 63)
                  (tn-p srcm)
                  (location= dst1 srcm)
                  (not (location= srcn srcm))
                  (stmt-delete-safe-p dst1 dst2
                                      '(- sb-vm::--mod64 sb-vm::--modfx
                                        %negate)))
-        (setf (stmt-operands next) (list dst2 srcn (asr src1 immr)))
+        (replace-operands next dst2 srcn (asr src1 immr))
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
@@ -4123,6 +5297,7 @@
   (destructuring-bind (dst1 src1 immr1 imms1) (stmt-operands stmt)
     (destructuring-bind (dst2 src2 immr2 imms2) (stmt-operands next)
       (when (and (/= imms1 63)
+                 (fixnump imms2) ;; can be a fixup
                  (/= imms2 63)
                  (= (1+ imms1) immr1)
                  (= (1+ imms2) immr2)
@@ -4135,7 +5310,7 @@
         (let ((shift (+ (- 63 imms1)
                         (- 63 imms2))))
           (when (<= shift 63)
-            (setf (stmt-operands next) (list dst2 src1 (mod (- shift) 64) (- 63 shift)))
+            (replace-operands next dst2 src1 (mod (- shift) 64) (- 63 shift))
             (add-stmt-labels next (stmt-labels stmt))
             (delete-stmt stmt)
             next))))))
@@ -4147,8 +5322,7 @@
                  (location= dst1 src2)
                  (stmt-delete-safe-p dst1 dst2
                                      nil '(sb-vm::move-to-word/fixnum)))
-        (setf (stmt-operands next)
-              (list dst2 src1 (min (+ immr1 immr2) 63) 63))
+        (replace-operands next dst2 src1 (min (+ immr1 immr2) 63) 63)
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
@@ -4165,9 +5339,7 @@
                                         sb-vm::ash-left-mod64
                                         sb-vm::ash-left-modfx)
                                       '(sb-vm::move-from-word/fixnum)))
-             (setf (stmt-mnemonic next) 'sbfm
-                   (stmt-operands next)
-                   (list dst2 src1 immr2 imms1))
+             (replace-stmt next 'sbfm dst2 src1 immr2 imms1)
              (add-stmt-labels next (stmt-labels stmt))
              (delete-stmt stmt)
              next)
@@ -4178,9 +5350,7 @@
                                       '(ash
                                         sb-vm::ash-left-mod64
                                         sb-vm::ash-left-modfx)))
-             (setf (stmt-mnemonic next) 'sbfm
-                   (stmt-operands next)
-                   (list dst2 src1 (mod (+ immr1 immr2) 64) imms1))
+             (replace-stmt next 'sbfm dst2 src1 (mod (+ immr1 immr2) 64) imms1)
              (add-stmt-labels next (stmt-labels stmt))
              (delete-stmt stmt)
              next)))))
@@ -4188,73 +5358,64 @@
 ;;; An even number can be shifted right and then negated,
 ;;; and fixnums are even.
 (defpattern "neg + asr -> neg" ((sub) (sbfm)) (stmt next)
-  (destructuring-bind (dst1 srcn srcm) (stmt-operands stmt)
+  (destructuring-bind (dst1 srcn srcm &optional vector-size) (stmt-operands stmt)
     (destructuring-bind (dst2 src2 immr imms) (stmt-operands next)
-      (when (and (= imms 63)
+      (when (and (not vector-size)
+                 (= imms 63)
                  (= immr 1)
                  (tn-p srcm)
                  (sc-is srcm sb-vm::any-reg)
                  (location= srcn zr-tn)
                  (location= dst1 src2)
                  (stmt-delete-safe-p dst1 dst2 nil '(sb-vm::move-to-word/fixnum)))
-        (setf (stmt-mnemonic next) 'sub
-              (stmt-operands next) (list dst2 srcn (asr srcm 1)))
+        (replace-stmt next 'sub dst2 srcn (asr srcm 1))
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
 
-(defpattern "mul + sub -> msub" ((madd) (sub)) (stmt next)
-  (destructuring-bind (dst1 srcn1 srcm1 srca) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn2 srcm2) (stmt-operands next)
-      (when (and (tn-p srcm2)
+(defpattern "mul + sub -> msub" ((mul) (sub)) (stmt next)
+  (destructuring-bind (dst1 srcn1 srcm1 &optional vector-size1) (stmt-operands stmt)
+    (destructuring-bind (dst2 srcn2 srcm2 &optional vector-size2) (stmt-operands next)
+      (when (and (not vector-size1)
+                 (not vector-size2)
+                 (tn-p srcm2)
                  (location= dst1 srcm2)
-                 (location= srca zr-tn)
                  (not (location= srcn2 srcm2))
                  (stmt-delete-safe-p dst1 dst2
                                      '(- sb-vm::--mod64 sb-vm::--modfx
                                        %negate sb-vm::%negate-mod64 sb-vm::%negate-modfx)))
-        (setf (stmt-mnemonic next) 'msub
-              (stmt-operands next) (list dst2 srcn1 srcm1 srcn2))
+        (replace-stmt next 'msub dst2 srcn1 srcm1 srcn2)
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
 
-(defpattern "mul + add -> madd" ((madd) (add)) (stmt next)
-  (destructuring-bind (dst1 srcn1 srcm1 srca) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn2 srcm2) (stmt-operands next)
-      (when (and (tn-p srcm2)
-                 (location= srca zr-tn)
+(defpattern "mul + add -> madd" ((mul) (add)) (stmt next)
+  (destructuring-bind (dst1 srcn1 srcm1 &optional vector-size1) (stmt-operands stmt)
+    (destructuring-bind (dst2 srcn2 srcm2 &optional vector-size2) (stmt-operands next)
+      (when (and (not vector-size1)
+                 (not vector-size2)
+                 (tn-p srcm2)
                  (not (location= srcn2 srcm2))
                  (or (location= dst1 srcm2)
                      (location= dst1 srcn2))
                  (stmt-delete-safe-p dst1 dst2
                                      '(+ sb-vm::+-mod64 sb-vm::+-modfx)))
-        (setf (stmt-mnemonic next) 'madd
-              (stmt-operands next) (list dst2
-                                         srcn1 srcm1
-                                         (if (location= dst1 srcm2)
-                                             srcn2
-                                             srcm2)))
+        (replace-stmt next 'madd dst2 srcn1 srcm1 (if (location= dst1 srcm2) srcn2 srcm2))
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
 
-(defpattern "neg + mul -> nmul" ((sub) (madd)) (stmt next)
-  (destructuring-bind (dst1 srcn1 srcm1) (stmt-operands stmt)
-   (destructuring-bind (dst2 srcn2 srcm2 srca) (stmt-operands next)
-      (when (and (location= srca zr-tn)
+(defpattern "neg + mul -> nmul" ((sub) (mul)) (stmt next)
+  (destructuring-bind (dst1 srcn1 srcm1 &optional vector-size1) (stmt-operands stmt)
+   (destructuring-bind (dst2 srcn2 srcm2 &optional vector-size2) (stmt-operands next)
+      (when (and (not vector-size1)
+                 (not vector-size2)
                  (location= srcn1 zr-tn)
                  (tn-p srcm1)
                  (or (location= dst1 srcn2)
                      (location= dst1 srcm2))
                  (stmt-delete-safe-p dst1 dst2 '(* sb-vm::*-mod64 sb-vm::*-modfx)))
-        (setf (stmt-mnemonic next) 'msub
-              (stmt-operands next) (list dst2
-                                         srcm1
-                                         (if (location= dst1 srcm2)
-                                             srcn2
-                                             srcm2)
-                                         zr-tn))
+        (replace-stmt next 'msub dst2 srcm1 (if (location= dst1 srcm2) srcn2 srcm2) zr-tn)
         (add-stmt-labels next (stmt-labels stmt))
         (delete-stmt stmt)
         next))))
@@ -4264,57 +5425,56 @@
 (defpattern "fmul + fsub -> fmsub" ((fmul) (fsub)) (stmt next)
   (when (policy (sb-c::vop-node (sb-assem::stmt-vop stmt))
             (= sb-c::float-accuracy 0))
-    (destructuring-bind (dst1 srcn1 srcm1) (stmt-operands stmt)
-      (destructuring-bind (dst2 srcn2 srcm2) (stmt-operands next)
-        (when (and (location= dst1 srcm2)
-                   (not (location= srcn2 srcm2))
-                   (stmt-delete-safe-p dst1 dst2 '(-)))
-          (setf (stmt-mnemonic next) 'fmsub
-                (stmt-operands next) (list dst2 srcn1 srcm1 srcn2))
-          (add-stmt-labels next (stmt-labels stmt))
-          (delete-stmt stmt)
-          next)))))
+    (destructuring-bind (dst1 srcn1 srcm1 &optional vector-size1 index1) (stmt-operands stmt)
+      (unless (or vector-size1 index1)
+        (destructuring-bind (dst2 srcn2 srcm2 &optional vector-size2) (stmt-operands next)
+          (unless vector-size2
+            (when (and (location= dst1 srcm2)
+                       (not (location= srcn2 srcm2))
+                       (stmt-delete-safe-p dst1 dst2 '(-)))
+              (replace-stmt next 'fmsub dst2 srcn1 srcm1 srcn2)
+              (add-stmt-labels next (stmt-labels stmt))
+              (delete-stmt stmt)
+              next)))))))
 
 (defpattern "fmul + fadd -> fmadd" ((fmul) (fadd)) (stmt next)
   (when (policy (sb-c::vop-node (sb-assem::stmt-vop stmt))
             (= sb-c::float-accuracy 0))
-    (destructuring-bind (dst1 srcn1 srcm1) (stmt-operands stmt)
-      (destructuring-bind (dst2 srcn2 srcm2) (stmt-operands next)
-        (when (and (or (location= dst1 srcm2)
-                       (location= dst1 srcn2))
-                   (not (location= srcn2 srcm2))
-                   (stmt-delete-safe-p dst1 dst2 '(+)))
-          (setf (stmt-mnemonic next) 'fmadd
-                (stmt-operands next) (list dst2 srcn1 srcm1 (if (location= dst1 srcm2)
-                                                                srcn2
-                                                                srcm2)))
-          (add-stmt-labels next (stmt-labels stmt))
-          (delete-stmt stmt)
-          next)))))
+    (destructuring-bind (dst1 srcn1 srcm1 &optional vector-size1 index1) (stmt-operands stmt)
+      (unless (or vector-size1 index1)
+        (destructuring-bind (dst2 srcn2 srcm2 &optional vector-size2) (stmt-operands next)
+          (unless vector-size2
+            (when (and (or (location= dst1 srcm2)
+                           (location= dst1 srcn2))
+                       (not (location= srcn2 srcm2))
+                       (stmt-delete-safe-p dst1 dst2 '(+)))
+              (replace-stmt next 'fmadd dst2 srcn1 srcm1
+                            (if (location= dst1 srcm2) srcn2 srcm2))
+              (add-stmt-labels next (stmt-labels stmt))
+              (delete-stmt stmt)
+              next)))))))
 
 (defpattern "fmul + fneg -> fnmul" ((fmul) (fneg)) (stmt next)
-  (destructuring-bind (dst1 srcn1 srcm1) (stmt-operands stmt)
-    (destructuring-bind (dst2 srcn2) (stmt-operands next)
-      (when (and (location= dst1 srcn2)
-                 (stmt-delete-safe-p dst1 dst2 '(%negate)))
-        (setf (stmt-mnemonic next) 'fnmul
-              (stmt-operands next) (list dst2 srcn1 srcm1))
-        (add-stmt-labels next (stmt-labels stmt))
-        (delete-stmt stmt)
-        next))))
+  (destructuring-bind (dst1 srcn1 srcm1 &optional vector-size1 index1) (stmt-operands stmt)
+    (unless (or vector-size1 index1)
+      (destructuring-bind (dst2 srcn2 &optional vector-size2) (stmt-operands next)
+        (unless vector-size2
+          (when (and (location= dst1 srcn2)
+                     (stmt-delete-safe-p dst1 dst2 '(%negate)))
+            (replace-stmt next 'fnmul dst2 srcn1 srcm1)
+            (add-stmt-labels next (stmt-labels stmt))
+            (delete-stmt stmt)
+            next))))))
 
 (defpattern "fneg + fmul -> fnmul" ((fneg) (fmul)) (stmt next)
-  (destructuring-bind (dst1 srcn1) (stmt-operands stmt)
-   (destructuring-bind (dst2 srcn2 srcm2) (stmt-operands next)
-      (when (and (or (location= dst1 srcn2)
-                     (location= dst1 srcm2))
-                 (stmt-delete-safe-p dst1 dst2 '(*)))
-        (setf (stmt-mnemonic next) 'fnmul
-              (stmt-operands next) (list dst2
-                                         (if (location= dst1 srcm2)
-                                             srcn2
-                                             srcm2)
-                                         srcn1))
-        (add-stmt-labels next (stmt-labels stmt))
-        (delete-stmt stmt)
-        next))))
+  (destructuring-bind (dst1 srcn1 &optional vector-size1) (stmt-operands stmt)
+    (unless vector-size1
+      (destructuring-bind (dst2 srcn2 srcm2 &optional vector-size2 index2) (stmt-operands next)
+        (unless (or vector-size2 index2)
+          (when (and (or (location= dst1 srcn2)
+                         (location= dst1 srcm2))
+                     (stmt-delete-safe-p dst1 dst2 '(*)))
+            (replace-stmt next 'fnmul dst2 (if (location= dst1 srcm2) srcn2 srcm2) srcn1)
+            (add-stmt-labels next (stmt-labels stmt))
+            (delete-stmt stmt)
+            next))))))

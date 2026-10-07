@@ -223,9 +223,12 @@
   #-sb-simd-pack unused01-widetag                 ;  5E
   #+sb-simd-pack-256 simd-pack-256-widetag        ;       69
   #-sb-simd-pack-256 unused03-widetag             ;  62
-  filler-widetag                                  ;  66   6D
-  unused04-widetag                                ;  6A   71
-  unused05-widetag                                ;  6E   75
+  #+sb-simd-pack-512 simd-pack-512-widetag        ;       6D
+  #-sb-simd-pack-512 unused04-widetag             ;  66
+  #+sb-simd-pack-512 simd-pack-512-mask-widetag   ;       71
+  #-sb-simd-pack-512 unused05-widetag             ;  6A
+
+  filler-widetag                                  ;  6E   75
   unused06-widetag                                ;  72   79
   unused07-widetag                                ;  76   7D
   #-64-bit unused08-widetag                       ;  7A
@@ -311,8 +314,10 @@
     (unbound-marker-widetag "unbound-marker")
     (weak-pointer-widetag "weakptr")
     (fdefn-widetag "fdefn")
-    (simd-pack-widetag "SIMD-pack")
-    (simd-pack-256-widetag "SIMD-pack256")
+    #+sb-simd-pack (simd-pack-widetag "SIMD-pack")
+    #+sb-simd-pack-256 (simd-pack-256-widetag "SIMD-pack256")
+    #+sb-simd-pack-512 (simd-pack-512-widetag "SIMD-pack512")
+    #+sb-simd-pack-512 (simd-pack-512-mask-widetag "SIMD-pack512-mask")
     (filler-widetag "filler")
     (simple-array-widetag "simple-array")
     (simple-array-nil-widetag "simple-array-NIL")
@@ -433,11 +438,36 @@
 ;;; There are 2 symbol flag bits. The placement restrictions on these stipulate:
 ;;; - no conflict with the generation number (byte 3, low 4 bits)
 ;;; - avoid #+permgen use of byte 3 bit 7 as the "remembered" bit
-;;; - prefer that the uint16_t package ID be naturally aligned if it matters.
 ;;; Given the above:
 ;;; - for x864: byte indices 1 and 2 for the package, byte index 3 for flags so that
 ;;;   the generation byte can stay where it is
 ;;; - for others: byte indices 2 and 3 for package, byte index 1 for flags.
+
+;;; The reason for a discrepancy between x86-64 and everybody else is that
+;;; x86-64 has no penalty for unaligned access, whereas we assume otherwise
+;;; that it is required (or preferred) to use a naturally-aligned uint16_t.
+;;;
+;;; A picture is worth a thousand words:
+;;;
+;;;                       byte 3                    | bytes 1,2  | byte 0  |
+;;;      +-----+-----+-----+-----+-----+------------+------------+---------+ #+x86-64
+;;;      |     |           |     |     |            |   2 byte   |         |
+;;;      |  R  |  f  |  f  |  V  |  -  | generation | package-id | widetag |
+;;;      |     |           |     |     |  (3 bits)  |            |         |
+;;;      +-----+-----+-----+-----+-----+------------+------------+---------+
+;;;
+;;;                       bytes 2,3       |    byte 1            | byte 0  |
+;;;                 +---------------------+-----+-----+----------+---------+ #-x86-64
+;;;                 |       2 byte        |     |     |          |         |
+;;;                 |     package-id      |  f  |  f  | 6 unused | widetag |
+;;;                 |                     |     |     |   bits   |         |
+;;;                 +---------------------|-----+-----+----------+---------+
+
+;;;
+;;; - = unused
+;;; V = "Visited" bit for mark-and-sweep collector
+;;; R = "Remset" presence bit
+;;; f = flag bits
 
 ;;; A symbol that is "fast bindable" is neither constant, nor global,
 ;;; nor a global symbol-macro, nor in a locked package. Such symbols can be

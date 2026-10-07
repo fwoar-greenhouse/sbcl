@@ -237,7 +237,11 @@
                               ((type= type (specifier-type 'null))
                                '(eql 0))
                               ((cons-type-p type)
-                               '(integer 1))
+                               (multiple-value-bind (min exactp)
+                                   (sb-kernel::cons-type-length-info type)
+                                 (if exactp
+                                     `(integer ,min ,min)
+                                     `(integer ,min))))
                               (t (bug "weird type in S-T-L-M-ERROR")))
          ;; FIXME: this format control causes ugly printing.  There's
          ;; probably some ~<~@:_~> incantation that would make it
@@ -283,22 +287,28 @@
 
 (defun is-a-valid-sequence-type-specifier-p (type)
   (let ((type (specifier-type type)))
-    (or (csubtypep type (specifier-type 'list))
-        (and (csubtypep type (specifier-type 'vector))
-             (not (csubtypep type (specifier-type '(and vector (not simple-array)))))))))
+    (and (not (csubtypep type (specifier-type 'nil)))
+         (or (csubtypep type (specifier-type 'list))
+             (and (csubtypep type (specifier-type 'vector))
+                  (not (csubtypep type (specifier-type '(and vector (not simple-array))))))))))
 
-(declaim (ftype (function (sequence index) nil) signal-index-too-large-error))
-(define-error-wrapper signal-index-too-large-error (sequence index)
-  (let* ((length (length sequence))
-         (max-index (and (plusp length)
-                         (1- length))))
-    (error 'index-too-large-error
-           :datum index
-           :sequence sequence
-           :expected-type (if max-index
-                              `(integer 0 ,max-index)
-                              ;; This seems silly, is there something better?
-                              '(integer 0 (0))))))
+(declaim (ftype (function (sequence index &optional t) nil) signal-index-too-large-error))
+(define-error-wrapper signal-index-too-large-error (sequence index &optional rest)
+  (if rest
+      (error 'index-too-large-error
+             :datum index
+             :sequence rest
+             :expected-type `(integer 0 (,rest)))
+      (let* ((length (length sequence))
+             (max-index (and (plusp length)
+                             (1- length))))
+        (error 'index-too-large-error
+               :datum index
+               :sequence sequence
+               :expected-type (if max-index
+                                  `(integer 0 ,max-index)
+                                  ;; This seems silly, is there something better?
+                                  '(integer 0 (0)))))))
 
 (declaim (ftype (function (t t t) nil) sequence-bounding-indices-bad-error))
 (define-error-wrapper sequence-bounding-indices-bad-error (sequence start end)
@@ -337,17 +347,33 @@
                 (zerop (length sequence))
                 (sb-sequence:emptyp sequence)))
 
+(declaim (maybe-inline elt-list %setelt-list))
+(defun elt-list (list index)
+  (declare (explicit-check)
+           (optimize speed))
+  (prog ((result list)
+         (i index))
+     (when (typep index '(and unsigned-byte fixnum))
+       (go loop))
+   bad
+     (signal-index-too-large-error list index)
+   loop
+     (unless (listp result)
+       (go bad))
+     (if (plusp (truly-the fixnum i))
+         (psetq i (1- i)
+                result (cdr result))
+         (if (atom result)
+             (go bad)
+             (return (car result))))
+     (go loop)))
+
 (defun elt (sequence index)
   "Return the element of SEQUENCE specified by INDEX."
-  (declare (explicit-check sequence))
+  (declare (explicit-check sequence)
+           (inline elt-list))
   (seq-dispatch-checking sequence
-      (do ((count index (1- count))
-           (list sequence (cdr list)))
-          ((= count 0)
-           (if (atom list)
-               (signal-index-too-large-error sequence index)
-               (car list)))
-        (declare (type index count)))
+      (elt-list sequence index)
       (locally
           (declare (optimize (sb-c:insert-array-bounds-checks 0)))
         (when (>= index (length sequence))
@@ -355,18 +381,31 @@
         (aref sequence index))
       (sb-sequence:elt sequence index)))
 
+(defun %setelt-list (list index newval)
+  (declare (explicit-check)
+           (optimize speed))
+  (prog ((result list)
+         (i index))
+     (when (typep index '(and unsigned-byte fixnum))
+       (go loop))
+   bad
+     (signal-index-too-large-error list index)
+   loop
+     (unless (listp result)
+       (go bad))
+     (if (plusp (truly-the fixnum i))
+         (psetq i (1- i)
+                result (cdr result))
+         (if (atom result)
+             (go bad)
+             (return (setf (car result) newval))))
+     (go loop)))
+
 (defun %setelt (sequence index newval)
   "Store NEWVAL as the component of SEQUENCE specified by INDEX."
   (declare (explicit-check sequence))
   (seq-dispatch-checking sequence
-      (do ((count index (1- count))
-           (seq sequence))
-          ((= count 0) (rplaca seq newval) newval)
-        (declare (fixnum count))
-        (let ((cdr (cdr seq)))
-          (if (atom cdr)
-              (signal-index-too-large-error sequence index)
-              (setq seq cdr))))
+      (%setelt-list sequence index newval)
       (if (>= index (length sequence))
           (signal-index-too-large-error sequence index)
           (locally
@@ -378,9 +417,9 @@
   "Return an integer that is the length of SEQUENCE."
   (declare (explicit-check))
   (seq-dispatch-checking sequence
-                (length sequence)
-                (length sequence)
-                (sb-sequence:length sequence)))
+      (length sequence)
+      (length sequence)
+      (sb-sequence:length sequence)))
 
 (defun make-sequence (result-type length &key (initial-element nil iep))
   "Return a sequence of the given RESULT-TYPE and LENGTH, with
@@ -912,19 +951,23 @@ many elements are copied."
          (target-sequence target-sequence1)
          (source-sequence source-sequence2)
          (target-start start1)
-         (source-start start2)
-         (target-end (or end1 length1))
-         (source-end (or end2 length2)))
+         (source-start start2))
     (seq-dispatch-checking target-sequence
-      (seq-dispatch-checking source-sequence
-        (return-from replace (list-replace-from-list))
-        (return-from replace (list-replace-from-vector))
-        nil)
-      (seq-dispatch-checking source-sequence
-        (return-from replace (vector-replace-from-list))
-        (return-from replace (vector-replace-from-vector))
-        nil)
-      t)
+        (let ((target-end (or end1 length1)))
+          (seq-dispatch-checking source-sequence
+              (return-from replace (let ((source-end (or end2 length2)))
+                                     (list-replace-from-list)))
+              (return-from replace (let ((source-end (or end2 length2)))
+                                     (list-replace-from-vector)))
+              nil))
+        (let ((target-end (or end1 length1)))
+          (seq-dispatch-checking source-sequence
+              (return-from replace (let ((source-end (or end2 length2)))
+                                     (vector-replace-from-list)))
+              (return-from replace (let ((source-end (or end2 length2)))
+                                     (vector-replace-from-vector)))
+              nil))
+        t)
     ;; If sequence1 is an extended-sequence, we know nothing about sequence2.
     ;; If sequence1 was a list or vector, then sequence2 is an extended-sequence
     ;; or not a sequence. Either way, check it.
@@ -2545,26 +2588,6 @@ many elements are copied."
                                 (apply #'sb-sequence:remove-if-not predicate sequence args)))))
 
 ;;;; REMOVE-DUPLICATES
-
-(defun string=-hash (string)
-  (sxhash (string string)))
-
-(defun string-equal-hash (string)
-  (psxhash (string string)))
-
-(declaim (inline make-hash-table-for-duplicates))
-(defun make-hash-table-for-duplicates (fun size)
-  (cond ((or (eq fun #'eq)
-             (eq fun #'eql)
-             (eq fun #'equal)
-             (eq fun #'equalp))
-         (values (make-hash-table :test fun :size size) nil))
-        ((eq fun #'string=)
-         (make-hash-table :test #'string= :hash-function #'string=-hash  :size size))
-        ((eq fun #'string-equal)
-         (make-hash-table :test #'string-equal :hash-function #'string-equal-hash :size size))
-        ((eq fun #'=)
-         (make-hash-table :test #'= :hash-function #'psxhash :size size))))
 
 ;;; Remove duplicates from a list. If from-end, remove the later duplicates,
 ;;; not the earlier ones. Thus if we check from-end we don't copy an item

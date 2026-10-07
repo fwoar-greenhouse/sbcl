@@ -166,46 +166,35 @@
       "R8B" "R9B" "R10B" "R11B" "R12B" "R13B" "R14B" "R15B"
       "AH" "CH" "DH" "BH"))
 
-  ;; floating point registers
-  (defreg float0 0 :float)
-  (defreg float1 1 :float)
-  (defreg float2 2 :float)
-  (defreg float3 3 :float)
-  (defreg float4 4 :float)
-  (defreg float5 5 :float)
-  (defreg float6 6 :float)
-  (defreg float7 7 :float)
-  (defreg float8 8 :float)
-  (defreg float9 9 :float)
-  (defreg float10 10 :float)
-  (defreg float11 11 :float)
-  (defreg float12 12 :float)
-  (defreg float13 13 :float)
-  (defreg float14 14 :float)
-  (defreg float15 15 :float)
-  (defregset *float-regs* float0 float1 float2 float3 float4 float5 float6 float7
-             float8 float9 float10 float11 float12 float13 float14 float15)
-
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
   (defconstant  register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
-  (defconstant-eqx register-arg-names '(rdx rdi rsi) #'equal)
-  (defregset    *register-arg-offsets* rdx rdi rsi)
+  (defconstant-eqx register-arg-names '(rdi rsi rdx) #'equal)
+  (defregset    *register-arg-offsets* rdi rsi rdx)
   #-win32
   (defregset    *c-call-register-arg-offsets* rdi rsi rdx rcx r8 r9)
   #+win32
   (defregset    *c-call-register-arg-offsets* rcx rdx r8 r9)
-  (defregset *descriptor-args* rdx rdi rsi rbx rcx r8 r9 r10 r14))
+  (defregset *descriptor-args* rdx rdi rsi rbx rcx r8 r9 r10 r14)
+  (defconstant float-reg-count 16))
+
+(defglobal *128-regs* (loop with regs = *qword-regs*
+                            while regs
+                            when (let ((reg (pop regs)))
+                                   (when (eql (1+ reg) (car regs))
+                                     (pop regs)
+                                     reg))
+                            collect it))
 
 ;;;; SB definitions
 
 (!define-storage-bases
-(define-storage-base registers :finite :size 16)
+ (define-storage-base registers :finite :size 16)
 
-(define-storage-base float-registers :finite :size 16)
-
+ (define-storage-base float-registers :finite :size 32)
+ (define-storage-base mask-registers :finite :size 8)
 ;;; Start from 2, for the old RBP (aka OCFP) and return address
 (define-storage-base stack :unbounded :size 2 :size-increment 1)
 (define-storage-base constant :non-packed)
@@ -218,22 +207,7 @@
   ;; non-immediate constants in the constant pool
   (constant constant)
 
-  (fp-single-zero immediate-constant)
-  (fp-double-zero immediate-constant)
-  (fp-complex-single-zero immediate-constant)
-  (fp-complex-double-zero immediate-constant)
-
-  (fp-single-immediate immediate-constant)
-  (fp-double-immediate immediate-constant)
-  (fp-complex-single-immediate immediate-constant)
-  (fp-complex-double-immediate immediate-constant)
-
-  #+sb-simd-pack (int-sse-immediate immediate-constant)
-  #+sb-simd-pack (double-sse-immediate immediate-constant)
-  #+sb-simd-pack (single-sse-immediate immediate-constant)
-  #+sb-simd-pack-256 (int-avx2-immediate immediate-constant)
-  #+sb-simd-pack-256 (double-avx2-immediate immediate-constant)
-  #+sb-simd-pack-256 (single-avx2-immediate immediate-constant)
+  (fp-immediate immediate-constant)
   (immediate immediate-constant)
 
   ;;
@@ -246,6 +220,7 @@
   ;; the non-descriptor stacks
   (signed-stack stack)                  ; (signed-byte 64)
   (unsigned-stack stack)                ; (unsigned-byte 64)
+  (signed-128-stack stack :element-size 2)
   (character-stack stack)               ; non-descriptor characters.
   (sap-stack stack)                     ; System area pointers.
   (single-stack stack)                  ; single-floats
@@ -264,6 +239,14 @@
   (double-avx2-stack stack :element-size 4)
   #+sb-simd-pack-256
   (single-avx2-stack stack :element-size 4)
+  #+sb-simd-pack-512
+  (int-avx512-stack stack :element-size 8)
+  #+sb-simd-pack-512
+  (double-avx512-stack stack :element-size 8)
+  #+sb-simd-pack-512
+  (single-avx512-stack stack :element-size 8)
+  #+sb-simd-pack-512
+  (kmask-stack stack)
 
   ;;
   ;; things that can go in the integer registers
@@ -314,85 +297,116 @@
                 :constant-scs (immediate)
                 :save-p t
                 :alternate-scs (unsigned-stack))
-
+   (signed-128-reg registers
+    :locations #.*128-regs*
+   ; :constant-scs (immediate)
+    :element-size 2
+    :save-p t
+    :alternate-scs (signed-128-stack))
   ;; non-descriptor SINGLE-FLOATs
   (single-reg float-registers
-              :locations #.*float-regs*
-              :constant-scs (fp-single-zero fp-single-immediate)
+              :locations #.(loop for i to 15 collect i)
+              :constant-scs (fp-immediate)
               :save-p t
               :alternate-scs (single-stack))
 
   ;; non-descriptor DOUBLE-FLOATs
   (double-reg float-registers
-              :locations #.*float-regs*
-              :constant-scs (fp-double-zero fp-double-immediate)
+              :locations #.(loop for i to 15 collect i)
+              :constant-scs (fp-immediate)
               :save-p t
               :alternate-scs (double-stack))
 
   (complex-single-reg float-registers
-                      :locations #.*float-regs*
-                      :constant-scs (fp-complex-single-zero fp-complex-single-immediate)
+                      :locations #.(loop for i to 15 collect i)
+                      :constant-scs (fp-immediate)
                       :save-p t
                       :alternate-scs (complex-single-stack))
 
   (complex-double-reg float-registers
-                      :locations #.*float-regs*
-                      :constant-scs (fp-complex-double-zero fp-complex-double-immediate)
+                      :locations #.(loop for i to 15 collect i)
+                      :constant-scs (fp-immediate)
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
   ;; temporary only
   #+sb-simd-pack
   (sse-reg float-registers
-           :locations #.*float-regs*)
+           :locations #.(loop for i to 15 collect i))
   ;; regular values
   #+sb-simd-pack
   (int-sse-reg float-registers
-               :locations #.*float-regs*
-               :constant-scs (int-sse-immediate)
+               :locations #.(loop for i to 15 collect i)
+               :constant-scs (fp-immediate)
                :save-p t
                :alternate-scs (int-sse-stack))
   #+sb-simd-pack
   (double-sse-reg float-registers
-                  :locations #.*float-regs*
-                  :constant-scs (double-sse-immediate)
+                  :locations #.(loop for i to 15 collect i)
+                  :constant-scs (fp-immediate)
                   :save-p t
                   :alternate-scs (double-sse-stack))
   #+sb-simd-pack
   (single-sse-reg float-registers
-                  :locations #.*float-regs*
-                  :constant-scs (single-sse-immediate)
+                  :locations #.(loop for i to 15 collect i)
+                  :constant-scs (fp-immediate)
                   :save-p t
                   :alternate-scs (single-sse-stack))
-  (ymm-reg float-registers :locations #.*float-regs*)
-  ;; These next 3 should probably be named to YMM-{INT,SINGLE,DOUBLE}-REG
-  ;; but I think there are 3rd-party libraries that expect these names.
   #+sb-simd-pack-256
   (int-avx2-reg float-registers
-               :locations #.*float-regs*
-               :constant-scs (int-avx2-immediate)
+               :locations #.(loop for i to 15 collect i)
+               :constant-scs (fp-immediate)
                :save-p t
                :alternate-scs (int-avx2-stack))
   #+sb-simd-pack-256
   (double-avx2-reg float-registers
-                  :locations #.*float-regs*
-                  :constant-scs (double-avx2-immediate)
+                  :locations #.(loop for i to 15 collect i)
+                  :constant-scs (fp-immediate)
                   :save-p t
                   :alternate-scs (double-avx2-stack))
   #+sb-simd-pack-256
   (single-avx2-reg float-registers
-                  :locations #.*float-regs*
-                  :constant-scs (single-avx2-immediate)
+                  :locations #.(loop for i to 15 collect i)
+                  :constant-scs (fp-immediate)
                   :save-p t
                   :alternate-scs (single-avx2-stack))
+  ;; ZMM SCs use all 32 registers (16-31 require EVEX encoding)
+  #+sb-simd-pack-512
+  (int-avx512-reg float-registers
+                  :locations #.(loop for i to 31 collect i)
+                  :constant-scs (fp-immediate)
+                  :save-p t
+                  :alternate-scs (int-avx512-stack))
+  #+sb-simd-pack-512
+  (double-avx512-reg float-registers
+                     :locations #.(loop for i to 31 collect i)
+                     :constant-scs (fp-immediate)
+                     :save-p t
+                     :alternate-scs (double-avx512-stack))
+  #+sb-simd-pack-512
+  (single-avx512-reg float-registers
+                     :locations #.(loop for i to 31 collect i)
+                     :constant-scs (fp-immediate)
+                     :save-p t
+                     :alternate-scs (single-avx512-stack))
+  #+sb-simd-pack-512
+  (mask-reg          mask-registers
+                     ;; k0 is special meaning "no masking", so we can't schedule those regs for
+                     ;; normal ops. I am not sure how to best model it, this is the simplest try
+                     :locations #.(loop for i from 1 to 7 collect i)
+                     :constant-scs (fp-immediate)
+                     :save-p t
+                     :alternate-scs (kmask-stack))
 
-  (catch-block stack :element-size catch-block-size)
-  (unwind-block stack :element-size unwind-block-size)))
+ (catch-block stack :element-size catch-block-size)
+ (unwind-block stack :element-size unwind-block-size)))
 
 (defparameter *qword-sc-names*
   '(any-reg descriptor-reg sap-reg signed-reg unsigned-reg control-stack
     signed-stack unsigned-stack sap-stack single-stack
-    character-reg character-stack constant))
+    character-reg character-stack constant
+    #+sb-simd-pack-512 mask-reg
+    #+sb-simd-pack-512 kmask-stack))
 ;;; added by jrd. I guess the right thing to do is to treat floats
 ;;; as a separate size...
 ;;;
@@ -406,7 +420,15 @@
                                  int-sse-stack single-sse-stack double-sse-stack))
 #+sb-simd-pack-256
 (defparameter *hword-sc-names* '(ymm-reg int-avx2-reg single-avx2-reg double-avx2-reg
-                                   int-avx2-stack single-avx2-stack double-avx2-stack))
+                                 int-avx2-stack single-avx2-stack
+                                 double-avx2-stack))
+#+sb-simd-pack-512
+(defparameter *zword-sc-names* '(int-avx512-reg
+                                 single-avx512-reg
+                                 double-avx512-reg
+                                 int-avx512-stack
+                                 single-avx512-stack
+                                 double-avx512-stack))
 ) ; EVAL-WHEN
 (!define-storage-classes
   . #.(mapcar (lambda (class-spec)
@@ -416,6 +438,8 @@
                           (#.*oword-sc-names*   :oword)
                           #+sb-simd-pack-256
                           (#.*hword-sc-names*   :hword)
+                          #+sb-simd-pack-512
+                          (#.*zword-sc-names*   :zword)
                           (#.*qword-sc-names*   :qword)
                           (#.*float-sc-names*   :float)
                           (#.*double-sc-names*  :double)
@@ -448,19 +472,20 @@
   ;; Because there is no :OFFSET, unanticipated use will be caught.
   (defconstant-eqx rip-tn
       (make-random-tn (sc-or-lose 'unsigned-reg) nil)
-    #'constantly-t)
-  (def-fpr-tns single-reg
-      float0 float1 float2 float3 float4 float5 float6 float7
-      float8 float9 float10 float11 float12 float13 float14 float15))
+    #'constantly-t))
 
 ;;; Return true if THING is a general-purpose register TN.
 (defun gpr-tn-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'registers)))
-;;; Return true if THING is an XMM register TN.
-(defun xmm-tn-p (thing)
+
+;;; Return true if THING is a TN in the FLOAT-REGISTERS storage base.  This
+;;; includes XMM, YMM, ZMM SIMD registers, but also scalar float, double and
+;;; complex float/double, but does not include mask registers.
+(defun float-tn-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'float-registers)))
+
 ;;; Return true if THING is on the stack (in whatever storage class).
 (defun stack-tn-p (thing)
   (and (tn-p thing)
@@ -499,18 +524,12 @@
                        (not (sb-c::producing-fasl-file)))))
        immediate-sc-number))
     #+compact-instance-header (layout immediate-sc-number)
-    (single-float
-       (if (eql value 0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
-    (double-float
-       (if (eql value 0d0) fp-double-zero-sc-number fp-double-immediate-sc-number))
-    ((complex single-float)
-       (if (eql value #c(0f0 0f0))
-            fp-complex-single-zero-sc-number
-            fp-complex-single-immediate-sc-number))
-    ((complex double-float)
-       (if (eql value #c(0d0 0d0))
-            fp-complex-double-zero-sc-number
-            fp-complex-double-immediate-sc-number))
+    ((or float (complex float)
+         #+(and sb-simd-pack (not sb-xc-host)) simd-pack
+         #+(and sb-simd-pack-256 (not sb-xc-host)) simd-pack-256
+         #+(and sb-simd-pack-512 (not sb-xc-host)) simd-pack-512
+         #+(and sb-simd-pack-512 (not sb-xc-host)) simd-pack-512-mask)
+     fp-immediate-sc-number)
     ;; This case has to follow the numeric cases because proxy floating-point numbers
     ;; are host structs. Or we could implement and use something like SB-XC:TYPECASE
     (structure-object
@@ -523,19 +542,7 @@
                #-sb-xc-host (and (eq (heap-allocated-p value) :static)
                                  (< (get-lisp-obj-address value)
                                     (get-lisp-obj-address sb-lockless:+tail+))))
-       immediate-sc-number))
-    #+(and sb-simd-pack (not sb-xc-host))
-    (simd-pack
-     (typecase value
-       ((simd-pack double-float) double-sse-immediate-sc-number)
-       ((simd-pack single-float) single-sse-immediate-sc-number)
-       (t int-sse-immediate-sc-number)))
-    #+(and sb-simd-pack-256 (not sb-xc-host))
-    (simd-pack-256
-     (typecase value
-       ((simd-pack-256 double-float) double-avx2-immediate-sc-number)
-       ((simd-pack-256 single-float) single-avx2-immediate-sc-number)
-       (t int-avx2-immediate-sc-number)))))
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (eql sc immediate-sc-number))
@@ -633,19 +640,25 @@
          (offset (tn-offset tn)))
     (ecase sb
       (registers
-       (concatenate 'string
-                    (reg-name (tn-reg tn))
-                    (case (sc-name (tn-sc tn))
-                      (descriptor-reg "(d)")
-                      (any-reg "(a)")
-                      (unsigned-reg "(u)")
-                      (signed-reg "(s)")
-                      (sap-reg "(p)")
-                      (t "(?)"))))
+       (if (sc-is tn signed-128-reg)
+           (multiple-value-bind (lo hi) (128-reg-parts tn)
+             (format nil "~a/~a (s128)"
+                     (reg-name (tn-reg lo))
+                     (reg-name (tn-reg hi))))
+           (concatenate 'string
+                        (reg-name (tn-reg tn))
+                        (case (sc-name (tn-sc tn))
+                          (descriptor-reg "(d)")
+                          (any-reg "(a)")
+                          (unsigned-reg "(u)")
+                          (signed-reg "(s)")
+                          (sap-reg "(p)")
+                          (t "(?)")))))
       (float-registers (format nil "FLOAT~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed")
+      (mask-registers (format nil "K~D" offset))
       (noise (symbol-name (sc-name sc))))))
 
 (defconstant nargs-offset rcx-offset)

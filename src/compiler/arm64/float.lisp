@@ -30,10 +30,10 @@
   (storew x (current-nfp-tn vop) (tn-offset y)))
 
 (define-move-fun (load-fp-immediate 1) (vop x y)
-                 ((single-immediate) (single-reg)
-                  (double-immediate) (double-reg)
-                  (complex-single-immediate) (complex-single-reg)
-                  (complex-double-immediate) (complex-double-reg))
+                 ((fp-immediate) (single-reg)
+                  (fp-immediate) (double-reg)
+                  (fp-immediate) (complex-single-reg)
+                  (fp-immediate) (complex-double-reg))
   (let ((x (tn-value x)))
     (cond ((eql x #c(0d0 0d0))
            (inst movi y 0 :2d))
@@ -41,8 +41,29 @@
            (inst fmov y zr-tn))
           ((encode-fp-immediate x)
            (inst fmov y x))
+          ((when (and (typep x '(complex float))
+                      (eql (realpart x) (imagpart x)))
+             (let* ((real (realpart x))
+                    (vector-size (typecase real
+                                   (double-float :2d)
+                                   (t :2s))))
+               (cond ((encode-fp-immediate real)
+                      (inst fmov y real vector-size)
+                      t)
+                     ((let ((bits (if (double-float-p real)
+                                      (ldb (byte 64 0)
+                                           (double-float-bits real))
+                                      (ldb (byte 32 0)
+                                           (single-float-bits real)))))
+                        (when (movi-immediate-p bits vector-size)
+                          (inst movi y bits vector-size)
+                          t)))))))
+          ((and (typep x '(complex float))
+                (member (imagpart x) '(0f0 0d0))
+                (encode-fp-immediate (realpart x)))
+           (inst fmov y (realpart x)))
           ((block nil
-             (load-immediate-word tmp-tn (typecase x
+             (load-immediate-word tmp-tn (etypecase x
                                            (double-float
                                             (double-float-bits x))
                                            (single-float
@@ -52,8 +73,10 @@
                                                  (logior (ash (single-float-bits (imagpart x)) 32)
                                                          (ldb (byte 32 0)
                                                               (single-float-bits (realpart x))))))
-                                           (t
-                                            (return)))
+                                           ((complex double-float)
+                                            (if (eql (imagpart x) 0d0)
+                                                (double-float-bits (realpart x))
+                                                (return))))
                                   t))
            (inst fmov y tmp-tn))
           (t
@@ -172,7 +195,7 @@
     (:results (y :scs (complex-single-reg) :load-if (not (location= x y))))
     (:note "complex single float move")
     (:generator 0
-      (move-complex-double y x)))
+      (move y x :8b)))
 (define-move-vop complex-single-move :move
   (complex-single-reg) (complex-single-reg))
 
@@ -182,7 +205,7 @@
   (:results (y :scs (complex-double-reg) :load-if (not (location= x y))))
   (:note "complex double float move")
   (:generator 0
-    (move-complex-double y x)))
+    (move y x :16b)))
 (define-move-vop complex-double-move :move
   (complex-double-reg) (complex-double-reg))
 
@@ -268,7 +291,7 @@
   (:generator 2
     (sc-case y
       (complex-double-reg
-       (move-complex-double y x))
+       (move y x))
       (complex-double-stack
        (storew x nfp (tn-offset y))))))
 (define-move-vop move-complex-double-float-arg :move-arg
@@ -289,7 +312,6 @@
 (define-vop (float-op)
   (:args (x) (y))
   (:results (r))
-  (:policy :fast-safe)
   (:note "inline float arithmetic")
   (:vop-var vop)
   (:save-p :compute-only))
@@ -328,9 +350,9 @@
                       (:generator ,cdcost
                         (inst ,cinst r x y :2d)))))))
   (frob + fadd +/single-float 2 +/double-float 2
-          s-fadd +/complex-single-float 3 +/complex-double-float 3)
+          fadd +/complex-single-float 3 +/complex-double-float 3)
   (frob - fsub -/single-float 2 -/double-float 2
-          s-fsub -/complex-single-float 3 -/complex-double-float 3)
+          fsub -/complex-single-float 3 -/complex-double-float 3)
   (frob * fmul */single-float 4  */double-float 5)
   (frob / fdiv //single-float 12 //double-float 19))
 
@@ -345,31 +367,35 @@
                        (when real-complex-name
                          `(define-vop (,real-complex-name)
                             (:translate ,op)
-                            (:policy :fast-safe)
                             (:args (x :scs (,real-sc)) (y :scs (,complex-sc)))
                             (:results (r :scs (,complex-sc)))
-                            ,@(when duplicatep `((:temporary (:sc ,complex-sc) dup)))
+                            ,@(when (eq duplicatep t) `((:temporary (:sc ,complex-sc) dup)))
                             (:arg-types ,real-type ,complex-type)
                             (:result-types ,complex-type)
                             (:generator ,cost
-                               ,@(if duplicatep
-                                     `((inst zip1 dup x x ,complex-inst-size)
-                                       (inst ,inst r dup y ,complex-inst-size))
-                                     `((inst ,inst r x y ,complex-inst-size))))))
+                               ,@(cond ((integerp duplicatep)
+                                        `((inst ,inst r y x ,complex-inst-size ,duplicatep)))
+                                       (duplicatep
+                                        `((inst zip1 dup x x ,complex-inst-size)
+                                          (inst ,inst r dup y ,complex-inst-size)))
+                                       (t
+                                        `((inst ,inst r x y ,complex-inst-size)))))))
                        (when complex-real-name
                          `(define-vop (,complex-real-name)
                             (:translate ,op)
-                            (:policy :fast-safe)
                             (:args (x :scs (,complex-sc)) (y :scs (,real-sc)))
                             (:results (r :scs (,complex-sc)))
-                            ,@(when duplicatep `((:temporary (:sc ,complex-sc) dup)))
+                            ,@(when (eq duplicatep t) `((:temporary (:sc ,complex-sc) dup)))
                             (:arg-types ,complex-type ,real-type)
                             (:result-types ,complex-type)
                             (:generator ,cost
-                               ,@(if duplicatep
-                                     `((inst zip1 dup y y ,complex-inst-size)
-                                       (inst ,inst r x dup ,complex-inst-size))
-                                     `((inst ,inst r x y ,complex-inst-size)))))))))
+                              ,@(cond ((integerp duplicatep)
+                                       `((inst ,inst r x y ,complex-inst-size ,duplicatep)))
+                                      (duplicatep
+                                       `((inst zip1 dup y y ,complex-inst-size)
+                                         (inst ,inst r x dup ,complex-inst-size)))
+                                      (t
+                                       `((inst ,inst r x y ,complex-inst-size))))))))))
                `(progn
                   ,@(gen single-real-complex-name single-complex-real-name
                          'single-float 'complex-single-float
@@ -377,16 +403,16 @@
                   ,@(gen double-real-complex-name double-complex-real-name
                          'double-float 'complex-double-float
                          'double-reg 'complex-double-reg ':2d)))))
-  (frob + s-fadd 3 nil
+  (frob + fadd 3 nil
         +/real-complex-single-float +/complex-real-single-float
         +/real-complex-double-float +/complex-real-double-float)
-  (frob - s-fsub 3 nil
+  (frob - fsub 3 nil
         -/real-complex-single-float -/complex-real-single-float
         -/real-complex-double-float -/complex-real-double-float)
-  (frob * s-fmul 6 t
+  (frob * fmul 6 0
         */real-complex-single-float */complex-real-single-float
         */real-complex-double-float */complex-real-double-float)
-  (frob / s-fdiv 20 t
+  (frob / fdiv 20 t
         nil //complex-real-single-float
         nil //complex-real-double-float))
 
@@ -395,7 +421,6 @@
                 (:args (x :scs (,sc)))
                 (:results (y :scs (,sc)))
                 (:translate ,translate)
-                (:policy :fast-safe)
                 (:arg-types ,type)
                 (:result-types ,type)
                 (:note "inline float arithmetic")
@@ -408,65 +433,51 @@
   (frob abs/double-float fabs abs double-reg double-float)
   (frob %negate/single-float fneg %negate single-reg single-float)
   (frob %negate/double-float fneg %negate double-reg double-float)
-  (frob %negate/complex-single-float s-fneg %negate
+  (frob %negate/complex-single-float fneg %negate
         complex-single-reg complex-single-float :2s)
-  (frob %negate/complex-double-float s-fneg %negate
+  (frob %negate/complex-double-float fneg %negate
         complex-double-reg complex-double-float :2d))
+
+
+(deftransform conjugate ((number) (:or ((complex-double-float) *)
+                                       ((complex-single-float) *)) *
+                         :vop t)
+  t)
 
 (macrolet ((frob (name sc type real-inst-size complex-inst-size)
              `(define-vop (,name)
                 (:args (x :scs (,sc)))
                 (:results (r :scs (,sc) :from :load))
                 (:translate conjugate)
-                (:policy :fast-safe)
                 (:arg-types ,type)
                 (:result-types ,type)
                 (:generator 1
-                   (inst s-fneg r x ,complex-inst-size)
+                   (inst fneg r x ,complex-inst-size)
                    (inst ins r 0 x 0 ,real-inst-size)))))
   (frob conjugate/complex-single-float complex-single-reg complex-single-float :s :2s)
   (frob conjugate/complex-double-float complex-double-reg complex-double-float :d :2d))
 
-(macrolet ((frob (name sc type complex-inst-size real-inst-size cost swap-y)
+(macrolet ((frob (name sc type complex-inst-size cost ext-shift ext-type)
              `(define-vop (,name)
                 (:args (x :scs (,sc)) (y :scs (,sc)))
                 (:results (r :scs (,sc)))
                 (:translate *)
-                (:policy :fast-safe)
                 (:arg-types ,type ,type)
                 (:result-types ,type)
-                (:temporary (:sc ,sc) real imag swap-y)
+                (:temporary (:sc ,sc) real imag)
                 (:generator ,cost
-                   ;; We want x * y = (rx*ry - ix*iy) + (rx*iy + ix*ry)*i.
-                   ;; We separate that into x * y = real + imag where
-                   ;;   real =  rx*ry + rx*iy*i
-                   ;;   imag = -ix*iy + ix*ry*i
-                   ;; (named after the parts of x that appear in them).
-                   ;; Denote a vector which holds real part r and
-                   ;; imaginary part i as [r i].
-                   ;; Start with [ rx rx]
-                   (inst trn1 real x x ,complex-inst-size)
-                   ;;        and [-ix ix]
-                   (inst trn2 imag x x ,complex-inst-size)
-                   (inst s-fneg imag imag ,complex-inst-size)
-                   (inst ins imag 1 x 1 ,real-inst-size)
-                   ,swap-y
-                   ;; Then we compute real = [ rx*ry rx*iy]
-                   (inst s-fmul real real y ,complex-inst-size)
-                   ;;             and imag = [-ix*iy ix*ry]
-                   (inst s-fmul imag imag swap-y ,complex-inst-size)
-                   ;; and finally add those to obtain x * y.
-                   (inst s-fadd r real imag ,complex-inst-size)))))
-  (frob */complex-single-float complex-single-reg complex-single-float :2s :s 20
-        (inst rev64 swap-y y :2s))
-  (frob */complex-double-float complex-double-reg complex-double-float :2d :d 25
-        (inst ext swap-y y y 8)))
+                  (inst fmul real y x ,complex-inst-size 0)
+                  (inst fneg imag y ,complex-inst-size)
+                  (inst ext imag imag y ,ext-shift ,ext-type)
+                  (inst fmul imag imag x ,complex-inst-size 1)
+                  (inst fadd r real imag ,complex-inst-size)))))
+  (frob */complex-single-float complex-single-reg complex-single-float :2s 13 4 :8b)
+  (frob */complex-double-float complex-double-reg complex-double-float :2d 17 8 :16b))
 
 (define-vop (fsqrtd)
   (:args (x :scs (double-reg)))
   (:results (y :scs (double-reg)))
   (:translate %sqrt)
-  (:policy :fast-safe)
   (:arg-types double-float)
   (:result-types double-float)
   (:note "inline float arithmetic")
@@ -478,7 +489,6 @@
   (:args (x :scs (single-reg)))
   (:results (y :scs (single-reg)))
   (:translate %sqrtf)
-  (:policy :fast-safe)
   (:arg-types single-float)
   (:result-types single-float)
   (:note "inline float arithmetic")
@@ -490,14 +500,13 @@
 
 (define-vop (float-compare)
   (:args (x) (y))
-  (:variant-vars is-=)
-  (:policy :fast-safe)
+  (:variant-vars quiet)
   (:note "inline float comparison")
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
     (note-this-location vop :internal-error)
-    (if is-=
+    (if quiet
         (inst fcmp x y)
         (inst fcmpe x y))))
 
@@ -509,34 +518,35 @@
   (frob single-float-compare single-reg single-float)
   (frob double-float-compare double-reg double-float))
 
-(macrolet ((frob (translate cond sname dname is-=)
+(macrolet ((frob (translate cond sname dname quiet)
              `(progn
                 (define-vop (,sname single-float-compare)
                   (:translate ,translate)
                   (:conditional ,cond)
-                  (:variant ,is-=))
+                  (:variant ,quiet))
                 (define-vop (,dname double-float-compare)
                   (:translate ,translate)
                   (:conditional ,cond)
-                  (:variant ,is-=)))))
+                  (:variant ,quiet)))))
   (frob < :mi </single-float </double-float nil)
+  (frob quiet< :mi quiet</single-float quiet</double-float t)
   (frob > :gt >/single-float >/double-float nil)
   (frob <= :ls <=/single-float <=/double-float nil)
   (frob >= :ge >=/single-float >=/double-float nil)
-  (frob = :eq =/single-float =/double-float t))
+  (frob = :eq =/single-float =/double-float nil)
+  (frob quiet= :eq quiet=/single-float quiet=/double-float t))
 
 (define-vop (float-compare-zero)
   (:args (x))
   (:info y)
   (:ignore y)
-  (:variant-vars is-=)
-  (:policy :fast-safe)
+  (:variant-vars quiet)
   (:note "inline float comparison")
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 2
     (note-this-location vop :internal-error)
-    (if is-=
+    (if quiet
         (inst fcmp x 0)
         (inst fcmpe x 0))))
 
@@ -549,21 +559,23 @@
   (frob double-float-compare-zero double-reg double-float
         (double-float -0d0 0d0)))
 
-(macrolet ((frob (translate cond sname dname is-=)
+(macrolet ((frob (translate cond sname dname quiet)
              `(progn
                 (define-vop (,sname single-float-compare-zero)
                   (:translate ,translate)
                   (:conditional ,cond)
-                  (:variant ,is-=))
+                  (:variant ,quiet))
                 (define-vop (,dname double-float-compare-zero)
                   (:translate ,translate)
                   (:conditional ,cond)
-                  (:variant ,is-=)))))
+                  (:variant ,quiet)))))
   (frob < :mi </single-float-zero </double-float-zero nil)
+  (frob quiet< :mi quiet</single-float-zero quiet</double-float-zero t)
   (frob > :gt >/single-float-zero >/double-float-zero nil)
   (frob <= :ls <=/single-float-zero <=/double-float-zero nil)
   (frob >= :ge >=/single-float-zero >=/double-float-zero nil)
-  (frob = :eq =/single-float-zero =/double-float-zero t))
+  (frob = :eq =/single-float-zero =/double-float-zero nil)
+  (frob quiet= :eq quiet=/single-float-zero quiet=/double-float-zero t))
 
 (macrolet ((define-complex-float-=
                (complex-complex-name complex-real-name real-complex-name
@@ -573,35 +585,58 @@
              `(progn
                 (define-vop (,complex-complex-name)
                   (:translate =)
-                  (:args (x :scs (,complex-sc)) (y :scs (,complex-sc)))
+                  (:args (x :scs (,complex-sc))
+                         (y :scs (,complex-sc (fp-immediate
+                                               (zerop (tn-value tn))))))
                   (:arg-types ,complex-type ,complex-type)
                   (:temporary (:sc ,complex-sc) mask)
-                  (:temporary (:sc unsigned-reg) min)
-                  (:conditional :ne)
-                  (:policy :fast-safe)
+                  (:conditional :eq)
+                  (:vop-var vop)
                   (:generator 3
-                     (inst fcmeq mask x y ,float-size)
-                     (inst uminv mask mask ,byte-size)
-                     (inst umov min mask 0 :b)
-                     (inst cmp min 0)))
+                    (when (sc-is y fp-immediate)
+                      (setf y (tn-value y)))
+                    (inst fcmeq mask x y ,float-size)
+                    ,(if (eq real-type 'double-float)
+                         `(inst xtn mask mask :2s))
+                    (inst umov tmp-tn mask 0 :d)
+                    (inst cmn tmp-tn 1)))
                 (define-vop (,eql-complex-complex-name)
                   (:translate eql)
-                  (:args (x :scs (,complex-sc)) (y :scs (,complex-sc)))
+                  (:args (x :scs (,complex-sc))
+                         (y :scs (,complex-sc (fp-immediate
+                                               (member (tn-value tn) '(#c(0d0 0d0) #c(0f0 0f0)))))))
                   (:arg-types ,complex-type ,complex-type)
-                  (:temporary (:sc ,complex-sc) mask)
-                  (:temporary (:sc unsigned-reg) min)
+                  (:temporary (:sc ,complex-sc
+                                   ,@(when (eq real-type 'single-float)
+                                       `(:unused-if (and (sc-is y fp-immediate)
+                                                         (eql (tn-value y) #c(0f0 0f0))))))
+                              mask)
                   (:conditional :ne)
-                  (:policy :fast-safe)
+                  (:vop-var vop)
                   (:generator 3
-                     (inst cmeq mask x y ,byte-size)
-                     (inst uminv mask mask ,byte-size)
-                     (inst umov min mask 0 :b)
-                     (inst cmp min 0)))
+                    (when (sc-is y fp-immediate)
+                      (setf y 0))
+
+                    ,@(if (eq real-type 'double-float)
+                          `((inst cmeq mask x y ,byte-size)
+                            (inst uminv mask mask ,byte-size)
+                            (inst umov tmp-tn mask 0 :b)
+                            (inst cmp tmp-tn 0))
+                          `((cond ((eq y 0)
+                                   (inst umov tmp-tn x 0 :d)
+                                   (inst cmn tmp-tn 0)
+                                   (change-vop-flags vop '(:eq)))
+                                  (t
+                                   (inst cmeq mask x y ,byte-size)
+                                   (inst umov tmp-tn mask 0 :d)
+                                   (inst cmn tmp-tn 1)
+                                   (change-vop-flags vop '(:eq))))))))
                 (define-vop (,real-complex-name ,complex-complex-name)
                   (:args (x :scs (,real-sc)) (y :scs (,complex-sc)))
                   (:arg-types ,real-type ,complex-type))
                 (define-vop (,complex-real-name ,complex-complex-name)
-                  (:args (x :scs (,complex-sc)) (y :scs (,real-sc)))
+                  (:args (x :scs (,complex-sc)) (y :scs (,real-sc (fp-immediate
+                                                                   (zerop (tn-value tn))))))
                   (:arg-types ,complex-type ,real-type)))))
   (define-complex-float-=
       =/complex-single-float =/complex-real-single-float
@@ -620,7 +655,6 @@
                (:results (y :scs (,to-sc)))
                (:arg-types ,from-type)
                (:result-types ,to-type)
-               (:policy :fast-safe)
                (:note "inline float coercion")
                (:translate ,translate)
                (:vop-var vop)
@@ -644,7 +678,6 @@
                 (:results (y :scs (,to-sc)))
                 (:arg-types ,from-type)
                 (:result-types ,to-type)
-                (:policy :fast-safe)
                 (:note "inline float coercion")
                 (:translate ,translate)
                 (:vop-var vop)
@@ -666,7 +699,6 @@
                 (:arg-types ,from-type)
                 (:result-types signed-num)
                 (:translate ,trans)
-                (:policy :fast-safe)
                 (:note "inline float truncate")
                 (:vop-var vop)
                 (:save-p :compute-only)
@@ -691,7 +723,6 @@
   (:arg-types signed-num)
   (:result-types single-float)
   (:translate make-single-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
@@ -719,7 +750,6 @@
   (:result-types double-float)
   (:translate make-double-float)
   (:temporary (:sc unsigned-reg) temp)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (inst orr temp lo-bits (lsl hi-bits 32))
@@ -736,7 +766,6 @@
   (:arg-types signed-num)
   (:result-types double-float)
   (:translate %make-double-float)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (sc-case res
@@ -754,15 +783,13 @@
   (:arg-types single-float)
   (:result-types signed-num)
   (:translate single-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (sc-case bits
       (signed-reg
        (sc-case float
          (single-reg
-          (inst fmov bits float)
-          (inst sxtw bits bits))
+          (inst smov bits float 0 :s))
          (single-stack
           (inst ldrsw bits
                 (@ (current-nfp-tn vop)
@@ -772,12 +799,7 @@
       (signed-stack
        (sc-case float
          (single-reg
-          (storew (32-bit-reg float) (current-nfp-tn vop) (tn-offset bits)))
-         ((single-stack descriptor-reg)
-          ;; Fun and games: This also affects PPC, silently.
-          ;; Hopefully it's a non-issue, but I'd rather have the
-          ;; explicit error than a silent miscompilation.
-          (bug "Unable to extract single-float bits from ~S to ~S" float bits)))))))
+          (storew (32-bit-reg float) (current-nfp-tn vop) (tn-offset bits))))))))
 
 (define-vop (double-float-bits)
   (:args (float :scs (double-reg descriptor-reg)))
@@ -785,7 +807,6 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
@@ -806,13 +827,11 @@
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-high-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
       (double-reg
-       (inst fmov hi-bits float)
-       (inst asr hi-bits hi-bits 32))
+       (inst smov hi-bits float 1 :s))
       (double-stack
         (inst ldrsw hi-bits
               (@ (current-nfp-tn vop)
@@ -837,13 +856,11 @@
   (:arg-types double-float)
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case float
       (double-reg
-       (inst fmov lo-bits float)
-       (inst and lo-bits lo-bits (ldb (byte 32 0) -1)))
+       (inst fmov (32-bit-reg lo-bits) float))
       (double-stack
        (inst ldr (32-bit-reg lo-bits)
              (@ (current-nfp-tn vop)
@@ -873,7 +890,6 @@
   (:result-types unsigned-num)
   (:translate floating-point-modes)
   (:temporary (:sc unsigned-reg) tmp2)
-  (:policy :fast-safe)
   (:generator 3
     (inst mrs res :fpsr)
     (inst and res res (load-immediate-word tmp-tn #xf800009f))
@@ -887,7 +903,6 @@
   (:arg-types unsigned-num)
   (:result-types unsigned-num)
   (:translate (setf floating-point-modes))
-  (:policy :fast-safe)
   (:generator 3
     (inst and tmp-tn new (load-immediate-word tmp-tn #xf800009f))
     (inst msr :fpsr tmp-tn)
@@ -901,20 +916,20 @@
   (:translate complex)
   (:args (real :scs (single-reg) :target r
                :load-if (not (location= real r)))
-         (imag :scs (single-reg) :to :save))
+         (imag :scs (single-reg)))
   (:arg-types single-float single-float)
-  (:results (r :scs (complex-single-reg) :from (:argument 0)
+  (:results (r :scs (complex-single-reg)
                :load-if (not (sc-is r complex-single-stack))))
   (:result-types complex-single-float)
   (:note "inline complex single-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
       (complex-single-reg
-       (unless (eql (tn-offset r) (tn-offset real))
-         (inst s-mov r real))
-       (inst ins r 1 imag 0 :s))
+       (cond ((location= r real)
+              (inst ins r 1 imag 0 :s))
+             (t
+              (inst zip1 r real imag :2s))))
       (complex-single-stack
        (let ((nfp (current-nfp-tn vop))
              (offset (tn-offset r)))
@@ -938,14 +953,14 @@
                :load-if (not (sc-is r complex-double-stack))))
   (:result-types complex-double-float)
   (:note "inline complex double-float creation")
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (sc-case r
       (complex-double-reg
-       (unless (eql (tn-offset r) (tn-offset real))
-         (inst s-mov r real))
-       (inst ins r 1 imag 0 :d))
+       (cond ((location= r real)
+              (inst ins r 1 imag 0 :d))
+             (t
+              (inst zip1 r real imag :2d))))
       (complex-double-stack
        (let ((nfp (current-nfp-tn vop))
              (offset (tn-offset r)))
@@ -965,15 +980,15 @@
   (:results (r :scs (single-reg)))
   (:result-types single-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (sc-case x
       (complex-single-reg
-       (inst ins r 0 x (ecase slot
-                           (:real 0)
-                           (:imag 1))
-             :s))
+       (ecase slot
+         (:real
+          (move-float r x))
+         (:imag
+          (inst dup r x :s 1))))
       (complex-single-stack
        (inst ldr r
              (@ (current-nfp-tn vop)
@@ -1000,15 +1015,15 @@
   (:results (r :scs (double-reg)))
   (:result-types double-float)
   (:variant-vars slot)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (sc-case x
       (complex-double-reg
-       (inst ins r 0 x (ecase slot
-                           (:real 0)
-                           (:imag 1))
-             :d))
+       (ecase slot
+         (:real
+          (move-float r x))
+         (:imag
+          (inst dup r x :d 1))))
       (complex-double-stack
        (loadw r (current-nfp-tn vop) (+ (ecase slot (:real 0) (:imag 1))
                                         (tn-offset x)))))))
@@ -1032,7 +1047,6 @@
 (macrolet ((def (name sc type &body insts)
              `(define-vop (,name)
                 (:translate swap-complex)
-                (:policy :fast-safe)
                 (:args (x :scs (,sc)))
                 (:arg-types ,type)
                 (:results (r :scs (,sc)))
@@ -1041,11 +1055,10 @@
   (def swap-complex/complex-single-float complex-single-reg complex-single-float
     (inst rev64 r x :2s))
   (def swap-complex/complex-double-float complex-double-reg complex-double-float
-    (inst ext r x x 8)))
+    (inst ext r x x 8 :16b)))
 
 (define-vop ()
   (:translate round-double)
-  (:policy :fast-safe)
   (:args (x :scs (double-reg) :target r))
   (:arg-types double-float (:constant symbol))
   (:info mode)
@@ -1060,7 +1073,6 @@
 
 (define-vop ()
   (:translate round-single)
-  (:policy :fast-safe)
   (:args (x :scs (single-reg) :target r))
   (:arg-types single-float (:constant symbol))
   (:info mode)

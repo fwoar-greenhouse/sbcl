@@ -127,9 +127,8 @@
   (:arg-refs x-ref)
   (:vop-var vop)
   (:conditional :eq)
-  (:policy :fast-safe)
   (:translate eq)
-  (:generator 7
+  (:generator 1
     (let ((value (sc-case y
                    (immediate
                     (let ((value (tn-value y)))
@@ -162,11 +161,11 @@
              `(define-vop (,eq-name ,eql-name)
                 (:translate eq)
                 (:variant-cost ,cost))))
-  (def fast-if-eq-character fast-char=/character 3)
-  (def fast-if-eq-character/c fast-char=/character/c 2)
-  (def fast-if-eq-integer/c fast-if-eql-integer/c 2)
-  (def fast-if-eq-signed fast-if-eql/signed 5)
-  (def fast-if-eq-unsigned fast-if-eql/unsigned 5))
+  (def if-eq-character char=/character 3)
+  (def if-eq-character/c char=/character/c 2)
+  (def if-eq-integer/c if-eql-integer/c 2)
+  (def if-eq-signed if-eql/signed 5)
+  (def if-eq-unsigned if-eql/unsigned 5))
 
 (define-vop (jump-table)
   (:args (index :scs (signed-reg unsigned-reg any-reg)

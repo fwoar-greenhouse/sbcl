@@ -384,7 +384,7 @@
                                                   ,(if (eql newline :lf)
                                                        :utf-8
                                                        `'(:utf-8 :newline ,newline))
-                                                  replacement string index)))
+                                                  replacement string error-position)))
                                 (flet ((add-byte (b) (vector-push-extend b new-array)))
                                   (dotimes (i (length replacement))
                                     (add-byte (aref replacement i)))
@@ -618,8 +618,8 @@
   (def :crlf define-utf8-string/crlf utf8->string/crlf bytes-per-utf8-character/crlf simple-get-utf8-char/crlf))
 
 #+(and sb-unicode 64-bit little-endian
-       (not (or arm64 x86-64))) ;; have true simd definitions
-(defun sb-vm::simd-copy-utf8-to-character-string (start end string ibuf)
+       (not (or arm64 x86-64))) ;; have simd definitions
+(defun sb-vm::utf8-to-character-string (start end string ibuf)
   (declare (type index start end)
            (optimize speed (safety 0)))
   (with-pinned-objects (string)
@@ -663,59 +663,52 @@
       (setf (buffer-head ibuf) head)
       (truly-the index (values (truncate string-offset 4))))))
 
-#+(and sb-unicode 64-bit little-endian)
-(defun sb-vm::simd-copy-utf8-crlf-to-character-string-with-size (start end string ibuf size-buffer)
-  (declare (type index start end)
+;;; No validations
+#+(and sb-unicode 64-bit little-endian (not (or arm64 x86-64)))
+(defun sb-vm::ascii-sap-to-character-string (sap string length)
+  (declare (index length)
+           (simple-character-string string)
            (optimize speed (safety 0)))
-  (with-pinned-objects (string size-buffer)
-    (let* ((head (buffer-head ibuf))
-           (tail (buffer-tail ibuf))
-           (sap (buffer-sap ibuf))
-           (n (logand (min (- end start)
-                           (- (- tail head) 1))
-                      (- 2)))
-           (repeat (ldb (byte 16 0) #x0101010101010101))
-           (ascii-mask (* 128 repeat))
+  (with-pinned-objects (string)
+    (let* ((n (logand length (- sb-vm:n-word-bytes)))
            (string-sap (vector-sap string))
-           (size-sap (vector-sap size-buffer))
-           (size-offset start)
-           (string-offset (* start 4))
-           (end (+ head n)))
-      (declare (index string-offset size-offset))
-      (declare (optimize sb-c::preserve-single-use-debug-variables
-                         sb-c::preserve-constants))
-      (loop while (< head end)
+           (string-offset 0))
+      (declare (fixnum string-offset))
+      (loop for byte-offset below n by sb-vm:n-word-bytes
             do
-            (let ((word (sap-ref-16 sap head)))
-              (when (logtest word ascii-mask)
-                (return))
-              (cond ((= word #x0A0D)
-                     (setf (sap-ref-32 string-sap string-offset) 10
-                           (sap-ref-8 size-sap size-offset) 2)
-                     (incf head 2)
-                     (incf string-offset 4)
-                     (incf size-offset 1))
-                    ((= (ash word -8) 13)
-                     (setf (sap-ref-32 string-sap string-offset) (ldb (byte 8 0) word)
-                           (sap-ref-8 size-sap size-offset) 1)
-                     (incf head 1)
-                     (incf string-offset 4)
-                     (incf size-offset 1))
-                    (t
-                     (setf (sap-ref-64 string-sap string-offset)
-                           (dpb (ldb (byte 8 8) word)
-                                (byte 32 32)
-                                (ldb (byte 8 0) word))
-                           (sap-ref-16 size-sap size-offset) #x0101)
-                     (incf head 2)
-                     (incf string-offset 8)
-                     (incf size-offset 2)))))
-      (setf (buffer-head ibuf) head)
-      size-offset)))
+            (let ((word (sap-ref-word sap byte-offset)))
+              (setf (sap-ref-word string-sap string-offset)
+                    (dpb (ldb (byte 8 8) word)
+                         (byte 8 32)
+                         (ldb (byte 8 0) word))
+                    (sap-ref-word string-sap (+ string-offset 8))
+                    (dpb (ldb (byte 8 24) word)
+                         (byte 8 32)
+                         (ldb (byte 8 16) word))
+                    (sap-ref-word string-sap (+ string-offset 16))
+                    (dpb (ldb (byte 8 40) word)
+                         (byte 8 32)
+                         (ldb (byte 8 32) word))
+                    (sap-ref-word string-sap (+ string-offset 24))
+                    (dpb (ldb (byte 8 56) word)
+                         (byte 8 32)
+                         (ldb (byte 8 48) word))))
+            (incf string-offset (* 4 sb-vm:n-word-bytes)))
+      (loop for i from n below length
+            do (setf (aref string i)
+                     (code-char (sap-ref-8 sap i)))))))
+
+#-(and sb-unicode 64-bit little-endian)
+(defun sb-vm::ascii-sap-to-character-string (sap string length)
+  (declare (index length)
+           (simple-character-string string)
+           (optimize speed (safety 0)))
+  (loop for i below length
+        do (setf (aref string i) (code-char (sap-ref-8 sap i)))))
 
 #+(and sb-unicode 64-bit little-endian
-       (not (or arm64 x86-64))) ;; have true simd definitions
-(defun sb-vm::simd-copy-utf8-to-base-string (start end string ibuf)
+       (not (or arm64 x86-64))) ;; have simd definitions
+(defun sb-vm::utf8-to-base-string (start end string ibuf)
   (declare (type index start end)
            (optimize speed (safety 0)))
   (with-pinned-objects (string)
@@ -743,8 +736,7 @@
       (setf (buffer-head ibuf) head)
       (truly-the index string-offset))))
 
-(defmacro utf8-char-loop (&key size-buffer
-                               crlf
+(defmacro utf8-char-loop (&key crlf
                                (eof t))
   `(do ()
        ((or (= tail head)
@@ -759,19 +751,15 @@
                                  (cond ((and (<= new-head tail)
                                              (= (sap-ref-8 sap (1+ head)) 10))
                                         (incf head 2)
-                                        ,@(when size-buffer
-                                            `((setf (aref size-buffer index) 2)))
                                         10)
                                        ,@(and eof
-                                          `((eof nil)))
+                                              `((eof nil)))
                                        (t
                                         ,@(and eof
                                                `((setf requested-refill t)))
                                         (return))))))))
                 ((< byte 128)
                  (incf head)
-                 ,@(when size-buffer
-                     `((setf (aref size-buffer index) 1)))
                  byte)
                 ((< byte 194)
                  (decode-break 1))
@@ -786,8 +774,6 @@
                          (unless (<= 128 byte2 191)
                            (decode-break 2))
                          (dpb byte (byte 5 6) byte2))
-                     ,@(when size-buffer
-                         `((setf (aref size-buffer index) 2)))
                      (setf head new-head))))
                 ((< byte 240)
                  (let ((new-head (+ head 3)))
@@ -806,8 +792,6 @@
                            (decode-break 3))
                          (dpb byte (byte 4 12)
                               (dpb byte2 (byte 6 6) byte3)))
-                     ,@(when size-buffer
-                         `((setf (aref size-buffer index) 3)))
                      (setf head new-head))))
                 (t
                  (let ((new-head (+ head 4)))
@@ -829,17 +813,44 @@
                          (dpb byte (byte 3 18)
                               (dpb byte2 (byte 6 12)
                                    (dpb byte3 (byte 6 6) byte4))))
-                     ,@(when size-buffer
-                         `((setf (aref size-buffer index) 4)))
                      (setf head new-head)))))))
        (incf index))
      (setf (buffer-head ibuf) head)))
 
-(defun fd-stream-read-n-characters/utf-8 (stream string size-buffer start end &aux (index start))
+(make-defs (($newline || -crlf))
+  (defun count-utf8$newline-byte-to-chars (stream)
+    (declare (optimize speed))
+    (let* ((ibuf (fd-stream-ibuf stream))
+           (sap (buffer-sap ibuf))
+           (index (ansi-stream-char-buffer-byte-position stream))
+           (codepoint (ansi-stream-char-buffer-byte-position-at stream))
+           (target-codepoint (ansi-stream-in-index stream)))
+      (declare (index index codepoint))
+      (loop
+       (when (>= codepoint target-codepoint)
+         (return index))
+       (let ((byte (sap-ref-8 sap index))
+             ($when (eq '$newline '-crlf)
+                    (tail (buffer-tail ibuf))))
+         (cond ((< byte #x80)
+                (incf index)
+                ($when (eq '$newline '-crlf)
+                       (when (and (= byte 13)
+                                  (< index tail)
+                                  (= (sap-ref-8 sap index) 10))
+                         (incf index))))
+               ((< byte #xe0)
+                (incf index 2))
+               ((< byte #xf0)
+                (incf index 3))
+               (t
+                (incf index 4))))
+       (incf codepoint)))))
+
+(defun fd-stream-read-n-characters/utf-8 (stream string start end &aux (index start))
   (declare (type fd-stream stream)
            (type index start end index)
-           (type ansi-stream-cin-buffer string)
-           (type ansi-stream-csize-buffer size-buffer))
+           (type ansi-stream-cin-buffer string))
   (when (fd-stream-eof-forced-p stream)
     (setf (fd-stream-eof-forced-p stream) nil)
     (return-from fd-stream-read-n-characters/utf-8 start))
@@ -847,22 +858,20 @@
       ((= (fill-pointer instead) 0)
        (setf (fd-stream-listen stream) nil))
     (setf (aref string index) (vector-pop instead))
-    (setf (aref size-buffer index) 0)
     (incf index)
     (when (= end index)
       (when (= (fill-pointer instead) 0)
         (setf (fd-stream-listen stream) nil))
       (return-from fd-stream-read-n-characters/utf-8 index)))
+
   (block outer
     (do ()
         (())
+      (setf (ansi-stream-char-buffer-byte-position-start stream)
+            (setf (ansi-stream-char-buffer-byte-position stream) (buffer-head (fd-stream-ibuf stream)))
+            (ansi-stream-char-buffer-start stream) index)
       #+(and sb-unicode 64-bit little-endian)
-      (let ((new-index (sb-vm::simd-copy-utf8-to-character-string index end string (fd-stream-ibuf stream))))
-        ;; Make sure to change this 1 whenever
-        ;; simd-copy-utf8-to-character-string starts processing more than
-        ;; just ascii characters.
-        (fill size-buffer 1 :start index :end new-index)
-        (setf index new-index))
+      (setf index (sb-vm::utf8-to-character-string index end string (fd-stream-ibuf stream)))
       (let* ((ibuf (fd-stream-ibuf stream))
              (head (buffer-head ibuf))
              (tail (buffer-tail ibuf))
@@ -873,17 +882,15 @@
                  (unless (> index start)
                    (stream-decoding-error-and-handle stream reason 1))
                  (return-from outer index)))
-          (utf8-char-loop :size-buffer t
-                          :eof nil))
+          (utf8-char-loop :eof nil))
         (when (or (> index start)
                   (null (catch 'eof-input-catcher (refill-input-buffer stream))))
           (return index))))))
 
-(defun fd-stream-read-n-characters/utf-8/crlf (stream string size-buffer start end &aux (index start))
+(defun fd-stream-read-n-characters/utf-8/crlf (stream string start end &aux (index start))
   (declare (type fd-stream stream)
            (type index start end index)
-           (type ansi-stream-cin-buffer string)
-           (type ansi-stream-csize-buffer size-buffer))
+           (type ansi-stream-cin-buffer string))
   (when (fd-stream-eof-forced-p stream)
     (setf (fd-stream-eof-forced-p stream) nil)
     (return-from fd-stream-read-n-characters/utf-8/crlf start))
@@ -891,7 +898,6 @@
       ((= (fill-pointer instead) 0)
        (setf (fd-stream-listen stream) nil))
     (setf (aref string index) (vector-pop instead))
-    (setf (aref size-buffer index) 0)
     (incf index)
     (when (= end index)
       (when (= (fill-pointer instead) 0)
@@ -900,9 +906,12 @@
   (block outer
     (do ()
         (())
+      (setf (ansi-stream-char-buffer-byte-position-start stream)
+            (setf (ansi-stream-char-buffer-byte-position stream) (buffer-head (fd-stream-ibuf stream)))
+            (ansi-stream-char-buffer-start stream) index)
       #+(and sb-unicode 64-bit little-endian)
       (setf index
-            (sb-vm::simd-copy-utf8-crlf-to-character-string-with-size index end string (fd-stream-ibuf stream) size-buffer))
+            (sb-vm::utf8-crlf-to-character-string index end string (fd-stream-ibuf stream)))
       (let* ((ibuf (fd-stream-ibuf stream))
              (head (buffer-head ibuf))
              (tail (buffer-tail ibuf))
@@ -913,7 +922,7 @@
                  (unless (> index start)
                    (stream-decoding-error-and-handle stream reason 1))
                  (return-from outer index)))
-          (utf8-char-loop :size-buffer t :crlf t :eof nil))
+          (utf8-char-loop :crlf t :eof nil))
         (when (or (> index start)
                   (null (catch 'eof-input-catcher (refill-input-buffer stream))))
           (return index))))))
@@ -966,26 +975,26 @@
                    (go loop)))))
   (def fd-stream-read-sequence/utf-8-to-string
       (simple-array character (*))
-    sb-vm::simd-copy-utf8-to-character-string
+    sb-vm::utf8-to-character-string
     :lf)
   #+sb-unicode
   (def fd-stream-read-sequence/utf-8-to-base-string
     simple-base-string
-    sb-vm::simd-copy-utf8-to-base-string
+    sb-vm::utf8-to-base-string
     :lf)
   (def fd-stream-read-sequence/utf-8-crlf-to-character-string
       (simple-array character (*))
-    sb-vm::simd-copy-utf8-crlf-to-character-string
+    sb-vm::utf8-crlf-to-character-string
     :crlf)
   #+sb-unicode
   (def fd-stream-read-sequence/utf-8-crlf-to-base-string
     simple-base-string
-    sb-vm::simd-copy-utf8-crlf-to-base-string
+    sb-vm::utf8-crlf-to-base-string
     :crlf))
 
 #+(and sb-unicode 64-bit little-endian
        (not (or arm64 x86-64)))
-(defun sb-vm::simd-copy-character-string-to-utf8 (start end string obuf)
+(defun sb-vm::character-string-to-utf8 (start end string obuf)
   (declare (type index start end)
            (optimize speed (safety 0)))
   (with-pinned-objects (string)
@@ -1037,9 +1046,9 @@
           #+(and sb-unicode 64-bit little-endian)
           (when (and (typep string '(simple-array character (*)))
                      (>= (- end start) 16))
-            (multiple-value-bind (new-start newline)
-                (truly-the (values index fixnum &optional) (sb-vm::simd-copy-character-string-to-utf8 start end string obuf))
-              (setf start new-start)
+            (multiple-value-bind (read newline)
+                (truly-the (values index fixnum &optional) (sb-vm::character-string-to-utf8 start end string obuf))
+              (setf start read)
               (when (>= newline 0)
                 (setf last-newline newline))))
           (let ((len (- (buffer-length obuf) 4))
@@ -1157,7 +1166,10 @@
   :fd-stream-read-n-characters fd-stream-read-n-characters/utf-8
   :write-n-bytes-fun output-bytes/utf-8/lf
   :char-encodable-p (let ((bits (char-code |ch|))) (not (<= #xd800 bits #xdfff)))
-  :handle-size nil)
+  :read-c-string-function read-from-c-string/utf-8/lf*
+  :output-c-string-function output-to-c-string/utf-8/lf
+  :handle-size nil
+  :count-chars count-utf8-byte-to-chars)
 
 (define-external-format/variable-width (:utf-8) t
   #+sb-unicode (code-char #xfffd) #-sb-unicode #\?
@@ -1302,20 +1314,21 @@
   :char-encodable-p (let ((bits (char-code |ch|))) (not (<= #xd800 bits #xdfff)))
   :fd-stream-read-n-characters fd-stream-read-n-characters/utf-8/crlf
   :newline-variant :crlf
+  :count-chars count-utf8-crlf-byte-to-chars
   :handle-size nil)
 
 #+(and sb-unicode 64-bit little-endian
-       (not arm64)) ;; have true simd definitions or might be redefined with def-variant
-(defun sb-vm::simd-copy-utf8-crlf-to-base-string (start end string ibuf)
+       (not arm64)) ;; have simd definitions or might be redefined with def-variant
+(defun sb-vm::utf8-crlf-to-base-string (start end string ibuf)
   (declare (type index start end)
            (optimize speed (safety 0)))
   (with-pinned-objects (string)
     (let* ((head (buffer-head ibuf))
            (tail (buffer-tail ibuf))
            (sap (buffer-sap ibuf))
-           (n (logand (min (- end start)
-                           (- (- tail head) 1))
-                      (- 2)))
+           (n (logand (min (1- (- end start))
+                           (1- (- tail head)))
+                      -2))
            (repeat (ldb (byte 16 0) #x0101010101010101))
            (ascii-mask (* 128 repeat))
            (string-sap (vector-sap string))
@@ -1334,7 +1347,7 @@
                      (incf head 2)
                      (incf string-offset 1))
                     ((= (ash word -8) 13)
-                     (setf (sap-ref-8 string-sap string-offset) word)
+                     (setf (sap-ref-8 string-sap string-offset) (ldb (byte 8 0) word))
                      (incf head 1)
                      (incf string-offset 1))
                     (t
@@ -1345,17 +1358,17 @@
       (truly-the index string-offset))))
 
 #+(and sb-unicode 64-bit little-endian
-       (not arm64)) ;; have true simd definitions or might be redefined with def-variant
-(defun sb-vm::simd-copy-utf8-crlf-to-character-string (start end string ibuf)
+       (not arm64)) ;; have simd definitions or might be redefined with def-variant
+(defun sb-vm::utf8-crlf-to-character-string (start end string ibuf)
   (declare (type index start end)
            (optimize speed (safety 0)))
   (with-pinned-objects (string)
     (let* ((head (buffer-head ibuf))
            (tail (buffer-tail ibuf))
            (sap (buffer-sap ibuf))
-           (n (logand (min (- end start)
-                           (- (- tail head) 1))
-                      (- 2)))
+           (n (logand (min (1- (- end start))
+                           (1- (- tail head)))
+                      -2))
            (repeat (ldb (byte 16 0) #x0101010101010101))
            (ascii-mask (* 128 repeat))
            (string-sap (vector-sap string))
@@ -1386,3 +1399,363 @@
       (setf (buffer-head ibuf) head)
       (truly-the index (values (truncate string-offset 4))))))
 
+(defun find-bad-utf8 (sap)
+  (let* ((size 0) (head 0) (byte 0) (|ch| nil) (decode-break-reason nil))
+    (dotimes (count (1- array-dimension-limit) count)
+      (setf decode-break-reason
+            (block decode-break-reason
+              (setf byte (sap-ref-8 sap head)
+                    size
+                    (cond ((< byte 128) 1)
+                          ((< byte 194)
+                           (return-from decode-break-reason 1))
+                          ((< byte 224) 2) ((< byte 240) 3) (t 4))
+                    |ch|
+                    (code-char
+                     (ecase size
+                       (1 byte)
+                       (2
+                        (let ((byte2 (sap-ref-8 sap (1+ head))))
+                          (unless (<= 128 byte2 191)
+                            (return-from decode-break-reason 2))
+                          (dpb byte (byte 5 6) byte2)))
+                       (3
+                        (let ((byte2 (sap-ref-8 sap (1+ head)))
+                              (byte3 (sap-ref-8 sap (+ 2 head))))
+                          (unless
+                              (and (<= 128 byte2 191) (<= 128 byte3 191)
+                                   (or (/= byte 224) (<= 160 byte2 191))
+                                   (or (/= byte 237) (<= 128 byte2 159)))
+                            (return-from decode-break-reason 3))
+                          (dpb byte (byte 4 12)
+                               (dpb byte2 (byte 6 6) byte3))))
+                       (4
+                        (let ((byte2 (sap-ref-8 sap (1+ head)))
+                              (byte3 (sap-ref-8 sap (+ 2 head)))
+                              (byte4 (sap-ref-8 sap (+ 3 head))))
+                          (unless
+                              (and (<= 128 byte2 191) (<= 128 byte3 191)
+                                   (<= 128 byte4 191)
+                                   (or (/= byte 240) (<= 144 byte2 191))
+                                   (or (/= byte 244) (<= 128 byte2 143)))
+                            (return-from decode-break-reason 4))
+                          (dpb byte (byte 3 18)
+                               (dpb byte2 (byte 6 12)
+                                    (dpb byte3 (byte 6 6) byte4))))))))
+              (incf head size)
+              nil))
+      (when decode-break-reason
+        (c-string-decoding-error :utf-8 sap head decode-break-reason))
+      (when (zerop (char-code |ch|)) (return count))))
+  (error "~s modified while validating UTF-8" sap))
+
+(declaim (inline word-has-zero-or-negative-bytes))
+(defun word-has-zero-or-negative-bytes (word)
+  (declare (word word)
+           (optimize speed))
+  (let* ((ones (ldb (byte sb-vm:n-word-bits 0) #x0101010101010101))
+         (high-bits (* ones #x80)))
+    (logtest (logior (logandc2 (- word ones) word) word)
+             high-bits)))
+
+(declaim (inline word-aligned-sap-p))
+(defun word-aligned-sap-p (sap)
+  (declare (system-area-pointer sap)
+           (optimize speed))
+  (zerop (rem (sap-int sap) sb-vm:n-word-bytes)))
+
+#-arm64
+(defun sb-vm::utf8-strlen (sap)
+  (declare (type system-area-pointer sap)
+           (optimize speed (safety 0)))
+  (macrolet ((return-if-not-cont (x)
+               `(let ((x ,x))
+                  (unless (<= #x80 x #xBF)
+                    (return (values nil 0)))
+                  x)))
+    (let ((index 0))
+      (declare (fixnum index))
+      ;; SWAR for ASCII
+      (when (word-aligned-sap-p sap)
+        (loop until (word-has-zero-or-negative-bytes (sap-ref-word sap index))
+              do (incf index sb-vm:n-word-bytes)))
+      ;; Scalar loop for ASCII
+      (loop
+       (let ((b0 (sap-ref-8 sap index)))
+         (cond ((< b0 #x80)
+                (when (zerop b0)
+                  (return-from sb-vm::utf8-strlen (values index index t)))
+                (incf index 1))
+               (t
+                (return)))))
+      (let ((codepoints index))
+        (declare (fixnum codepoints))
+        (loop
+         (let ((b0 (sap-ref-8 sap index)))
+           (cond
+             ;; ASCII
+             ((< b0 #x80)
+              (when (zerop b0)
+                (return (values codepoints index nil)))
+              (incf index 1))
+             ;; 2 bytes
+             ((<= #xC2 b0 #xDF)
+              (return-if-not-cont (sap-ref-8 sap (+ index 1)))
+              (incf index 2))
+
+             ;; 3 bytes
+             ((<= #xE0 b0 #xEF)
+              (let ((b1 (return-if-not-cont (sap-ref-8 sap (+ index 1))))
+                    (b2 (return-if-not-cont (sap-ref-8 sap (+ index 2)))))
+                (declare (ignore b2))
+                (unless (if (= b0 #xE0)
+                            (<= #xA0 b1 #xBF) ; Overlong
+                            (if (= b0 #xED)
+                                (<= #x80 b1 #x9F) ; Surrogate halves
+                                t))
+                  (return (values nil 0 nil))))
+              (incf index 3))
+             ;; 4 bytes
+             ((<= #xF0 b0 #xF4)
+              (let ((b1 (return-if-not-cont (sap-ref-8 sap (+ index 1))))
+                    (b2 (return-if-not-cont (sap-ref-8 sap (+ index 2))))
+                    (b3 (return-if-not-cont (sap-ref-8 sap (+ index 3)))))
+                (declare (ignore b2 b3))
+                (unless (if (= b0 #xF0)
+                            (<= #x90 b1 #xBF) ; Overlong
+                            (if (= b0 #xF4)
+                                (<= #x80 b1 #x8F) ; Too Large
+                                t))
+                  (return (values nil 0 nil))))
+              (incf index 4))
+             (t (return (values nil 0 nil)))))
+         (incf codepoints))))))
+
+
+;;; An entry point with boxed SAP for putting inside ef-read-c-string-fun
+(defun read-from-c-string/utf-8/lf* (sap element-type)
+  (read-from-c-string/utf-8/lf sap element-type))
+
+#-arm64
+(defun sb-vm::utf8-sap-to-character-string (sap string byte-length)
+  (declare (optimize speed (safety 0))
+           (type system-area-pointer sap)
+           (type index byte-length)
+           (type (simple-array character (*)) string))
+  (let ((byte-index 0)
+        (char-index 0))
+    (declare (type fixnum byte-index char-index))
+    (loop while (< byte-index byte-length)
+          do
+          (let ((b0 (sap-ref-8 sap byte-index)))
+            (cond
+              ((< b0 #x80)
+               (setf (schar string char-index) (code-char b0))
+               (incf byte-index 1))
+              ((< b0 #xE0)
+               (let ((b1 (sap-ref-8 sap (+ byte-index 1))))
+                 (setf (schar string char-index)
+                       (code-char (dpb b0 (byte 5 6) b1)))
+                 (incf byte-index 2)))
+              ((< b0 #xF0)
+               (let ((b1 (sap-ref-8 sap (+ byte-index 1)))
+                     (b2 (sap-ref-8 sap (+ byte-index 2))))
+                 (setf (schar string char-index)
+                       (code-char (dpb b0 (byte 4 12)
+                                       (dpb b1 (byte 6 6) b2))))
+                 (incf byte-index 3)))
+              (t
+               (let ((b1 (sap-ref-8 sap (+ byte-index 1)))
+                     (b2 (sap-ref-8 sap (+ byte-index 2)))
+                     (b3 (sap-ref-8 sap (+ byte-index 3))))
+                 (setf (schar string char-index)
+                       (code-char (dpb b0 (byte 3 18)
+                                       (dpb b1 (byte 6 12)
+                                            (dpb b2 (byte 6 6) b3)))))
+                 (incf byte-index 4)))))
+          (incf char-index))))
+
+(defun read-from-c-string/utf-8/lf (sap element-type)
+  (declare (type system-area-pointer sap)
+           (optimize (speed 3) (safety 0)))
+  (multiple-value-bind (char-length byte-length all-ascii) (sb-vm::utf8-strlen sap)
+    (unless char-length
+      (find-bad-utf8 sap))
+    (let ((string
+            (case element-type
+              (base-char (make-string char-length :element-type 'base-char))
+              (character (make-string char-length :element-type 'character))
+              (t (make-string char-length :element-type element-type)))))
+      (if all-ascii
+          (cond ((typep string '(array character))
+                 (sb-vm::ascii-sap-to-character-string sap string char-length))
+                (t
+                 (with-pinned-objects (string)
+                   (sb-impl::memcpy (vector-sap string) sap char-length))))
+          (sb-vm::utf8-sap-to-character-string sap string byte-length))
+      string)))
+
+(declaim (ftype (sfunction ((simple-array character (*))) nil)
+                check-utf8-encoding))
+(defun check-utf8-encoding (string)
+  (loop for char across string
+        for code = (char-code char)
+        when (<= #xd800 code #xdfff)
+        do
+        (c-string-encoding-error string code))
+  (error "~s modified while validating UTF-8" string))
+
+(declaim (ftype (sfunction ((simple-array character (*))) (values (or null index) t))
+                character-string-utf8-length))
+#-arm64
+(defun character-string-utf8-length (string)
+  (let* ((string-length (length string))
+         (index 0))
+    (declare (index index))
+    #+64-bit
+    (let ((word-length (truncate string-length 2)))
+      ;; SWAR ASCII
+      (loop until (or (>= index word-length)
+                      (logtest (%vector-raw-bits string index) #xFFFFFF80FFFFFF80))
+            do (incf index)))
+    (let ((index (* index 2)))
+      (declare (index index))
+      ;; ASCII-only
+      (loop when (>= index string-length)
+            do (return-from character-string-utf8-length (values index t))
+            until (> (char-code (char string index)) 127)
+            do (incf index))
+      (let ((length index))
+        (declare (index length))
+        (loop until (>= index string-length)
+              do
+              (let ((bits (char-code (char string index))))
+                (incf length
+                      (cond ((< bits 128) 1)
+                            ((< bits 2048) 2)
+                            ((< bits 65536)
+                             (when (<= #xd800 bits #xdfff)
+                               (return-from character-string-utf8-length (values nil nil)))
+                             3)
+                            (t 4)))
+                (incf index)))
+        (values length nil)))))
+
+#-arm64
+(defun sb-vm::character-string-to-ascii-byte-array (byte-array string length)
+  (declare (index length)
+           (simple-character-string string)
+           ((simple-array (unsigned-byte 8) (*)) byte-array)
+           (optimize speed (safety 0)))
+  (let ((byte-index 0))
+    (declare (index byte-index))
+    ;; SWAR ASCII
+    #+64-bit
+    (with-pinned-objects (byte-array)
+      (let ((sap (vector-sap byte-array))
+            (word-length (truncate length 2))
+            (index 0))
+        (declare (index index))
+        (loop until (>= index word-length)
+              do (let* ((word (%vector-raw-bits string index))
+                        (a (ldb (byte 8 0) word))
+                        (b (ash word -24)))
+                   (setf (sap-ref-16 sap (* index 2))
+                         (logior a b)))
+
+                 (incf index)
+                 (incf byte-index 2))))
+    (loop for i from byte-index below length
+          do (setf (aref byte-array i)
+                   (logand (char-code (aref string i)) #xFF)))))
+
+#-little-endian
+(defun sb-vm::character-string-to-utf8-byte-array (byte-array string length)
+  (declare ((simple-array character (*)) string)
+           ((simple-array (unsigned-byte 8) (*)) byte-array)
+           (optimize speed (safety 0)))
+  (declare (ignore length))
+  (let ((index 0))
+    (declare (index index))
+    (with-pinned-objects (byte-array)
+      (loop with sap = (vector-sap byte-array)
+            for char across string
+            for bits = (char-code char)
+            do (cond ((< bits 128)
+                      (setf (aref byte-array index) bits)
+                      (incf index))
+                     ((< bits 2048)
+                      (setf (aref byte-array (+ 1 index)) (logior 128 (ldb (byte 6 0) bits))
+                            (aref byte-array index) (logior 192 (ldb (byte 5 6) bits)))
+                      (incf index 2))
+                     ((< bits 65536)
+                      (setf (aref byte-array (+ 2 index)) (logior 128 (ldb (byte 6 0) bits))
+                            (aref byte-array (+ 1 index)) (logior 128 (ldb (byte 6 6) bits))
+                            (aref byte-array index) (logior 224 (ldb (byte 4 12) bits)))
+                      (incf index 3))
+                     (t
+                      (setf (aref byte-array (+ 3 index)) (logior 128 (ldb (byte 6 0) bits))
+                            (aref byte-array (+ 2 index)) (logior 128 (ldb (byte 6 6) bits))
+                            (aref byte-array (+ 1 index)) (logior 128 (ldb (byte 6 12) bits))
+                            (aref byte-array index) (logior 240 (ldb (byte 3 18) bits)))
+                      (incf index 4)))))))
+
+#+(and little-endian (not arm64))
+(defun sb-vm::character-string-to-utf8-byte-array (byte-array string length)
+  (declare ((simple-array character (*)) string)
+           ((simple-array (unsigned-byte 8) (*)) byte-array)
+           (optimize speed (safety 0)))
+  (declare (ignore length))
+  (let ((index 0))
+    (declare (index index))
+    (with-pinned-objects (byte-array)
+      (loop with sap = (vector-sap byte-array)
+            for char across string
+            for bits = (char-code char)
+            do (cond ((< bits 128)
+                      (setf (aref byte-array index) bits)
+                      (incf index))
+                     ((< bits 2048)
+                      (setf (sap-ref-16 sap index)
+                            (logior
+                             #x80C0
+                             (dpb (ldb (byte 6 0) bits)
+                                  (byte 8 8)
+                                  (ldb (byte 5 6) bits))))
+                      (incf index 2))
+                     ((< bits 65536)
+                      (setf (sap-ref-16 sap (1+ index))
+                            (logior
+                             #x8080
+                             (dpb (ldb (byte 6 0) bits)
+                                  (byte 8 8)
+                                  (ldb (byte 6 6) bits))))
+                      (setf (aref byte-array index) (logior 224 (ldb (byte 4 12) bits)))
+                      (incf index 3))
+                     (t
+                      (setf (sap-ref-32 sap index)
+                            (logior
+                             #x808080F0
+                             (dpb (ldb (byte 6 0) bits)
+                                  (byte 8 24)
+                                  (dpb (ldb (byte 6 6) bits)
+                                       (byte 8 16)
+                                       (dpb (ldb (byte 6 12) bits)
+                                            (byte 8 8)
+                                            (ldb (byte 3 18) bits))))))
+                      (incf index 4)))))))
+
+(defun output-to-c-string/utf-8/lf (string)
+  (declare (type simple-string string)
+           (optimize speed (safety 0)))
+  (cond ((base-string-p string) string)
+        (t
+         (multiple-value-bind (buffer-length ascii-only) (character-string-utf8-length string)
+           (unless buffer-length
+             (check-utf8-encoding string))
+           (let ((buffer (make-array (1+ buffer-length) :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)))
+             (if ascii-only
+                 (sb-vm::character-string-to-ascii-byte-array buffer string buffer-length)
+                 (sb-vm::character-string-to-utf8-byte-array buffer string buffer-length))
+             buffer)))))

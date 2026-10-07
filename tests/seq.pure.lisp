@@ -416,8 +416,7 @@
 
 (with-test (:name :&more-elt-index-too-large)
   (checked-compile-and-assert
-      (:optimize `(:filter ,(lambda (&key safety &allow-other-keys)
-                              (= safety 3))))
+      (:optimize :safe)
       `(lambda (&rest args)
          (elt args 0))
     (() (condition 'sb-kernel:index-too-large-error))))
@@ -1137,3 +1136,19 @@
      ((v '(1 2)) v)
      ((v #(2 3)) v)
      ((v #9*1) v))))
+
+(with-test (:name :elt-constants-type)
+  (assert-type
+   (lambda (x n)
+     (elt (if x
+              #(1 2)
+              '(1 3))
+          n))
+   (integer 1 3)))
+
+(with-test (:name :concatenate-string-char)
+  (assert (equal
+           (ctu:ir1-named-calls
+            `(lambda (i)
+               (concatenate 'base-string (string (code-char i)))))
+           '(sb-kernel:%concatenate-to-base-string-subseq))))

@@ -16,18 +16,43 @@
   (let (single-mov
         ffff-count
         zero-count
-        (val (ldb (byte 64 0) val)))
-    (flet ((single-mov ()
-             (loop for i below 64 by 16
-                   for part = (ldb (byte 16 i) val)
-                   count (/= part #xFFFF) into ffff
-                   count (plusp part) into zero
-                   finally
-                   (setf ffff-count ffff
-                         zero-count zero
-                         single-mov (or (= ffff 1)
-                                        (= zero 1))))
-             single-mov))
+        (val (ldb (byte 64 0) val))
+        (descriptorp (logbitp (tn-offset y) #.(sb-c::sc-locations (sc-or-lose 'descriptor-reg)))))
+    (labels ((single-mov ()
+               (loop for i below 64 by 16
+                     for part = (ldb (byte 16 i) val)
+                     count (/= part #xFFFF) into ffff
+                     count (plusp part) into zero
+                     finally
+                     (setf ffff-count ffff
+                           zero-count zero
+                           single-mov (or (= ffff 1)
+                                          (= zero 1))))
+               single-mov)
+             (gc-safe-p (x)
+               (or (not descriptorp)
+                   (not (logtest x fixnum-tag-mask))))
+             (emit-eor (base mask)
+               (when (encode-logical-immediate base)
+                 (cond ((gc-safe-p base)
+                        (inst orr y zr-tn base)
+                        (inst eor y y mask)
+                        t)
+                       ((gc-safe-p mask)
+                        (inst orr y zr-tn mask)
+                        (inst eor y y base)
+                        t))))
+             (load-low32 (w)
+               (let ((w (ldb (byte 32 0) w)))
+                 (cond ((encode-logical-immediate w 32)
+                        (inst orr (32-bit-reg y) wzr-tn w)
+                        t)
+                       ((zerop (ldb (byte 16 0) (lognot w)))
+                        (inst movn (32-bit-reg y) (ldb (byte 16 16) (lognot w)) 16)
+                        t)
+                       ((zerop (ldb (byte 16 16) (lognot w)))
+                        (inst movn (32-bit-reg y) (ldb (byte 16 0) (lognot w)))
+                        t)))))
       (cond ((typep val '(unsigned-byte 16))
              (inst movz y val)
              y)
@@ -38,84 +63,116 @@
              (inst orr y zr-tn val)
              y)
             ((and (typep val '(unsigned-byte 32))
-                  (cond ((encode-logical-immediate val 32)
-                         (inst orr (32-bit-reg y) wzr-tn val)
-                         t)
-                        ((zerop (ldb (byte 16 0) (lognot val)))
-                         (inst movn (32-bit-reg y) (ldb (byte 16 16) (lognot val)) 16)
-                         t)
-                        ((zerop (ldb (byte 16 16) (lognot val)))
-                         (inst movn (32-bit-reg y) (ldb (byte 16 0) (lognot val)))
-                         t)))
-
+                  (load-low32 val))
              y)
             ((and ignore-tag
                   (not (logtest fixnum-tag-mask val))
                   ;; Contiguous bits are more likely to be better
                   (logbitp n-fixnum-tag-bits val))
-             (load-immediate-word y (logior val fixnum-tag-mask)
-                                  single-instruction))
+             (load-immediate-word y (logior val fixnum-tag-mask) single-instruction))
+            ;; Two instructions
             ((and
               (not (single-mov))
               (not single-instruction)
-              (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
-                (flet ((try (i part fill)
-                         (let ((filled (dpb fill (byte 16 i) val)))
-                           (cond ((and (encode-logical-immediate filled)
-                                       (not (and descriptorp
-                                                 (logtest filled fixnum-tag-mask))))
-                                  (inst orr y zr-tn filled)
-                                  (inst movk y part i)
-                                  t)))))
-                  (loop for i below 64 by 16
-                        for part = (ldb (byte 16 i) val)
-                        thereis (or (try i part #xFFFF)
-                                    (try i part 0)
-                                    (try i part
-                                         (ldb (byte 16 (mod (+ i 16) 64))
-                                              val)))))))
+              (or
+               (flet ((try (i part fill)
+                        (let ((filled (dpb fill (byte 16 i) val)))
+                          (cond ((and (encode-logical-immediate filled)
+                                      (gc-safe-p filled))
+                                 (inst orr y zr-tn filled)
+                                 (inst movk y part i)
+                                 t)))))
+                 (loop for i below 64 by 16
+                       for part = (ldb (byte 16 i) val)
+                       thereis (or (try i part #xFFFF)
+                                   (try i part 0)
+                                   (try i part (ldb (byte 16 (mod (+ i 16) 64)) val))
+                                   (try i part (ldb (byte 16 (mod (+ i 32) 64)) val)))))
+
+               (loop for mask in '(#xFFFFFFFF00000000
+                                   #xFFFF0000FFFF0000
+                                   #xFF00FF00FF00FF00
+                                   #xF0F0F0F0F0F0F0F0
+                                   #x1E1E1E1E1E1E1E1E
+                                   #xCCCCCCCCCCCCCCCC
+                                   #x3333333333333333
+                                   #xAAAAAAAAAAAAAAAA
+                                   #x5555555555555555)
+                     thereis (emit-eor (logxor val mask) mask))
+
+               (and (/= (ldb (byte 32 32) val) 0)
+                    (or (zerop (ldb (byte 16 32) val))
+                        (zerop (ldb (byte 16 48) val)))
+                    (load-low32 val)
+                    (let ((h2 (ldb (byte 16 32) val))
+                          (h3 (ldb (byte 16 48) val)))
+                      (if (plusp h2)
+                          (inst movk y h2 32)
+                          (inst movk y h3 48))
+                      t))
+               (let* ((low32 (ldb (byte 32 0) val))
+                      (imm12 (1+ (ldb (byte 12 12) low32)))
+                      (delta (ash imm12 12))
+                      (base (ldb (byte 64 0) (- val delta))))
+                 (when (and (<= 1 imm12 4095)
+                            (zerop (ldb (byte 32 32) base))
+                            (load-low32 base))
+                   (inst add y y (ash imm12 12))
+                   t))
+               (when (= (ldb (byte 32 32) val) 1)
+                 (loop for s from 1 to 32
+                       for mask = (ldb (byte 64 0) (ash (1- (ash 1 (- 33 s))) s))
+                       for base = (ldb (byte 64 0) (logxor val mask))
+                       thereis (and (zerop (ldb (byte 32 32) base))
+                                    (gc-safe-p base)
+                                    (encode-logical-immediate mask)
+                                    (load-low32 base)
+                                    (inst eor y y mask)
+                                    t)))))
              y)
+            ;; Three instructions
             ((and (not single-mov)
                   (not single-instruction)
+                  (> (min ffff-count zero-count) 2)
                   (let ((a (ldb (byte 16 0) val))
                         (b (ldb (byte 16 16) val))
                         (c (ldb (byte 16 32) val))
-                        (d (ldb (byte 16 48) val)))
-                    (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
-                      (flet ((try (part val1 hole1 val2 hole2)
-                               (let* ((whole (dpb part (byte 16 16) part))
-                                      (whole (dpb whole (byte 32 32) whole)))
-                                 (when (and (encode-logical-immediate whole)
-                                            (not (and descriptorp
-                                                      (logtest whole fixnum-tag-mask))))
-                                   (inst orr y zr-tn whole)
-                                   (inst movk y val1 hole1)
-                                   (inst movk y val2 hole2)
-                                   t))))
-                        (cond ((= a b)
-                               (try a c 32 d 48))
-                              ((= a c)
-                               (try a b 16 d 48))
-                              ((= a d)
-                               (try a b 16 c 32))
-                              ((= b c)
-                               (try b a 0 d 48))
-                              ((= b d)
-                               (try b a 0 c 32))
-                              ((= c d)
-                               (try c a 0 b 16)))))))
-             y)
-            ((and (not single-mov)
-                  (not single-instruction)
-                  (= (ldb (byte 32 0) val)
-                     (ldb (byte 32 32) val))
-                  (let ((a (ldb (byte 16 0) val))
-                        (b (ldb (byte 16 16) val)))
-                    (when (and (/= a #xFFFF 0)
-                               (/= b #xFFFF 0))
-                      (inst movz y a)
-                      (inst movk y b 16)
-                      (inst orr y y (lsl y 32)))))
+                        (d (ldb (byte 16 48) val))
+                        (low32  (ldb (byte 32 0) val))
+                        (high32 (ldb (byte 32 32) val)))
+                    (flet ((try (whole hole1 hole2)
+                             (when (and (encode-logical-immediate whole)
+                                        (gc-safe-p whole))
+                               (inst orr y zr-tn whole)
+                               (inst movk y (ldb (byte 16 hole1) val) hole1)
+                               (inst movk y (ldb (byte 16 hole2) val) hole2)
+                               t))
+                           (rep16 (x) (* x #x0001000100010001))
+                           (rep32 (x) (dpb x (byte 32 32) x)))
+                      (or (try (rep32 low32) 32 48)
+                          (try (rep32 high32) 0 16)
+                          (and (= a c) (try (rep16 a) 16 48))
+                          (and (= b d) (try (rep16 b) 0  32))
+                          (and (= a d) (try (rep16 a) 16 32))
+                          (and (= b c) (try (rep16 b) 0  48))
+                          (when (and (= low32 high32)
+                                     (/= a #xFFFF 0)
+                                     (/= b #xFFFF 0))
+                            (inst movz y a)
+                            (inst movk y b 16)
+                            (inst orr y y (lsl y 32))
+                            t)
+                          (when (and (= a b) (= c d)
+                                     (/= a #xFFFF 0)
+                                     (/= c #xFFFF 0))
+                            (inst movz y a 0)
+                            (inst movk y c 32)
+                            (inst orr y y (lsl y 16))
+                            t)
+                          (when (load-low32 low32)
+                            (inst movk y c 32)
+                            (inst movk y d 48)
+                            t)))))
              y)
             ((and (< ffff-count zero-count)
                   (or single-mov
@@ -606,3 +663,241 @@
     (emit-label true)
     (load-symbol res t)
     done))
+
+(define-move-fun (store-128-stack 5) (vop x y)
+                 ((signed-128-reg) (signed-128-stack))
+  (with-128-parts (lo hi x)
+    (let ((nfp (current-nfp-tn vop)))
+      (inst str lo (@ nfp (load-store-offset (tn-byte-offset y))))
+      (inst str hi (@ nfp (load-store-offset (+ (tn-byte-offset y) 8)))))))
+
+(define-move-fun (load-128-stack 5) (vop x y)
+                 ((signed-128-stack) (signed-128-reg))
+  (with-128-parts (lo hi y)
+    (let ((nfp (current-nfp-tn vop)))
+      (inst ldr lo (@ nfp (load-store-offset (tn-byte-offset x))))
+      (inst ldr hi (@ nfp (load-store-offset (+ (tn-byte-offset x) 8)))))))
+
+(define-vop (128-move)
+  (:args (x :scs (signed-128-reg) :target y))
+  (:results (y :scs (signed-128-reg)))
+  (:note "128 integer move")
+  (:generator 0
+    (move-128 y x)))
+
+(define-move-vop 128-move :move
+  (signed-128-reg) (signed-128-reg))
+
+(define-vop (s128-move-signed)
+  (:args (x :scs (signed-reg immediate)))
+  (:arg-types signed-num)
+  (:results ((lo-y hi-y) :scs (signed-128-reg)))
+  (:note "128 integer move")
+  (:generator 0
+    (sc-case x
+      (immediate
+       (load-immediate-word lo-y (ldb (byte 64 0) (tn-value x)))
+       (load-immediate-word hi-y (ldb (byte 64 64) (tn-value x))))
+      (t
+       (move lo-y x)
+       (inst asr hi-y lo-y  63)))))
+
+(define-move-vop s128-move-signed :move
+  (signed-reg) (signed-128-reg))
+
+(define-vop (s128-move-unsigned)
+  (:args (x :scs (unsigned-reg immediate)))
+  (:arg-types unsigned-num)
+  (:results ((lo-y hi-y) :scs (signed-128-reg)))
+  (:note "128 integer move")
+  (:generator 0
+    (sc-case x
+      (immediate
+       (load-immediate-word lo-y (tn-value x)))
+      (t
+       (move lo-y x)))
+    (inst mov hi-y 0)))
+
+(define-move-vop s128-move-unsigned :move
+  (unsigned-reg) (signed-128-reg))
+
+(define-vop (move-to-128/integer)
+  (:args (x :scs (descriptor-reg any-reg immediate) :to :save))
+  (:results ((lo-y hi-y) :scs (signed-128-reg)))
+  (:result-refs results)
+  (:note "integer to untagged 128 coercion")
+  (:generator 40
+    (sc-case x
+      (immediate
+       (load-immediate-word lo-y (ldb (byte 64 0) (tn-value x)))
+       (load-immediate-word hi-y (ldb (byte 64 64) (tn-value x))))
+      (any-reg
+       (inst asr lo-y x 1)
+       (inst asr hi-y x 63))
+      (t
+       (assemble ()
+         (inst asr lo-y x 1)
+         (inst tbz x 0 SIGN-EXTEND)
+
+         (loadw lo-y x bignum-digits-offset other-pointer-lowtag)
+         (inst ldrb tmp-tn (@ x (- 1 other-pointer-lowtag)))
+         (inst tbnz tmp-tn 0 SIGN-EXTEND)
+
+         (loadw hi-y x (1+ bignum-digits-offset) other-pointer-lowtag)
+         (inst b DONE)
+
+         SIGN-EXTEND
+         (inst asr hi-y lo-y 63)
+         DONE)))))
+
+(define-move-vop move-to-128/integer :move
+  (any-reg descriptor-reg)
+  (signed-128-reg))
+
+(define-vop (move-from-128)
+  (:args ((lo hi) :scs (signed-128-reg) :to :save))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:note "signed 128 to integer coercion")
+  (:temporary (:sc unsigned-reg) header)
+  (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
+  (:generator 30
+    (inst mov header (bignum-header-for-length 2))
+    (inst cmp hi (asr lo 63))
+    (inst b :ne allocate)
+    (inst adds y lo lo)
+    (inst b :vc done)
+    (inst mov header (bignum-header-for-length 1))
+    #+bignum-assertions
+    (inst mov hi 0)
+    allocate
+    (with-fixed-allocation
+        (y lr nil (+ 2 bignum-digits-offset))
+      (storew-pair header 0 lo bignum-digits-offset tmp-tn)
+      (storew hi tmp-tn 2))
+    DONE))
+
+(define-move-vop move-from-128 :move
+  (signed-128-reg)
+  (any-reg descriptor-reg))
+
+(define-vop (move-128-arg)
+  (:args (x :scs (signed-128-reg descriptor-reg any-reg signed-reg unsigned-reg immediate)
+            :to :save)
+         (fp :scs (any-reg)
+             :load-if (not (sc-is y signed-128-reg))
+             :to :save))
+  (:temporary (:sc any-reg) stack-offset-temp)
+  (:results (y))
+  (:note "128 integer argument move")
+  (:generator 0
+    (sc-case x
+      (signed-128-reg
+       (sc-case y
+         (signed-128-reg
+          (move-128 y x))
+         ((signed-128-stack)
+          (with-128-parts (lo hi x)
+            (stp-stack lo hi y fp stack-offset-temp)))))
+      (any-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (inst asr lo-y x 1)
+            (inst asr hi-y x 63)))
+         ((signed-128-stack)
+          (let ((offset (tn-byte-offset y)))
+            (inst asr tmp-tn x 1)
+            (inst str tmp-tn
+                  (@ fp (load-store-offset offset stack-offset-temp)))
+            (inst asr tmp-tn x 63)
+            (inst str tmp-tn
+                  (@ fp (load-store-offset (+ offset 8) stack-offset-temp)))))))
+      (signed-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (move lo-y x)
+            (inst asr hi-y lo-y 63)))
+         ((signed-128-stack)
+          (inst asr tmp-tn x 63)
+          (stp-stack x tmp-tn y fp stack-offset-temp))))
+      (unsigned-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (move lo-y x)
+            (inst mov hi-y 0)))
+         ((signed-128-stack)
+          (stp-stack x zr-tn y fp stack-offset-temp))))
+      (descriptor-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (assemble ()
+              (inst asr lo-y x 1)
+              (inst tbz x 0 SIGN-EXTEND)
+
+              (loadw lo-y x bignum-digits-offset other-pointer-lowtag)
+              (inst ldrb tmp-tn (@ x (- 1 other-pointer-lowtag)))
+              (inst tbnz tmp-tn 0 SIGN-EXTEND)
+
+              (loadw hi-y x (1+ bignum-digits-offset) other-pointer-lowtag)
+              (inst b DONE)
+
+              SIGN-EXTEND
+              (inst asr hi-y lo-y 63)
+              DONE)))
+         ((signed-128-stack)
+          (let ((offset (tn-byte-offset y)))
+            (assemble ()
+              (inst asr tmp-tn x 1)
+              (inst tbz x 0 SIGN-EXTEND)
+
+              (loadw tmp-tn x bignum-digits-offset other-pointer-lowtag)
+              (inst ldrb stack-offset-temp (@ x (- 1 other-pointer-lowtag)))
+              (inst tbnz stack-offset-temp 0 SIGN-EXTEND)
+              (inst str tmp-tn (@ fp (load-store-offset offset stack-offset-temp)))
+              (loadw tmp-tn x (1+ bignum-digits-offset) other-pointer-lowtag)
+              (inst str tmp-tn (@ fp (load-store-offset (+ offset 8) stack-offset-temp)))
+              (inst b DONE)
+
+              SIGN-EXTEND
+              (inst str tmp-tn (@ fp (load-store-offset offset stack-offset-temp)))
+              (inst asr tmp-tn tmp-tn 63)
+              (inst str tmp-tn (@ fp (load-store-offset (+ offset 8) stack-offset-temp)))
+
+              DONE)))))
+      (immediate
+       (let ((lo (ldb (byte 64 0) (tn-value x)))
+             (hi (ldb (byte 64 64) (tn-value x))))
+         (sc-case y
+           (signed-128-reg
+            (with-128-parts (lo-y hi-y y)
+              (load-immediate-word lo-y lo)
+              (load-immediate-word hi-y hi)))
+           ((signed-128-stack)
+            (if (zerop hi)
+                (stp-stack (load-immediate-word tmp-tn lo) zr-tn y fp stack-offset-temp)
+                (let ((offset (tn-byte-offset y)))
+                  (inst str (load-immediate-word tmp-tn lo)
+                        (@ fp (load-store-offset offset stack-offset-temp)))
+                  (inst str (load-immediate-word tmp-tn hi)
+                        (@ fp (load-store-offset (+ offset 8) stack-offset-temp))))))))))))
+
+(define-move-vop move-128-arg :move-arg
+  (signed-128-reg descriptor-reg any-reg signed-reg unsigned-reg immediate)
+  (signed-128-reg))
+
+(define-move-vop move-arg :move-arg
+  (signed-128-reg) (any-reg descriptor-reg))
+
+(define-vop (move-from-s128/fixnum)
+  (:args ((lo) :scs (signed-128-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:result-types tagged-num)
+  (:note "fixnum tagging")
+  (:generator 1
+     (inst lsl y lo n-fixnum-tag-bits)))
+
+(define-move-vop move-from-s128/fixnum :move
+  (signed-128-reg) (any-reg descriptor-reg))

@@ -15,47 +15,10 @@
 
 ;;;; utilities
 
-;;; Return the LTN-POLICY indicated by the node policy.
-;;;
-;;; FIXME: It would be tidier to use an LTN-POLICY object (an instance
-;;; of DEFSTRUCT LTN-POLICY) instead of a keyword, and have queries
-;;; like LTN-POLICY-SAFE-P become slot accessors. If we do this,
-;;; grep for and carefully review use of literal keywords, so that
-;;; things like
-;;;   (EQ (TEMPLATE-LTN-POLICY TEMPLATE) :SAFE)
-;;; don't get overlooked.
-;;;
-;;; FIXME: Classic CMU CL went to some trouble to cache LTN-POLICY
-;;; values in LTN-ANALYZE so that they didn't have to be recomputed on
-;;; every block. I stripped that out (the whole DEFMACRO FROB thing)
-;;; because I found it too confusing. Thus, it might be that the
-;;; new uncached code spends an unreasonable amount of time in
-;;; this lookup function. This function should be profiled, and if
-;;; it's a significant contributor to runtime, we can cache it in
-;;; some more local way, e.g. by adding a CACHED-LTN-POLICY slot to
-;;; the NODE structure, and doing something like
-;;;   (DEFUN NODE-LTN-POLICY (NODE)
-;;;     (OR (NODE-CACHED-LTN-POLICY NODE)
-;;;         (SETF (NODE-CACHED-LTN-POLICY NODE)
-;;;               (NODE-UNCACHED-LTN-POLICY NODE)))
-(defun node-ltn-policy (node)
-  (declare (type node node))
-  (policy node
-          (let ((eff-space (max space
-                                ;; on the theory that if the code is
-                                ;; smaller, it will take less time to
-                                ;; compile (could lose if the smallest
-                                ;; case is out of line, and must
-                                ;; allocate many linkage registers):
-                                compilation-speed)))
-            (if (zerop safety)
-                (if (>= speed eff-space) :fast :small)
-                (if (>= speed eff-space) :fast-safe :small-safe)))))
-
 ;;; Return true if LTN-POLICY is a safe policy.
 (defun ltn-policy-safe-p (ltn-policy)
   (ecase ltn-policy
-    ((:safe :fast-safe :small-safe) t)
+    ((:fast-safe :small-safe) t)
     ((:small :fast) nil)))
 
 ;;; For possibly-new blocks, make sure that there is an associated
@@ -299,6 +262,74 @@
 
   (values))
 
+(defun annotate-pass-through-values-lvar (lvar)
+  (declare (type lvar lvar))
+  (aver (not (lvar-dynamic-extent lvar)))
+  (let ((2lvar (make-ir2-lvar nil)))
+    (setf (ir2-lvar-kind 2lvar) :pass-through)
+    (setf (ir2-lvar-locs 2lvar) nil)
+    (setf (lvar-info lvar) 2lvar))
+  (ltn-annotate-casts lvar)
+  (values))
+
+(defun pass-through-path-p (start-block end-block)
+  (declare (type cblock start-block end-block))
+  (let ((visited nil))
+    (labels ((benign-block-p (block)
+               (do-nodes (node lvar block)
+                 (typecase node
+                   ((or ref cast bind entry)
+                    t)
+                   (combination
+                    (let ((name (combination-fun-source-name node nil)))
+                      (unless (member name '(%special-unbind
+                                             #+nil %cleanup-point
+                                             #+nil %catch-breakup
+                                             ;; not useful in practice, because the user-written cleaup
+                                             ;; code needs to be analyzed for non-mv-clobbering
+                                             #|%unwind-protect-breakup|#))
+                        (return-from benign-block-p nil))))
+                   (t
+                    (return-from benign-block-p nil))))
+               t)
+             (walk (block)
+               (cond ((eq block end-block) t)
+                     ((member block visited) nil)
+                     ((null (block-succ block)) nil)
+                     ((cdr (block-succ block)) nil)
+                     (t
+                      (push block visited)
+                      (let ((succ (first (block-succ block))))
+                        (if (eq succ end-block)
+                            t
+                            (and (benign-block-p succ)
+                                 (walk succ))))))))
+      (walk start-block))))
+
+(defun return-pass-through-p (return-node lvar)
+  (declare (type creturn return-node) (type lvar lvar))
+  (when (vop-existsp :named sb-vm::return-pass-through)
+    (let ((use (lvar-uses lvar)))
+      (cond ((node-p use)
+             (and (basic-combination-p use)
+                  (eq (basic-combination-kind use) :full)
+                  (not (node-tail-p use))
+                  (eq use (block-last (node-block use)))
+                  (pass-through-path-p (node-block use) (node-block return-node))))
+            ((and (consp use) (= (length use) 2))
+             (let ((call-node (find-if (lambda (u)
+                                         (and (basic-combination-p u)
+                                              (eq (basic-combination-kind u) :full)))
+                                       use))
+                   (nlx-node (find-if (lambda (u)
+                                        (and (combination-p u)
+                                             (eq (combination-fun-source-name u nil) '%nlx-entry)))
+                                      use)))
+               (and call-node nlx-node
+                    (not (node-tail-p call-node))
+                    (eq call-node (block-last (node-block call-node)))
+                    (pass-through-path-p (node-block call-node) (node-block return-node)))))))))
+
 ;;; Annotate LVAR for a fixed, but arbitrary number of values, of the
 ;;; specified primitive TYPES.
 (defun annotate-fixed-values-lvar (lvar types &optional lvar-types)
@@ -358,7 +389,11 @@
                     (values nil :unknown)
                     (values-types int))
               (if (eq kind :unknown)
-                  (annotate-unknown-values-lvar lvar)
+                  (cond #+(and x86-64 tls-based-mv-return)
+                        ((return-pass-through-p node lvar)
+                         (annotate-pass-through-values-lvar lvar))
+                        (t
+                         (annotate-unknown-values-lvar lvar)))
                   (annotate-fixed-values-lvar
                    lvar (mapcar #'primitive-type types)
                    types)))))
@@ -375,9 +410,18 @@
   (declare (type mv-combination call))
   (setf (basic-combination-kind call) :local)
   (setf (node-tail-p call) nil)
-  (let ((args (basic-combination-args call))
-        (vars (lambda-vars
-               (ref-leaf (lvar-use (basic-combination-fun call))))))
+  (let* ((args (basic-combination-args call))
+        (fun (ref-leaf (lvar-use (basic-combination-fun call))))
+        (vars (lambda-vars fun))
+        (last-used))
+    (loop for c on vars
+          when (leaf-refs (car c))
+          do (setf last-used c))
+    ;; Discard unused variables at the end
+    (when (cdr last-used)
+      (setf vars
+            (setf (lambda-vars fun)
+                  (ldiff vars (cdr last-used)))))
     (if (singleton-p args)
         (annotate-fixed-values-lvar
          (first args)
@@ -392,7 +436,9 @@
                  vars)
          (mapcar #'basic-var-type vars))
         (let ((types (mapcar (lambda (var)
-                               (cons (primitive-type (basic-var-type var))
+                               (cons (when (and #+(or x86-64 arm64)
+                                                (lambda-var-refs var))
+                                       (primitive-type (basic-var-type var)))
                                      (basic-var-type var)))
                              vars)))
           (dolist (arg args)
@@ -404,6 +450,7 @@
                       do
                       (destructuring-bind (&optional prim-type . lvar-type) (pop types)
                         (primitive-types (or prim-type
+                                             #-(or x86-64 arm64)
                                              *backend-t-primitive-type*))
                         (lvar-types (or lvar-type
                                         *universal-type*))))
@@ -411,6 +458,18 @@
                  arg
                  (primitive-types) (lvar-types))))))))
   (values))
+
+#+tls-based-mv-return
+(defun annotate-unknown-direct-call-values-lvar (lvar)
+  (declare (type lvar lvar))
+  (aver (not (lvar-dynamic-extent lvar)))
+  (let ((2lvar (make-ir2-lvar nil)))
+    (setf (ir2-lvar-kind 2lvar) :direct
+          (ir2-lvar-locs 2lvar)
+          (list* (make-normal-tn sb-vm::*fixnum-primitive-type*) ;; arg-count
+                 (loop repeat sb-vm::register-arg-count
+                       collect (make-normal-tn *backend-t-primitive-type*))))
+    (setf (lvar-info lvar) 2lvar)))
 
 ;;; We force all the argument lvars to use the unknown values
 ;;; convention. The lvars are annotated in reverse order, since the
@@ -436,11 +495,33 @@
            (setf (node-tail-p call) nil))
           (t
            (setf (basic-combination-info call) :full)
-           (annotate-fun-lvar (basic-combination-fun call) nil)
-           (loop for (arg . prev) on (reverse args)
-                 do
-                 ;; Only the first argument's CSP is used
-                 (annotate-unknown-values-lvar arg t prev)))))
+           (let* ((reversed-args (reverse args))
+                  #+tls-based-mv-return
+                  (last-arg (car reversed-args)))
+             ;; If only one the last argument is a full call its
+             ;; return values from thread-mv-return-values can be used directly
+             (cond #+tls-based-mv-return
+                   ((and (not (node-tail-p call))
+                         (let ((node (lvar-uses last-arg)))
+                           (and (combination-p node)
+                                (eq (basic-combination-info node) :full)
+                                (almost-immediately-used-p last-arg node)))
+                         (loop for arg in (cdr reversed-args)
+                               never (eq (nth-value 1 (values-types (lvar-derived-type arg))) :unknown))
+                         (lvar-single-value-p (node-lvar call)))
+                    (annotate-fun-lvar (basic-combination-fun call)) ;; can delay, there's mv-call-direct-named
+                    (annotate-unknown-direct-call-values-lvar last-arg)
+                    (loop for arg in (cdr reversed-args)
+                          do
+                          (annotate-fixed-values-lvar arg
+                                                      (mapcar #'primitive-type (values-types (lvar-derived-type arg))))))
+                   (t
+                    (annotate-fun-lvar (basic-combination-fun call) nil)
+
+                    (loop for (arg . prev) on reversed-args
+                          do
+                          ;; Only the first argument's CSP is used
+                          (annotate-unknown-values-lvar arg t prev))))))))
 
   (values))
 
@@ -491,8 +572,12 @@
   (let* ((test (if-test node))
          (use (lvar-uses test)))
     (unless (and (combination-p use)
-                 (immediately-used-p test use)
+                 (if-vop-existsp (:named sb-vm::move-conditional-result)
+                   (immediately-used-p test use)
+                   t)
                  (let ((info (basic-combination-info use)))
+                   (when (listp info)
+                     (setf info (car info)))
                    (and (template-p info)
                         (template-conditional-p info))))
       (annotate-ordinary-lvar test)))
@@ -603,12 +688,10 @@
                  (error "Neither LVAR nor TN supplied."))))))))
 
 ;;; Check that the argument type restriction for TEMPLATE are
-;;; satisfied in call. If an argument's TYPE-CHECK is :NO-CHECK and
-;;; our policy is safe, then only :SAFE templates are OK.
-(defun template-args-ok (template call safe-p)
+;;; satisfied in call.
+(defun template-args-ok (template call)
   (declare (type template template)
            (type combination call))
-  (declare (ignore safe-p))
   (let ((mtype (template-more-args-type template)))
     (do ((args (basic-combination-args call) (cdr args))
          (types (template-arg-types template) (cdr types)))
@@ -689,7 +772,7 @@
       (operand-restriction-ok (first types) (primitive-type result-type)))
      (t t))))
 
-;;; Return true if CALL is an ok use of TEMPLATE according to SAFE-P.
+;;; Return true if CALL is an ok use of TEMPLATE
 ;;; -- If the template has a GUARD that isn't true, then we ignore the
 ;;;    template, not even considering it to be rejected.
 ;;; -- If the argument type restrictions aren't satisfied, then we
@@ -705,18 +788,15 @@
 ;;;
 ;;; If the template is *not* ok, then the second value is a keyword
 ;;; indicating which aspect failed.
-(defun is-ok-template-use (template call safe-p)
+(defun is-ok-template-use (template call)
   (declare (type template template) (type combination call))
   (let* ((guard (template-guard template))
          (lvar (node-lvar call))
          (dtype (node-derived-type call)))
     (cond ((and guard (not (funcall guard call)))
            (values nil :guard))
-          ((not (template-args-ok template call safe-p))
-           (values nil
-                   (if (and safe-p (template-args-ok template call nil))
-                       :arg-check
-                       :arg-types)))
+          ((not (template-args-ok template call))
+           (values nil :arg-types))
           ((template-conditional-p template)
            (or (vop-existsp :named sb-vm::move-conditional-result)
                (let ((dest (lvar-dest lvar)))
@@ -737,61 +817,69 @@
 ;;; 3. The tail of Templates for templates we haven't examined yet.
 ;;;
 ;;; We just call IS-OK-TEMPLATE-USE until it returns true.
-(defun find-template (templates call safe-p)
+(defun find-template (templates call)
   (declare (list templates) (type combination call))
   (do ((templates templates (rest templates))
        (rejected nil))
       ((null templates)
        (values nil rejected nil))
     (let ((template (first templates)))
-      (when (is-ok-template-use template call safe-p)
+      (when (is-ok-template-use template call)
         (return (values template rejected (rest templates))))
       (setq rejected template))))
+
+(defun tagged-template-p (vop-info)
+  (let ((untagged t))
+    (and (loop for related fixnum = (vop-info-related-args vop-info) then (ash related -1)
+               for costs in (vop-info-arg-costs vop-info)
+               always (or (not (logbitp 0 related))
+                          (progn
+                            (unless (eql (svref costs sb-vm:signed-reg-sc-number) 0)
+                              (setf untagged nil))
+                            (eql (svref costs sb-vm:any-reg-sc-number) 0))))
+         (not untagged)
+         (loop for costs in (vop-info-result-costs vop-info)
+               always (eql (svref costs sb-vm:any-reg-sc-number) 0)))))
 
 ;;; Given a partially annotated known call and a translation policy,
 ;;; return the appropriate template, or NIL if none can be found. We
 ;;; scan the templates (ordered by increasing cost) looking for a
 ;;; template whose restrictions are satisfied and that has our policy.
-;;;
-;;; If we find a template that doesn't have our policy, but has a
-;;; legal alternate policy, then we also record that to return as a
-;;; last resort. If our policy is safe, then only safe policies are
-;;; O.K., otherwise anything goes.
-;;;
-;;; If we find a template with :SAFE policy, then we return it, or any
-;;; cheaper fallback template. The theory behind this is that if it is
-;;; cheapest, small and safe, we can't lose. If it is not cheapest,
-;;; then we use the fallback, which won't have the desired policy, but
-;;; :SAFE isn't desired either, so we might as well go with the
-;;; cheaper one. The main reason for doing this is to make sure that
-;;; cheap safe templates are used when they apply and the current
-;;; policy is something else. This is useful because :SAFE has the
-;;; additional semantics of implicit argument type checking, so we may
-;;; be forced to define a template with :SAFE policy when it is really
-;;; small and fast as well.
-(defun find-template-for-ltn-policy (call ltn-policy)
-  (declare (type combination call)
-           (type ltn-policy ltn-policy))
-  (let ((safe-p (ltn-policy-safe-p ltn-policy))
-        (current (fun-info-templates (basic-combination-fun-info call)))
-        (fallback nil)
+(defun find-template-for-ltn-policy (call)
+  (declare (type combination call))
+  (let ((current (fun-info-templates (basic-combination-fun-info call)))
         (rejected nil))
-    (loop
-     (multiple-value-bind (template this-reject more)
-         (find-template current call safe-p)
-       (unless rejected
-         (setq rejected this-reject))
-       (setq current more)
-       (unless template
-         (return (values fallback rejected)))
-       (let ((tcpolicy (template-ltn-policy template)))
-         (cond ((eq tcpolicy ltn-policy)
-                (return (values template rejected)))
-               ((eq tcpolicy :safe)
-                (return (values (or fallback template) rejected)))
-               ((or (not safe-p) (eq tcpolicy :fast-safe))
-                (unless fallback
-                  (setq fallback template)))))))))
+    ;; If tagged and untagged VOPs are applicable, select them both, select-tagging will decide which to use later
+    (let ((first (member-if (lambda (template)
+                              (cond ((and (is-ok-template-use template call)
+                                          (ecase (template-ltn-policy template)
+                                            ;; handle :small :small-safe if they are ever used
+
+                                            ((:fast-safe :safe) t)
+                                            (:fast (policy call (zerop safety))))))
+                                    (t
+                                     (setf rejected template)
+                                     nil)))
+                            current)))
+
+      (values
+       (when first
+         (let ((tagged (car first)))
+           (if (tagged-template-p tagged)
+               (let ((untagged (find-if (lambda (template)
+                                          (and (not (tagged-template-p template))
+                                               (is-ok-template-use template call)
+                                               (ecase (template-ltn-policy template)
+                                                 ((:fast-safe :safe) t)
+                                                 (:fast (policy call (zerop safety))))))
+                                        (cdr first))))
+                 (cond (untagged
+                        (setf rejected nil)
+                        (list tagged untagged))
+                       (t
+                        tagged)))
+               tagged)))
+       rejected))))
 
 (defvar *efficiency-note-limit* 2
   "This is the maximum number of possible optimization alternatives will be
@@ -807,18 +895,16 @@
 ;;; figure out any reason why TEMPLATE was rejected. Users should
 ;;; never see these messages, but they can happen in situations where
 ;;; the VM definition is messed up somehow.
-(defun strange-template-failure (template call ltn-policy frob)
+(defun strange-template-failure (template call frob)
   (declare (type template template) (type combination call)
-           (type ltn-policy ltn-policy) (type function frob))
+           (type function frob))
   (funcall frob "This shouldn't happen!  Bug?")
   (multiple-value-bind (win why)
-      (is-ok-template-use template call (ltn-policy-safe-p ltn-policy))
+      (is-ok-template-use template call)
     (aver (not win))
     (ecase why
       (:guard
        (funcall frob "template guard failed"))
-      (:arg-check
-       (funcall frob "The template isn't safe, yet we were counting on it."))
       (:arg-types
        (funcall frob "argument types invalid")
        (funcall frob "argument primitive types:~%  ~S"
@@ -864,13 +950,12 @@
 ;;; We go to some trouble to make the whole multi-line output into a
 ;;; single call to COMPILER-NOTIFY so that repeat messages are
 ;;; suppressed, etc.
-(defun note-rejected-templates (call ltn-policy template)
-  (declare (type combination call) (type ltn-policy ltn-policy)
+(defun note-rejected-templates (call template)
+  (declare (type combination call)
            (type (or template null) template))
-
-  (collect ((losers))
-    (let ((safe-p (ltn-policy-safe-p ltn-policy))
-          (verbose-p (policy call (= inhibit-warnings 0)))
+  (let ((safe-p (policy call (plusp safety))))
+    (collect ((losers))
+    (let ((verbose-p (policy call (= inhibit-warnings 0)))
           (max-cost (- (template-cost
                         (or template
                             (template-or-lose 'call-named)))
@@ -879,10 +964,9 @@
         (when (> (template-cost try) max-cost) (return))
         (let ((guard (template-guard try)))
           (when (and (or (not guard) (funcall guard call))
-                     (or (not safe-p)
-                         (ltn-policy-safe-p (template-ltn-policy try)))
-                     (not (and (eq ltn-policy :safe)
-                               (eq (template-ltn-policy try) :fast-safe)))
+                     (ecase (template-ltn-policy try)
+                       ((:fast-safe :safe) t)
+                       (:fast (not safe-p)))
                      (or verbose-p
                          (and (template-note try)
                               (valid-fun-use
@@ -911,13 +995,13 @@
                      (template-cost loser))
               (cond
                ((and valid strict-valid)
-                (strange-template-failure loser call ltn-policy #'lose1))
+                (strange-template-failure loser call #'lose1))
                ((not valid)
                 (aver (not (valid-fun-use call type
                                           :lossage-fun #'lose1
                                           :unwinnage-fun #'lose1))))
                (t
-                (aver (ltn-policy-safe-p ltn-policy))
+                (aver safe-p)
                 (lose1 "can't trust output type assertion under safe policy")))
               (notes 1))))
 
@@ -931,7 +1015,7 @@
                                  . ,(messages))
                                `("forced to do full call"
                                  nil
-                                 . ,(messages))))))))
+                                 . ,(messages)))))))))
   (values))
 
 ;;; If a function has a special-case annotation method use that,
@@ -940,15 +1024,14 @@
 ;;; full call.
 (defun ltn-analyze-known-call (call)
   (declare (type combination call))
-  (let* ((ltn-policy (node-ltn-policy call))
-         (info (basic-combination-fun-info call))
+  (let* ((info (basic-combination-fun-info call))
          (method (fun-info-ltn-annotate info))
          (args (basic-combination-args call))
          (hook (fun-info-ir2-hook info)))
     (when hook
       (funcall hook call))
     (when method
-      (funcall method call ltn-policy)
+      (funcall method call)
       (return-from ltn-analyze-known-call (values)))
 
     (dolist (arg args)
@@ -956,13 +1039,13 @@
             (make-ir2-lvar (primitive-type (lvar-type arg)))))
 
     (multiple-value-bind (template rejected)
-        (find-template-for-ltn-policy call ltn-policy)
+        (find-template-for-ltn-policy call)
       ;; If we are unable to use some templates due to unsatisfied
       ;; operand type restrictions and our policy enables efficiency
       ;; notes, then we call NOTE-REJECTED-TEMPLATES.
       (when (and rejected
                  (policy call (> speed inhibit-warnings)))
-        (note-rejected-templates call ltn-policy template))
+        (note-rejected-templates call template))
       ;; If we are forced to do a full call, we check to see whether
       ;; the function called is the same as the current function. If
       ;; so, we give a warning, as this is probably a botched attempt
@@ -1030,6 +1113,8 @@
     (ecase (ir2-lvar-kind 2lvar)
       (:unknown
        (annotate-unknown-values-lvar value))
+      (:pass-through
+       (annotate-pass-through-values-lvar value))
       (:fixed
        (let* ((count (length (ir2-lvar-locs 2lvar)))
               (ctype (lvar-derived-type value)))
@@ -1066,6 +1151,8 @@
           (ltn-analyze-known-call node))))
       (cif (ltn-analyze-if node))
       (jump-table (ltn-analyze-jump-table node))
+      (vop-jumper
+       (setf (node-tail-p node) nil))
       (creturn) ;; delay to FLUSH-FULL-CALL-TAIL-TRANSFERS
       ((or bind entry))
       (exit (ltn-analyze-exit node))
@@ -1151,4 +1238,3 @@
   (ltn-analyze-block block)
   (aver (not (ir2-block-popped (block-info block))))
   (values))
-

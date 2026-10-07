@@ -104,6 +104,7 @@
    ("invalid argument count" invalid-arg-count 1)
    ("invalid argument count" local-invalid-arg-count 2)
    ("bogus argument to VALUES-LIST" bogus-arg-to-values-list 1)
+   ("attempt to return too many values" too-many-return-values 1)
    ("An attempt was made to use an undefined SYMBOL-VALUE." unbound-symbol 1)
    ("attempt to RETURN-FROM a block that no longer exists" invalid-unwind 0)
    ("attempt to THROW to a non-existent tag" unseen-throw-tag 1)
@@ -181,6 +182,8 @@
   #+long-float ((complex long-float) object-not-complex-long-float)
   #+sb-simd-pack simd-pack
   #+sb-simd-pack-256 simd-pack-256
+  #+sb-simd-pack-512 simd-pack-512
+  #+sb-simd-pack-512 simd-pack-512-mask
   weak-pointer
   instance
   #+sb-unicode

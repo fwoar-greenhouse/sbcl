@@ -22,27 +22,39 @@
   (unless (location= dst src)
     (sc-case dst
       ((single-reg complex-single-reg)
-       (aver (xmm-tn-p src))
+       (aver (float-tn-p src))
        (inst movaps dst src))
       ((double-reg complex-double-reg)
-       (aver (xmm-tn-p src))
+       (aver (float-tn-p src))
        (inst movapd dst src))
       #+sb-simd-pack
       ((int-sse-reg sse-reg)
-       (aver (xmm-tn-p src))
+       (aver (float-tn-p src))
        (inst movdqa dst src))
       #+sb-simd-pack
       ((single-sse-reg double-sse-reg)
-       (aver (xmm-tn-p src))
+       (aver (float-tn-p src))
        (inst movaps dst src))
       #+sb-simd-pack-256
-      ((ymm-reg int-avx2-reg)
-       (aver (xmm-tn-p src))
+      (int-avx2-reg
+       (aver (float-tn-p src))
        (inst vmovdqa dst src))
       #+sb-simd-pack-256
       ((single-avx2-reg double-avx2-reg)
-       (aver (xmm-tn-p src))
+       (aver (float-tn-p src))
        (inst vmovaps dst src))
+      #+sb-simd-pack-512
+      (int-avx512-reg
+       (aver (float-tn-p src))
+       (inst vmovdqu64 dst src))
+      #+sb-simd-pack-512
+      ((single-avx512-reg double-avx512-reg)
+       (aver (float-tn-p src))
+       (inst vmovups dst src))
+      ((signed-128-reg)
+       (with-128-parts (lo-src hi-src src lo-dst hi-dst dst)
+         (move lo-dst lo-src)
+         (move hi-dst hi-src)))
       (t
        (if size
            (inst mov size dst src)
@@ -99,6 +111,11 @@
       ;; Otherwise do something depending on #[-+]gs-seg
       (let (#+gs-seg (thread-tn nil))
         (ea thread-segment-reg (ash slot-index word-shift) thread-tn))))
+
+#+tls-based-mv-return
+(defmacro thread-mv-count ()
+  ;; This is byte index 1 of thread_state_word
+  '(ea (1+ (ash thread-state-word-slot word-shift)) thread-tn))
 
 ;;; Similar to thread-slot-ea, but INDEX in this case does not signify the Nth slot {0,1,2,..}
 ;;; but rather the displacement into the thread's storage, added to the thread base address.
@@ -223,6 +240,8 @@
      #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
      ,@(remove :generator body :key 'car)
      (:node-var node)
+     #+sb-simd-pack-512
+     (:save-p :avx512)
      (:generator ,(car g) ; cost
        (macrolet
            ((instrument-alloc (&rest args) `(emit-instrument-alloc node thread-tn ,@args))
@@ -287,7 +306,6 @@
   `(progn
      (define-vop (,name)
        (:translate ,translate)
-       (:policy :fast-safe)
        (:args (object :scs (descriptor-reg) :to :eval)
               (index :scs (any-reg signed-reg unsigned-reg
                                    (immediate
@@ -343,7 +361,6 @@
   `(progn
      (define-vop (,name)
        (:translate ,translate)
-       (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg signed-reg unsigned-reg)))
        (:arg-types ,type tagged-num)
@@ -357,7 +374,6 @@
                              object index (index-scale n-word-bytes index)))))
      (define-vop (,(symbolicate name "-C"))
        (:translate ,translate)
-       (:policy :fast-safe)
        (:args (object :scs (descriptor-reg)))
        (:info index)
        (:arg-types ,type
@@ -392,7 +408,6 @@
   `(progn
      (define-vop (,name)
        (:translate ,translate)
-       (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg signed-reg unsigned-reg)))
        (:info addend)
@@ -413,7 +428,6 @@
      ;; and use a vop that only takes the object and just ONE index?
      (define-vop (,(symbolicate name "-C"))
        (:translate ,translate)
-       (:policy :fast-safe)
        (:args (object :scs (descriptor-reg)))
        (:info index addend)
        (:arg-types ,type
@@ -439,7 +453,6 @@
         (barrier (member name '(instance-index-set %closure-index-set %weakvec-set))))
     `(define-vop (,name)
        (:translate ,translate)
-       (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg signed-reg unsigned-reg
                                    (immediate
@@ -450,7 +463,7 @@
                                 'immediate
                                 `(immediate (let ((value (tn-value tn)))
                                               (and (integerp value)
-                                                   (plausible-signed-imm32-operand-p (,(if tagged 'fixnumize 'progn) value)))))))))
+                                                   (imm32-p (,(if tagged 'fixnumize 'progn) value)))))))))
        (:arg-types ,type tagged-num ,el-type)
        (:arg-refs obj-ref ind-ref val-ref)
        (:vop-var vop)

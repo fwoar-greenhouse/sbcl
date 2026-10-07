@@ -288,6 +288,25 @@ if a restart was invoked."
           (is (= 1 (length result)))
           (is (eql (sym "FOO" "SYM") (car result))))))))
 
+(with-test (:name (export :name-conflict :restart sb-impl::take-new))
+  (with-packages (("old-exporting" (:export "foo"))
+                  ("new-exporting" (:intern "foo"))
+                  ("using" (:use "old-exporting" "new-exporting")))
+    (let* ((old-exporting (find-package "old-exporting"))
+           (new-exporting (find-package "new-exporting"))
+           (using (find-package "using"))
+           (old-symbol (find-symbol "foo" old-exporting))
+           (new-symbol (find-symbol "foo" new-exporting)))
+      (assert (equal (list old-symbol :inherited)
+                     (multiple-value-list (find-symbol "foo" using))))
+      (handler-bind ((sb-ext:name-conflict
+                       (lambda (condition)
+                         (declare (ignore condition))
+                         (invoke-restart 'sb-impl::take-new))))
+        (export new-symbol new-exporting))
+      (assert (equal (list new-symbol :internal)
+                     (multiple-value-list (find-symbol "foo" using)))))))
+
 ;;; IMPORT
 (with-test (:name :import-nil.1)
   (with-packages (("FOO" (:use) (:intern "NIL"))
@@ -412,6 +431,7 @@ if a restart was invoked."
     (unwind-protect
          (handler-bind ((name-conflict
                           (lambda (c)
+                            (declare (ignore c))
                             (assert (not (find-restart 'sb-impl::dont-import-it)))
                             (assert (not (find-restart 'sb-impl::shadowing-import-it)))
                             (invoke-restart 'abort))))
@@ -493,6 +513,7 @@ if a restart was invoked."
            (export (intern "FOO" p2) p2)
            (handler-bind ((name-conflict
                             (lambda (c)
+                              (declare (ignore c))
                               (assert (not (find-restart 'sb-impl::keep-old)))
                               (assert (not (find-restart 'sb-impl::take-new)))
                               (invoke-restart 'abort))))
@@ -737,6 +758,17 @@ if a restart was invoked."
     (assert (eq (intern "FOO" p2)
                 (let ((*package* p1))
                   (intern "FOO" :own-nickname))))))
+
+(with-test (:name (add-package-local-nickname :nickname-conflict :restart sb-impl::keep-old))
+  (with-tmp-packages ((p1 (make-package "NICKNAME-CONFLICT1"))
+                      (p2 (make-package "NICKNAME-CONFLICT2"))
+                      (p3 (make-package "NICKNAME-CONFLICT3")))
+    (assert (eq p3 (add-package-local-nickname #1="N" p1 p3)))
+    (handler-bind ((error (lambda (condition)
+                            (declare (ignore condition))
+                            (invoke-restart 'sb-impl::keep-old))))
+      (assert (eq p3 (add-package-local-nickname #1# p2 p3))))
+    (assert (eq p1 (cdr (assoc "N" (package-local-nicknames p3) :test #'string=))))))
 
 (defun random-package-name (min max)
   (let* ((s (make-string (+ min (random (- max min))))))

@@ -67,7 +67,6 @@
   (:args (car))
   (:results (result :scs (descriptor-reg)))
   (:ignore car)
-  (:policy :fast-safe)
   (:generator 0
     (inst str null-tn (@ csp-tn n-word-bytes :post-index))
     (inst add-sub result csp-tn (- list-pointer-lowtag (* cons-size n-word-bytes)))))
@@ -79,7 +78,6 @@
   (:temporary (:sc non-descriptor-reg) temp)
   (:temporary (:scs (non-descriptor-reg) :offset lr-offset) lr)
   (:results (result :scs (descriptor-reg) :from :argument))
-  (:policy :fast-safe)
   (:translate make-fdefn)
   (:generator 37
     (with-fixed-allocation (result lr fdefn-widetag fdefn-size)
@@ -166,13 +164,13 @@
     ;; Allocate the object and set its header
     (pseudo-atomic (lr)
       (allocation nil bytes lowtag result :flag-tn lr)
-      (storew header result 0 lowtag))))
+      (storew header tmp-tn))))
 
 #+(and sb-xc-host immobile-space)
 (define-vop (alloc-immobile-fixedobj)
   (:args (size-class :scs (any-reg) :target c-arg1)
          (nwords :scs (any-reg) :target c-arg2)
-         (header :scs (any-reg) :target c-arg3))
+         (header :scs (unsigned-reg) :target c-arg3))
   (:results (result :scs (descriptor-reg)))
   (:save-p t)
   (:temporary (:sc unsigned-reg :from (:argument 0) :to :eval :offset nl0-offset) c-arg1)

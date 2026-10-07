@@ -183,19 +183,6 @@
                                         `(ash (fast-read-byte) ,(* i 8))))))
        (logior ,@bytes))))
 
-;;; like FAST-READ-U-INTEGER, but the size may be determined at run time
-(defmacro fast-read-var-u-integer (n)
-  (let ((n-pos (gensym))
-        (n-res (gensym))
-        (n-cnt (gensym)))
-    `(do ((,n-pos 8 (+ ,n-pos 8))
-          (,n-cnt (1- ,n) (1- ,n-cnt))
-          (,n-res
-           (fast-read-byte)
-           (dpb (fast-read-byte) (byte 8 ,n-pos) ,n-res)))
-         ((zerop ,n-cnt) ,n-res)
-       (declare (type index ,n-pos ,n-cnt)))))
-
 ;;; FIXME: why do all of these reading functions and macros declare
 ;;; (SPEED 0)?  was there some bug in the compiler which has since
 ;;; been fixed?  --njf, 2004-09-08
@@ -885,19 +872,31 @@
 
 #+sb-simd-pack
 (define-fop 88 :not-host (fop-simd-pack)
-  (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
-    (let ((tag (fast-read-s-integer 8)))
-      (cond #+sb-simd-pack-256
-            ((logbitp 6 tag)
-             (%make-simd-pack-256 (logand tag #b00111111)
-                                  (fast-read-u-integer 8)
-                                  (fast-read-u-integer 8)
-                                  (fast-read-u-integer 8)
-                                  (fast-read-u-integer 8)))
-            (t
-             (%make-simd-pack tag
-                              (fast-read-u-integer 8)
-                              (fast-read-u-integer 8)))))))
+  (let ((tag (read-byte-arg (fasl-input-stream)))
+        (a (read-word-arg (fasl-input-stream)))
+        (b (read-word-arg (fasl-input-stream))))
+    (cond #+sb-simd-pack-256
+          ((ldb-test (byte 2 6) tag)
+           (let ((c (read-word-arg (fasl-input-stream)))
+                 (d (read-word-arg (fasl-input-stream))))
+             (cond
+               ((logbitp 6 tag)
+                (%make-simd-pack-256 (logand tag #b00111111)
+                                     a b c d))
+               #+sb-simd-pack-512
+               (t
+                (%make-simd-pack-512 (logand tag #b00111111)
+                                     a b c d
+                                     (read-word-arg (fasl-input-stream))
+                                     (read-word-arg (fasl-input-stream))
+                                     (read-word-arg (fasl-input-stream))
+                                     (read-word-arg (fasl-input-stream)))))))
+          (t
+           (%make-simd-pack tag a b)))))
+
+#+sb-simd-pack-512
+(define-fop 90 :not-host (fop-simd-pack-512-mask)
+  (%make-simd-pack-512-mask (read-word-arg (fasl-input-stream))))
 
 ;;;; loading lists
 

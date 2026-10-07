@@ -3146,8 +3146,6 @@ static void pin_call_chain_and_boxed_registers(struct thread* th) {
 #endif
 
 #if !GENCGC_IS_PRECISE
-extern void visit_context_registers(void (*proc)(os_context_register_t, void*),
-                                    os_context_t *context, void*);
 static void NO_SANITIZE_ADDRESS NO_SANITIZE_MEMORY
 conservative_stack_scan(struct thread* th,
                         __attribute__((unused)) generation_index_t gen,
@@ -3205,9 +3203,11 @@ conservative_stack_scan(struct thread* th,
 # elif defined(LISP_FEATURE_SB_THREAD)
 
 #ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
-    lispobj* csp = th->control_stack_pointer;
+    lispobj* csp = (lispobj *) csp_around_foreign_call(th);
+    if (!csp)
+        csp = th->control_stack_pointer;
     if (csp)
-      esp = (void*) csp;
+        esp = (void*) csp;
 #endif
 
     int i;
@@ -3440,11 +3440,16 @@ garbage_collect_generation(generation_index_t generation, int raise,
     }
 #endif
 
-    // Thread creation optionally no longer synchronizes the creating and
-    // created thread. When synchronized, the parent thread is responsible
-    // for pinning the start function for handoff to the created thread.
-    // When not synchronized, The startup parameters are pinned via this list
-    // which will always be NIL if the feature is not enabled.
+    /* A nascent thread no longer depends on its creator thread to ensure liveness
+     * of the critically important heap objects needed to start itself up, such as
+     * the initial function and arguments. We used to rely on synchronized ownership
+     * transfer of those objects, and a semaphore signaling that hand-off was complete.
+     * (The crux of the problem is that a thread prior to being linked via all_threads
+     * lacks any GC state, especially stack roots.)
+     * Currently the startup is mediated through SB-THREAD::*STARTING-THREADS* which
+     * transiently contains data for zero or more new threads. Not only must data be
+     * kept live, but objects must be pinned (not moved) until the native thread
+     * constructor and new_thread_trampoline have reached a stable state */
 #ifdef STARTING_THREADS
     lispobj pin_list = SYMBOL(STARTING_THREADS)->value;
     for ( ; pin_list != NIL ; pin_list = CONS(pin_list)->cdr ) {
@@ -3521,9 +3526,8 @@ garbage_collect_generation(generation_index_t generation, int raise,
     {
         struct thread *th;
         for_each_thread(th) {
-            scav_binding_stack((lispobj*)th->binding_stack_start,
-                               (lispobj*)get_binding_stack_pointer(th),
-                               compacting_p() ? 0 : gc_mark_obj);
+            bindingstack_vals_visit(th->binding_stack_start, get_binding_stack_pointer(th),
+                                    compacting_p() ? 0 : gc_mark_obj);
             /* do the tls as well */
             lispobj* from = &th->lisp_thread;
             lispobj* to = (lispobj*)(SymbolValue(FREE_TLS_INDEX,0) + (char*)th);
@@ -3532,6 +3536,14 @@ garbage_collect_generation(generation_index_t generation, int raise,
                 scavenge(from, nwords);
             else
                 gc_mark_range(from, nwords);
+#ifdef LISP_FEATURE_TLS_BASED_MV_RETURN
+            from = th->mv_return_values;
+            nwords = thread_mv_cell_count(th);
+            if (compacting_p())
+                scavenge(from,nwords);
+            else
+                gc_mark_range(from, nwords);
+#endif
         }
     }
 
@@ -3661,7 +3673,7 @@ garbage_collect_generation(generation_index_t generation, int raise,
     scavenge_newspace(new_space);
     if (save_lisp_gc_iteration == 2) finish_code_metadata();
 
-    scan_binding_stack();
+    bindingstack_syms_fix();
     smash_weak_pointers();
     /* Return private-use pages to the general pool so that Lisp can have them */
     gc_dispose_private_pages();

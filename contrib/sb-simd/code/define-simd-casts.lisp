@@ -13,9 +13,14 @@
 
 ;;; The pXXX SIMD types are special - we define their 'cast' function
 ;;; manually.
-(define-inline sb-simd-sse:p128 (x) (the sb-simd-sse:p128 x))
-(define-inline sb-simd-avx:p128 (x) (the sb-simd-avx:p128 x))
-(define-inline sb-simd-avx:p256 (x) (the sb-simd-avx:p256 x))
+#+x86-64
+(progn
+ (define-inline sb-simd-sse:p128 (x) (the sb-simd-sse:p128 x))
+ (define-inline sb-simd-avx:p128 (x) (the sb-simd-avx:p128 x))
+ (define-inline sb-simd-avx:p256 (x) (the sb-simd-avx:p256 x))
+ (define-inline sb-simd-avx512f:p512 (x) (the sb-simd-avx512f:p512 x)))
+#+arm64
+(define-inline sb-simd-neon:p128 (x) (the sb-simd-neon:p128 x))
 
 (macrolet
     (;; We cannot call known functions directly in the definition of a
@@ -48,13 +53,14 @@
            `(progn
               (define-notinline ,err (x)
                 (error "Cannot convert ~S to ~S." x ',name))
-              (sb-c:defknown ,name (t) (values ,name &optional)
-                  (sb-c:foldable)
-                :overwrite-fndb-silently t)
-              (sb-c:deftransform ,name ((x) (,simd-type) *)
-                'x)
-              (sb-c:deftransform ,name ((x) (real) *)
-                '(,broadcast (,real-type x)))
+              ,@(when (instruction-set-available-p instruction-set)
+                  `((sb-c:defknown ,name (t) (values ,name &optional)
+                        (sb-c:foldable)
+                      :overwrite-fndb-silently t)
+                    (sb-c:deftransform ,name ((x) (,simd-type) *)
+                      'x)
+                    (sb-c:deftransform ,name ((x) (real) *)
+                      '(,broadcast (,real-type x)))))
               (defun ,name (x)
                 (typecase x
                   (,simd-type x)

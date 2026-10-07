@@ -54,7 +54,7 @@ structures are printed with #n#.")
   "The position of the right margin in ems (for pretty-printing).")
 (defvar *print-miser-width* nil
   "If the remaining space between the current column and the right margin
-   is less than this, then print using ``miser-style'' output. Miser
+   is less than this, then print using \"miser-style\" output. Miser
    style conditional newlines are turned on, and all indentations are
    turned off. If NIL, never use miser mode.")
 (defvar *print-pprint-dispatch*
@@ -1979,6 +1979,34 @@ variable: an unreadable object representing the error is printed instead.")
       (prin1 (fdefn-name fdefn) stream))))
 
 #+sb-simd-pack
+(defun simd-pack-print (stream type tag pack multiplier)
+  (declare ((integer 0 8) tag multiplier))
+  (print-unreadable-object (pack stream)
+    (princ type stream)
+    (macrolet ((simd-pack-case (&body cases)
+                 (let ((vector (make-list (length +simd-pack-element-types+))))
+                   (loop for (type . rest) in cases
+                         do (setf (elt vector (position type +simd-pack-element-types+ :test #'equal))
+                                  `(list ,@rest)))
+                   `(load-time-value (vector ,@vector)))))
+      (let ((cases
+              (simd-pack-case
+               (double-float " ~,13E" 1 #'sb-vm::%simd-pack-ref-double)
+               (single-float " ~,7E" 2 #'sb-vm::%simd-pack-ref-single)
+               ((unsigned-byte 8) " ~3D" 8 #'sb-vm::%simd-pack-ref-8)
+               ((unsigned-byte 16) " ~5D" 4 #'sb-vm::%simd-pack-ref-16)
+               ((unsigned-byte 32) " ~10D" 2 #'sb-vm::%simd-pack-ref-32)
+               ((unsigned-byte 64) " ~20D" 1 #'sb-vm::%simd-pack-ref-64)
+               ((signed-byte 8) " ~4@D" 8 #'sb-vm::%simd-pack-signed-ref-8)
+               ((signed-byte 16) " ~6@D" 4 #'sb-vm::%simd-pack-signed-ref-16)
+               ((signed-byte 32) " ~11@D" 2 #'sb-vm::%simd-pack-signed-ref-32)
+               ((signed-byte 64) " ~20@D" 1 #'sb-vm::%simd-pack-signed-ref-64))))
+        (destructuring-bind (format count accessor)
+            (aref cases tag)
+          (loop for i below (* (truly-the (integer 0 8) count) multiplier)
+                do (format stream format (funcall (truly-the function accessor) pack i))))))))
+
+#+sb-simd-pack
 (defmethod print-object ((pack simd-pack) stream)
   (cond ((and *print-readably* *read-eval*)
          (format stream "#.(~S #b~3,'0b #x~16,'0X #x~16,'0X)"
@@ -1989,38 +2017,7 @@ variable: an unreadable object representing the error is printed instead.")
         (*print-readably*
          (print-not-readable-error pack stream))
         (t
-         (print-unreadable-object (pack stream)
-           (etypecase pack
-             ((simd-pack double-float)
-              (multiple-value-call #'format stream "~S~@{ ~,13E~}" 'simd-pack
-                (%simd-pack-doubles pack)))
-             ((simd-pack single-float)
-              (multiple-value-call #'format stream "~S~@{ ~,7E~}" 'simd-pack
-                (%simd-pack-singles pack)))
-             ((simd-pack (unsigned-byte 8))
-              (multiple-value-call #'format stream "~S~@{ ~3D~}" 'simd-pack
-                (%simd-pack-ub8s pack)))
-             ((simd-pack (unsigned-byte 16))
-              (multiple-value-call #'format stream "~S~@{ ~5D~}" 'simd-pack
-                (%simd-pack-ub16s pack)))
-             ((simd-pack (unsigned-byte 32))
-              (multiple-value-call #'format stream "~S~@{ ~10D~}" 'simd-pack
-                (%simd-pack-ub32s pack)))
-             ((simd-pack (unsigned-byte 64))
-              (multiple-value-call #'format stream "~S~@{ ~20D~}" 'simd-pack
-                (%simd-pack-ub64s pack)))
-             ((simd-pack (signed-byte 8))
-              (multiple-value-call #'format stream "~S~@{ ~4,@D~}" 'simd-pack
-                (%simd-pack-sb8s pack)))
-             ((simd-pack (signed-byte 16))
-              (multiple-value-call #'format stream "~S~@{ ~6,@D~}" 'simd-pack
-                (%simd-pack-sb16s pack)))
-             ((simd-pack (signed-byte 32))
-              (multiple-value-call #'format stream "~S~@{ ~11@D~}" 'simd-pack
-                (%simd-pack-sb32s pack)))
-             ((simd-pack (signed-byte 64))
-              (multiple-value-call #'format stream "~S~@{ ~20@D~}" 'simd-pack
-                (%simd-pack-sb64s pack))))))))
+         (simd-pack-print stream 'simd-pack (%simd-pack-tag pack) pack 2))))
 
 #+sb-simd-pack-256
 (defmethod print-object ((pack simd-pack-256) stream)
@@ -2035,38 +2032,37 @@ variable: an unreadable object representing the error is printed instead.")
         (*print-readably*
          (print-not-readable-error pack stream))
         (t
-         (print-unreadable-object (pack stream)
-           (etypecase pack
-             ((simd-pack-256 double-float)
-              (multiple-value-call #'format stream "~S~@{ ~,13E~}" 'simd-pack-256
-                (%simd-pack-256-doubles pack)))
-             ((simd-pack-256 single-float)
-              (multiple-value-call #'format stream "~S~@{ ~,7E~}" 'simd-pack-256
-                (%simd-pack-256-singles pack)))
-             ((simd-pack-256 (unsigned-byte 8))
-              (multiple-value-call #'format stream "~S~@{ ~3D~}" 'simd-pack-256
-                (%simd-pack-256-ub8s pack)))
-             ((simd-pack-256 (unsigned-byte 16))
-              (multiple-value-call #'format stream "~S~@{ ~5D~}" 'simd-pack-256
-                (%simd-pack-256-ub16s pack)))
-             ((simd-pack-256 (unsigned-byte 32))
-              (multiple-value-call #'format stream "~S~@{ ~10D~}" 'simd-pack-256
-                (%simd-pack-256-ub32s pack)))
-             ((simd-pack-256 (unsigned-byte 64))
-              (multiple-value-call #'format stream "~S~@{ ~20D~}" 'simd-pack-256
-                (%simd-pack-256-ub64s pack)))
-             ((simd-pack-256 (signed-byte 8))
-              (multiple-value-call #'format stream "~S~@{ ~4@D~}" 'simd-pack-256
-                (%simd-pack-256-sb8s pack)))
-             ((simd-pack-256 (signed-byte 16))
-              (multiple-value-call #'format stream "~S~@{ ~6@D~}" 'simd-pack-256
-                (%simd-pack-256-sb16s pack)))
-             ((simd-pack-256 (signed-byte 32))
-              (multiple-value-call #'format stream "~S~@{ ~11@D~}" 'simd-pack-256
-                (%simd-pack-256-sb32s pack)))
-             ((simd-pack-256 (signed-byte 64))
-              (multiple-value-call #'format stream "~S~@{ ~20@D~}" 'simd-pack-256
-                (%simd-pack-256-sb64s pack))))))))
+         (simd-pack-print stream 'simd-pack-256 (%simd-pack-256-tag pack) pack 4))))
+
+#+sb-simd-pack-512
+(defmethod print-object ((mask simd-pack-512-mask) stream)
+  (let ((value (%simd-pack-512-mask-value mask)))
+    (cond ((and *print-readably* *read-eval*)
+           (format stream "#.(~S #x~16,'0X)" '%make-simd-pack-512-mask value))
+          (*print-readably*
+           (print-not-readable-error mask stream))
+          (t
+           (print-unreadable-object (mask stream)
+             (format stream "~S ~20D" 'simd-pack-512-mask value))))))
+
+#+sb-simd-pack-512
+(defmethod print-object ((pack simd-pack-512) stream)
+  (cond ((and *print-readably* *read-eval*)
+         (format stream "#.(~S #b~3,'0B #x~16,'0D #x~16,'0D #x~16,'0D #x~16,'0D #x~16,'0D #x~16,'0D #x~16,'0D #x~16,'0D)"
+                 '%make-simd-pack-512
+                 (%simd-pack-512-tag pack)
+                 (%simd-pack-512-0 pack)
+                 (%simd-pack-512-1 pack)
+                 (%simd-pack-512-2 pack)
+                 (%simd-pack-512-3 pack)
+                 (%simd-pack-512-4 pack)
+                 (%simd-pack-512-5 pack)
+                 (%simd-pack-512-6 pack)
+                 (%simd-pack-512-7 pack)))
+        (*print-readably*
+         (print-not-readable-error pack stream))
+        (t
+         (simd-pack-print stream 'simd-pack-512 (%simd-pack-512-tag pack) pack 8))))
 
 ;;;; functions
 
@@ -2084,16 +2080,21 @@ variable: an unreadable object representing the error is printed instead.")
     (when (unprintable-instance-p object)
       (return-from print-object
         (print-unreadable-object (object stream :type t :identity t)))))
-  (let* ((name (%fun-name object))
+  (let* ((unencapsulated (sb-ext:unencapsulated-function object))
+         (name (%fun-name unencapsulated))
          (proper-name-p (and (legal-fun-name-p name) (fboundp name)
                              (eq (fdefinition name) object))))
     ;; ":TYPE T" is no good, since CLOSURE doesn't have full-fledged status.
     (print-unreadable-object (object stream :identity (not proper-name-p))
-      (format stream "~A~@[ ~S~]"
-              ;; CLOSURE and SIMPLE-FUN should print as #<FUNCTION>
+      (format stream "~A~@[ ~S~]~:[ ENCAPSULATED~;~]"
+              ;; CLOSURE and SIMPLE-FUN should print as #<FUNCTION>,
               ;; but anything else prints as its exact type.
-              (if (funcallable-instance-p object) (type-of object) 'function)
-              name))))
+              (if (or (funcallable-instance-p object)
+                      (typep object 'sb-kernel:interpreted-function))
+                  (type-of object)
+                  'function)
+              name
+              (eq unencapsulated object)))))
 
 ;;;; catch-all for unknown things
 

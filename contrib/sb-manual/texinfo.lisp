@@ -1,0 +1,315 @@
+(in-package :sb-manual)
+
+(defun xref-defined-p (xref)
+  (let ((name (xref-name xref))
+        (locative-type (xref-locative-type xref)))
+    (case locative-type
+      ((function generic-function)
+       (ignore-errors (fdefinition name)))
+      ((variable)
+       (member (sb-int:info :variable :kind name)
+               '(:global :special :constant)))
+      ((declaration)
+       (find name (sb-cltl2:declaration-information 'declaration)))
+      ((class structure condition)
+       (find-class name nil))
+      ((type)
+       (sb-ext:defined-type-name-p name))
+      (t
+       (cond ((eq locative-type (dummy 'macro))
+              (ignore-errors (macro-function name)))
+             ((or (eq locative-type (dummy 'setf-function))
+                  (eq locative-type (dummy 'setf-generic-function)))
+              (ignore-errors (fdefinition name)))
+             (t
+              (assert nil () "Unexpected locative type in ~S."
+                      xref)))))))
+
+;;; We don't DEFINE-DUMMY DREF:ARGLIST and DREF:DOCSTRING because we
+;;; don't want USE-PAX to affect Texinfo output, which it would
+;;; because DREF:ARGLIST differs from the {incom,re}prehensible
+;;; LAMBDA-LIST*.
+(defun %arglist (xref)
+  (let ((name (xref-name xref))
+        (locative-type (xref-locative-type xref)))
+    (lambda-list* name locative-type)))
+
+(defun %docstring (xref)
+  (let ((sb-pcl::*normalize-sbcl-docstrings* nil))
+    (values (let ((name (xref-name xref))
+                  (locative-type (xref-locative-type xref)))
+              (case locative-type
+                ((function variable declaration)
+                 (documentation name locative-type))
+                ((generic-function)
+                 (documentation name 'function))
+                ((type class structure condition)
+                 (documentation name 'type))
+                (t
+                 (cond ((eq locative-type (dummy 'macro))
+                        (documentation (macro-function name) t))
+                       ((eq locative-type (dummy 'setf-function))
+                        (documentation (fdefinition name) t))
+                       ((eq locative-type (dummy 'setf-generic-function))
+                        (documentation (fdefinition name) t))
+                       (t
+                        (assert nil () "Unexpected locative type in ~S."
+                                xref))))))
+            ;; To be compatible with PAX::@PACKAGE-AND-READTABLE, we
+            ;; always return a non-NIL package.
+            (docstring-package xref))))
+
+(defun lambda-list* (name kind)
+  (case kind
+    ((package constant variable type structure class condition method
+              declaration nil)
+     nil)
+    (t
+     ;; KLUDGE: Eugh.
+     ;;
+     ;; believe it or not, the above comment was written before CSR
+     ;; came along and obfuscated this.  (2005-07-04)
+     (when (symbolp name)
+       (labels ((clean (x &key optional key)
+                  (typecase x
+                    (atom x)
+                    ((cons (member &optional))
+                     (cons (car x) (clean (cdr x) :optional t)))
+                    ((cons (member &key))
+                     (cons (car x) (clean (cdr x) :key t)))
+                    ((cons (member &whole &environment))
+                     ;; Skip these
+                     (clean (cdr x) :optional optional :key key))
+                    ((cons cons)
+                     (cons
+                      (cond (key (if (consp (caar x))
+                                     (caaar x)
+                                     (caar x)))
+                            (optional (caar x))
+                            (t (clean (car x))))
+                      (clean (cdr x) :key key :optional optional)))
+                    (cons
+                     (cons
+                      (cond ((or key optional) (car x))
+                            (t (clean (car x))))
+                      (clean (cdr x) :key key :optional optional))))))
+         (multiple-value-bind (ll unknown)
+             (sb-introspect:function-lambda-list name)
+           (if unknown
+               (values nil t)
+               (clean ll))))))))
+
+
+(defun locative-type-to-texinfo (locative-type)
+  (case locative-type
+    (function
+     (values "Function" "ffindex"))
+    (generic-function
+     (values "Generic function" "ffindex"))
+    (variable
+     (values "Variable" "vvindex"))
+    (class
+     (values "Class" "ttindex"))
+    (condition
+     (values "Condition" "ttindex"))
+    (structure
+     (values "Structure" "ttindex"))
+    (type
+     (values "Type" "ttindex"))
+    (declaration
+     (values "Declaration" "ddindex"))
+    (t
+     (cond
+       ((eq locative-type (dummy 'macro))
+        (values "Macro" "ffindex"))
+       ((eq locative-type (dummy 'setf-function))
+        (values "Setf function" "ffindex"))
+       ((eq locative-type (dummy 'setf-generic-function))
+        (values "Setf generic function" "ffindex"))
+       (t
+        (assert nil () "Unexpected locative type ~S." locative-type))))))
+
+(defmacro with-texinfo-to-file (file &body body)
+  `(call-maybe-with-texinfo-to-file (lambda () ,@body)
+                                   ,file))
+
+(defun call-maybe-with-texinfo-to-file (fn file)
+  (if file
+      (with-open-file (*standard-output* file :direction :output
+                                         :if-does-not-exist :create
+                                         :if-exists :supersede)
+        (format t "@c Generated by the sb-manual contrib. Do not edit.~%~%")
+        (funcall fn))
+      (funcall fn)))
+
+(defun remove-markup (string)
+  (remove #\\ string))
+
+;;; Write the Texinfo for SECTION to *STANDARD-OUTPUT*. When recursing
+;;; into child sections, if a section is in PAGES, then emit an
+;;; @include and open a new a file for output.
+(defun emit-texinfo-for-section (section &key pages (depth 0)
+                                 top-level-menus-to-file
+                                 top-level-contents-to-file)
+  (let ((title (remove-markup (section-title section)))
+        (entries (section-entries section)))
+    (format t "@node ~A~%" (texinfo-node-id section))
+    (write-concept-keys (concept-keys section) *standard-output*)
+    (format t "~A ~A~%~%"
+            (ecase depth
+              (0 "@top")
+              (1 "@chapter")
+              (2 "@section")
+              (3 "@subsection")
+              (4 "@subsubsection"))
+            title)
+    ;; Generate the @menu
+    (let ((child-sections
+            (loop for entry in entries
+                  when (and (not (stringp entry))
+                            (eq (xref-locative-type entry) (dummy 'section)))
+                    collect (symbol-value (xref-name entry)))))
+      (when child-sections
+        (unless top-level-menus-to-file
+          (format t "@menu~%"))
+        (with-texinfo-to-file top-level-menus-to-file
+          (dolist (child-section child-sections)
+            (format t "* ~A: ~A.~%"
+                    (remove-markup (section-title child-section))
+                    (texinfo-node-id child-section))))
+        (unless top-level-menus-to-file
+          (format t "@end menu~%~%"))))
+    ;; Generate the documentation
+    (let ((*package* (section-package section)))
+      (with-texinfo-to-file top-level-contents-to-file
+        (dolist (entry entries)
+          (cond ((stringp entry)
+                 ;; KLUDGE: @SBCL-MANUAL has an extra docstring that's
+                 ;; pretty much the same as @copying in
+                 ;; doc/manual/sbcl.texinfo. Skip it.
+                 (unless top-level-contents-to-file
+                   (emit-texinfo-for-docstring entry)
+                   (format t "~%")))
+                (t
+                 (if (not (eq (xref-locative-type entry) (dummy 'section)))
+                     (emit-texinfo-for-definition entry)
+                     (let ((page (find (xref-name entry) pages
+                                       :key #'first)))
+                       (when page
+                         (format t "@include ~A~%" (second page)))
+                       (with-texinfo-to-file (second page)
+                         (emit-texinfo-for-section
+                          (symbol-value (xref-name entry))
+                          :pages pages
+                          :depth (1+ depth))))))))))))
+
+(defun emit-texinfo-for-definition (xref)
+  (if (not (xref-defined-p xref))
+      (warn "~@<Not documenting ~S because it is not defined.~:@>" xref)
+      (multiple-value-bind (docstring *package*) (%docstring xref)
+        (multiple-value-bind (type index)
+            (locative-type-to-texinfo (xref-locative-type xref))
+          (let* ((name (xref-name xref))
+                 (*print-case* :downcase)
+                 ;; For e.g. #'print
+                 (*print-pretty* t)
+                 ;; The arglist must be on the @deffn line.
+                 (*print-right-margin* most-positive-fixnum))
+            (format t "@anchor{~A ~A ~A}~%" type
+                    (string-downcase (package-name (symbol-package name)))
+                    (string-downcase (symbol-name name)))
+            ;; E.g. @vvindex @sortas{save-hooks* sb-ext} *save-hooks* [sb-ext]
+            (let ((symbol-name (string-downcase (symbol-name name)))
+                  (symbol-package-name
+                    (string-downcase (package-name (symbol-package name)))))
+              (format t "@~A @sortas{~A ~A} ~A [~A]~%"
+                      index
+                      (sort-as-name symbol-name)
+                      (sort-as-name symbol-package-name)
+                      symbol-name
+                      symbol-package-name))
+            ;; Since we took indexing into our own hands, we just use
+            ;; @deffn for all definitions. We could also use @defblock and
+            ;; @defline.
+            (format t "@deffn{~A} ~A~{ ~A~}~%"
+                    ;; E.g. "Variable"
+                    type
+                    (let ((*package* (find-package :cl)))
+                      (prin1-to-string name))
+                    (%arglist xref))
+            (when docstring
+              (emit-texinfo-for-docstring docstring (%arglist xref)))
+            (format t "@end deffn~%"))))))
+
+;;; Remove leading non-alphanumeric characters. They are not important
+;;; when sorting names into indices.
+(defun sort-as-name (name)
+  (subseq name (or (position-if #'alphanumericp name) 0)))
+
+(defun emit-texinfo-for-docstring (docstring &optional arglist)
+  (markdown-to-texinfo (reindent-docstring docstring) arglist))
+
+
+;;; Currently, we have the Texinfo file under version control to keep
+;;; a closer eye on the Markdown-to-Texinfo converter, which is young.
+;;; When that's no longer the case, this is no longer needed.
+(defparameter *pages*
+  '((@support-and-bugs "support-and-bugs.texinfo")
+    (@introduction "intro.texinfo")
+    (@starting-and-stopping "start-stop.texinfo")
+    (@compiler "compiler.texinfo")
+    (@debugger "debugger.texinfo")
+    (@efficiency "efficiency.texinfo")
+    (@beyond-the-ansi-standard "beyond-ansi.texinfo")
+    (@external-formats "external-formats.texinfo")
+    (@foreign-function-interface "ffi.texinfo")
+    (@pathnames "pathnames.texinfo")
+    (@streams "streams.texinfo")
+    (@package-locks "package-locks.texinfo")
+    (@threading "threading.texinfo")
+    (@timers "timers.texinfo")
+    (@networking "../../contrib/sb-bsd-sockets/sb-bsd-sockets.texinfo")
+    (@profiling "profiling.texinfo")
+    (@statistical-profiler "../../contrib/sb-sprof/sb-sprof.texinfo")
+    (@contributed-modules "contrib-modules.texinfo")
+    (@sb-aclrepl "../../contrib/sb-aclrepl/sb-aclrepl.texinfo")
+    (@sb-concurrency "../../contrib/sb-concurrency/sb-concurrency.texinfo")
+    (@sb-cover "../../contrib/sb-cover/sb-cover.texinfo")
+    (@sb-grovel "../../contrib/sb-grovel/sb-grovel.texinfo")
+    (@sb-introspect "../../contrib/sb-introspect/sb-introspect.texinfo")
+    (@sb-manual "../../contrib/sb-manual/sb-manual.texinfo")
+    (@sb-md5 "../../contrib/sb-md5/sb-md5.texinfo")
+    (@sb-posix "../../contrib/sb-posix/sb-posix.texinfo")
+    (@sb-queue "../../contrib/sb-queue/sb-queue.texinfo")
+    (@sb-rotate-byte "../../contrib/sb-rotate-byte/sb-rotate-byte.texinfo")
+    (@sb-sb-simd "../../contrib/sb-simd/sb-simd.texinfo")
+    (@sb-simple-streams
+     "../../contrib/sb-simple-streams/sb-simple-streams.texinfo")
+    (@deprecation "deprecation.texinfo")))
+
+(defun generate-texinfo ()
+  (let ((*default-pathname-defaults*
+          (truename (merge-pathnames
+                     "../../doc/manual/"
+                     sb-sys::*sbcl-homedir-pathname*))))
+    (with-texinfo-to-file "variables.texinfo"
+      (format t "@set VERSION ~A~%~
+                 @set UPDATE-MONTH ~A~%"
+              (lisp-implementation-version)
+              (documentation-generation-date-string)))
+    ;; We redirect most lines via *PAGES*, :TOP-LEVEL-MENUS-TO-FILE,
+    ;; :TOP-LEVEL-CONTENTS-TO-FILE. Silence the rest, which are not
+    ;; needed, as sbcl.texinfo only needs the includes.
+    (let ((*standard-output* (make-broadcast-stream)))
+      (emit-texinfo-for-section
+       (symbol-value '@sbcl-manual) :pages *pages*
+       :top-level-menus-to-file "sbcl-menu.texinfo"
+       :top-level-contents-to-file "sbcl-contents.texinfo"))))
+
+#+nil
+(generate-texinfo)
+
+#+nil
+(emit-texinfo-for-section @sb-aclrepl)
+#+nil
+(emit-texinfo-for-section @starting-and-stopping)

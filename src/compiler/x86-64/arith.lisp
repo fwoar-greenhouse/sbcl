@@ -34,19 +34,16 @@
                 null-tn))
            (t
             (register-inline-constant :qword x)))))
-;; If 'plausible-signed-imm32-operand-p' is true, use it; otherwise use a RIP-relative constant
+;; If 'imm32-p' is true, use it; otherwise use a RIP-relative constant
 ;; or possibly return the NIL-based address of one of +POPULAR-RAW-CONSTANTS+
 (defun constantize (x)
-  (awhen (plausible-signed-imm32-operand-p x)
+  (awhen (imm32-p x)
     (return-from constantize it))
   (ref-shared-qword-literal x))
 
 ;;;; unary operations
 
-(define-vop (fast-safe-arith-op)
-  (:policy :fast-safe))
-
-(define-vop (fixnum-unop fast-safe-arith-op)
+(define-vop (fixnum-unop)
   (:args (x :scs (any-reg control-stack) :target res))
   (:results (res :scs (any-reg control-stack)))
   (:temporary (:sc unsigned-reg) temp)
@@ -54,7 +51,7 @@
   (:arg-types tagged-num)
   (:result-types tagged-num))
 
-(define-vop (signed-unop fast-safe-arith-op)
+(define-vop (signed-unop)
   (:args (x :scs (signed-reg signed-stack) :target res))
   (:results (res :scs (signed-reg signed-stack)))
   (:temporary (:sc unsigned-reg) temp)
@@ -80,36 +77,36 @@
       (neg (inst neg reg)))
     (move result reg)))
 
-(define-vop (fast-negate/fixnum fixnum-unop)
+(define-vop (negate/fixnum fixnum-unop)
   (:translate %negate)
   (:vop-var vop)
   (:generator 1 (emit-inline-neg 'neg x res temp vop)))
 
-(define-vop (fast-negate/signed signed-unop)
+(define-vop (negate/signed signed-unop)
   (:translate %negate)
   (:vop-var vop)
   (:generator 2 (emit-inline-neg 'neg x res temp vop)))
 
-(define-vop (fast-negate/unsigned signed-unop)
+(define-vop (negate/unsigned signed-unop)
   (:args (x :scs (unsigned-reg unsigned-stack) :target res))
   (:arg-types unsigned-num)
   (:translate %negate)
   (:vop-var vop)
   (:generator 3 (emit-inline-neg 'neg x res temp vop)))
 
-(define-vop (fast-negate/signed-unsigned signed-unop)
+(define-vop (negate/signed-unsigned signed-unop)
   (:results (res :scs (unsigned-reg unsigned-stack)))
   (:result-types unsigned-num)
   (:translate %negate)
   (:vop-var vop)
   (:generator 3 (emit-inline-neg 'neg x res temp vop)))
 
-(define-vop (fast-lognot/fixnum fixnum-unop)
+(define-vop (lognot/fixnum fixnum-unop)
   (:translate lognot)
   (:vop-var vop)
   (:generator 1 (emit-inline-neg 'not x res temp vop t)))
 
-(define-vop (fast-lognot/signed signed-unop)
+(define-vop (lognot/signed signed-unop)
   (:translate lognot)
   (:vop-var vop)
   (:generator 2 (emit-inline-neg 'not x res temp vop nil)))
@@ -118,7 +115,7 @@
 
 ;;; Assume that any constant operand is the second arg...
 
-(define-vop (fast-fixnum-binop fast-safe-arith-op)
+(define-vop (fixnum-binop)
   (:args (x :target r :scs (any-reg)
             :load-if (not (and (sc-is x control-stack)
                                (sc-is y any-reg)
@@ -134,7 +131,7 @@
   (:result-types tagged-num)
   (:note "inline fixnum arithmetic"))
 
-(define-vop (fast-unsigned-binop fast-safe-arith-op)
+(define-vop (unsigned-binop)
   (:args (x :target r :scs (unsigned-reg)
             :load-if (not (and (sc-is x unsigned-stack)
                                (sc-is y unsigned-reg)
@@ -150,7 +147,7 @@
   (:result-types unsigned-num)
   (:note "inline (unsigned-byte 64) arithmetic"))
 
-(define-vop (fast-signed-binop fast-safe-arith-op)
+(define-vop (signed-binop)
   (:args (x :target r :scs (signed-reg)
             :load-if (not (and (sc-is x signed-stack)
                                (sc-is y signed-reg)
@@ -166,7 +163,7 @@
   (:result-types signed-num)
   (:note "inline (signed-byte 64) arithmetic"))
 
-(define-vop (fast-fixnum-binop-c fast-safe-arith-op)
+(define-vop (fixnum-binop-c)
   (:args (x :target r :scs (any-reg) :load-if t))
   (:info y)
   (:arg-types tagged-num (:constant fixnum))
@@ -174,7 +171,7 @@
   (:result-types tagged-num)
   (:note "inline fixnum arithmetic"))
 
-(define-vop (fast-unsigned-binop-c fast-safe-arith-op)
+(define-vop (unsigned-binop-c)
   (:args (x :target r :scs (unsigned-reg) :load-if t))
   (:info y)
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
@@ -182,7 +179,7 @@
   (:result-types unsigned-num)
   (:note "inline (unsigned-byte 64) arithmetic"))
 
-(define-vop (fast-signed-binop-c fast-safe-arith-op)
+(define-vop (signed-binop-c)
   (:args (x :target r :scs (signed-reg) :load-if t))
   (:info y)
   (:arg-types signed-num (:constant (signed-byte 64)))
@@ -196,43 +193,65 @@
                                unsigned=>unsigned c/unsigned=>unsigned)
 
              `(progn
-                (define-vop (,(symbolicate "FAST-" translate "/FIXNUM=>FIXNUM")
-                             fast-fixnum-binop)
+                (define-vop (,(symbolicate translate "/FIXNUM=>FIXNUM")
+                             fixnum-binop)
                   (:translate ,translate)
                   (:generator 2
                    ,@(or fixnum=>fixnum `((move r x) (inst ,op r y)))))
-                (define-vop (,(symbolicate 'fast- translate '-c/fixnum=>fixnum)
-                             fast-fixnum-binop-c)
+                (define-vop (,(symbolicate translate '-c/fixnum=>fixnum)
+                             fixnum-binop-c)
                   (:arg-refs x-ref)
                   (:translate ,translate)
                   (:generator 1
                    ,@(or c/fixnum=>fixnum
-                         `((move r x) (inst ,op r (constantize (fixnumize y)))))))
-                (define-vop (,(symbolicate "FAST-" translate "/SIGNED=>SIGNED")
-                             fast-signed-binop)
+                         `((let ((fy (fixnumize y)))
+                             (cond ((and (not (imm32-p fy))
+                                         (not (location= x r)))
+                                    (inst mov r fy)
+                                    (inst ,op r x))
+                                   (t
+                                    (move r x)
+                                    (inst ,op r (constantize fy)))))))))
+                (define-vop (,(symbolicate translate "/SIGNED=>SIGNED")
+                             signed-binop)
                   (:translate ,translate)
                   (:generator ,(1+ untagged-penalty)
                    ,@(or signed=>signed `((move r x) (inst ,op r y)))))
-                (define-vop (,(symbolicate 'fast- translate '-c/signed=>signed)
-                             fast-signed-binop-c)
+                (define-vop (,(symbolicate translate '-c/signed=>signed)
+                             signed-binop-c)
+                  (:arg-refs x-ref)
                   (:translate ,translate)
                   (:generator ,untagged-penalty
-                   ,@(or c/signed=>signed `((move r x) (inst ,op r (constantize y))))))
-                (define-vop (,(symbolicate "FAST-"
+                   ,@(or c/signed=>signed
+                       `((cond ((and (not (imm32-p y))
+                                     (not (location= x r)))
+                                (inst mov r y)
+                                (inst ,op r x))
+                               (t
+                                (move r x)
+                                (inst ,op r (constantize y))))))))
+                (define-vop (,(symbolicate ""
                                            translate
                                            "/UNSIGNED=>UNSIGNED")
-                             fast-unsigned-binop)
+                             unsigned-binop)
                   (:translate ,translate)
                   (:generator ,(1+ untagged-penalty)
                    ,@(or unsigned=>unsigned `((move r x) (inst ,op r y)))))
-                (define-vop (,(symbolicate 'fast-
+                (define-vop (,(symbolicate
                                            translate
                                            '-c/unsigned=>unsigned)
-                             fast-unsigned-binop-c)
+                             unsigned-binop-c)
+                  (:arg-refs x-ref)
                   (:translate ,translate)
                   (:generator ,untagged-penalty
                    ,@(or c/unsigned=>unsigned
-                         `((move r x) (inst ,op r (constantize y)))))))))
+                       `((cond ((and (not (imm32-p y))
+                                     (not (location= x r)))
+                                (inst mov r y)
+                                (inst ,op r x))
+                               (t
+                                (move r x)
+                                (inst ,op r (constantize y)))))))))))
 
   ;; The following have microoptimizations for some special cases
   ;; not caught by the front end.
@@ -257,18 +276,32 @@
               (unless (location= x r)
                 (inst mov (if gpr-r-p :dword :qword) r x))
               (inst and :dword r y))
-             ((and (not (plausible-signed-imm32-operand-p y))
-                   (let* ((int (sb-c::type-approximate-interval (tn-ref-type x-ref)))
-                          (mask (logandc1 (logior y fixnum-tag-mask)
-                                          (ldb (byte (+ (integer-length (sb-c::interval-high int)) n-fixnum-tag-bits) 0) -1))))
-                     (when (and (>= (sb-c::interval-low int) 0)
-                                (= (logcount mask) 1))
-                       (move r x)
-                       (inst btr r (1- (integer-length mask)))
-                       t))))
-             (t
+             ((imm32-p y)
               (move r x)
-              (inst and r (constantize y))))))
+              (inst and r y))
+             ((let* ((width (sb-c::unsigned-type-width (tn-ref-type x-ref)))
+                     (extra-ones (and width
+                                      (dpb -1 (byte (- 64 (1+ width)) (1+ width)) y))))
+                ;; Try filling the zeros in the mask with ones where the integer already has zeros,
+                ;; which might sign-extend the mask into a negative 32-bit immediate
+                (cond ((imm32-p extra-ones)
+                       (move r x)
+                       (inst and r extra-ones)
+                       t)
+                      (t
+                       (let* ((int (sb-c::type-approximate-interval (tn-ref-type x-ref)))
+                              (mask (logandc1 (logior y fixnum-tag-mask)
+                                              (ldb (byte (+ (integer-length (sb-c::interval-high int)) n-fixnum-tag-bits) 0) -1))))
+                         (when (and (>= (sb-c::interval-low int) 0)
+                                    (= (logcount mask) 1))
+                           (move r x)
+                           (inst btr r (1- (integer-length mask)))
+                           t))))))
+             ((location= x r)
+              (inst and r (constantize y)))
+             (t
+              (inst mov r y)
+              (inst and r x)))))
     :c/unsigned=>unsigned
     ((let ((gpr-r-p (gpr-tn-p r)))
        (cond ((eql y most-positive-word)
@@ -282,13 +315,26 @@
              ((and gpr-r-p
                    (eql y (1- (expt 2 8))))
               (inst movzx '(:byte :dword) r x))
-             ((and (not (plausible-signed-imm32-operand-p y))
-                   (= (logcount (logandc1 y most-positive-word)) 1))
+             ((imm32-p y)
+              (move r x)
+              (inst and r y))
+             ((let* ((width (sb-c::unsigned-type-width (tn-ref-type x-ref)))
+                     (extra-ones (and width
+                                      (dpb -1 (byte (- 64 width) width) y))))
+                ;; Try filling the zeros in the mask with ones where the integer already has zeros,
+                ;; which might sign-extend the mask into a negative 32-bit immediate
+                (when (imm32-p extra-ones)
+                  (move r x)
+                  (inst and r extra-ones)
+                  t)))
+             ((= (logcount (logandc1 y most-positive-word)) 1)
               (move r x)
               (inst btr r (1- (integer-length (logandc1 y most-positive-word)))))
+             ((location= x r)
+              (inst and r (constantize y)))
              (t
-              (move r x)
-              (inst and r (constantize y))))))
+              (inst mov r y)
+              (inst and r x)))))
     :c/signed=>signed
     ((let ((gpr-r-p (gpr-tn-p r)))
        (cond ((and gpr-r-p
@@ -300,51 +346,85 @@
              ((and gpr-r-p
                    (eql y (1- (expt 2 8))))
               (inst movzx '(:byte :dword) r x))
-             ((and (not (plausible-signed-imm32-operand-p y))
-                   (= (logcount (logandc1 y most-positive-word)) 1))
+             ((imm32-p y)
+              (move r x)
+              (inst and r y))
+             ((let* ((width (sb-c::unsigned-type-width (tn-ref-type x-ref)))
+                     (extra-ones (and width
+                                      (dpb -1 (byte (- 64 width) width) y))))
+                ;; Try filling the zeros in the mask with ones where the integer already has zeros,
+                ;; which might sign-extend the mask into a negative 32-bit immediate
+                (when (imm32-p extra-ones)
+                  (move r x)
+                  (inst and r extra-ones)
+                  t)))
+             ((= (logcount (logandc1 y most-positive-word)) 1)
               (move r x)
               (inst btr r (1- (integer-length (logandc1 y most-positive-word)))))
+             ((location= x r)
+              (inst and r (constantize y)))
              (t
-              (move r x)
-              (inst and r (constantize y)))))))
+              (inst mov r y)
+              (inst and r x))))))
 
   (define-binop logior 2 or
     :c/fixnum=>fixnum
     ((let ((y (fixnumize y)))
-       (move r x)
-       (cond ((and (not (plausible-signed-imm32-operand-p y))
+       (cond ((imm32-p y)
+              (move r x)
+              (inst or r y))
+             ((and (not (imm32-p y))
                    (= (logcount y) 1))
+              (move r x)
               (inst bts r (1- (integer-length y))))
+             ((location= x r)
+              (inst or r (constantize y)))
              (t
-              (inst or r (constantize y))))))
+              (inst mov r y)
+              (inst or r x)))))
     :c/unsigned=>unsigned
     ((cond ((and (gpr-tn-p r) (eql y -1)) ; special-case "OR reg, all-ones"
             ;; I have yet to elicit this case. Can it happen?
             (inst mov r -1))
-           ((and (not (plausible-signed-imm32-operand-p y))
-                 (= (logcount y) 1))
+           ((imm32-p y)
+            (move r x)
+            (inst or r y))
+           ((= (logcount y) 1)
             (move r x)
             (inst bts r (1- (integer-length y))))
+           ((location= x r)
+            (inst or r (constantize y)))
            (t
-            (move r x)
-            (inst or r (constantize y)))))
+            (inst mov r y)
+            (inst or r x))))
     :c/signed=>signed
-    ((move r x)
-     (cond ((and (not (plausible-signed-imm32-operand-p y))
+    ((cond ((imm32-p y)
+            (move r x)
+            (inst or r y))
+           ((and (not (imm32-p y))
                  (= (logcount (ldb (byte n-word-bits 0) y)) 1))
+            (move r x)
             (inst bts r (1- (integer-length (ldb (byte n-word-bits 0) y)))))
+           ((location= x r)
+            (inst or r (constantize y)))
            (t
-            (inst or r (constantize y))))))
+            (inst mov r y)
+            (inst or r x)))))
 
   (define-binop logxor 2 xor
     :c/unsigned=>unsigned
-    ((move r x)
-     (let ((y (constantize y)))
-       (if (eql y -1) ; special-case "XOR reg, [all-ones]"
-           (inst not r)
-           (inst xor r y))))))
+    ((cond ((imm32-p y)
+            (move r x)
+            (if (eql y most-positive-word) ; special-case "XOR reg, [all-ones]"
+                (inst not r)
+                (inst xor r y)))
+           ((location= x r)
+            (inst xor r (constantize y)))
+           (t
+            (inst mov r y)
+            (inst xor r x))))))
 
-(define-vop (fast-logior-unsigned-signed=>signed fast-safe-arith-op)
+(define-vop (logior-unsigned-signed=>signed)
   (:args (x :scs (unsigned-reg) :to (:result 1))
          (y :target r :scs (signed-reg)))
   (:arg-types unsigned-num signed-num)
@@ -356,7 +436,7 @@
     (move r y)
     (inst or r x)))
 
-(define-vop (fast-logior-signed-unsigned=>signed fast-safe-arith-op)
+(define-vop (logior-signed-unsigned=>signed)
   (:args (x :target r :scs (signed-reg))
          (y :scs (unsigned-reg)))
   (:arg-types signed-num unsigned-num)
@@ -441,6 +521,17 @@
          (setq op 'add y (- y)))
         ((and (eq op 'add) (eql y (ash 1 31)))
          (setq op 'sub y (- y))))
+  (flet ((movabs (x y)
+           (when (and (integerp x)
+                      (not (imm32-p x))
+                      (gpr-tn-p result)
+                      (not (alias-p result y)))
+             (inst mov result x)
+             (inst* op result y)
+             (return-from emit-inline-add-sub))))
+    (movabs x y)
+    (when (eq op 'add)
+      (movabs y x)))
 
   ;; Oversized integers need to become RIP-relative constants
   (when (integerp x) (setq x (constantize x)))
@@ -448,45 +539,45 @@
 
   (let* ((y-is-reg-or-imm32 (or (gpr-tn-p y) (typep y '(signed-byte 32))))
          (commutative (eq op 'add)))
-      (when (alias-p result x)
-        ;; the first two clauses are correct because if the instruction was SUB with
-        ;; an immediate then it got turned into ADD with the negation of the immediate.
-        (cond ((eql y -1) (inst dec x))
-              ((eql y +1) (inst inc x))
-              ((or (gpr-tn-p x) y-is-reg-or-imm32)
-               ;; At most one memory operand. Result could be memory or register.
+    (when (alias-p result x)
+      ;; the first two clauses are correct because if the instruction was SUB with
+      ;; an immediate then it got turned into ADD with the negation of the immediate.
+      (cond ((eql y -1) (inst dec x))
+            ((eql y +1) (inst inc x))
+            ((or (gpr-tn-p x) y-is-reg-or-imm32)
+             ;; At most one memory operand. Result could be memory or register.
                (inst* op x y))
-              (t ; two memory operands: X is not a GPR, Y is neither GPR nor immm
-               (inst mov temp y)
-               (inst* op x temp)))
-        (return-from emit-inline-add-sub))
-      (when (and (alias-p result y) commutative)
-        ;; Result in the same location as Y can happen because we no longer specify
-        ;; that RESULT is live from (:ARGUMENT 0).
-        (cond ((or (gpr-tn-p x) (gpr-tn-p y))
-               (inst* op y x))
-              (t
-               (inst mov temp x)
-               (inst* op y temp)))
-        (return-from emit-inline-add-sub))
-      (let ((reg (if (and (gpr-tn-p result)
-                          ;; If Y aliases RESULT in SUB, then an initial (move reg x)
-                          ;; could clobber Y.
+            (t ; two memory operands: X is not a GPR, Y is neither GPR nor immm
+             (inst mov temp y)
+             (inst* op x temp)))
+      (return-from emit-inline-add-sub))
+    (when (and (alias-p result y) commutative)
+      ;; Result in the same location as Y can happen because we no longer specify
+      ;; that RESULT is live from (:ARGUMENT 0).
+      (cond ((or (gpr-tn-p x) (gpr-tn-p y))
+             (inst* op y x))
+            (t
+             (inst mov temp x)
+             (inst* op y temp)))
+      (return-from emit-inline-add-sub))
+    (let ((reg (if (and (gpr-tn-p result)
+                        ;; If Y aliases RESULT in SUB, then an initial (move reg x)
+                        ;; could clobber Y.
                           (or commutative (not (alias-p result y))))
-                     result
-                     temp)))
-        (cond ((and (eq op 'add) ; LEA can't do subtraction
-                    (gpr-tn-p x) y-is-reg-or-imm32) ; register + (register | imm32)
-               (inst lea reg (if (fixnump y) (ea y x) (ea x y))))
-              (t
-               ;; If commutative, then neither X nor Y is an alias of RESULT.
-               ;; If non-commutative, then RESULT could be Y, in which case REG is
-               ;; TEMP so that we don't trash Y by moving X into it.
+                   result
+                   temp)))
+      (cond ((and (eq op 'add)          ; LEA can't do subtraction
+                  (gpr-tn-p x) y-is-reg-or-imm32) ; register + (register | imm32)
+             (inst lea reg (if (fixnump y) (ea y x) (ea x y))))
+            (t
+             ;; If commutative, then neither X nor Y is an alias of RESULT.
+             ;; If non-commutative, then RESULT could be Y, in which case REG is
+             ;; TEMP so that we don't trash Y by moving X into it.
                (inst mov reg x)
                (cond ((and (eq op 'add) (eql y 1)) (inst inc reg))
                      ((and (eq op 'add) (eql y -1)) (inst dec reg))
                      (t (inst* op reg y)))))
-        (move result reg))))
+      (move result reg))))
 
 ;;; FIXME: we shouldn't need 12 variants, plus the modular variants, for what should
 ;;; be 1 vop. Certainly + and - can be done by one vop which examines lvar-fun-name.
@@ -499,7 +590,7 @@
                                (op (ecase fun-name (+ 'add) (- 'sub) (* 'mul)))
                                (emit (if (eq op 'mul) 'emit-inline-smul 'emit-inline-add-sub)))
              `(progn
-                (define-vop (,name fast-safe-arith-op)
+                (define-vop (,name)
                   (:translate ,fun-name)
                   (:args (x :scs (,@scs) ,@(if (eq op 'sub)
                                                '(:target r)))
@@ -512,7 +603,7 @@
                   (:note ,note)
                   (:generator ,(1+ cost)
                    (,emit ',op x y r temp vop ',val-xform ,@extra)))
-                (define-vop (,name/c fast-safe-arith-op)
+                (define-vop (,name/c)
                   (:translate ,fun-name)
                   (:args (x :scs ,scs))
                   (:info y)
@@ -524,34 +615,34 @@
                   (:note ,note)
                   (:generator ,cost
                    (,emit ',op x (,val-xform y) r temp vop ',val-xform ,@extra))))))
-  (def + fast-+/fixnum=>fixnum fast-+-c/fixnum=>fixnum
+  (def + +/fixnum=>fixnum +-c/fixnum=>fixnum
        (any-reg control-stack) tagged-num fixnum 1 fixnumize)
-  (def + fast-+/signed=>signed fast-+-c/signed=>signed
+  (def + +/signed=>signed +-c/signed=>signed
        (signed-reg signed-stack) signed-num (signed-byte 64) 3)
-  (def + fast-+/unsigned=>unsigned fast-+-c/unsigned=>unsigned
+  (def + +/unsigned=>unsigned +-c/unsigned=>unsigned
        (unsigned-reg unsigned-stack) unsigned-num (unsigned-byte 64) 3)
 
-  (def + fast-+/signed-unsigned fast-+-c/signed-unsigned
+  (def + +/signed-unsigned +-c/signed-unsigned
       (signed-reg signed-stack unsigned-reg unsigned-stack) (:or signed-num unsigned-num) (signed-byte 64) 5)
 
-  (def - fast--/fixnum=>fixnum fast---c/fixnum=>fixnum
+  (def - -/fixnum=>fixnum --c/fixnum=>fixnum
        (any-reg control-stack) tagged-num fixnum 1 fixnumize)
-  (def - fast--/signed=>signed fast---c/signed=>signed
+  (def - -/signed=>signed --c/signed=>signed
        (signed-reg signed-stack) signed-num (signed-byte 64) 3)
-  (def - fast--/unsigned=>unsigned fast---c/unsigned=>unsigned
+  (def - -/unsigned=>unsigned --c/unsigned=>unsigned
        (unsigned-reg unsigned-stack) unsigned-num (unsigned-byte 64) 3)
 
-  (def - fast--/signed-unsigned fast---c/signed-unsigned
+  (def - -/signed-unsigned --c/signed-unsigned
       (signed-reg signed-stack unsigned-reg unsigned-stack) (:or signed-num unsigned-num) (signed-byte 64) 5)
 
-  (def * fast-*/fixnum=>fixnum fast-*-c/fixnum=>fixnum
+  (def * */fixnum=>fixnum *-c/fixnum=>fixnum
        (any-reg control-stack) tagged-num fixnum 1 identity t)
-  (def * fast-*/signed=>signed fast-*-c/signed=>signed
+  (def * */signed=>signed *-c/signed=>signed
        (signed-reg signed-stack) signed-num (signed-byte 64) 3 identity nil)
   ;; unsigned is different because MUL always uses RAX:RDX as 1st operand.
   )
 
-(define-vop (fast--/unsigned=>signed fast-safe-arith-op)
+(define-vop (-/unsigned=>signed)
   (:translate -)
   (:args (x :scs (unsigned-reg unsigned-stack) :target r)
          (y :scs (unsigned-reg unsigned-stack immediate) :load-if nil))
@@ -566,8 +657,8 @@
 
 ;;;; Special logand cases: (logand signed unsigned) => unsigned
 
-(define-vop (fast-logand/signed-unsigned=>unsigned
-             fast-logand/unsigned=>unsigned)
+(define-vop (logand/signed-unsigned=>unsigned
+             logand/unsigned=>unsigned)
   (:args (x :target r :scs (signed-reg)
             :load-if (not (and (sc-is x signed-stack)
                                (sc-is y unsigned-reg)
@@ -579,13 +670,13 @@
 ;; This special case benefits from the special case for c/unsigned=>unsigned.
 ;; In particular, converting a (signed-byte 64) to (unsigned-byte 64) by
 ;; way of (LDB (byte 64 0)) doesn't need an AND instruction.
-(define-vop (fast-logand-c/signed-unsigned=>unsigned
-             fast-logand-c/unsigned=>unsigned)
+(define-vop (logand-c/signed-unsigned=>unsigned
+             logand-c/unsigned=>unsigned)
   (:args (x :target r :scs (signed-reg)))
   (:arg-types signed-num (:constant (unsigned-byte 64))))
 
-(define-vop (fast-logand/unsigned-signed=>unsigned
-             fast-logand/unsigned=>unsigned)
+(define-vop (logand/unsigned-signed=>unsigned
+             logand/unsigned=>unsigned)
   (:args (x :target r :scs (unsigned-reg)
             :load-if (not (and (sc-is x unsigned-stack)
                                (sc-is y signed-reg)
@@ -596,7 +687,7 @@
 
 ;;;; multiplication and division
 
-(define-vop (fast-*/unsigned=>unsigned fast-safe-arith-op)
+(define-vop (*/unsigned=>unsigned)
   (:translate *)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
@@ -615,7 +706,7 @@
     (inst mul y)
     (move r eax)))
 
-(define-vop (fast-*-c/unsigned=>unsigned fast-safe-arith-op)
+(define-vop (*-c/unsigned=>unsigned)
   (:translate *)
   (:args (x :scs (unsigned-reg) :target eax))
   (:info y)
@@ -634,12 +725,14 @@
     (inst mul :qword (ref-shared-qword-literal y))
     (move r eax)))
 
-(defun wordpair-to-bignum (result flag low high node)
+(defun wordpair-to-bignum (result flag low high xmm node)
+  (aver (= (tn-offset xmm) 15))
   (inst push high)
   (inst push low)
   (inst mov :byte result flag)
   (call-reg-specific-asm-routine node "BIGNUM-TO-" result))
-(defun unsigned-wordpair-to-bignum (result flag low high node)
+(defun unsigned-wordpair-to-bignum (result flag low high xmm node)
+  (aver (= (tn-offset xmm) 15))
   (inst push high)
   (inst push low)
   (inst mov :byte result flag)
@@ -650,18 +743,14 @@
   (:args (x :scs (signed-reg) :target rax)
          (y :scs (signed-reg)))
   (:arg-types signed-num signed-num)
-  (:temporary (:sc signed-reg :offset rax-offset :from (:argument 0))
-              rax)
-  (:temporary (:sc signed-reg :offset rdx-offset :from (:argument 1))
-              rdx)
+  (:temporary (:sc signed-reg :offset rax-offset :from (:argument 0)) rax)
+  (:temporary (:sc signed-reg :offset rdx-offset :from (:argument 1)) rdx)
   (:temporary (:sc signed-reg :from :eval) twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
-  (:generator 10
+  (:generator 11
     (move rax x)
     (inst imul y)
     (inst mov :byte twodigit 1) ; = "yes"
@@ -671,8 +760,85 @@
     (inst jmp :no DONE)
     (zeroize twodigit) ; = "no"
     allocate
-    (wordpair-to-bignum r twodigit rax rdx node)
+    (wordpair-to-bignum r twodigit rax rdx scratch node)
     DONE))
+
+(define-vop (*/signed=>s128)
+  (:translate *)
+  (:boxing-variant */signed=>integer)
+  (:args (x :scs (signed-reg) :target rax)
+         (y :scs (signed-reg)))
+  (:arg-types signed-num signed-num)
+  (:temporary (:sc signed-reg :offset rax-offset :from (:argument 0)) rax)
+  (:temporary (:sc signed-reg :offset rdx-offset :from (:argument 1)) rdx)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:vop-var vop)
+  (:generator 10
+    (move rax x)
+    (inst imul y)
+    (move lo rax)
+    (move hi rdx)))
+
+(define-vop (*/s128*s128=>s128)
+  (:translate *)
+  (:args ((lo-x hi-x) :scs (signed-128-reg))
+         ((lo-y hi-y) :scs (signed-128-reg)))
+  (:arg-types signed-byte-128 signed-byte-128)
+  (:temporary (:sc signed-reg :offset rax-offset) rax)
+  (:temporary (:sc signed-reg :offset rdx-offset) rdx)
+  (:temporary (:sc signed-reg) tmp)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:vop-var vop)
+  (:generator 12
+    (move tmp hi-x)
+    (inst imul tmp lo-y)
+
+    (move rax lo-x)
+    (inst imul rax hi-y)
+    (inst add tmp rax)
+
+    (move rax lo-x)
+    (inst mul lo-y)
+
+    (inst add rdx tmp)
+
+    (move lo rax)
+    (move hi rdx)))
+
+(define-vop (*/s128*signed=>s128)
+  (:translate *)
+  (:args ((lo-x hi-x) :scs (signed-128-reg))
+         (y :scs (signed-reg)))
+  (:arg-types signed-byte-128 signed-num)
+  (:temporary (:sc signed-reg :offset rax-offset) rax)
+  (:temporary (:sc signed-reg :offset rdx-offset) rdx)
+  (:temporary (:sc signed-reg) tmp)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:vop-var vop)
+  (:generator 18
+    (move rax lo-x)
+    (inst mul y)
+
+    (move tmp hi-x)
+    (inst imul tmp y)
+    (inst add rdx tmp)
+
+    (move tmp y)
+    (inst sar tmp 63)
+    (inst imul tmp lo-x)
+    (inst add rdx tmp)
+
+    (move lo rax)
+    (move hi rdx)))
+
+(define-vop (*/signed*s128=>s128 */s128*signed=>s128)
+  (:translate *)
+  (:args (y :scs (signed-reg))
+         ((lo-x hi-x) :scs (signed-128-reg)))
+  (:arg-types signed-num signed-byte-128))
 
 (define-vop (+/signed=>integer)
   (:translate +)
@@ -681,13 +847,11 @@
   (:arg-types signed-num signed-num)
   (:temporary (:sc signed-reg :from (:argument 0)) low)
   (:temporary (:sc signed-reg :from :eval) high twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
-  (:generator 7
+  (:generator 20
     (move low x)
     (inst add low y)
     (inst mov :byte twodigit 1)
@@ -699,8 +863,150 @@
     allocate
     ;; high := CF broadcast into all bits. Ignored if single-digit
     (inst sbb high high)
-    (wordpair-to-bignum r twodigit low high node)
+    (wordpair-to-bignum r twodigit low high scratch node)
     DONE))
+
+(define-vop (+/unsigned=>integer)
+  (:translate +)
+  (:args (x :scs (unsigned-reg))
+         (y :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num)
+  (:results (r :scs (descriptor-reg)))
+  (:vop-var vop)
+  (:node-var node)
+  (:generator 18
+    (cond ((location= r x))
+          ((location= r y)
+           (setf y x))
+          (t
+           (move r x)))
+    (inst add r y)
+    (inst jmp :c TWO)
+    (inst jmp :s TWO)
+    (inst shl r 1)
+    (inst jmp :no DONE)
+    ;; This is a little like MOVE-FROM-SIGNED or MOVE-FROM-UNSIGNED
+    ;; but not quite the same as either.
+    ;; Restore the bits of R, but we don't need the carry - it has to be 0
+    ;; because if it weren't 0 then OF would have been set.
+    (inst shr r 1)
+    ;; "signed" meaning that bit index 63 which happens to be 0 is
+    ;; in fact a sign bit and not the 64th bit of the significand.
+    (signed=>bignum-in-reg node r)
+    (inst jmp DONE)
+    TWO
+    (two-word-bignum node r)
+    DONE))
+
+(define-vop (-/unsigned=>integer)
+  (:translate -)
+  (:args (x :scs (unsigned-reg) :target low)
+         (y :scs (unsigned-reg)))
+  (:arg-types unsigned-num unsigned-num)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) low)
+  (:temporary (:sc unsigned-reg :from :eval) high twodigit)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
+  (:results (r :scs (descriptor-reg)))
+  (:vop-var vop)
+  (:node-var node)
+  (:generator 18
+    (move low x)
+    (inst sub low y)
+    (inst mov :byte twodigit 1)
+
+    (inst jmp :c negative)
+    (inst jmp :s allocate)
+    (inst jmp positive)
+    negative
+    (inst jmp :ns allocate)
+    positive
+
+    (move r low)
+    (inst shl r 1)
+    (inst jmp :no DONE)
+    (zeroize twodigit)
+    allocate
+    (inst sbb high high)
+    (wordpair-to-bignum r twodigit low high scratch node)
+    DONE))
+
+(define-vop (+/signed=>s128)
+  (:translate +)
+  (:boxing-variant +/signed=>integer)
+  (:args (x :scs (signed-reg) :target lo-r)
+         (y :scs (signed-reg) :to :save)) ;; swap on location=?
+  (:arg-types signed-num signed-num)
+  (:results ((lo-r hi-r) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 8
+    (move lo-r x)
+    (zeroize hi-r)
+    (inst add lo-r y)
+    (inst set :l hi-r)
+    (inst neg hi-r)))
+
+(define-vop (+/unsigned=>s128)
+  (:translate +)
+  (:boxing-variant +/unsigned=>integer)
+  (:args (x :scs (unsigned-reg) :target lo)
+         (y :scs (unsigned-reg) :to :save))
+  (:arg-types unsigned-num unsigned-num)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 10
+    (move lo x)
+    (zeroize hi)
+    (inst add lo y)
+    (inst set :b hi)))
+
+(define-vop (+/unsigned-signed=>s128)
+  (:translate +)
+  (:args (x :scs (unsigned-reg) :target lo)
+         (y :scs (signed-reg) :to :save))
+  (:arg-types unsigned-num signed-num)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 10
+    (move lo x)
+    (move hi y)
+    (inst sar hi 63)
+    (inst add lo y)
+    (inst adc hi 0 )))
+
+(define-vop (+/signed-unsigned=>s128 +/unsigned-signed=>s128)
+  (:args (y :scs (signed-reg) :to :save)
+         (x :scs (unsigned-reg) :target lo))
+  (:arg-types signed-num unsigned-num))
+
+(define-vop (+/s128+signed=>s128)
+  (:translate +)
+  (:args ((lo-x hi-x) :scs (signed-128-reg) :target lo-r)
+         (y :scs (signed-reg (immediate (imm32-p (tn-value tn)))) :to :save))
+  (:arg-types signed-byte-128 signed-num)
+  (:temporary (:sc signed-reg) tmp)
+  (:results ((lo-r hi-r) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 10
+    (move lo-r lo-x)
+    (move hi-r hi-x)
+    (sc-case y
+      (immediate
+       (let ((val (tn-value y)))
+         (inst add lo-r val)
+         (if (minusp val)
+             (inst adc hi-r -1)
+             (inst adc hi-r 0))))
+      (t
+       (move tmp y)
+       (inst sar tmp 63)
+       (inst add lo-r y)
+       (inst adc hi-r tmp)))))
+
+(define-vop (+/signed+s128=>s128 +/s128+signed=>s128)
+  (:translate +)
+  (:args (y :scs (signed-reg) :to :save)
+         ((lo-x hi-x) :scs (signed-128-reg) :target lo-r))
+  (:arg-types signed-num signed-byte-128))
 
 (define-vop (-/signed=>integer)
   (:translate -)
@@ -709,13 +1015,11 @@
   (:arg-types signed-num signed-num)
   (:temporary (:sc signed-reg :from (:argument 0)) low)
   (:temporary (:sc signed-reg :from :eval) high twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
-  (:generator 7
+  (:generator 20
     (move low x)
     (inst sub low y)
     (inst mov :byte twodigit 1)
@@ -727,8 +1031,87 @@
     allocate
     (inst cmc)
     (inst sbb high high)
-    (wordpair-to-bignum r twodigit low high node)
+    (wordpair-to-bignum r twodigit low high scratch node)
     DONE))
+
+(define-vop (-/signed=>s128)
+  (:translate -)
+  (:boxing-variant -/signed=>integer)
+  (:args (x :scs (signed-reg) :target lo)
+         (y :scs (signed-reg) :to :save))
+  (:arg-types signed-num signed-num)
+  (:temporary (:sc signed-reg) tmp)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:vop-var vop)
+  (:generator 10
+    (move lo x)
+    (move hi x)
+    (inst sar hi 63)
+    (move tmp y)
+    (inst sar tmp 63)
+    (inst sub lo y)
+    (inst sbb hi tmp)))
+
+(define-vop (-/s128-s128=>s128)
+  (:translate -)
+  (:args ((lo-x hi-x) :scs (signed-128-reg) :target lo)
+         ((lo-y hi-y) :scs (signed-128-reg) :to :save))
+  (:arg-types signed-byte-128 signed-byte-128)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:vop-var vop)
+  (:generator 13
+    (move lo lo-x)
+    (inst sub lo lo-y)
+    (move hi hi-x)
+    (inst sbb hi hi-y)))
+
+(define-vop (-/s128-signed=>s128)
+  (:translate -)
+  (:args ((lo-x hi-x) :scs (signed-128-reg) :target lo-r)
+         (y :scs (signed-reg (immediate (imm32-p (tn-value tn)))) :to :save))
+  (:arg-types signed-byte-128 signed-num)
+  (:temporary (:sc signed-reg) tmp)
+  (:results ((lo-r hi-r) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 11
+    (move lo-r lo-x)
+    (move hi-r hi-x)
+    (sc-case y
+      (immediate
+       (let ((val (tn-value y)))
+         (inst sub lo-r val)
+         (if (minusp val)
+             (inst sbb hi-r -1)
+             (inst sbb hi-r 0))))
+      (t
+       (move tmp y)
+       (inst sar tmp 63)
+       (inst sub lo-r y)
+       (inst sbb hi-r tmp)))))
+
+(define-vop (-/signed-s128=>s128)
+  (:translate -)
+  (:args (x :scs (signed-reg immediate) :target lo-r)
+         ((lo-y hi-y) :scs (signed-128-reg) :to :save))
+  (:arg-types signed-num signed-byte-128)
+  (:results ((lo-r hi-r) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 11
+    (sc-case x
+      (immediate
+       (let ((val (tn-value x)))
+         (inst mov lo-r val)
+         (inst mov hi-r (if (minusp val)
+                            -1
+                            0))))
+      (t
+       (move lo-r x)
+       (move hi-r lo-r)
+       (inst sar hi-r 63)))
+    (inst sub lo-r lo-y)
+    (inst sbb hi-r hi-y)))
 
 (define-vop (*/unsigned=>integer)
   (:translate *)
@@ -738,20 +1121,18 @@
   (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 0)) rax)
   (:temporary (:sc unsigned-reg :offset rdx-offset :from (:argument 1)) rdx)
   (:temporary (:sc signed-reg :from (:argument 2)) multidigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
-  (:generator 10
+  (:generator 11
     (move rax x)
     (inst mul y)
     (inst mov :byte multidigit 1) ; might need 2 or 3 digits to represent
     ;; OF implies RDX nonzero. Sign bit of RDX gets tested in asm routine
     (inst jmp :o allocate)
     (move r rax)
-    (inst shl r 1) ; n-fixnum-tag-bits
+    (inst shl r 1)                      ; n-fixnum-tag-bits
     ;; If we shifted out a 1 bit from the low digit, then it's a 2-digit bignum
     (inst jmp :c allocate)
     ;; If not-CF and not-OF then the top 2 bits of the low digit are both zero
@@ -759,7 +1140,7 @@
     (inst jmp :no DONE)
     (zeroize multidigit)
     allocate
-    (unsigned-wordpair-to-bignum r multidigit rax rdx node)
+    (unsigned-wordpair-to-bignum r multidigit rax rdx scratch node)
     DONE))
 
 (define-vop (ash-left-add-signed)
@@ -773,10 +1154,8 @@
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)
                :unused-if (sc-is shift immediate)) rcx)
   (:temporary (:sc signed-reg :from :eval) twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
   (:generator 10
@@ -809,7 +1188,7 @@
     (inst jmp :no DONE)
     (zeroize twodigit)
     allocate
-    (wordpair-to-bignum r twodigit rax rdx node)
+    (wordpair-to-bignum r twodigit rax rdx scratch node)
     DONE))
 
 (define-vop ()
@@ -818,10 +1197,8 @@
          (add :scs (unsigned-reg)))
   (:arg-types signed-num unsigned-num)
   (:temporary (:sc signed-reg) twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
   (:generator 10
@@ -835,7 +1212,7 @@
     (inst jmp :no DONE)
     (zeroize twodigit)
     allocate
-    (wordpair-to-bignum r twodigit add x node)
+    (wordpair-to-bignum r twodigit add x scratch node)
     DONE))
 
 (define-vop (ash-left-add-unsigned)
@@ -849,10 +1226,8 @@
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)
                :unused-if (sc-is shift immediate)) rcx)
   (:temporary (:sc signed-reg :from (:argument 2)) multidigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
   (:generator 10
@@ -877,7 +1252,7 @@
     (inst jmp :no DONE)
     (zeroize multidigit)
     allocate
-    (unsigned-wordpair-to-bignum r multidigit rax rdx node)
+    (unsigned-wordpair-to-bignum r multidigit rax rdx scratch node)
     DONE))
 
 (defun signed=>bignum-in-reg (node reg) ; arg/result in same reg
@@ -890,83 +1265,14 @@
 (defun two-word-bignum (node reg)
   (call-reg-specific-asm-routine node "TWO-WORD-BIGNUM-TO-" reg))
 
-(define-vop (+/unsigned=>integer)
-  (:translate +)
-  (:args (x :scs (unsigned-reg))
-         (y :scs (unsigned-reg)))
-  (:arg-types unsigned-num unsigned-num)
-  (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
-  (:vop-var vop)
-  (:node-var node)
-  (:generator 8
-    (cond ((location= r x))
-          ((location= r y)
-           (setf y x))
-          (t
-           (move r x)))
-    (inst add r y)
-    (inst jmp :c TWO)
-    (inst jmp :s TWO)
-    (inst shl r 1)
-    (inst jmp :no DONE)
-    ;; This is a little like MOVE-FROM-SIGNED or MOVE-FROM-UNSIGNED
-    ;; but not quite the same as either.
-    ;; Restore the bits of R, but we don't need the carry - it has to be 0
-    ;; because if it weren't 0 then OF would have been set.
-    (inst shr r 1)
-    ;; "signed" meaning that bit index 63 which happens to be 0 is
-    ;; in fact a sign bit and not the 64th bit of the significand.
-    (signed=>bignum-in-reg node r)
-    (inst jmp DONE)
-    TWO
-    (two-word-bignum node r)
-    DONE))
-
-(define-vop (-/unsigned=>integer)
-  (:translate -)
-  (:args (x :scs (unsigned-reg) :target low)
-         (y :scs (unsigned-reg)))
-  (:arg-types unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :from (:argument 0)) low)
-  (:temporary (:sc unsigned-reg :from :eval) high twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
-  (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
-  (:vop-var vop)
-  (:node-var node)
-  (:generator 8
-    (move low x)
-    (inst sub low y)
-    (inst mov :byte twodigit 1)
-
-    (inst jmp :c negative)
-    (inst jmp :s allocate)
-    (inst jmp positive)
-    negative
-    (inst jmp :ns allocate)
-    positive
-
-    (move r low)
-    (inst shl r 1)
-    (inst jmp :no DONE)
-    (zeroize twodigit)
-    allocate
-    (inst sbb high high)
-    (wordpair-to-bignum r twodigit low high node)
-    DONE))
-
 (define-vop (%negate/unsigned=>integer)
   (:translate %negate)
   (:args (x :scs (unsigned-reg) :target low))
   (:arg-types unsigned-num)
   (:temporary (:sc unsigned-reg :from (:argument 0)) low)
   (:temporary (:sc unsigned-reg :from :eval) high twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
   (:generator 8
@@ -987,7 +1293,7 @@
     (zeroize twodigit)
     allocate
     (inst sbb high high)
-    (wordpair-to-bignum r twodigit low high node)
+    (wordpair-to-bignum r twodigit low high scratch node)
     DONE))
 
 (define-vop (%negate/signed=>integer)
@@ -996,13 +1302,11 @@
   (:arg-types signed-num)
   (:temporary (:sc signed-reg :from (:argument 0)) low)
   (:temporary (:sc signed-reg :from :eval) high twodigit)
-  (:temporary (:sc complex-double-reg :offset 0) scratch)
-  (:ignore scratch)
+  (:temporary (:sc complex-double-reg :offset 15) scratch)
   (:results (r :scs (descriptor-reg)))
-  (:policy :fast-safe)
   (:vop-var vop)
   (:node-var node)
-  (:generator 7
+  (:generator 20
     (move low x)
     (inst neg low)
     (inst mov :byte twodigit 1)
@@ -1014,8 +1318,36 @@
     allocate
     (inst cmc)
     (inst sbb high high)
-    (wordpair-to-bignum r twodigit low high node)
+    (wordpair-to-bignum r twodigit low high scratch node)
     DONE))
+
+(define-vop (%negate/signed=>s128)
+  (:translate %negate)
+  (:boxing-variant %negate/signed=>integer)
+  (:args (x :scs (signed-reg)))
+  (:arg-types signed-num)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 15
+    (move lo x)
+    (move hi x)
+    (inst sar hi 63)
+    (inst neg hi)
+    (inst neg lo)
+    (inst sbb hi 0)))
+
+(define-vop (%negate/s128=>s128)
+  (:translate %negate)
+  (:args ((lo-x hi-x) :scs (signed-128-reg)))
+  (:arg-types signed-byte-128)
+  (:results ((lo hi) :scs (signed-128-reg)))
+  (:result-types signed-byte-128)
+  (:generator 16
+    (move hi hi-x)
+    (move lo lo-x)
+    (inst neg hi)
+    (inst neg lo)
+    (inst sbb hi 0)))
 
 (define-vop (overflow*-fixnum)
   (:translate overflow*)
@@ -1025,7 +1357,6 @@
   (:info type)
   (:results (r :scs (any-reg) :from :load))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 1
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1042,7 +1373,6 @@
   (:info y type)
   (:results (r :scs (any-reg) :from :load))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1062,7 +1392,6 @@
   (:info type)
   (:results (r :scs (signed-reg) :from :load))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1082,7 +1411,6 @@
   (:temporary (:sc signed-reg :offset rdx-offset) rdx)
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1105,7 +1433,6 @@
   (:results (r :scs (unsigned-reg)))
   (:ignore rdx)
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 4
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1126,7 +1453,6 @@
   (:temporary (:sc signed-reg :offset rdx-offset) rdx)
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1153,7 +1479,6 @@
   (:temporary (:sc unsigned-reg) temp)
   (:results (r :scs (signed-reg) :from :load))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 6
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1181,12 +1506,11 @@
   (:translate overflow+)
   (:args (x :scs (unsigned-reg))
          (y :scs (unsigned-reg (immediate
-                                (plausible-signed-imm32-operand-p (tn-value tn))))))
+                                (imm32-p (tn-value tn))))))
   (:arg-types unsigned-num unsigned-num)
   (:info type)
   (:results (r :scs (unsigned-reg) :from (:argument 0)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (move r x)
@@ -1202,12 +1526,11 @@
   (:translate overflow+)
   (:args (x :scs (signed-reg))
          (y :scs (signed-reg (immediate
-                              (plausible-signed-imm32-operand-p (tn-value tn))))))
+                              (imm32-p (tn-value tn))))))
   (:arg-types signed-num signed-num)
   (:info type)
   (:results (r :scs (signed-reg) :from (:argument 0)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (move r x)
@@ -1223,12 +1546,11 @@
   (:translate overflow+)
   (:args (x :scs (any-reg))
          (y :scs (any-reg (immediate
-                           (plausible-signed-imm32-operand-p (fixnumize (tn-value tn)))))))
+                           (imm32-p (fixnumize (tn-value tn)))))))
   (:arg-types tagged-num tagged-num)
   (:info type)
   (:results (r :scs (any-reg) :from (:argument 0)))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 1
     (move r x)
@@ -1249,7 +1571,6 @@
   (:temporary (:sc unsigned-reg) temp1 temp2)
   (:results (r :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1274,7 +1595,6 @@
   (:temporary (:sc unsigned-reg) tmp)
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1296,7 +1616,6 @@
                    ) x y)
   (:results (r :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1319,7 +1638,6 @@
   (:info type)
   (:results (r :scs (unsigned-reg) :from (:argument 0)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (move r x)
@@ -1337,7 +1655,6 @@
   (:info type)
   (:results (r :scs (signed-reg) :from (:argument 0)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (move r x)
@@ -1351,12 +1668,11 @@
   (:translate overflow-)
   (:args (x :scs (any-reg))
          (y :scs (any-reg (immediate
-                           (plausible-signed-imm32-operand-p (fixnumize (tn-value tn)))))))
+                           (imm32-p (fixnumize (tn-value tn)))))))
   (:arg-types tagged-num tagged-num)
   (:info type)
   (:results (r :scs (any-reg) :from (:argument 0)))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 1
     (move r x)
@@ -1377,7 +1693,6 @@
   (:temporary (:sc unsigned-reg) temp1 temp2)
   (:results (r :scs (signed-reg) :from :load))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1402,7 +1717,6 @@
   (:temporary (:sc unsigned-reg) temp1 temp2)
   (:results (r :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 5
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1427,7 +1741,6 @@
   (:temporary (:sc unsigned-reg) tmp)
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1449,7 +1762,6 @@
   (:temporary (:sc unsigned-reg) tmp)
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1470,7 +1782,6 @@
   (:info type)
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1491,7 +1802,6 @@
   (:temporary (:sc unsigned-reg) tmp)
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1510,7 +1820,6 @@
   (:info type)
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1527,7 +1836,6 @@
   (:info type)
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 2
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1546,7 +1854,6 @@
   (:info type)
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1565,7 +1872,6 @@
   (:info type)
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
     (let* ((*location-context* (unless (eq type 'fixnum)
@@ -1584,7 +1890,6 @@
   (:info type)
   (:results (r :scs (any-reg) :from :load))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:check-type x)
   (:generator 10
@@ -1625,7 +1930,6 @@
   (:temporary (:sc unsigned-reg) temp)
   (:results (result :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:variant-vars signed)
   (:generator 3
@@ -1727,7 +2031,6 @@
   (:temporary (:sc unsigned-reg) temp)
   (:results (result :scs (signed-reg) :from :load))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:variant-vars type-check)
   (:variant nil)
@@ -1845,7 +2148,6 @@
               temp)
   (:results (r :scs (any-reg) :from :load))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:check-type x)
   (:generator 2
@@ -2006,7 +2308,6 @@
   (:info type)
   (:results (r :scs (any-reg) :from :load))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:vop-var vop)
   (:check-type x)
   (:generator 2
@@ -2021,7 +2322,7 @@
       (inst jmp :o error))))
 
 
-(define-vop (fast-truncate/fixnum=>fixnum fast-safe-arith-op)
+(define-vop (truncate/fixnum=>fixnum)
   (:translate truncate)
   (:args (x :scs (any-reg) :target eax)
          (y :scs (any-reg control-stack)))
@@ -2054,7 +2355,7 @@
             (inst lea quo (ea nil eax (ash 1 n-fixnum-tag-bits)))))
     (move rem edx)))
 
-(define-vop (fast-truncate-c/fixnum=>fixnum fast-safe-arith-op)
+(define-vop (truncate-c/fixnum=>fixnum)
   (:translate truncate)
   (:args (x :scs (any-reg) :target rax))
   (:info y)
@@ -2083,7 +2384,7 @@
               (inst lea quo (ea nil rax (ash 1 n-fixnum-tag-bits))))))
     (move rem rdx)))
 
-(define-vop (fast-truncate/unsigned=>unsigned fast-safe-arith-op)
+(define-vop (truncate/unsigned=>unsigned)
   (:translate truncate)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg signed-stack)))
@@ -2112,7 +2413,7 @@
     (move quo eax)
     (move rem edx)))
 
-(define-vop (fast-truncate-c/unsigned=>unsigned fast-safe-arith-op)
+(define-vop (truncate-c/unsigned=>unsigned)
   (:translate truncate)
   (:args (x :scs (unsigned-reg) :target eax))
   (:info y)
@@ -2135,7 +2436,7 @@
     (move quo eax)
     (move rem edx)))
 
-(define-vop (fast-truncate/signed=>signed fast-safe-arith-op)
+(define-vop (truncate/signed=>signed)
   (:translate truncate)
   (:args (x :scs (signed-reg) :target eax)
          (y :scs (signed-reg signed-stack)))
@@ -2164,7 +2465,7 @@
     (move quo eax)
     (move rem edx)))
 
-(define-vop (fast-truncate-c/signed=>signed fast-safe-arith-op)
+(define-vop (truncate-c/signed=>signed)
   (:translate truncate)
   (:args (x :scs (signed-reg) :target eax))
   (:info y)
@@ -2187,7 +2488,7 @@
     (move quo eax)
     (move rem edx)))
 
-(define-vop (truncate-mod64 fast-truncate/signed=>signed)
+(define-vop (truncate-mod64 truncate/signed=>signed)
   (:translate truncate-mod64)
   (:results (quo :scs (unsigned-reg))
             (rem :scs (signed-reg)))
@@ -2217,7 +2518,7 @@
     DONE
     (move quo eax)))
 
-(define-vop (fast-truncate/signed-unsigned=>signed fast-safe-arith-op)
+(define-vop (truncate/signed-unsigned=>signed)
   (:translate truncate)
   (:args (x :scs (signed-reg (immediate
                               (minusp (tn-value tn)))) :to :result)
@@ -2287,7 +2588,7 @@
          (and (> abs 1)
               (= (logcount abs) 1)))))
 
-(define-vop (truncate/signed-power-of-two fast-safe-arith-op)
+(define-vop (truncate/signed-power-of-two)
   (:translate truncate)
   (:args (x :scs (signed-reg) :to :result))
   (:arg-types signed-num (:constant (satisfies power-of-two-p)))
@@ -2372,9 +2673,8 @@
                  ,@body)
                 (when save (inst mov save result)))))
 
-(define-vop (fast-ash-c/fixnum=>fixnum)
+(define-vop (ash-c/fixnum=>fixnum)
   (:translate ash)
-  (:policy :fast-safe)
   (:args (number :scs (any-reg control-stack) :target result))
   (:info amount)
   (:arg-types tagged-num (:constant integer))
@@ -2402,7 +2702,7 @@
                      (inst sar result 63)
                      (inst and result (lognot fixnum-tag-mask)))))))))
 
-(define-vop (fast-ash-left/fixnum=>fixnum)
+(define-vop (ash-left/fixnum=>fixnum)
   (:translate ash)
   (:args (number :scs (any-reg control-stack) :target result)
          (amount :scs (unsigned-reg) :target ecx))
@@ -2410,18 +2710,17 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (any-reg control-stack) :from (:argument 0)))
   (:result-types tagged-num)
-  (:policy :fast-safe)
   (:note "inline ASH")
   (:temporary (:sc unsigned-reg) temp)
+  (:related-args number)
   (:generator 3
     (with-shift-operands
-      (move ecx amount)
+        (move ecx amount)
       ;; The result-type ensures us that this shift will not overflow.
       (inst shl result :cl))))
 
-(define-vop (fast-ash-c/signed=>signed)
+(define-vop (ash-c/signed=>signed)
   (:translate ash)
-  (:policy :fast-safe)
   (:args (number :scs (signed-reg signed-stack) :target result))
   (:info amount)
   (:arg-types signed-num (:constant integer))
@@ -2436,9 +2735,8 @@
             (cond ((plusp amount) (inst shl result amount))
                   (t (inst sar result (min 63 (- amount))))))))))
 
-(define-vop (fast-ash-c/unsigned=>unsigned)
+(define-vop (ash-c/unsigned=>unsigned)
   (:translate ash)
-  (:policy :fast-safe)
   (:args (number :scs (unsigned-reg unsigned-stack) :target result))
   (:info amount)
   (:arg-types unsigned-num (:constant integer))
@@ -2456,7 +2754,7 @@
                  (inst shl result amount)
                  (inst shr result (- amount))))))))
 
-(define-vop (fast-ash-left/signed=>signed)
+(define-vop (ash-left/signed=>signed)
   (:translate ash)
   (:args (number :scs (signed-reg signed-stack) :target result)
          (amount :scs (unsigned-reg) :target ecx))
@@ -2464,15 +2762,15 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (signed-reg signed-stack) :from (:argument 0)))
   (:result-types signed-num)
-  (:policy :fast-safe)
   (:note "inline ASH")
   (:temporary (:sc unsigned-reg) temp)
+  (:related-args number)
   (:generator 4
     (with-shift-operands
-      (move ecx amount)
+        (move ecx amount)
       (inst shl result :cl))))
 
-(define-vop (fast-ash-left/unsigned=>unsigned)
+(define-vop (ash-left/unsigned=>unsigned)
   (:translate ash)
   (:args (number :scs (unsigned-reg unsigned-stack) :target result)
          (amount :scs (unsigned-reg) :target ecx))
@@ -2480,16 +2778,16 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (unsigned-reg unsigned-stack) :from (:argument 0)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:note "inline ASH")
   (:temporary (:sc unsigned-reg) temp)
+  (:related-args number)
   (:generator 4
     (with-shift-operands
-      (move ecx amount)
+        (move ecx amount)
       (inst shl result :cl))))
 
-(define-vop (fast-ash-left/fixnum-modfx=>fixnum
-             fast-ash-left/fixnum=>fixnum)
+(define-vop (ash-left/fixnum-modfx=>fixnum
+             ash-left/fixnum=>fixnum)
   (:translate ash-left-modfx)
   (:arg-refs nil amount-ref)
   (:generator 3
@@ -2503,16 +2801,16 @@
       OKAY
       (inst shl result :cl))))
 
-(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
-             fast-ash-c/unsigned=>unsigned)
+(define-vop (ash-left-mod64-c/unsigned=>unsigned
+             ash-c/unsigned=>unsigned)
   (:translate ash-left-mod64))
 
-(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
-             fast-ash-c/fixnum=>fixnum)
+(define-vop (ash-left-modfx-c/fixnum=>fixnum
+             ash-c/fixnum=>fixnum)
   (:translate ash-left-modfx))
 
-(define-vop (fast-ash-left/unsigned-mod64=>unsigned
-             fast-ash-left/unsigned=>unsigned)
+(define-vop (ash-left/unsigned-mod64=>unsigned
+             ash-left/unsigned=>unsigned)
   (:translate ash-left-mod64)
   (:arg-refs nil amount-ref)
   (:generator 4
@@ -2526,9 +2824,8 @@
       OKAY
       (inst shl result :cl))))
 
-(define-vop (fast-%ash/right/unsigned)
+(define-vop (%ash/right/unsigned)
   (:translate %ash/right)
-  (:policy :fast-safe)
   (:args (number :scs (unsigned-reg unsigned-stack) :target result)
          (amount :scs (unsigned-reg) :target rcx))
   (:arg-types unsigned-num unsigned-num)
@@ -2536,14 +2833,14 @@
   (:result-types unsigned-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
   (:temporary (:sc unsigned-reg) temp)
+  (:related-args number)
   (:generator 4
     (with-shift-operands
-      (move rcx amount)
+        (move rcx amount)
       (inst shr result :cl))))
 
-(define-vop (fast-%ash/right/signed)
+(define-vop (%ash/right/signed)
   (:translate %ash/right)
-  (:policy :fast-safe)
   (:args (number :scs (signed-reg signed-stack) :target result)
          (amount :scs (unsigned-reg) :target rcx))
   (:arg-types signed-num unsigned-num)
@@ -2551,14 +2848,14 @@
   (:result-types signed-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
   (:temporary (:sc unsigned-reg) temp)
+  (:related-args number)
   (:generator 4
     (with-shift-operands
-      (move rcx amount)
+        (move rcx amount)
       (inst sar result :cl))))
 
-(define-vop (fast-%ash/right/fixnum)
+(define-vop (%ash/right/fixnum)
   (:translate %ash/right)
-  (:policy :fast-safe)
   (:args (number :scs (any-reg control-stack) :target result)
          (amount :scs (unsigned-reg) :target rcx))
   (:arg-types tagged-num unsigned-num)
@@ -2566,16 +2863,16 @@
   (:result-types tagged-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
   (:temporary (:sc unsigned-reg) temp)
+  (:related-args number)
   (:generator 3
     (with-shift-operands
-      (move rcx amount)
+        (move rcx amount)
       (inst sar result :cl)
       (inst and result (lognot fixnum-tag-mask)))))
 ) ; end MACROLET
 
-(define-vop (fast-ash/unsigned=>unsigned)
+(define-vop (ash/unsigned=>unsigned)
   (:translate ash)
-  (:policy :fast-safe)
   (:args (number :scs (unsigned-reg) :target result)
          (amount :scs (signed-reg) :target ecx))
   (:arg-types unsigned-num signed-num)
@@ -2584,6 +2881,7 @@
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:arg-refs nil amount-ref)
   (:variant-vars check-amount signed)
+  (:related-args number)
   (:note "inline ASH")
   (:generator 5
     (let ((amount-width (if (csubtypep (tn-ref-type amount-ref)
@@ -2622,8 +2920,8 @@
 
         DONE))))
 
-(define-vop (fast-ash/signed=>signed
-             fast-ash/unsigned=>unsigned)
+(define-vop (ash/signed=>signed
+             ash/unsigned=>unsigned)
   (:args (number :scs (signed-reg) :target result)
          (amount :scs (signed-reg) :target ecx))
   (:arg-types signed-num signed-num)
@@ -2631,26 +2929,26 @@
   (:result-types signed-num)
   (:variant nil t))
 
-(define-vop (fast-ash-modfx/signed=>signed
-             fast-ash/signed=>signed)
+(define-vop (ash-modfx/signed=>signed
+             ash/signed=>signed)
   (:variant t t)
   (:translate ash-modfx))
 
-(define-vop (fast-ash-modfx/unsigned=>signed
-             fast-ash/unsigned=>unsigned)
+(define-vop (ash-modfx/unsigned=>signed
+             ash/unsigned=>unsigned)
   (:results (result :scs (signed-reg) :from (:argument 0)))
   (:result-types signed-num)
   (:variant t nil)
   (:translate ash-modfx)
   (:variant-cost 6))
 
-(define-vop (fast-ash-mod64/unsigned=>unsigned
-             fast-ash/unsigned=>unsigned)
+(define-vop (ash-mod64/unsigned=>unsigned
+             ash/unsigned=>unsigned)
   (:variant t nil)
   (:translate ash-mod64))
 
-(define-vop (fast-ash-mod64/signed=>unsigned
-             fast-ash/signed=>signed)
+(define-vop (ash-mod64/signed=>unsigned
+             ash/signed=>signed)
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:variant t t)
@@ -2664,7 +2962,6 @@
   (flushable))
 (define-vop ()
   (:translate udiv32-via-multiply)
-  (:policy :fast-safe)
   (:args (dividend :scs (unsigned-reg))
          (magic :scs (unsigned-reg))
          (add :scs (unsigned-reg))
@@ -2703,7 +3000,6 @@
   (flushable))
 (define-vop ()
   (:translate urem32-via-multiply)
-  (:policy :fast-safe)
   (:args (dividend :scs (unsigned-reg))
          (divisor :scs (unsigned-reg))
          (magic :scs (unsigned-reg))
@@ -2750,7 +3046,6 @@
                            &aux (name (symbolicate "FASTREM-" bits)))
        `(define-vop (,name)
           (:translate ,name)
-          (:policy :fast-safe)
           (:args (dividend :scs (unsigned-reg) :target rax)
                  (c :scs (unsigned-reg))
                  (divisor :scs (unsigned-reg)))
@@ -2783,7 +3078,6 @@
 
 (define-vop (%lea/unsigned=>unsigned)
   (:translate %lea)
-  (:policy :fast-safe)
   (:args (base :scs (unsigned-reg))
          (index :scs (unsigned-reg)))
   (:info scale disp)
@@ -2797,7 +3091,6 @@
 
 (define-vop (%lea/signed=>signed)
   (:translate %lea)
-  (:policy :fast-safe)
   (:args (base :scs (signed-reg))
          (index :scs (signed-reg)))
   (:info scale disp)
@@ -2811,7 +3104,6 @@
 
 (define-vop (%lea/fixnum=>fixnum)
   (:translate %lea)
-  (:policy :fast-safe)
   (:args (base :scs (any-reg))
          (index :scs (any-reg)))
   (:info scale disp)
@@ -2827,9 +3119,8 @@
 ;;; fixed so that it's actually _faster_ than the non-CMOV version; at
 ;;; least on my Celeron-XXX laptop, this version is marginally slower
 ;;; than the above version with branches.  -- CSR, 2003-09-04
-(define-vop (fast-cmov-ash/unsigned=>unsigned)
+(define-vop (cmov-ash/unsigned=>unsigned)
   (:translate ash)
-  (:policy :fast-safe)
   (:args (number :scs (unsigned-reg) :target result)
          (amount :scs (signed-reg) :target ecx))
   (:arg-types unsigned-num signed-num)
@@ -2839,6 +3130,7 @@
   (:temporary (:sc any-reg :from (:eval 0) :to (:eval 1)) zero)
   (:note "inline ASH")
   (:guard (member :cmov *backend-subfeatures*))
+  (:related-args number)
   (:generator 4
     (move result number)
     (move ecx amount)
@@ -2860,7 +3152,6 @@
 (define-vop (signed-byte-64-len)
   (:translate integer-length)
   (:note "inline (signed-byte 64) integer-length")
-  (:policy :fast-safe)
   (:args (arg :scs (signed-reg) :to :save))
   (:arg-refs arg-ref)
   (:arg-types signed-num)
@@ -2883,7 +3174,6 @@
 (define-vop (unsigned-byte-64-len)
   (:translate integer-length)
   (:note "inline (unsigned-byte 64) integer-length")
-  (:policy :fast-safe)
   (:args (arg :scs (unsigned-reg)))
   (:arg-refs arg-ref)
   (:arg-types unsigned-num)
@@ -2905,7 +3195,6 @@
 (define-vop (positive-fixnum-len)
   (:translate integer-length)
   (:note "inline positive fixnum integer-length")
-  (:policy :fast-safe)
   (:args (arg :scs (any-reg)))
   (:arg-types positive-fixnum)
   (:results (res :scs (unsigned-reg)))
@@ -2922,7 +3211,6 @@
 (define-vop (fixnum-len)
   (:translate integer-length)
   (:note "inline fixnum integer-length")
-  (:policy :fast-safe)
   (:args (arg :scs (any-reg) :to :save))
   (:arg-types tagged-num)
   (:results (res :scs (unsigned-reg)))
@@ -2935,7 +3223,6 @@
 
 (define-vop ()
   (:translate count-trailing-zeros)
-  (:policy :fast-safe)
   (:args (arg :scs (signed-reg unsigned-reg) :to :save))
   (:arg-types (:or signed-num unsigned-num))
   (:results (res :scs (unsigned-reg)))
@@ -2946,41 +3233,40 @@
 
 ;;;; binary conditional VOPs
 
-(define-vop (fast-conditional)
+(define-vop (conditional)
   (:conditional :e)
   (:info)
-  (:temporary (:sc unsigned-reg) temp)
-  (:policy :fast-safe))
+  (:temporary (:sc unsigned-reg) temp))
 
-(define-vop (fast-conditional/fixnum fast-conditional)
+(define-vop (conditional/fixnum conditional)
   (:args (x :scs (any-reg control-stack))
          (y :scs (any-reg control-stack)))
   (:arg-types tagged-num tagged-num)
   (:note "inline fixnum comparison"))
 
-(define-vop (fast-conditional-c/fixnum fast-conditional/fixnum)
+(define-vop (conditional-c/fixnum conditional/fixnum)
   (:args (x :scs (any-reg control-stack)))
   (:arg-types tagged-num (:constant fixnum))
   (:info y))
 
-(define-vop (fast-conditional/signed fast-conditional)
+(define-vop (conditional/signed conditional)
   (:args (x :scs (signed-reg signed-stack))
          (y :scs (signed-reg signed-stack)))
   (:arg-types signed-num signed-num)
   (:note "inline (signed-byte 64) comparison"))
 
-(define-vop (fast-conditional-c/signed fast-conditional/signed)
+(define-vop (conditional-c/signed conditional/signed)
   (:args (x :scs (signed-reg signed-stack)))
   (:arg-types signed-num (:constant (signed-byte 64)))
   (:info y))
 
-(define-vop (fast-conditional/unsigned fast-conditional)
+(define-vop (conditional/unsigned conditional)
   (:args (x :scs (unsigned-reg unsigned-stack))
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
   (:note "inline (unsigned-byte 64) comparison"))
 
-(define-vop (fast-conditional-c/unsigned fast-conditional/unsigned)
+(define-vop (conditional-c/unsigned conditional/unsigned)
   (:args (x :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
   (:info y))
@@ -2994,7 +3280,7 @@
                     (sc-is y immediate))
            (setf y (tn-value y)))
          (when (integerp y)
-           (acond ((plausible-signed-imm32-operand-p y)
+           (acond ((imm32-p y)
                    (return-from ensure-not-mem+mem (values x it)))
                   ((typep y '(unsigned-byte 32))
                    ;; Rather than a RIP-relative constant, load a dword (w/o sign-extend)
@@ -3045,30 +3331,46 @@
          ;; in an 8-bit-aligned field. For now I'm only dealing with
          ;; the restricted case of 8 bits at (BYTE 8 8).
          (reducible-to-byte-p
-          (and (eq size :word) (not (logtest #xFF y)))))
-    (cond  ((and (integerp y)
-                 (not (plausible-signed-imm32-operand-p y))
-                 (= (logcount (ldb (byte n-word-bits 0) y)) 1))
-            (change-vop-flags sb-assem::*current-vop* '(:c))
-            (inst bt x (1- (integer-length (ldb (byte n-word-bits 0) y)))))
-           ((not size)
-            ;; Ensure that both operands are acceptable
-            ;; by possibly loading one into TEMP
+           (and (eq size :word) (not (logtest #xFF y))))
+         (memory-p (sc-is x control-stack unsigned-stack signed-stack)))
+    (cond ((and (not memory-p)
+                (case y
+                  (#.(ash 1 63)
+                   (inst test x x)
+                   t)
+                  (#.(ash 1 31)
+                   (inst test :dword x x)
+                   t)
+                  (#.(ash 1 15)
+                   (inst test :word x x)
+                   t)
+                  (#.(ash 1 7)
+                   (inst test :byte x x)
+                   t)))
+           (change-vop-flags sb-assem::*current-vop* '(:s)))
+          ((and (integerp y)
+                (not (imm32-p y))
+                (= (logcount (ldb (byte n-word-bits 0) y)) 1))
+           (change-vop-flags sb-assem::*current-vop* '(:c))
+           (inst bt x (1- (integer-length (ldb (byte n-word-bits 0) y)))))
+          ((not size)
+           ;; Ensure that both operands are acceptable
+           ;; by possibly loading one into TEMP
             (multiple-value-setq (x y) (ensure-not-mem+mem x y temp))
             (inst test :qword x y))
-          ((sc-is x control-stack unsigned-stack signed-stack)
+          (memory-p
            ;; Otherwise, when using an immediate operand smaller
            ;; than 64 bits, narrow the reg/mem operand to match.
-           (let ((disp (frame-byte-offset (tn-offset x))))
-             (when reducible-to-byte-p
-               (setq size :byte disp (1+ disp) y (ash y -8)))
-             (inst test size (ea disp rbp-tn) y)))
+            (let ((disp (frame-byte-offset (tn-offset x))))
+              (when reducible-to-byte-p
+                (setq size :byte disp (1+ disp) y (ash y -8)))
+              (inst test size (ea disp rbp-tn) y)))
           (t
            (aver (gpr-tn-p x))
            (if (and reducible-to-byte-p (<= (tn-offset x) rbx-offset))
                ;; Use upper byte of word reg {A,C,D,B}X -> {A,C,D,B}H
-               (inst test :byte `(,x . :high-byte) (ash y -8))
-               (inst test size x y))))))
+                (inst test :byte `(,x . :high-byte) (ash y -8))
+                (inst test size x y))))))
 
 (deftransform logtest ((x y) (:or ((signed-word signed-word) *)
                                   ((word word) *))
@@ -3082,8 +3384,8 @@
                                         /unsigned -c/unsigned)
                         for cost in '(4 3 6 5 6 5)
                         collect
-                        `(define-vop (,(symbolicate "FAST-LOGTEST" suffix)
-                                      ,(symbolicate "FAST-CONDITIONAL" suffix))
+                        `(define-vop (,(symbolicate "LOGTEST" suffix)
+                                      ,(symbolicate "CONDITIONAL" suffix))
                            (:translate logtest)
                            (:conditional :ne)
                            (:generator ,cost
@@ -3094,7 +3396,7 @@
 
 ;;; This works for tagged or untagged values, but the vop optimizer
 ;;; has to pre-adjust Y if tagged.
-(define-vop (logtest-memref fast-conditional)
+(define-vop (logtest-memref conditional)
   (:args (x :scs (descriptor-reg)))
   (:arg-types * (:constant integer))
   (:info y)
@@ -3125,7 +3427,7 @@
 ;;; Try to absorb a memory load into LOGTEST.
 ;;; This removes one instruction and possibly shortens the TEST by eliding
 ;;; a REX prefix.
-(defoptimizer (sb-c::vop-optimize fast-logtest-c/fixnum sb-c::select-representations) (vop)
+(defoptimizer (sb-c::vop-optimize logtest-c/fixnum sb-c::select-representations) (vop)
   (unless (tn-ref-memory-access (vop-args vop))
     (let ((prev (sb-c::previous-vop-is
                  ;; TODO: missing data-vector-ref/simple-vector-c
@@ -3136,7 +3438,7 @@
                        ;; because CAR,CDR, etc would need to cast/assert the loaded
                        ;; value to fixnum. However, in practive it doesn't work anyway
                        ;; because there seems to be a spurious MOVE vop in between
-                       ;; the SLOT and the FAST-LOGTEST-C/FIXNUM.
+                       ;; the SLOT and the logtest-C/FIXNUM.
                        ;; But ironically enough we _did_ seem to want to optimize
                        ;; an expression in GENERATE-CODE along the lines of:
                        ;;  (if (oddp (length (ir2-component-constants ir2-component))) ...)
@@ -3169,10 +3471,10 @@
               (sb-c::delete-vop prev)
               (sb-c::delete-vop vop)
               new)))))))
-(setf (sb-c::vop-info-optimizer (template-or-lose 'fast-logtest-c/signed))
-      (cons #'vop-optimize-fast-logtest-c/fixnum-optimizer 'sb-c::select-representations))
-(setf (sb-c::vop-info-optimizer (template-or-lose 'fast-logtest-c/unsigned))
-      (cons #'vop-optimize-fast-logtest-c/fixnum-optimizer 'sb-c::select-representations))
+(setf (sb-c::vop-info-optimizer (template-or-lose 'logtest-c/signed))
+      (cons #'vop-optimize-logtest-c/fixnum-optimizer 'sb-c::select-representations))
+(setf (sb-c::vop-info-optimizer (template-or-lose 'logtest-c/unsigned))
+      (cons #'vop-optimize-logtest-c/fixnum-optimizer 'sb-c::select-representations))
 
 (deftransform logbitp ((index integer) (:or ((signed-word signed-word) *)
                                             ((word word) *)) * :vop t)
@@ -3183,7 +3485,7 @@
 ;;; E1:       25FE0F0000       AND EAX, 4094
 ;;; E6:       4885C0           TEST RAX, RAX
 ;;; E9:       74C9             JEQ L2
-(define-vop (logbitp fast-safe-arith-op)
+(define-vop (logbitp)
   (:translate logbitp)
   (:conditional :c)
   (:args (bit :scs (signed-reg unsigned-reg))
@@ -3221,7 +3523,7 @@
                    :qword)
             word bit))))
 
-(define-vop (logbitp/c fast-safe-arith-op)
+(define-vop (logbitp/c)
   (:translate logbitp)
   (:conditional :c)
   (:info bit)
@@ -3244,23 +3546,26 @@
            (binding* ((frame-disp  (frame-byte-offset (tn-offset int)))
                       ((extra-disp bit-shift) (floor bit 8)))
              (inst test :byte (ea (+ frame-disp extra-disp) rbp-tn) (ash 1 bit-shift)))
-           (change-vop-flags vop '(:ne))
-           (return-from logbitp/c))
-          ((= bit 31)       ; test the sign bit of the 32-bit register
+           (change-vop-flags vop '(:ne)))
+          ((= bit 7) ; test the sign bit
+           (inst test :byte int int)
+           (change-vop-flags vop '(:s)))
+          ((= bit 15)
+           (inst test :word int int)
+           (change-vop-flags vop '(:s)))
+          ((= bit 31)
            (inst test :dword int int)
-           (change-vop-flags vop '(:s))
-           (return-from logbitp/c))
+           (change-vop-flags vop '(:s)))
           ((= bit 63)
            (inst test int int)
-           (change-vop-flags vop '(:s))
-           (return-from logbitp/c))
+           (change-vop-flags vop '(:s)))
           ((< bit 32)
            (inst test (if (< bit 8) :byte :dword) int (ash 1 bit))
-           (change-vop-flags vop '(:ne))
-           (return-from logbitp/c)))
-    (inst bt (if (<= bit 31) :dword :qword) int bit)))
+           (change-vop-flags vop '(:ne)))
+          (t
+           (inst bt (if (<= bit 31) :dword :qword) int bit)))))
 
-(define-vop (logbitp-memref fast-conditional)
+(define-vop (logbitp-memref conditional)
   (:args (x :scs (descriptor-reg)))
   (:arg-types (:constant (mod 64)) *)
   (:info bit)
@@ -3312,7 +3617,7 @@
 ;;; We can delete some MOVEs that seem often to get inserted with iteration constructs
 ;;; such as (setq i (1+ i)) where the result of 1+ creates a new TN which is moved
 ;;; to the same TN that is the input to 1+, but PACK chooses different physical registers
-;;; for the arg and result of FAST-+-C/FIXNUM=>FIXNUM. So we "cleverly" can use the LEA
+;;; for the arg and result of +-C/FIXNUM=>FIXNUM. So we "cleverly" can use the LEA
 ;;; instruction as a 3-operand ADD, only to move the destination of LEA back to the
 ;;; same register that was one of the input operands. Yet the TN which was the result
 ;;; had otherwise no use. Why does this happen? I don't know.
@@ -3324,7 +3629,7 @@
 ;;; several physical representations, such as accepting either tagged or untagged,
 ;;; and the SC has not been chosen yet (which happens), then we can't remove.
 ;;;
-;;; For some reason, it seems to come up a trememdous amount with FAST-+-C/FIXNUM=>FIXNUM.
+;;; For some reason, it seems to come up a trememdous amount with +-C/FIXNUM=>FIXNUM.
 ;;; Maybe it comes up with others, I don't know. No harm in trying, I suppose.
 ;;; To do this for other vops, you have to be certain that the move isn't a coercion.
 ;;;
@@ -3332,15 +3637,15 @@
 ;;; so that this optimizer could be made architecture-independent]
 ;;; The SB-C::DELETE- function isn't defined yet in the build order, so wrap it in a lambda.
 (flet ((optimizer (vop) (sb-c::delete-unnecessary-move vop)))
-  (dolist (name '(sb-vm::fast-+-c/fixnum=>fixnum
-                  sb-vm::fast-+-c/signed=>signed
-                  sb-vm::fast-+-c/unsigned=>unsigned
-                  sb-vm::fast---c/fixnum=>fixnum
-                  sb-vm::fast---c/signed=>signed
-                  sb-vm::fast---c/unsigned=>unsigned
-                  sb-vm::fast-*-c/fixnum=>fixnum
-                  sb-vm::fast-*-c/signed=>signed
-                  sb-vm::fast-*-c/unsigned=>unsigned))
+  (dolist (name '(sb-vm::+-c/fixnum=>fixnum
+                  sb-vm::+-c/signed=>signed
+                  sb-vm::+-c/unsigned=>unsigned
+                  sb-vm::--c/fixnum=>fixnum
+                  sb-vm::--c/signed=>signed
+                  sb-vm::--c/unsigned=>unsigned
+                  sb-vm::*-c/fixnum=>fixnum
+                  sb-vm::*-c/signed=>signed
+                  sb-vm::*-c/unsigned=>unsigned))
     (sb-c::set-vop-optimizer (template-or-lose name) #'optimizer)))
 
 (defun emit-optimized-cmp (x y temp &optional x-ctype)
@@ -3369,58 +3674,108 @@
                (inst cmp operand-size x y)))))
 
 
-(macrolet ((define-conditional-vop (tran cond unsigned
-                                    addend addend-signed addend-unsigned
-                                    &optional zero)
-             `(progn
-                ,@(loop for (suffix cost signed constant)
-                        in '((/fixnum 4 t)
-                             (-c/fixnum 3 t t)
-                             (/signed 6 t)
-                             (-c/signed 5 t t)
-                             (/unsigned 6)
-                              (-c/unsigned 5 nil t))
-                        collect
-                        (flet ((fix (n)
-                                 (if (eq suffix '-c/fixnum)
-                                     `(fixnumize ,n)
-                                     n)))
-                          `(define-vop (,(symbolicate "FAST-IF-" tran suffix)
-                                        ,(symbolicate "FAST-CONDITIONAL"  suffix))
-                             (:translate ,tran)
-                             (:vop-var vop)
-                             (:conditional)
-                             (:conditional ,(if signed cond unsigned))
-                             (:arg-refs x-tn-ref)
-                             (:generator ,cost
-                               ,(when constant
-                                  `(cond ((zerop (+ y ,addend))
-                                          (setf y 0)
-                                          (change-vop-flags
-                                           vop
-                                           ',(if signed
-                                                 (list addend-signed)
-                                                 (list addend-unsigned))))
-                                         ,@(when (and zero
-                                                      signed)
-                                             ;; (< x 0) can be tested using only the sign flag,
-                                             ;; which allows sub x, y; test x, x to be optimized
-                                             `(((zerop y)
-                                                (change-vop-flags vop '(,zero)))))
-                                         ((and
-                                           (not (plausible-signed-imm32-operand-p ,(fix 'y)))
-                                           (plausible-signed-imm32-operand-p ,(fix `(+ y ,addend))))
-                                          (incf y ,addend)
-                                          (change-vop-flags
-                                           vop
-                                           ',(if signed
-                                                 (list addend-signed)
-                                                 (list addend-unsigned))))))
-                               (emit-optimized-cmp
-                                 x ,(fix 'y)
-                                 temp (tn-ref-type x-tn-ref)))))))))
-  (define-conditional-vop < :l :b -1 :le :be :s)
-  (define-conditional-vop > :g :a 1 :ge :ae))
+(macrolet
+    ((define-cmp-vop (tran cond unsigned
+                      addend addend-signed addend-unsigned
+                      &optional zero)
+       `(progn
+          ,@(loop for (suffix cost signed constant)
+                  in '((/fixnum 4 t)
+                       (-c/fixnum 3 t t)
+                       (/signed 6 t)
+                       (-c/signed 5 t t)
+                       (/unsigned 6)
+                       (-c/unsigned 5 nil t))
+                  for fixnump = (eq suffix '-c/fixnum)
+                  for name = (symbolicate "IF-" tran suffix)
+                  collect
+                  (flet ((fix (n)
+                           (if fixnump
+                               `(fixnumize ,n)
+                               n)))
+                    `(define-vop (,name ,(symbolicate "CONDITIONAL"  suffix))
+                       (:translate ,tran)
+                       (:vop-var vop)
+                       (:conditional)
+                       (:conditional ,(if signed cond unsigned))
+                       (:arg-refs x-ref)
+                       (:generator ,cost
+                         ,(when constant
+                            (let ((test-form
+                                    `(and (gpr-tn-p x)
+                                          (case fixnum-width
+                                            (64
+                                             (inst test x x)
+                                             t)
+                                            (32
+                                             (inst test :dword x x)
+                                             t)
+                                            (16
+                                             (inst test :word x x)
+                                             t)
+                                            (8
+                                             (inst test :byte x x)
+                                             t)))))
+                              ;; Check only one bit if possible
+                              `(let ((width (sb-c::unsigned-type-width (tn-ref-type x-ref))))
+                                 (when width
+                                   (let* ((bit (1- width))
+                                          (fixnum-width (+ width ,(if fixnump
+                                                                      1
+                                                                      0)))
+                                          (fixnum-bit (+ bit ,(if fixnump
+                                                                  1
+                                                                  0)))
+                                          (size (if (<= fixnum-width 32)
+                                                    :dword
+                                                    :qword)))
+                                     (when (>= fixnum-width 8)
+                                       ,(ecase tran
+                                          (<
+                                           `(when (= y (ash 1 bit))
+                                              (cond (,test-form
+                                                     (change-vop-flags vop '(:ns))
+                                                     (return-from ,name))
+                                                    ((> fixnum-bit 31)
+                                                     (inst bt size x fixnum-bit)
+                                                     (change-vop-flags vop '(:nc))
+                                                     (return-from ,name)))))
+                                          (>
+                                           `(when (= y (1- (ash 1 bit)))
+                                              (cond (,test-form
+                                                     (change-vop-flags vop '(:s))
+                                                     (return-from ,name))
+                                                    ((> fixnum-bit 31)
+                                                     (inst bt size x fixnum-bit)
+                                                     (change-vop-flags vop '(:c))
+                                                     (return-from ,name))))))))))))
+                         ,(when constant
+                            `(cond
+                               ((zerop (+ y ,addend))
+                                (setf y 0)
+                                (change-vop-flags
+                                 vop
+                                 ',(if signed
+                                       (list addend-signed)
+                                       (list addend-unsigned))))
+                               ,@(when (and zero
+                                            signed)
+                                   ;; (< x 0) can be tested using only the sign flag,
+                                   ;; which allows sub x, y; test x, x to be optimized
+                                   `(((zerop y)
+                                      (change-vop-flags vop '(,zero)))))
+                               ((and
+                                 (not (imm32-p ,(fix 'y)))
+                                 (imm32-p ,(fix `(+ y ,addend))))
+                                (incf y ,addend)
+                                (change-vop-flags
+                                 vop
+                                 ',(if signed
+                                       (list addend-signed)
+                                       (list addend-unsigned))))))
+                         (emit-optimized-cmp x ,(fix 'y) temp (tn-ref-type x-ref)))))))))
+  (define-cmp-vop < :l :b -1 :le :be :s)
+  (define-cmp-vop > :g :a 1 :ge :ae))
 
 (define-vop (<-unsigned-signed)
   (:translate <)
@@ -3429,7 +3784,6 @@
   (:arg-types unsigned-num signed-num)
   (:temporary (:sc signed-reg) temp)
   (:conditional :b)
-  (:policy :fast-safe)
   (:generator 7
     (zeroize temp)
     (inst test signed signed)
@@ -3441,7 +3795,6 @@
   (:args (unsigned :scs (unsigned-reg))
          (signed :scs (signed-reg)))
   (:arg-types unsigned-num signed-num)
-  (:policy :fast-safe)
   (:conditional :a)
   (:generator 7
     (inst test signed signed)
@@ -3455,7 +3808,6 @@
          (unsigned :scs (unsigned-reg)))
   (:arg-types signed-num unsigned-num)
   (:conditional :a)
-  (:policy :fast-safe)
   (:generator 7
     (inst test signed signed)
     (inst jmp :l done)
@@ -3478,7 +3830,6 @@
          (signed :scs (signed-reg)))
   (:arg-types unsigned-num signed-num)
   (:conditional :e)
-  (:policy :fast-safe)
   (:generator 7
     (inst test signed signed)
     (inst jmp :l done)
@@ -3490,19 +3841,19 @@
          (unsigned :scs (unsigned-reg)))
   (:arg-types signed-num unsigned-num))
 
-(define-vop (fast-if-eql/signed fast-conditional/signed)
+(define-vop (if-eql/signed conditional/signed)
   (:translate eql)
   (:generator 6 (emit-optimized-cmp x y temp)))
 
-(define-vop (fast-if-eql-c/signed fast-conditional-c/signed)
+(define-vop (if-eql-c/signed conditional-c/signed)
   (:translate eql)
   (:generator 5 (emit-optimized-cmp x y temp)))
 
-(define-vop (fast-if-eql/unsigned fast-conditional/unsigned)
+(define-vop (if-eql/unsigned conditional/unsigned)
   (:translate eql)
   (:generator 6 (emit-optimized-cmp x y temp)))
 
-(define-vop (fast-if-eql-c/unsigned fast-conditional-c/unsigned)
+(define-vop (if-eql-c/unsigned conditional-c/unsigned)
   (:translate eql)
   (:generator 5 (emit-optimized-cmp x y temp)))
 
@@ -3513,7 +3864,6 @@
              `(define-vop ()
                 (:translate ,translate)
                 (:note ,(string translate))
-                (:policy :fast-safe)
                 (:args (num :scs (unsigned-reg) :target r)
                        (amount :scs (signed-reg) :target rcx))
                 (:arg-types unsigned-num tagged-num)
@@ -3530,7 +3880,7 @@
 ;;;; Modular functions
 
 (defmacro define-mod-binop ((name prototype) function)
-  (if (search "FAST-*" (string prototype)) ; fast-* doesn't accept stack locations yet
+  (if (search "*/" (string prototype)) ; *- doesn't accept stack locations yet
       `(define-vop (,name ,prototype)
            (:args (x :target r :scs (unsigned-reg signed-reg)
                      :load-if (not (and (or (sc-is x unsigned-stack)
@@ -3564,7 +3914,7 @@
          (:translate ,function))))
 
 (defmacro define-mod-binop-c ((name prototype) function)
-  (if (search "FAST-*" (string prototype)) ; fast-* doesn't accept stack locations yet
+  (if (search "*/" (string prototype)) ; *- doesn't accept stack locations yet
       `(define-vop (,name ,prototype)
          (:args (x :target r :scs (unsigned-reg signed-reg) :load-if t))
          (:info y)
@@ -3583,16 +3933,16 @@
 (macrolet ((def (name)
              (let ((fun64   (symbolicate name "-MOD64"))
                    (funfx   (symbolicate name "-MODFX"))
-                   (vopu    (symbolicate "FAST-" name "/UNSIGNED=>UNSIGNED"))
-                   (vopcu   (symbolicate "FAST-" name "-C/UNSIGNED=>UNSIGNED"))
-                   (vopf    (symbolicate "FAST-" name "/FIXNUM=>FIXNUM"))
-                   (vopcf   (symbolicate "FAST-" name "-C/FIXNUM=>FIXNUM"))
-                   (vop64u  (symbolicate "FAST-" name "-MOD64/WORD=>UNSIGNED"))
-                   (vop64f  (symbolicate "FAST-" name "-MOD64/FIXNUM=>FIXNUM"))
-                   (vop64cu (symbolicate "FAST-" name "-MOD64-C/WORD=>UNSIGNED"))
-                   (vop64cf (symbolicate "FAST-" name "-MOD64-C/FIXNUM=>FIXNUM"))
-                   (vopfxf  (symbolicate "FAST-" name "-MODFX/FIXNUM=>FIXNUM"))
-                   (vopfxcf (symbolicate "FAST-" name "-MODFX-C/FIXNUM=>FIXNUM")))
+                   (vopu    (symbolicate name "/UNSIGNED=>UNSIGNED"))
+                   (vopcu   (symbolicate name "-C/UNSIGNED=>UNSIGNED"))
+                   (vopf    (symbolicate name "/FIXNUM=>FIXNUM"))
+                   (vopcf   (symbolicate name "-C/FIXNUM=>FIXNUM"))
+                   (vop64u  (symbolicate name "-MOD64/WORD=>UNSIGNED"))
+                   (vop64f  (symbolicate name "-MOD64/FIXNUM=>FIXNUM"))
+                   (vop64cu (symbolicate name "-MOD64-C/WORD=>UNSIGNED"))
+                   (vop64cf (symbolicate name "-MOD64-C/FIXNUM=>FIXNUM"))
+                   (vopfxf  (symbolicate name "-MODFX/FIXNUM=>FIXNUM"))
+                   (vopfxcf (symbolicate name "-MODFX-C/FIXNUM=>FIXNUM")))
                (declare (ignore vop64cf)) ; maybe someone will want it some day
                `(progn
                   (define-modular-fun ,fun64 (x y) ,name :untagged nil 64)
@@ -3612,7 +3962,6 @@
 (define-modular-fun %negate-mod64 (x) %negate :untagged nil 64)
 (define-vop (%negate-mod64)
   (:translate %negate-mod64)
-  (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target r))
   (:arg-types unsigned-num)
   (:results (r :scs (unsigned-reg)))
@@ -3622,7 +3971,7 @@
     (inst neg r)))
 
 (define-modular-fun %negate-modfx (x) %negate :tagged t #.n-fixnum-bits)
-(define-vop (%negate-modfx fast-negate/fixnum)
+(define-vop (%negate-modfx negate/fixnum)
   (:translate %negate-modfx))
 (in-package "SB-C")
 
@@ -3694,7 +4043,6 @@
                                   (sc-is r unsigned-stack)
                                   (location= x r)))))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
   (:generator 1
     (move r x)
     (inst not r)))
@@ -3718,15 +4066,13 @@
 
 (define-vop (bignum-length get-header-data)
   (:translate sb-bignum:%bignum-length)
-  (:policy :fast-safe)
   (:results (res :scs (unsigned-reg)))
   (:generator 6
     #.(assert (subtypep 'sb-bignum:bignum-length '(unsigned-byte 32)))
     (inst mov :dword res (ea (1+ (- other-pointer-lowtag)) x))))
 
 (define-vop (bignum-set-length set-header-data)
-  (:translate sb-bignum:%bignum-set-length)
-  (:policy :fast-safe))
+  (:translate sb-bignum:%bignum-set-length))
 
 #-bignum-assertions ; %BIGNUM-ref is an inline function if compiling with assertions
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
@@ -3742,7 +4088,6 @@
 
 (define-vop (digit-0-or-plus)
   (:translate sb-bignum:%digit-0-or-plusp)
-  (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:conditional :ns)
@@ -3755,7 +4100,6 @@
 ;;; This is easy to deal with and may save a fixnum-word conversion.
 (define-vop (add-w/carry)
   (:translate sb-bignum:%add-with-carry)
-  (:policy :fast-safe)
   (:args (a :scs (unsigned-reg) :target result)
          (b :scs (unsigned-reg unsigned-stack) :to :eval)
          (c :scs (any-reg unsigned-reg control-stack immediate) :target temp))
@@ -3783,7 +4127,6 @@
 ;;; of the x86-64 convention.
 (define-vop (sub-w/borrow)
   (:translate sb-bignum:%subtract-with-borrow)
-  (:policy :fast-safe)
   (:args (a :scs (unsigned-reg) :to :eval :target result)
          (b :scs (unsigned-reg unsigned-stack) :to :result)
          (c :scs (any-reg unsigned-reg control-stack immediate)))
@@ -4057,9 +4400,76 @@
     (inst adc hi 0)
     (inst mov (ea #1# r index 8) hi)))
 
+(define-vop (bignum-mulx-multiply-loop)
+  (:args (a* :scs (descriptor-reg))
+         (la :scs (unsigned-reg unsigned-stack))
+         (b* :scs (descriptor-reg))
+         (lb :scs (unsigned-reg unsigned-stack))
+         (r* :scs (descriptor-reg)))
+  (:arg-types bignum unsigned-num bignum unsigned-num bignum)
+  (:temporary (:sc unsigned-reg :offset rdx-offset) rdx)
+  (:temporary (:sc unsigned-reg) a b-end r-end index carry lo hi outer-len)
+  (:generator 40
+    (inst mov :dword index lb)
+    (inst lea b-end (ea #1=(- (* bignum-digits-offset n-word-bytes) other-pointer-lowtag) b* index 8))
+    (inst lea r-end (ea #1# r* index 8))
+
+    (inst mov rdx (ea #1# a*))
+
+    (inst neg index)
+    (zeroize carry) ;; clears cf
+
+    ROW0-LOOP
+    (inst mulx hi lo (ea 0 b-end index 8))
+    (inst adc lo carry)
+    (inst mov carry hi)
+    (inst mov (ea 0 r-end index 8) lo)
+
+    (inst inc index)
+    (inst jmp :nz ROW0-LOOP)
+
+    (inst adc carry 0)
+    (inst mov (ea r-end) carry)
+
+    (inst mov :dword index la)
+    (inst dec :dword index)
+    (inst jmp :z DONE)
+    (inst mov :dword outer-len index)
+
+    (inst lea a (ea (+ #1# n-word-bytes) a*))
+    (inst add r-end n-word-bytes)
+
+    OUTER-LOOP
+    (inst mov rdx (ea a))
+    (inst add a n-word-bytes)
+
+    (inst mov :dword index lb)
+    (inst neg index)
+    (zeroize carry) ;; clears cf
+
+    INNER-LOOP
+    (inst mulx hi lo (ea 0 b-end index 8))
+
+    (inst adc lo carry)
+    (inst adc hi 0)
+
+    (inst add (ea 0 r-end index 8) lo)
+    (inst mov carry hi)
+
+    (inst inc index)
+    (inst jmp :nz INNER-LOOP)
+
+    (inst adc carry 0)
+    (inst mov (ea r-end) carry)
+
+    (inst add r-end n-word-bytes)
+    (inst dec :dword outer-len)
+    (inst jmp :nz OUTER-LOOP)
+
+    DONE))
+
 (define-vop (bignum-mult-and-add-3-arg)
   (:translate sb-bignum:%multiply-and-add)
-  (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack))
          (carry-in :scs (unsigned-reg unsigned-stack)))
@@ -4081,7 +4491,6 @@
 
 (define-vop (bignum-mult-and-add-4-arg)
   (:translate sb-bignum:%multiply-and-add)
-  (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack))
          (prev :scs (unsigned-reg unsigned-stack))
@@ -4106,7 +4515,6 @@
 
 (define-vop (bignum-mult)
   (:translate sb-bignum:%multiply)
-  (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
@@ -4125,7 +4533,6 @@
 
 (define-vop (mulhi)
   (:translate %multiply-high)
-  (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
@@ -4142,7 +4549,6 @@
 
 (define-vop (mulhi/fx)
   (:translate %multiply-high)
-  (:policy :fast-safe)
   (:args (x :scs (any-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types positive-fixnum unsigned-num)
@@ -4159,7 +4565,6 @@
 
 (define-vop ()
   (:translate %signed-multiply-high)
-  (:policy :fast-safe)
   (:args (x :scs (signed-reg) :target eax)
          (y :scs (signed-reg signed-stack)))
   (:arg-types signed-num signed-num)
@@ -4175,7 +4580,6 @@
     (move hi edx)))
 
 (define-vop (signed-multiply-low-high)
-  (:policy :fast-safe)
   (:args (x :scs (any-reg) :target eax)
          (y :scs (any-reg)))
   (:arg-types tagged-num tagged-num)
@@ -4194,7 +4598,6 @@
 
 (define-vop (bignum-floor)
   (:translate sb-bignum:%bigfloor)
-  (:policy :fast-safe)
   (:args (div-high :scs (unsigned-reg) :target edx)
          (div-low :scs (unsigned-reg) :target eax)
          (divisor :scs (unsigned-reg unsigned-stack)))
@@ -4215,7 +4618,6 @@
 
 (define-vop (signify-digit)
   (:translate sb-bignum:%fixnum-digit-with-correct-sign)
-  (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg unsigned-stack) :target res))
   (:arg-types unsigned-num)
   (:results (res :scs (any-reg signed-reg)
@@ -4230,7 +4632,6 @@
 
 (define-vop (digit-ashr)
   (:translate sb-bignum:%ashr)
-  (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg unsigned-stack) :target result)
          (count :scs (unsigned-reg) :target ecx))
   (:arg-types unsigned-num positive-fixnum)
@@ -4246,7 +4647,6 @@
 
 (define-vop (digit-ashr/c)
   (:translate sb-bignum:%ashr)
-  (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg unsigned-stack) :target result))
   (:arg-types unsigned-num (:constant (integer 0 63)))
   (:info count)
@@ -4274,14 +4674,13 @@
 
 (define-vop (logand-bignum/c)
   (:translate logand)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:arg-types bignum (:constant word))
   (:results (r :scs (unsigned-reg)))
   (:info mask)
   (:result-types unsigned-num)
   (:generator 4
-     (cond ((or (plausible-signed-imm32-operand-p mask)
+     (cond ((or (imm32-p mask)
                 (location= x r))
             (loadw r x bignum-digits-offset other-pointer-lowtag)
             (unless (or (eql mask -1)
@@ -4302,7 +4701,6 @@
              (inst sar reg shift)))))
  (define-vop (mask-signed-field-word/c)
    (:translate sb-c::mask-signed-field)
-   (:policy :fast-safe)
    (:args (x :scs (signed-reg unsigned-reg any-reg) :target r))
    (:arg-types (:constant (integer 0 64)) untagged-num)
    (:results (r :scs (any-reg signed-reg)))
@@ -4342,7 +4740,6 @@
 
  (define-vop (mask-signed-field-bignum/c)
    (:translate sb-c::mask-signed-field)
-   (:policy :fast-safe)
    (:args (x :scs (descriptor-reg) :target r))
    (:arg-types (:constant (integer 0 64)) bignum)
    (:results (r :scs (signed-reg)))
@@ -4359,7 +4756,6 @@
 
   (define-vop (mask-signed-field-integer)
     (:translate sb-c::mask-signed-field)
-    (:policy :fast-safe)
     (:args (x :scs (descriptor-reg) :to :save))
     (:arg-refs x-ref)
     (:arg-types (:constant (integer 0 64)) t)
@@ -4414,7 +4810,6 @@
 
 (define-vop (mask-signed-field-fixnum)
   (:translate sb-c::mask-signed-field)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg) :target r))
   (:arg-refs x-ref)
   (:arg-types (:constant (eql #.n-fixnum-bits)) t)
@@ -4446,7 +4841,6 @@
 
 (define-vop (logand-word-mask)
   (:translate logand)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg) :to :save))
   (:arg-refs x-ref)
   (:arg-types t (:constant word))
@@ -4460,7 +4854,7 @@
                :unused-if (csubtypep (tn-ref-type x-ref)
                                      (specifier-type 'integer)))
               temp)
-  (:generator 10
+  (:generator 9
     (let ((fixnum-mask-p (and (= n-fixnum-tag-bits 1)
                               (= mask (ash most-positive-word -1)))))
       (assemble ()
@@ -4490,15 +4884,14 @@
         DONE
         (unless (or fixnum-mask-p
                     (= mask most-positive-word))
-          (if (and (not (plausible-signed-imm32-operand-p mask))
+          (if (and (not (imm32-p mask))
                    (= (logcount (logandc1 mask most-positive-word)) 1))
               (inst btr r (1- (integer-length (logandc1 mask most-positive-word))))
-              (inst and r (or (plausible-signed-imm32-operand-p mask)
+              (inst and r (or (imm32-p mask)
                               (constantize mask)))))))))
 
 (define-vop (logand-word-mask/integer-unsigned)
   (:translate logand)
-  (:policy :fast-safe)
   (:args (x :scs (descriptor-reg) :to :save)
          (mask :scs (unsigned-reg) :to :save))
   (:arg-refs x-ref mask-ref)
@@ -4553,20 +4946,55 @@
                              :qword)
                      r mask)))))))
 
-(defun plausible-signed-imm32-operand-or-32-mask-p (n)
+(defun imm32-or-32-mask-p (n)
   (or (eql n (1- (expt 2 32)))
-      (plausible-signed-imm32-operand-p n)))
+      (imm32-p n)))
 
 (define-vop (logand-word-mask/integer-unsigned-c logand-word-mask/integer-unsigned)
   (:args (x :scs (descriptor-reg)))
   (:info mask)
-  (:arg-types t (:constant (satisfies plausible-signed-imm32-operand-or-32-mask-p))))
+  (:arg-types t (:constant (satisfies imm32-or-32-mask-p))))
 
 (define-vop (logand-word-mask/unsigned-integer logand-word-mask/integer-unsigned)
   (:args (mask :scs (unsigned-reg) :to :save)
          (x :scs (descriptor-reg) :to :save))
   (:arg-refs mask-ref x-ref)
   (:arg-types unsigned-num t))
+
+(define-vop (logand-s128/unsigned)
+  (:translate logand)
+  (:args ((lo hi) :scs (signed-128-reg))
+         (mask :scs (unsigned-reg)))
+  (:arg-types signed-byte-128 unsigned-num)
+  (:results (r :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 8
+    (cond ((eql mask most-positive-word)
+           (move r lo))
+          ((eql mask (1- (expt 2 32)))
+           (inst mov :dword r lo))
+          ((and (not (integerp mask))
+                (location= r mask))
+           (inst and mask lo))
+          ((and (integerp mask)
+                (not (imm32-p mask)))
+           (cond ((location= r lo)
+                  (inst mov hi mask)
+                  (inst and r hi))
+                 (t
+                  (inst mov r mask)
+                  (inst and r lo))))
+          (t
+           (move r lo)
+           (inst and r mask)))))
+
+(define-vop (logand-s128/unsigned/c logand-s128/unsigned)
+  (:args ((lo hi) :scs (signed-128-reg)))
+  (:info mask)
+  (:arg-types signed-byte-128 (:constant (unsigned-byte 64))))
+
 
 (in-package "SB-C")
 
@@ -4642,8 +5070,8 @@
   (let ((next-vop (vop-next vop))
         next-next-vop)
     (case (and next-vop (vop-info-name (vop-info next-vop)))
-      ((sb-vm::fast-logand-c/unsigned=>unsigned
-        sb-vm::fast-logand-c/signed-unsigned=>unsigned)
+      ((sb-vm::logand-c/unsigned=>unsigned
+        sb-vm::logand-c/signed-unsigned=>unsigned)
        (when (exactly-one-read-p (vop-results vop))
          (car (vop-codegen-info next-vop))))
       (sb-vm::move-from-word/fixnum
@@ -4653,7 +5081,7 @@
        (when (and (exactly-one-read-p (vop-results vop))
                   (setq next-next-vop (vop-next next-vop))
                   (eq (vop-info-name (vop-info next-next-vop))
-                      'sb-vm::fast-logand-c/fixnum=>fixnum)
+                      'sb-vm::logand-c/fixnum=>fixnum)
                   (exactly-one-read-p (vop-results next-vop)))
          (car (vop-codegen-info next-next-vop)))))))
 
@@ -4674,7 +5102,6 @@
                       (:temporary (:sc signed-reg) temp2)
                       (:conditional :be)
                       (:vop-var vop)
-                      (:policy :fast-safe)
                       (:generator 2
                         (let ((lo (+ lo ,@(and excl-low
                                                '(1))))
@@ -4682,7 +5109,7 @@
                                                '(-1))))
                               (int (sb-c::type-approximate-interval (tn-ref-type x-ref))))
                           (flet ((imm (x)
-                                   (cond ((plausible-signed-imm32-operand-p x)
+                                   (cond ((imm32-p x)
                                           x)
                                          (t
                                           (inst mov temp2 x)
@@ -4720,7 +5147,7 @@
                                         (inst test x x)
                                         (change-vop-flags vop '(:ge)))
                                        ((and (= (logcount (+ hi 1)) 1)
-                                             (> fhi 127))
+                                             (not (imm32-p fhi)))
                                         (change-vop-flags vop '(:e))
                                         (move temp x)
                                         (inst shr temp (integer-length fhi)))
@@ -4750,7 +5177,6 @@
                   (:temporary (:sc signed-reg) temp2)
                   (:conditional)
                   (:vop-var vop)
-                  (:policy :fast-safe)
                   (:generator 5
                     (let* ((orig-lo (+ lo ,@ (and excl-low
                                                   `(1))))
@@ -4777,7 +5203,7 @@
                       (when (sb-c::interval-high<=n int orig-hi)
                         (setf hi ,(fixnumize most-positive-fixnum)))
                       (flet ((imm (x &optional (const t) (temp temp2))
-                               (cond ((plausible-signed-imm32-operand-p x)
+                               (cond ((imm32-p x)
                                       x)
                                      (const
                                       (constantize x))
@@ -4882,7 +5308,7 @@
   (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
   (:results (res :scs (any-reg)))
   (:result-types tagged-num)
-  (:policy :fast-safe)
+  (:related-args y)
   (:generator 2
     (move res y)
     (unless (csubtypep (tn-ref-type posn-ref) (specifier-type '(mod 64)))
@@ -4908,7 +5334,7 @@
   (:ignore size)
   (:results (res :scs (unsigned-reg)))
   (:result-types unsigned-num)
-  (:policy :fast-safe)
+  (:related-args y)
   (:generator 3
     (move res y)
     (unless (csubtypep (tn-ref-type posn-ref) (specifier-type '(mod 64)))
@@ -4932,7 +5358,7 @@
   (:ignore size)
   (:results (res :scs (signed-reg)))
   (:result-types signed-num)
-  (:policy :fast-safe)
+  (:related-args y)
   (:generator 3
     (move res y)
     (unless (csubtypep (tn-ref-type posn-ref) (specifier-type '(mod 64)))
@@ -4965,7 +5391,6 @@
                :unused-if (< n-temps 4)) temp3)
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
-  (:policy :fast-safe)
   (:generator 3
     (aver (eq (cadr (svref steps 0)) 'sb-c::t0))
     ;; this should be a null move due to :target on arg
@@ -5039,7 +5464,6 @@
     (flushable))
 (define-vop (zero-or-one/ub32)
   (:translate zero-or-one)
-  (:policy :fast-safe)
   (:args (arg :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:results (res :scs (unsigned-reg)))
@@ -5055,20 +5479,17 @@
           (inst set :nz res)))))
 
 (define-vop ()
-  (:policy :fast-safe)
   (:translate rotate-right-word)
   (:args (integer :scs (unsigned-reg) :target result))
   (:info count)
-  (:arg-types unsigned-num (:constant (mod 64)))
+  (:arg-types unsigned-num (:constant (integer 1 63)))
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 5
-    (aver (not (= count 0)))
     (move result integer)
     (inst ror result count)))
 
 (define-vop ()
-  (:policy :fast-safe)
   (:translate ash-right-two-words)
   (:args (a :scs (unsigned-reg) :to :save)
          (b :scs (unsigned-reg) :target result))
@@ -5081,7 +5502,6 @@
     (inst shrd result a count)))
 
 (define-vop (ash-right-two-words-variable)
-  (:policy :fast-safe)
   (:translate ash-right-two-words)
   (:args (a :scs (unsigned-reg) :to :save)
          (b :scs (unsigned-reg) :target result)
@@ -5098,7 +5518,6 @@
 ;; Based on TargetLowering::expandBITREVERSE in llvm/lib/CodeGen/SelectionDAG/TargetLowering.cpp
 (define-vop ()
   (:translate reverse-bits-64)
-  (:policy :fast-safe)
   (:args (arg :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:results (res :scs (unsigned-reg)))
@@ -5132,7 +5551,6 @@
 
 (define-vop (abs)
   (:translate abs)
-  (:policy :fast-safe)
   (:args (x :scs (signed-reg)))
   (:arg-refs x-ref)
   (:arg-types signed-num)

@@ -100,10 +100,12 @@
     ((gpr-tn-p target)
      ;; val can be a fixup for an immobile-space symbol, i.e. not a number,
      ;; hence not acceptable to ZEROP.
-     (cond ((and (numberp val) (zerop val)) (zeroize target))
+     (cond ((eql val 0) (zeroize target))
            (t (inst mov target val))))
     ;; Likewise if the value is small enough.
-    ((typep val '(or (signed-byte 32) #+(or immobile-space permgen) fixup))
+    ((or (imm32-p val)
+         #+(or immobile-space permgen)
+         (fixup-p val))
      ;; This logic is similar to that of STOREW*.
      ;; It would be nice to pull it all together in one place.
      ;; The basic idea is that storing any byte-aligned 8-bit value
@@ -149,7 +151,7 @@
       (sc-case y
         ((any-reg descriptor-reg)
          (if (sc-is x immediate)
-             (if (eql val 0) (zeroize y) (move-immediate y val))
+             (move-immediate y val)
              (move y x)))
         ((control-stack)
          (if (= (tn-offset fp) rsp-offset)
@@ -203,28 +205,6 @@
 
 
 ;;; Arg is a fixnum or bignum, figure out which and load if necessary.
-#-#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
-(define-vop (move-to-word/integer)
-  (:args (x :scs (descriptor-reg) :target rax))
-  (:results (y :scs (signed-reg unsigned-reg)))
-  (:note "integer to untagged word coercion")
-  ;; I'm not convinced that increasing the demand for rAX is
-  ;; better than adding 1 byte to some instruction encodings.
-  ;; I'll leave it alone though.
-  (:temporary (:sc unsigned-reg :offset rax-offset
-               :from (:argument 0) :to (:result 0) :target y) rax)
-  (:generator 4
-    (move rax x)
-    (inst test :byte rax fixnum-tag-mask)
-    (inst jmp :z FIXNUM)
-    (loadw y rax bignum-digits-offset other-pointer-lowtag)
-    (inst jmp DONE)
-    FIXNUM
-    (inst sar rax n-fixnum-tag-bits)
-    (move y rax)
-    DONE))
-
-#+#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg) :target y))
   (:results (y :scs (signed-reg unsigned-reg)))
@@ -401,3 +381,257 @@
 ;;; to a descriptor passing location.
 (define-move-vop move-arg :move-arg
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
+
+(define-move-fun (store-128-stack 5) (vop x y)
+  ((signed-128-reg) (signed-128-stack))
+  (with-128-parts (lo hi x)
+    (inst mov (ea (frame-byte-offset (tn-offset y)) rbp-tn)
+          lo)
+    (inst mov (ea (frame-byte-offset (+ (tn-offset y) 1)) rbp-tn)
+          hi)))
+
+(define-move-fun (load-128-stack 5) (vop x y)
+  ((signed-128-stack) (signed-128-reg))
+  (with-128-parts (lo hi y)
+    (inst mov lo (ea (frame-byte-offset (tn-offset x)) rbp-tn))
+    (inst mov hi (ea (frame-byte-offset (+ (tn-offset x) 1)) rbp-tn))))
+
+(define-vop (128-move)
+  (:args (x :scs (signed-128-reg) :target y))
+  (:results (y :scs (signed-128-reg)))
+  (:note "128 integer move")
+  (:generator 0
+    (move y x)))
+
+(define-move-vop 128-move :move
+  (signed-128-reg) (signed-128-reg))
+
+(define-vop (s128-move-signed)
+  (:args (x :scs (signed-reg immediate)))
+  (:arg-types signed-num)
+  (:results ((lo-y hi-y) :scs (signed-128-reg)))
+  (:note "128 integer move")
+  (:generator 0
+    (sc-case x
+      (immediate
+       (let ((low (ldb (byte 64 0) (tn-value x)))
+             (high (ldb (byte 64 64) (tn-value x))))
+         (move-immediate lo-y low)
+         (move-immediate hi-y high)))
+      (t
+       (move lo-y x)
+       (move hi-y x)
+       (inst sar hi-y 63)))))
+
+(define-move-vop s128-move-signed :move
+  (signed-reg) (signed-128-reg))
+
+(define-vop (s128-move-unsigned)
+  (:args (x :scs (unsigned-reg immediate)))
+  (:arg-types unsigned-num)
+  (:results ((lo-y hi-y) :scs (signed-128-reg)))
+  (:note "128 integer move")
+  (:generator 0
+    (sc-case x
+      (immediate
+       (move-immediate lo-y (tn-value x)))
+      (t
+       (move lo-y x)))
+    (zeroize hi-y)))
+
+(define-move-vop s128-move-unsigned :move
+  (unsigned-reg) (signed-128-reg))
+
+(define-vop (move-to-128/integer)
+  (:args (x :scs (descriptor-reg any-reg immediate) :to :save))
+  (:results ((lo-y hi-y) :scs (signed-128-reg)))
+  (:result-refs results)
+  (:note "integer to untagged 128 coercion")
+  (:generator 40
+    (sc-case x
+      (immediate
+       (let ((low (ldb (byte 64 0) (tn-value x)))
+             (high (ldb (byte 64 64) (tn-value x))))
+         (move-immediate lo-y low)
+         (move-immediate hi-y high)))
+      (any-reg
+       (move lo-y x)
+       (inst sar lo-y 1)
+       (move hi-y x)
+       (inst sar hi-y 63))
+      (t
+       (assemble ()
+         (move lo-y x)
+         (inst sar lo-y 1)
+         (inst jmp :nc SIGN-EXTEND)
+
+         (loadw lo-y x bignum-digits-offset other-pointer-lowtag)
+         (inst cmp :byte (ea (- 1 other-pointer-lowtag) x) 1)
+         (inst jmp :e SIGN-EXTEND)
+
+         (loadw hi-y x (1+ bignum-digits-offset) other-pointer-lowtag)
+         (inst jmp DONE)
+
+         SIGN-EXTEND
+         (move hi-y lo-y)
+         (inst sar hi-y 63)
+         DONE)))))
+
+(define-move-vop move-to-128/integer :move
+  (any-reg descriptor-reg)
+  (signed-128-reg))
+
+(define-vop (move-from-128)
+  (:args ((lo hi) :scs (signed-128-reg) :to :save))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:note "signed 128 to integer coercion")
+  (:temporary (:sc unsigned-reg) twodigit)
+  (:vop-var vop)
+  (:node-var node)
+  (:temporary (:sc complex-double-reg :offset 15) xmm)
+  (:generator 30
+    (inst mov :byte twodigit 1)
+    ;; Is hi a sign extended from lo?
+    (move y lo)
+    (inst sar y 63)
+    (inst cmp y hi)
+    (inst jmp :ne TWO)
+
+    (move y lo)
+    (inst add y y)
+    (inst jmp :no DONE)
+    (zeroize twodigit)
+    TWO
+    (wordpair-to-bignum y twodigit lo hi xmm node)
+    DONE))
+
+(define-move-vop move-from-128 :move
+  (signed-128-reg)
+  (any-reg descriptor-reg))
+
+(define-vop (move-128-arg)
+  (:args (x :scs (signed-128-reg descriptor-reg any-reg signed-reg unsigned-reg immediate)
+            :to :save)
+         (fp :scs (any-reg)
+             :load-if (not (sc-is y signed-128-reg))
+             :to :save))
+  (:temporary (:sc unsigned-reg) tmp)
+  (:results (y))
+  (:note "128 integer argument move")
+  (:generator 0
+    (sc-case x
+      (signed-128-reg
+       (sc-case y
+         (signed-128-reg
+          (move y x))
+         ((signed-128-stack)
+          (with-128-parts (lo hi x)
+            (storew lo fp (frame-word-offset (tn-offset y)))
+            (storew hi fp (frame-word-offset (1+ (tn-offset y))))))))
+      (any-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (move lo-y x)
+            (inst sar lo-y 1)
+            (move hi-y x)
+            (inst sar hi-y 63)))
+         ((signed-128-stack)
+          (move tmp x)
+          (inst sar tmp 1)
+          (storew tmp fp (frame-word-offset (tn-offset y)))
+          (move tmp x)
+          (inst sar tmp 63)
+          (storew tmp fp (frame-word-offset (1+ (tn-offset y)))))))
+      (signed-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (move lo-y x)
+            (move hi-y x)
+            (inst sar hi-y 63)))
+         ((signed-128-stack)
+          (move tmp x)
+          (inst sar tmp 63)
+          (storew x fp (frame-word-offset (tn-offset y)))
+          (storew tmp fp (frame-word-offset (1+ (tn-offset y)))))))
+      (unsigned-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (move lo-y x)
+            (zeroize hi-y)))
+         ((signed-128-stack)
+          (storew x fp (frame-word-offset (tn-offset y)))
+          (storew 0 fp (frame-word-offset (1+ (tn-offset y)))))))
+      (descriptor-reg
+       (sc-case y
+         (signed-128-reg
+          (with-128-parts (lo-y hi-y y)
+            (assemble ()
+              (move lo-y x)
+              (inst sar lo-y 1)
+              (inst jmp :nc SIGN-EXTEND)
+
+              (loadw lo-y x bignum-digits-offset other-pointer-lowtag)
+              (inst cmp :byte (ea (- 1 other-pointer-lowtag) x) 1)
+              (inst jmp :e SIGN-EXTEND)
+
+              (loadw hi-y x (1+ bignum-digits-offset) other-pointer-lowtag)
+              (inst jmp DONE)
+
+              SIGN-EXTEND
+              (move hi-y lo-y)
+              (inst sar hi-y 63)
+              DONE)))
+         ((signed-128-stack)
+          (let ((offset (frame-word-offset (tn-offset y))))
+            (assemble ()
+              (move tmp x)
+              (inst sar tmp 1)
+              (inst jmp :nc SIGN-EXTEND)
+
+              (loadw tmp x bignum-digits-offset other-pointer-lowtag)
+              (inst cmp :byte (ea (- 1 other-pointer-lowtag) x) 1)
+              (inst jmp :e SIGN-EXTEND)
+              (storew tmp fp offset)
+              (loadw  tmp x (1+ bignum-digits-offset) other-pointer-lowtag)
+              (storew tmp fp (- offset 1))
+              (inst jmp DONE)
+
+              SIGN-EXTEND
+              (storew tmp fp offset)
+              (inst sar tmp 63)
+              (storew tmp fp (- offset 1))
+              DONE)))))
+      (immediate
+       (let ((low (ldb (byte 64 0) (tn-value x)))
+             (high (ldb (byte 64 64) (tn-value x))))
+         (sc-case y
+           (signed-128-reg
+            (with-128-parts (lo-y hi-y y)
+              (move-immediate lo-y low)
+              (move-immediate hi-y high)))
+           ((signed-128-stack)
+            (move-immediate (ea (frame-byte-offset (tn-offset y)) fp) low tmp)
+            (move-immediate (ea (frame-byte-offset (1+ (tn-offset y))) fp) high tmp))))))))
+
+(define-move-vop move-128-arg :move-arg
+  (signed-128-reg descriptor-reg any-reg signed-reg unsigned-reg immediate)
+  (signed-128-reg))
+
+(define-move-vop move-arg :move-arg
+  (signed-128-reg) (any-reg descriptor-reg))
+
+(define-vop (move-from-s128/fixnum)
+  (:args ((lo) :scs (signed-128-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:result-types tagged-num)
+  (:note "fixnum tagging")
+  (:generator 1
+    (if (location= lo y)
+        (inst shl y n-fixnum-tag-bits)
+        (inst lea y (ea lo lo)))))
+
+(define-move-vop move-from-s128/fixnum :move
+  (signed-128-reg) (any-reg descriptor-reg))

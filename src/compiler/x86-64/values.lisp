@@ -85,7 +85,6 @@
 (define-vop (values-list)
   (:args (arg :scs (descriptor-reg) :target list))
   (:arg-refs arg-ref)
-  (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
   (:temporary (:sc descriptor-reg :from (:argument 0) :to (:result 1)) list)
@@ -119,7 +118,6 @@
     (unless (eq (tn-kind count) :unused)
       (inst mov count start)            ; start is high address
       (inst sub count rsp-tn)           ; stackp is low address
-      #-#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
       (inst shr count (- word-shift n-fixnum-tag-bits)))))
 
 ;;; Copy the more arg block to the top of the stack so we can use them

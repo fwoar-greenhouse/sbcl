@@ -232,14 +232,7 @@
         ext:*gc-verbose* nil))
 
 #+sbcl
-(progn
-  (setq cl:*compile-print* nil)
-  (load (find-bootstrap-file "^muffler"))
-  ;; Let's just say we never care to see these.
-  (declaim (sb-ext:muffle-conditions
-            (satisfies unable-to-optimize-note-p)
-            (satisfies optional+key-style-warning-p)
-            sb-ext:code-deletion-note)))
+(setq cl:*compile-print* nil)
 
 ;;;; special read-macros for building the cold system (and even for
 ;;;; building some of our tools for building the cold system)
@@ -281,8 +274,8 @@
                (funcall (compile nil (read-from-file pathname))
                         (read-from-file "^base-target-features.lisp-expr")))
              (customizer-file-name
-              (custom-or-default 'cl-user::*sbcl-customize-target-features-file*
-                                 "customize-target-features.lisp"))
+               (custom-or-default 'cl-user::*sbcl-customize-target-features-file*
+                                  "customize-target-features.lisp"))
              (customizer (if (probe-file customizer-file-name)
                              (compile nil
                                       (read-from-file customizer-file-name))
@@ -309,6 +302,8 @@
         ;; all versions that support arm, so always enable them there
         (when (target-featurep '(:and :sb-thread (:or :linux :freebsd :openbsd (:and :darwin :arm64))))
           (pushnew :sb-futex sb-xc:*features*))
+        (when (target-featurep '(:and :64-bit :sb-futex :little-endian))
+          (pushnew :bitpacked-mutex sb-xc:*features*))
         (when (target-featurep '(:and :sb-thread (:or :arm64 :x86-64)))
           (pushnew :system-tlabs sb-xc:*features*))
         (when (target-featurep '(:and (:or :permgen :immobile-space) :x86-64))
@@ -324,6 +319,8 @@
           (push :os-thread-stack sb-xc:*features*))
         (when (target-featurep '(:and :sb-thread :x86-64))
           (push :tls-load-indirect sb-xc:*features*))
+        #+nil (when (target-featurep ':x86-64) ; not yet
+                (push :tls-based-mv-return sb-xc:*features*))
         (when (target-featurep '(:and :x86 :int4-breakpoints))
           ;; 0xCE is a perfectly good 32-bit instruction,
           ;; unlike on x86-64 where it is illegal. It's therefore
@@ -344,6 +341,14 @@
             (unless (or int3-enable int4-enable ud2-enable)
               ;; don't love the name, but couldn't think of a better one
               (push :sw-int-avoidance sb-xc:*features*))))
+
+        (when (member :avx2 backend-subfeatures)
+          (push :sse4 backend-subfeatures)
+          (push :avx backend-subfeatures))
+
+        (when (member :sse4 backend-subfeatures)
+          (push :sse3 backend-subfeatures))
+
         (when (or (target-featurep :arm64)
                   (and (target-featurep :x86-64)
                        (member :sse4 backend-subfeatures)))
@@ -594,6 +599,13 @@
 
 ;;;; tools to compile SBCL sources to create the cross-compiler
 
+(defun delete-if-exists (pathname)
+  ;; The used to be expressed as (WHEN (PROBE-FILE X) (DELETE-FILE X))
+  ;; which is potentially 100x more costly in terms of filesystem operations
+  ;; depending on how many times PROBE-FILE decided to invoke lstat.
+  (handler-case (delete-file pathname)
+    (file-error (c) (declare (ignore c)) t)))
+
 ;;; a wrapper for compilation/assembly, used mostly to centralize
 ;;; the procedure for finding full filenames from "stems"
 ;;;
@@ -651,8 +663,7 @@
     ;; delete any preexisting object file in order to avoid confusing
     ;; ourselves later should we happen to bail out of compilation
     ;; with an error.
-    (when (and (not *compile-for-effect-only*) (probe-file obj))
-      (delete-file obj))
+    (unless *compile-for-effect-only* (delete-if-exists obj))
 
     ;; Original comment:
     ;;
@@ -681,8 +692,7 @@
     ;; and some compilers (e.g. OpenMCL) will complain if they're
     ;; asked to write over a file that exists already (and isn't
     ;; recognizeably a fasl file), so
-    (when (probe-file tmp-obj)
-      (delete-file tmp-obj))
+    (delete-if-exists tmp-obj)
 
     ;; Try to use the compiler to generate a new temporary object file.
     (flet ((report-recompile-restart (stream)
@@ -740,10 +750,9 @@
 
     ;; If we get to here, compilation succeeded, so it's OK to rename
     ;; the temporary output file to the permanent object file.
-    (cond ((not *compile-for-effect-only*)
-           (rename-file-a-la-unix tmp-obj obj))
-          ((probe-file tmp-obj)
-           (delete-file tmp-obj)))      ; clean up the trash
+    (if *compile-for-effect-only*
+        (delete-if-exists tmp-obj)
+        (rename-file-a-la-unix tmp-obj obj))
 
     ;; nice friendly traditional return value
     (pathname obj)))
@@ -764,17 +773,37 @@
     (funcall fn)))
 (compile 'in-host-compilation-mode)
 
+(defmacro stop-on-warnings (&body forms)
+  #-sbcl
+  `(progn ,@forms)
+  #+sbcl
+  `(let (warnp style-warnp)
+     (multiple-value-prog1
+         (handler-bind ((style-warning
+                          (lambda (c)
+                            (signal c)
+                            (setf style-warnp (type-of c))))
+                        (simple-warning
+                          (lambda (c)
+                            (setf warnp (type-of c)))))
+           ,@forms)
+       (when (and (string>= (cl:lisp-implementation-version) "2.1")
+                  (or warnp style-warnp) *fail-on-warnings*)
+         (cerror "Proceed anyway"
+                 "make-host-1 stopped due to unexpected ~A." (or warnp style-warnp))))))
+
 ;;; Process a file as source code for the cross-compiler, compiling it
 ;;; (if necessary) in the appropriate environment, then loading it
 ;;; into the cross-compilation host Common lisp.
 (defun host-cload-stem (stem flags)
   (loop
    (with-simple-restart (recompile "Recompile")
-     (let ((compiled-filename (in-host-compilation-mode
-                               (lambda ()
-                                 (compile-stem stem flags :host-compile)))))
-       (return
-         (load compiled-filename))))))
+     (stop-on-warnings
+       (let ((compiled-filename (in-host-compilation-mode
+                                 (lambda ()
+                                   (compile-stem stem flags :host-compile)))))
+         (return
+           (load compiled-filename)))))))
 (compile 'host-cload-stem)
 
 ;;; like HOST-CLOAD-STEM, except that we don't bother to compile
@@ -899,15 +928,13 @@
                    ;; normal build writes the file in place
                    stem)))))
 
+(defvar *perfect-hash-generator-program*)
 (defun perfect-hash-generator-program ()
-  ;; The path depends on what the host is, not what the target is
-  #+unix "tools-for-build/perfecthash"
-  #+win32 "tools-for-build/perfecthash.exe")
-
-#+(or sbcl ecl ccl clisp cmucl)
-(when (probe-file (perfect-hash-generator-program))
-  (pushnew :use-host-hash-generator cl:*features*)
-  (setq *perfect-hash-generator-mode* :RECORD))
+  (cond ((boundp '*perfect-hash-generator-program*) *perfect-hash-generator-program*)
+        (t
+         ;; The path depends on what the host is, not what the target is
+         #+unix "tools-for-build/perfecthash"
+         #+win32 "tools-for-build/perfecthash.exe")))
 
 ;;; I want this to work using the host-native readtable if sb-cold:*xc-readtable*
 ;;; isn't established. The caller should bind *READTABLE* to ours if reading
@@ -949,7 +976,6 @@
           (error "hash generator duplicates: ~D" errors))))))
 (compile 'preload-perfect-hash-generator)
 
-#+use-host-hash-generator
 (defun run-perfecthash (input)
   (with-output-to-string (result)
     (flet (#+sbcl
@@ -1022,6 +1048,9 @@
                (values (ccl:external-process-output-stream process)
                        (ccl:external-process-input-stream process)
                        process))))
+      #-(or sbcl cmu clisp ccl ecl)
+      (progn (error "Can't run MPH generator") "")
+      #+(or sbcl cmu clisp ccl ecl)
       (multiple-value-bind (input-stream output-stream process) (launch)
         (format output-stream "~{~X~%~}" (coerce input 'list))
         (close output-stream)
@@ -1031,9 +1060,8 @@
         (close input-stream)
         (wait process)))))
 
-
 (defun emulate-generate-perfect-hash-sexpr (array identifier digest)
-  (declare #-use-host-hash-generator (ignore identifier))
+  (declare (ignorable identifier))
   ;; Entries are written to disk with hashes sorted in ascending order so that
   ;; comparing as sets can be done using EQUALP.
   ;; Sort nondestructively in case something else looks at the value as supplied.
@@ -1045,7 +1073,6 @@
     (ecase *perfect-hash-generator-mode*
       (:playback
        (error "perfect hash file is missing a needed entry for ~x" array))
-      #+use-host-hash-generator
       (:record
        ;; This will only display anything when we didn't have the data,
        ;; so it's actually not too "noisy" in a normal build.
@@ -1148,19 +1175,6 @@
             (push entry entries))))
       (setq entries (sort entries #'compare :key #'cdar))
       (save-perfect-hashfuns destination entries))))
-
-(defun maybe-save-perfect-hashfuns-for-playback ()
-  ;; Check again for corruption
-  (let ((uniqueness-checker (make-hash-table :test 'equalp)))
-    (dolist (entry *perfect-hash-generator-memo*)
-      (let ((array (cdar entry)))
-        (assert (not (gethash array uniqueness-checker)))
-        (setf (gethash array uniqueness-checker) t))))
-  #+(and use-host-hash-generator sbcl)
-  (when (eq *perfect-hash-generator-mode* :record)
-    (save-perfect-hashfuns (perfect-hash-generator-journal :output)
-                           *perfect-hash-generator-memo*))
-  t)
 
 ;;;; Please avoid writing "consecutive" (un-nested) reader conditionals
 ;;;; in this file, whether for the same or different feature test.

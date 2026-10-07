@@ -283,25 +283,41 @@
 
 ;;; Instructions are streamed into a section before (optionally combining
 ;;; sections and) assembling into a SEGMENT.
-(defstruct (stmt (:constructor make-stmt (labels vop mnemonic operands)))
+(defstruct (stmt (:constructor make-stmt (labels vop prefix op operands)))
   (labels)
   (vop)
-  (mnemonic)
-  (operands)
+  ;; Currently the prefix is used only by the x86-64 assembler but nearly all the
+  ;; other supported CPUs have the concept of modifiers on an instructions that could
+  ;; reasonably be split out from the OP field if doing so simplifies analysis
+  ;; of instructions in the peephole optimization pass.
+  ;; e.g. on risc-v we could record memory ordering flags (acq/rel) as distinct
+  ;; from the OP. (And we may want to rename this slot to MODIFIERS)
+  (prefix 0 :type fixnum)
+  (op) ; symbol denoting an INST, or possibly a pseudo-op like .align
   (plist nil) ; put anything you want here for later passes such as instcombine
   (prev nil)
-  (next nil))
+  (next nil)
+  ;; In the target compiler, a STMT could be a variable-length structure with OPERANDS
+  ;; as the trailing payload. The peephole optimizer wouldn't be able to modify
+  ;; instances as it currently does, but that was not necessarily a desirable aspect
+  ;; of the design. The main reason STMT was made mutable in the first place
+  ;; was to capture the usage pattern of emit-a-label / emit-an-instruction as one
+  ;; STMT without having to add an stateful accumulator within EMIT.
+  ;; Unfortunately as things stand, there is an awful lot of DESTRUCTURING-BIND
+  ;; of STMT-OPERANDS which precludes changing the representation.
+  (operands nil :type list))
+
 (declaim (freeze-type stmt))
 (defmethod print-object ((stmt stmt) stream)
   (print-unreadable-object (stmt stream :type t :identity t)
     (format stream "~@[~A ~]~A ~:S"
-            (stmt-labels stmt) (stmt-mnemonic stmt) (stmt-operands stmt))))
+            (stmt-labels stmt) (stmt-op stmt) (stmt-operands stmt))))
 
 ;;; A section is just a doubly-linked list of statements with a head and
 ;;; tail pointer to allow insertion anywhere,
 ;;; and a dummy head node to avoid special-casing an empty section.
 (defun make-section ()
-  (let ((first (make-stmt nil nil :ignore nil)))
+  (let ((first (make-stmt nil nil 0 :ignore nil)))
     (cons first first)))
 (defun section-start (section) (car section))
 (defmacro section-tail (section) `(cdr ,section))
@@ -376,38 +392,70 @@
 ;;; This is used only to keep track of which vops emit which insts.
 (defvar *current-vop*)
 
+;;; Map of opcode symbol to function that emits it into the byte stream
+;;; (or with the schedulding assembler, into the queue)
+;;; Key is a symbol. Value is either #<function> or (#<function>),
+;;; the latter if function wants to receive prefix arguments.
+(defglobal *inst-encoder* (make-hash-table)) ; keys are symbols
+(declaim (inline accept-prefixes-p))
+(defun accept-prefixes-p (op)
+  (listp (gethash op *inst-encoder* 0))) ; if not found -> any non-list
+
 ;;; Return the final statement emitted.
 (defun emit (section &rest things)
   ;; each element of THINGS can be:
   ;; - a label
-  ;; - a list (mnemonic . operands) for a machine instruction or assembler directive
+  ;; - a list (op . operands) for a machine instruction or assembler directive
   ;; - a function to emit a postit
   (let ((last (section-tail section))
         (vop (if (boundp '*current-vop*) *current-vop*)))
     (dolist (thing things (setf (section-tail section) last))
       (if (label-p thing) ; Accumulate multiple labels until the next instruction
-          (if (stmt-mnemonic last)
-              (setq last (insert-stmt (make-stmt thing vop nil nil) last))
+          (if (stmt-op last)
+              (setq last (insert-stmt (make-stmt thing vop 0 nil nil) last))
               (let ((old (stmt-labels last)) (new (list thing)))
                 (setf (stmt-labels last)
                       (if (label-p old) (cons old new) (nconc old new)))))
-          (multiple-value-bind (mnemonic operands)
+          (multiple-value-bind (op operands)
               (if (consp thing) (values (car thing) (cdr thing)) thing)
-            (unless (member mnemonic '(.align .byte .skip))
+            (unless (member op '(.align .byte .skip .lispwords))
               ;; This automatically gets the .QWORD pseudo-op which we use on x86-64
-              ;; to create jump tables, but it's sort of unfortunate that the mnemonic
-              ;; is specific to that backend. It should probably be .LISPWORD instead.
+              ;; to create jump tables, but it's sort of unfortunate that the pseudo-op
+              ;; is specific to that backend. It should probably be .LISPWORDS instead.
               ;; Anyway, the good news is that jump tables flag all the labels as used.
               (dolist (operand operands)
                 (if (label-p operand)
                     (setf (label-usedp operand) t)
                     ;; backend decides what labels are used
                     (%mark-used-labels operand))))
-            (if (stmt-mnemonic last)
-                (setq last (insert-stmt (make-stmt nil vop mnemonic operands) last))
-                (setf (stmt-vop last) (or (stmt-vop last) vop)
-                      (stmt-mnemonic last) mnemonic
-                      (stmt-operands last) operands)))))))
+            (multiple-value-bind (prefix operands)
+                (if (accept-prefixes-p op) (extract-prefix-keywords operands) (values 0 operands))
+              (if (stmt-op last)
+                  (setq last (insert-stmt (make-stmt nil vop prefix op operands) last))
+                  (setf (stmt-vop last) (or (stmt-vop last) vop)
+                        (stmt-prefix last) prefix
+                        (stmt-op last) op
+                        (stmt-operands last) operands))))))))
+
+;;; Change the instruction and/or operands of a stmt.
+;;; If STMT were immutable, this would allocate and link a new
+;;; STMT into the chain, and delete the old. For now it's just SETF
+(declaim (ftype (sfunction (stmt symbol &rest t) stmt) replace-stmt)
+         (ftype (sfunction (stmt fixnum symbol &rest t) stmt) replace-prefixed)
+         (ftype (sfunction (stmt &rest t) stmt) replace-operands))
+(defun replace-stmt (stmt op &rest operands)
+  (setf (stmt-prefix stmt) 0 ; clear it. (Use REPLACE-PREFIXED instead to set a new prefix)
+        (stmt-op stmt) op
+        (stmt-operands stmt) operands)
+  stmt)
+(defun replace-prefixed (stmt prefix op &rest operands)
+  (setf (stmt-prefix stmt) prefix
+        (stmt-op stmt) op
+        (stmt-operands stmt) operands)
+  stmt)
+(defun replace-operands (stmt &rest operands)
+  (setf (stmt-operands stmt) operands)
+  stmt)
 
 #-(or x86-64 x86)
 (defun %mark-used-labels (operand) ; default implementation
@@ -1385,12 +1433,6 @@
 
 ;;;; interface to the rest of the compiler
 
-;;; Map of opcode symbol to function that emits it into the byte stream
-;;; (or with the schedulding assembler, into the queue)
-;;; Key is a symbol. Value is either #<function> or (#<function>),
-;;; the latter if function wants to receive prefix arguments.
-(defglobal *inst-encoder* (make-hash-table)) ; keys are symbols
-
 ;;; Return T only if STATEMENT has a label which is potentially a branch
 ;;; target, and not merely labeled to store a location of interest.
 (defun labeled-statement-p (statement &aux (labels (stmt-labels statement)))
@@ -1398,12 +1440,12 @@
 
 #-x86-64
 (progn
-  (defun extract-prefix-keywords (x) x)
-  (defun decode-prefix (args) args))
+  (defun extract-prefix-keywords (x) (values 0 x))
+  (defun decode-prefix (prefix) (declare (ignore prefix)) nil))
 
 (defun dump-symbolic-asm (start stream &aux last-vop all-labels (n 0))
   (format stream "~2&Assembler input:~%")
-  (when (eq (stmt-mnemonic start) :ignore)
+  (when (eq (stmt-op start) :ignore)
     (setq start (stmt-next start))) ; Skip dummy head of statement list
   (do ((statement start (stmt-next statement))
        (*print-pretty* nil))
@@ -1413,7 +1455,7 @@
       (unless (eq vop last-vop)
         (format stream "## ~A~%" (sb-c::vop-name vop)))
       (setq last-vop vop))
-    (let ((op (stmt-mnemonic statement))
+    (let ((op (stmt-op statement))
           (eol-comment ""))
       (awhen (stmt-labels statement)
         (let ((list (ensure-list it))
@@ -1429,9 +1471,8 @@
           (format stream "# postit ~S~A~%" op eol-comment)
           (format stream "    ~:@(~A~) ~{~A~^, ~}~A~%"
                   op
-                  (if (consp (gethash op *inst-encoder*))
-                      (decode-prefix (stmt-operands statement))
-                      (stmt-operands statement))
+                  (append (decode-prefix (stmt-prefix statement))
+                          (stmt-operands statement))
                   eol-comment))))
   (let ((*print-length* nil)
         (*print-pretty* t)
@@ -1446,7 +1487,7 @@
 (defun append-sections (first second)
   (let ((last-stmt (section-tail first)))
     (let ((head (section-start second)))
-      (aver (eq (stmt-mnemonic head) :ignore))
+      (aver (eq (stmt-op head) :ignore))
       (when (stmt-next head)
         (setf (stmt-next last-stmt) (stmt-next head)
               (stmt-prev (stmt-next head)) last-stmt)
@@ -1486,11 +1527,11 @@
       (awhen (stmt-vop statement) (setq *current-vop* it))
       (dolist (label (ensure-list (stmt-labels statement)))
         (%emit-label segment *current-vop* label))
-      (let ((mnemonic (stmt-mnemonic statement))
-            (operands (stmt-operands statement)))
-        (if (functionp mnemonic)
-            (%emit-postit segment mnemonic)
-            (case mnemonic
+      (let* ((op (stmt-op statement))
+             (encoder (gethash op *inst-encoder*)))
+        (if (functionp op)
+            (%emit-postit segment op)
+            (case op
               (.begin-without-scheduling
                (aver (not in-without-scheduling))
                (setq in-without-scheduling t
@@ -1505,14 +1546,19 @@
                      was-scheduling nil))
                ((nil)) ; ignore
                (t
-                (let ((encoder (gethash mnemonic *inst-encoder*)))
-                  (cond (encoder
-                         (instruction-hooks segment)
-                         (apply (the function (if (listp encoder) (car encoder) encoder))
-                                segment
-                                (perform-operand-lowering operands)))
-                        (t
-                         (bug "No encoder for ~S" mnemonic))))))))))
+                (unless encoder (bug "No encoder for ~/sb-ext:print-symbol-with-prefix/" op))
+                (instruction-hooks segment)
+                (multiple-value-bind (prefix f)
+                    (if (atom encoder) ; does not want prefix
+                        ;; If NIL were to be a valid prefix, this could easily be changed
+                        ;; to :none or :no-prefix for disambiguation.
+                        (values nil encoder)
+                        (values (stmt-prefix statement) (car encoder)))
+                  (multiple-value-call
+                      (the function f) segment
+                      (if (eq prefix nil) (values) prefix)
+                      (values-list (perform-operand-lowering
+                                    (stmt-operands statement)))))))))))
   (finalize-segment segment))
 
 ;;; The interface to %ASSEMBLE
@@ -1585,34 +1631,34 @@
 #-x86-64
 (defun perform-operand-lowering (operands) operands)
 
-(defun trace-inst (section mnemonic operands)
+(defun trace-inst (section op operands)
   (when sb-c::*compiler-trace-output*
     (let* ((asmstream *asmstream*)
            (section-name
             (if (eq section (asmstream-code-section asmstream))
                 :regular
                 :elsewhere)))
-      (sb-c::trace-instruction section-name *current-vop* mnemonic operands
+      (sb-c::trace-instruction section-name *current-vop* op operands
                                (asmstream-tracing-state asmstream)))))
 
-(defmacro inst (&whole whole mnemonic &rest args)
+(defmacro inst (&whole whole op &rest args)
   "Emit the specified instruction to the current segment."
-  (let* ((sym (find-symbol (string mnemonic) *backend-instruction-set-package*))
+  (let* ((sym (find-symbol (string op) *backend-instruction-set-package*))
          (definedp (nth-value 1 (gethash sym *inst-encoder*))))
     (cond ((not definedp)
-           ;; INST* can not execute random forms, so MNEMONIC must be a literal to be
+           ;; INST* can not execute random forms, so OP must be a literal to be
            ;; recognized as a macro instruction. It's basically a lisp macro that can
            ;; coexist with other identically-named lisp macros or functions.
            ;; For example, arm64 has {ASR, LSR} as DEFUNs and macro instructions.
            ;; By using an unusual convention of a symbol with #\: in its name,
            ;; FIND-SYMBOL reliably tests whether a macro is defined without further
            ;; using FBOUNDP or MACRO-FUNCTION.
-           (let ((macro (find-symbol (format nil "M:~A" mnemonic)
+           (let ((macro (find-symbol (format nil "M:~A" op)
                                      *backend-instruction-set-package*)))
              (when macro
                (return-from inst `(,macro ,@args))))
-           (warn "Undefined instruction: ~s in~% ~s" mnemonic whole)
-           `(error "Undefined instruction: ~s in~% ~s" ',mnemonic ',whole))
+           (warn "Undefined instruction: ~s in~% ~s" op whole)
+           `(error "Undefined instruction: ~s in~% ~s" ',op ',whole))
           (t
            `(inst* ',sym ,@args)))))
 
@@ -1627,11 +1673,12 @@
 ;;;     but not its front-end. This could be changed, but it's not wrong.
 ;;; As such, we must detect that we are emitting directly to machine code.
 ;;;
-(defun inst* (mnemonic &rest operands)
+(defun inst* (op &rest operands)
   (let ((dest
-         (etypecase mnemonic
+         (etypecase op
            (symbol
-            ;; If called by a vop, the first argument is a mnemonic.
+            ;; If called by a vop, the first argument is a machine instruction mnemonic,
+            ;; or a pseudo-op.
             *current-destination*)
            (segment
             ;; If called by an instruction encoder to encode other instructions,
@@ -1640,22 +1687,31 @@
             ;; instructions to emit. Similar results could be achievedy by factoring
             ;; out other emitters into callable functions, though the INST macro
             ;; tends to be a more convenient interface.
-            (prog1 mnemonic (setq mnemonic (the symbol (pop operands)))))))
-        (action (gethash mnemonic *inst-encoder*)))
-    (unless action ; try canonicalizing again
-      (setq mnemonic (find-symbol (string mnemonic)
-                                  *backend-instruction-set-package*)
-            action (gethash mnemonic *inst-encoder*))
-      (aver action))
-    (when (listp action) (setq operands (extract-prefix-keywords operands)))
+            (prog1 op (setq op (the symbol (pop operands)))))))
+        (encoder (gethash op *inst-encoder*)))
+    (unless encoder ; try canonicalizing again
+      (setq op (find-symbol (string op) *backend-instruction-set-package*)
+            encoder (gethash op *inst-encoder*))
+      (aver encoder))
     (typecase dest
       (cons ; streaming in to the assembler
-       (trace-inst dest mnemonic operands)
-       (emit dest (cons mnemonic operands)))
+       ;; If the instruction accepts prefixes, we used to convert them (zero or more
+       ;; symbols) into a bitmask here, before sending the list of operands into EMIT.
+       ;; Now we leave it up to EMIT to do that, and it will separate any prefixes
+       ;; into the STMT-PREFIX slot.
+       (trace-inst dest op operands)
+       (emit dest (cons op operands)))
       (segment ; streaming out of the assembler
        (instruction-hooks dest)
-       (apply (the function (if (listp action) (car action) action))
-              dest (perform-operand-lowering operands))))))
+       (multiple-value-bind (prefix operands f)
+           (if (atom encoder) ; does not want prefix
+               (values nil operands encoder)
+               ;; Encoders require the bit representation of prefixes, not symbols.
+               (multiple-value-bind (prefix operands) (extract-prefix-keywords operands)
+                 (values prefix operands (car encoder))))
+         (multiple-value-call (the function f) dest
+                              (if (eq prefix nil) (values) prefix)
+                              (values-list (perform-operand-lowering operands))))))))
 
 (defun emit-label (label)
   "Emit LABEL at this location in the current section."
@@ -1833,7 +1889,7 @@
     (setf (gethash symbol *inst-encoder*)
           (if accept-prefixes (cons function t) function))))
 
-(defmacro define-instruction (name lambda-list &rest options)
+(defmacro define-instruction (name lambda-list &body options)
   (binding* ((fun-name (intern (symbol-name name) *backend-instruction-set-package*))
              (segment-name (car lambda-list))
              (vop-name nil)
@@ -1968,12 +2024,15 @@
 (%def-inst-encoder '.byte
                    (lambda (segment &rest bytes)
                      (dolist (byte bytes) (emit-byte segment byte))))
+(%def-inst-encoder '.bytes
+                   (lambda (segment bytes)
+                     (map nil (lambda (byte) (emit-byte segment byte)) bytes)))
 (%def-inst-encoder '.skip
-                    (lambda (segment n-bytes &optional (pattern 0))
-                      (%emit-skip segment n-bytes pattern)))
+                   (lambda (segment n-bytes &optional (pattern 0))
+                     (%emit-skip segment n-bytes pattern)))
 (%def-inst-encoder
- '.lispword
- (lambda (segment &rest vals)
+ '.lispwords
+ (lambda (segment vals)
    (flet ((emit-bytes (segment val)
             #+little-endian
             (loop for i below sb-vm:n-word-bits by 8
@@ -1981,29 +2040,31 @@
             #+big-endian
             (loop for i from (- sb-vm:n-word-bits 8) downto 0 by 8
                   do (emit-byte segment (ldb (byte 8 i) val)))))
-     (dolist (val vals)
-       (cond ((label-p val)
-              ;; note a fixup prior to writing the backpatch so that the fixup's
-              ;; position is the location counter at the patch point
-              ;; (i.e. prior to skipping N-WORD-BYTES bytes)
-              ;; This fixup is *not* recorded in code->fixups. Instead, trans_code()
-              ;; will fixup a counted initial subsequence of unboxed words.
-              ;; Q: why are fixup notes a "compiler" abstractions?
-              ;; They seem pretty assembler-related to me.
-              (sb-c:note-fixup segment :absolute (sb-c:make-fixup nil :code-object 0))
-              (emit-back-patch
-               segment
-               sb-vm:n-word-bytes
-               (let ((val val)) ; capture the current label
-                 (lambda (segment posn)
-                   (declare (ignore posn)) ; don't care where the fixup itself is
-                   (emit-bytes segment
-                               (+ (sb-c:component-header-length)
-                                  (- (segment-header-skew segment))
-                                  (- sb-vm:other-pointer-lowtag)
-                                  (label-position val)))))))
-             (t
-              (emit-bytes segment val)))))))
+     (map nil
+          (lambda (val)
+            (cond ((label-p val)
+                   ;; note a fixup prior to writing the backpatch so that the fixup's
+                   ;; position is the location counter at the patch point
+                   ;; (i.e. prior to skipping N-WORD-BYTES bytes)
+                   ;; This fixup is *not* recorded in code->fixups. Instead, trans_code()
+                   ;; will fixup a counted initial subsequence of unboxed words.
+                   ;; Q: why are fixup notes a "compiler" abstractions?
+                   ;; They seem pretty assembler-related to me.
+                   (sb-c:note-fixup segment :absolute (sb-c:make-fixup nil :code-object 0))
+                   (emit-back-patch
+                    segment
+                    sb-vm:n-word-bytes
+                    (let ((val val))    ; capture the current label
+                      (lambda (segment posn)
+                        (declare (ignore posn)) ; don't care where the fixup itself is
+                        (emit-bytes segment
+                                    (+ (sb-c:component-header-length)
+                                       (- (segment-header-skew segment))
+                                       (- sb-vm:other-pointer-lowtag)
+                                       (label-position val)))))))
+                  (t
+                   (emit-bytes segment val))))
+          vals))))
 
 ;;;; Peephole pass
 
@@ -2044,8 +2105,8 @@
         ;; (e.g. "MOV reg, ea" + ? + "CMP reg, val") provided that the "?"
         ;; does not interact with instructions around it.
         (unless (labeled-statement-p next)
-          (let ((op (stmt-mnemonic stmt))
-                (next-op (stmt-mnemonic next)))
+          (let ((op (stmt-op stmt))
+                (next-op (stmt-op next)))
             ;; Look for a rule that can be applied
             (dolist (rule *asm-pattern-matchers*)
               (destructuring-bind (opcodes1 opcodes2 . action) rule

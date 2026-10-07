@@ -85,7 +85,6 @@
   (:results (int :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:translate sap-int)
-  (:policy :fast-safe)
   (:generator 1
     (move int sap)))
 
@@ -95,7 +94,6 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate int-sap)
-  (:policy :fast-safe)
   (:generator 1
     (move sap int)))
 
@@ -107,7 +105,6 @@
   (:arg-types system-area-pointer signed-num)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:policy :fast-safe)
   (:generator 2
     (inst add res ptr offset)))
 
@@ -118,7 +115,6 @@
   (:arg-types system-area-pointer (:constant (satisfies add-sub-immediate-p)))
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:policy :fast-safe)
   (:generator 1
     (inst add res ptr offset)))
 
@@ -129,7 +125,6 @@
   (:arg-types system-area-pointer (:constant (satisfies negative-add-sub-immediate-p)))
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:policy :fast-safe)
   (:generator 1
     (inst sub res ptr (- offset))))
 
@@ -138,7 +133,6 @@
   (:args (ptr1 :scs (sap-reg))
          (ptr2 :scs (sap-reg)))
   (:arg-types system-area-pointer system-area-pointer)
-  (:policy :fast-safe)
   (:results (res :scs (signed-reg)))
   (:result-types signed-num)
   (:generator 1
@@ -146,7 +140,7 @@
 
 ;;;; mumble-SYSTEM-REF and mumble-SYSTEM-SET
 (macrolet ((def-system-ref-and-set
-               (ref-name set-name sc type size &key signed)
+               (ref-name set-name sc type size offset-test &key signed)
              `(progn
                 ,@(when (implements-cas-sap-ref ref-name)
                     (multiple-value-bind (load store cas)
@@ -156,7 +150,6 @@
                           (t      (values 'ldaxr  'stlxr 'casal)))
                       `((define-vop (,(symbolicate "CAS-" ref-name))
                           (:translate (cas ,ref-name))
-                          (:policy :fast-safe)
                           (:args (oldval :scs (,sc zero))
                                  (newval :scs (,sc zero))
                                  (sap :scs (sap-reg))
@@ -190,7 +183,6 @@
                            (inst dmb)))
                         (define-vop (,(symbolicate "CAS-" ref-name "-8.1"))
                           (:translate (cas ,ref-name))
-                          (:policy :fast-safe)
                           (:args (oldval :scs (,sc) :target result)
                                  (newval :scs (,sc zero))
                                  (sap :scs (sap-reg))
@@ -210,7 +202,6 @@
                                   `((inst sbfm result result 0 ,(1- bits))))))))))
                 (define-vop (,ref-name)
                   (:translate ,ref-name)
-                  (:policy :fast-safe)
                   (:args (sap :scs (sap-reg))
                          (offset :scs (signed-reg)))
                   (:arg-types system-area-pointer signed-num)
@@ -229,7 +220,6 @@
                       (@ sap offset))))
                 (define-vop (,set-name)
                   (:translate ,set-name)
-                  (:policy :fast-safe)
                   (:args (value :scs (,sc zero))
                          (sap :scs (sap-reg))
                          (offset :scs (signed-reg)))
@@ -245,10 +235,9 @@
                       (@ sap offset))))
                 (define-vop (,(symbolicate ref-name "-C"))
                   (:translate ,ref-name)
-                  (:policy :fast-safe)
                   (:args (sap :scs (sap-reg)))
                   (:info offset)
-                  (:arg-types system-area-pointer (:constant (satisfies ldr-str-offset-encodable)))
+                  (:arg-types system-area-pointer (:constant (satisfies ,offset-test)))
                   (:RESULTS (result :scs (,sc)))
                   (:result-types ,type)
                   (:generator 4
@@ -264,11 +253,10 @@
                       (@ sap offset))))
                 (define-vop (,(symbolicate set-name "-C"))
                   (:translate ,set-name)
-                  (:policy :fast-safe)
                   (:args (value :scs (,sc zero))
                          (sap :scs (sap-reg)))
                   (:info offset)
-                  (:arg-types ,type system-area-pointer (:constant (satisfies ldr-str-offset-encodable)))
+                  (:arg-types ,type system-area-pointer (:constant (satisfies ,offset-test)))
                   (:generator 4
                     (inst ,(case size
                              (:byte 'strb)
@@ -279,34 +267,62 @@
                            'value)
                       (@ sap offset)))))))
   (def-system-ref-and-set sap-ref-8 %set-sap-ref-8
-    unsigned-reg positive-fixnum :byte :signed nil)
+    unsigned-reg positive-fixnum :byte ldr-str-8-offset-encodable :signed nil)
   (def-system-ref-and-set signed-sap-ref-8 %set-signed-sap-ref-8
-    signed-reg tagged-num :byte :signed t)
+    signed-reg tagged-num :byte ldr-str-8-offset-encodable :signed t)
   (def-system-ref-and-set sap-ref-16 %set-sap-ref-16
-    unsigned-reg positive-fixnum :short :signed nil)
+    unsigned-reg positive-fixnum :short ldr-str-16-offset-encodable :signed nil)
   (def-system-ref-and-set signed-sap-ref-16 %set-signed-sap-ref-16
-    signed-reg tagged-num :short :signed t)
+    signed-reg tagged-num :short ldr-str-16-offset-encodable :signed t)
   (def-system-ref-and-set sap-ref-32 %set-sap-ref-32
-    unsigned-reg unsigned-num :word :signed nil)
+    unsigned-reg unsigned-num :word ldr-str-32-offset-encodable :signed nil)
   (def-system-ref-and-set signed-sap-ref-32 %set-signed-sap-ref-32
-    signed-reg signed-num :word :signed t)
+    signed-reg signed-num :word ldr-str-32-offset-encodable :signed t)
   (def-system-ref-and-set sap-ref-64 %set-sap-ref-64
-    unsigned-reg unsigned-num :long :signed nil)
+    unsigned-reg unsigned-num :long ldr-str-offset-encodable :signed nil)
   (def-system-ref-and-set signed-sap-ref-64 %set-signed-sap-ref-64
-    signed-reg signed-num :long :signed t)
+    signed-reg signed-num :long ldr-str-offset-encodable :signed t)
   (def-system-ref-and-set sap-ref-sap %set-sap-ref-sap
-    sap-reg system-area-pointer :long)
+    sap-reg system-area-pointer :long ldr-str-offset-encodable)
   (def-system-ref-and-set sap-ref-lispobj %set-sap-ref-lispobj
-    descriptor-reg * :long)
+    descriptor-reg * :long ldr-str-offset-encodable)
   (def-system-ref-and-set sap-ref-single %set-sap-ref-single
-    single-reg single-float :single)
+    single-reg single-float :single ldr-str-32-offset-encodable)
   (def-system-ref-and-set sap-ref-double %set-sap-ref-double
-    double-reg double-float :double))
+    double-reg double-float :double ldr-str-offset-encodable))
+
+(define-vop (%sap-ref-indexed)
+  (:translate %sap-ref-16-indexed %sap-ref-32-indexed %sap-ref-64-indexed)
+  (:args (sap :scs (sap-reg))
+         (index :scs (signed-reg unsigned-reg)))
+  (:arg-types system-area-pointer untagged-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:node-var node)
+  (:generator 1
+    (ecase (sb-c::combination-fun-source-name node)
+      (%sap-ref-16-indexed (inst ldrh result (@ sap (extend index :lsl 1))))
+      (%sap-ref-32-indexed (inst ldr (32-bit-reg result) (@ sap (extend index :lsl 2))))
+      (%sap-ref-64-indexed (inst ldr result (@ sap (extend index :lsl 3)))))))
+
+(define-vop (%signed-sap-ref-indexed)
+  (:translate %signed-sap-ref-16-indexed %signed-sap-ref-32-indexed
+              %signed-sap-ref-64-indexed)
+  (:args (sap :scs (sap-reg))
+         (index :scs (signed-reg unsigned-reg)))
+  (:arg-types system-area-pointer untagged-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:node-var node)
+  (:generator 1
+    (ecase (sb-c::combination-fun-source-name node)
+      (%signed-sap-ref-16-indexed (inst ldrsh result (@ sap (extend index :lsl 1))))
+      (%signed-sap-ref-32-indexed (inst ldrsw result (@ sap (extend index :lsl 2))))
+      (%signed-sap-ref-64-indexed (inst ldr result (@ sap (extend index :lsl 2)))))))
 
 ;;; Noise to convert normal lisp data objects into SAPs.
 (define-vop (vector-sap)
   (:translate vector-sap)
-  (:policy :fast-safe)
   (:args (vector :scs (descriptor-reg)))
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)

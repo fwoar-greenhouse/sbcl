@@ -292,7 +292,6 @@
   (:args (value :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:conditional :eq)
-  (:policy :fast-safe)
   (:translate signed-byte-64-p)
   (:generator 5
     (inst tst value (ash 1 (1- n-word-bits)))))
@@ -544,12 +543,10 @@
   (:arg-refs arg-ref)
   (:args (value :scs (any-reg descriptor-reg)))
   (:conditional :eq)
-  (:policy :fast-safe)
   (:generator 4
     (inst tst value n-fixnum-tag-bits)))
 
 (define-vop (fixnump/unsigned)
-  (:policy :fast-safe)
   (:args (value :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:translate fixnump)
@@ -561,13 +558,21 @@
 
 (define-vop (fixnump/signed)
   (:args (value :scs (signed-reg)))
-  (:policy :fast-safe)
   (:conditional :vc)
-  (:info)
   (:arg-types signed-num)
   (:translate fixnump)
   (:generator 3
     (inst adds zr-tn value value)))
+
+(define-vop (fixnump/s128)
+  (:args ((lo hi) :scs (signed-128-reg)))
+  (:arg-types signed-byte-128)
+  (:translate fixnump)
+  (:conditional :eq)
+  (:generator 5
+    (inst asr  tmp-tn lo 62)
+    (inst adds zr-tn lo lo)
+    (inst ccmp hi tmp-tn :vc 0)))
 
 (progn
   (define-vop (>-integer-fixnum)
@@ -579,7 +584,6 @@
     (:conditional)
     (:info target not-p)
     (:arg-refs integer-ref)
-    (:policy :fast-safe)
     (:variant-vars comparison)
     (:variant :gt)
     (:generator 10
@@ -758,7 +762,6 @@
   (:args (value :scs (any-reg descriptor-reg)))
   (:arg-refs value-ref)
   (:conditional :eq)
-  (:policy :fast-safe)
   (:translate single-float-p)
   (:vop-var vop)
   (:generator 7
@@ -810,11 +813,7 @@
     (loadw r object instance-slots-offset instance-pointer-lowtag)))
 
 (defun structure-is-a (layout temp this-id test-layout &optional desc-temp target not-p done)
-  (let ((test-layout (case (layout-classoid-name test-layout)
-                       (condition +condition-layout-flag+)
-                       (pathname  +pathname-layout-flag+)
-                       (structure-object +structure-layout-flag+)
-                       (t test-layout))))
+  (let ((test-layout (or (struct-typep-bit-test-p test-layout) test-layout)))
    (cond ((integerp test-layout)
           (inst ldrsw temp
                 (@ layout
@@ -832,10 +831,7 @@
           nil)
          (t
           (let* ((test-id (layout-id test-layout))
-                 (depthoid (layout-depthoid test-layout))
-                 (offset (+ (id-bits-offset)
-                            (ash (- depthoid 2) 2)
-                            (- instance-pointer-lowtag))))
+                 (depthoid (layout-depthoid test-layout)))
             (when (and target
                        (> depthoid sb-kernel::layout-id-vector-fixed-capacity))
               (inst ldrsw temp
@@ -847,9 +843,9 @@
                           instance-pointer-lowtag)))
               (inst cmp temp (add-sub-immediate (fixnumize depthoid)))
               (inst b :lt (if not-p target done)))
-            (inst ldr (32-bit-reg this-id) (@ layout offset))
+            (inst ldr (32-bit-reg this-id) (@ layout (layout-id-offset test-layout)))
             ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
-            (cond ((typep test-id '(and (signed-byte 8) (not (eql 0))))
+            (cond ((typep test-id '(signed-byte 8))
                    (if (minusp test-id)
                        (inst cmn (32-bit-reg this-id) (- test-id))
                        (inst cmp (32-bit-reg this-id) test-id)))
@@ -869,7 +865,6 @@
   (:translate sb-c::%structure-is-a)
   (:args (x :scs (descriptor-reg)))
   (:arg-types * (:constant t))
-  (:policy :fast-safe)
   (:conditional :eq)
   (:info test-layout)
   (:temporary (:sc unsigned-reg) this-id temp)
@@ -881,23 +876,19 @@
   (:args (object :scs (descriptor-reg)))
   (:arg-types * (:constant t))
   (:arg-refs args)
-  (:policy :fast-safe)
   (:conditional)
   (:info target not-p test-layout)
   (:temporary (:sc descriptor-reg) layout)
   (:temporary (:sc unsigned-reg
                :unused-if
                (and (instance-tn-ref-p args)
-                    #1=(and (not (memq (layout-classoid-name test-layout)
-                                       '(condition pathname structure-object)))
+                    #1=(and (not (struct-typep-bit-test-p test-layout))
                             (let ((classoid (layout-classoid test-layout)))
                               (and (eq (classoid-state classoid) :sealed)
                                    (not (classoid-subclasses classoid)))))))
               temp)
   (:temporary (:sc unsigned-reg
-               :unused-if (or (memq (layout-classoid-name test-layout)
-                                    '(condition pathname structure-object))
-                              #1#))
+               :unused-if (or (struct-typep-bit-test-p test-layout) #1#))
               this-id)
   (:temporary (:sc descriptor-reg
                :unused-if (not #1#))
@@ -918,20 +909,16 @@
 (define-vop (structure-typep*)
   (:args (layout :scs (descriptor-reg)))
   (:arg-types * (:constant t))
-  (:policy :fast-safe)
   (:info target not-p test-layout)
   (:temporary (:sc unsigned-reg
                :unused-if
-               #1=(and (not (memq (layout-classoid-name test-layout)
-                                  '(condition pathname structure-object)))
+               #1=(and (not (struct-typep-bit-test-p test-layout))
                        (let ((classoid (layout-classoid test-layout)))
                          (and (eq (classoid-state classoid) :sealed)
                               (not (classoid-subclasses classoid))))))
               temp)
   (:temporary (:sc unsigned-reg
-               :unused-if (or (memq (layout-classoid-name test-layout)
-                                    '(condition pathname structure-object))
-                              #1#))
+               :unused-if (or (struct-typep-bit-test-p test-layout) #1#))
               this-id)
   (:temporary (:sc descriptor-reg
                :unused-if (not #1#))
@@ -942,6 +929,35 @@
                     not-p)
                 :ne :eq) target)
     done))
+
+(define-vop (get-layout-id)
+  (:args (layout :scs (descriptor-reg)))
+  (:info offset)
+  (:results (r :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 1
+    ;; Layout IDs are 32-bit (signed-byte 30) values. As long as GET-LAYOUT-ID and
+    ;; TEST-LAYOUT-ID both use 32-bit-reg, no sign-extension is needed.
+    (inst ldr (32-bit-reg r) (@ layout (- offset instance-pointer-lowtag)))))
+
+(define-vop (test-layout-id)
+  (:args (id :scs (signed-reg)))
+  (:arg-types signed-num (:constant t))
+  (:info target not-p test-layout)
+  (:temporary (:sc non-descriptor-reg) temp)
+  (:generator 1
+    (let ((test-id (layout-id test-layout)))
+      (cond ((typep test-id '(signed-byte 8))
+             (if (minusp test-id)
+                 (inst cmn (32-bit-reg id) (- test-id))
+                 (inst cmp (32-bit-reg id) test-id)))
+            (t
+             (destructuring-bind (size . label)
+                 (register-inline-constant :dword `(:layout-id ,test-layout))
+               (declare (ignore size))
+               (inst load-from-label (32-bit-reg temp) label))
+             (inst cmp (32-bit-reg id) (32-bit-reg temp)))))
+    (inst b (if not-p :ne :eq) target)))
 
 (define-vop (keywordp type-predicate)
   (:translate keywordp)

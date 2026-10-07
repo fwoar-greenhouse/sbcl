@@ -163,8 +163,7 @@
 
 (define-assembly-routine (unwind
                           (:return-style :none)
-                          (:translate %unwind)
-                          (:policy :fast-safe))
+                          (:translate %unwind))
                          ((:arg block (any-reg descriptor-reg) a0-offset)
                           (:arg start (any-reg descriptor-reg) ocfp-offset)
                           (:arg count (any-reg descriptor-reg) nargs-offset)
@@ -202,7 +201,7 @@
 
 (define-assembly-routine (throw
                           (:return-style :none))
-                         ((:arg target descriptor-reg a0-offset)
+                         ((:arg target (descriptor-reg any-reg) a0-offset)
                           (:arg start any-reg ocfp-offset)
                           (:arg count any-reg nargs-offset)
                           (:temp catch any-reg a1-offset)

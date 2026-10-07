@@ -28,7 +28,9 @@
 ;;;;      is zeroized to ensure that the result is a positive bignum.
 #+sb-assembling
 (macrolet
-    ((alloc-other (&rest rest)
+    ((float-scratch ()
+       (make-random-tn (sc-or-lose 'single-reg) 15))
+     (alloc-other (&rest rest)
        `(emit-alloc-other nil thread-tn ,@rest))
      (signed (reg)
        `(define-assembly-routine (,(symbolicate "ALLOC-SIGNED-BIGNUM-IN-" reg))
@@ -60,13 +62,13 @@
           (inst test :byte result result) ; is-two-digit flag
           (inst jmp :z one-word-bignum)
           (alloc-other bignum-widetag (+ bignum-digits-offset 2) result)
-          (inst movdqu float0-tn (ea 8 rsp-tn))
-          (inst movdqu (object-slot-ea result 1 other-pointer-lowtag) float0-tn)
-          (inst ret 16) ; pop args
+          (inst movdqu (float-scratch) (ea 8 rsp-tn))
+          (inst movdqu (object-slot-ea result 1 other-pointer-lowtag) (float-scratch))
+          (inst ret 16)                 ; pop args
           ONE-WORD-BIGNUM
           (alloc-other bignum-widetag (+ bignum-digits-offset 1) result)
-          (inst movq float0-tn (ea 8 rsp-tn))
-          (inst movq (object-slot-ea result 1 other-pointer-lowtag) float0-tn)
+          (inst movq (float-scratch) (ea 8 rsp-tn))
+          (inst movq (object-slot-ea result 1 other-pointer-lowtag) (float-scratch))
           (inst ret 16)))
      ;; "from unsigned" might need to allocate 3 digits, but it receives only high:low
      ;; because the highest digit if needed must be all 0.
@@ -82,22 +84,22 @@
           ;; Since 2 digits and 3 digits consume the same number of bytes
           ;; due to padding, they can share the allocation request.
           (alloc-other bignum-widetag (+ bignum-digits-offset 3) result)
-          (inst movdqu float0-tn (ea 8 rsp-tn))
-          (inst movdqu (object-slot-ea result 1 other-pointer-lowtag) float0-tn)
+          (inst movdqu (float-scratch) (ea 8 rsp-tn))
+          (inst movdqu (object-slot-ea result 1 other-pointer-lowtag) (float-scratch))
           ;; don't assume prezeroed unboxed pages. (zeroize word even if 2-digit result)
           (inst mov :qword (object-slot-ea result 3 other-pointer-lowtag) 0)
           ;; Test sign bit of digit index 1
           (inst test :byte (ea (+ 7 (ash (+ bignum-digits-offset 1) word-shift)
                                   (- other-pointer-lowtag)) result) #xff)
-          (inst jmp :s SKIP) ; if signed, then keep all 3 digits
+          (inst jmp :s SKIP)       ; if signed, then keep all 3 digits
           ;; else, no sign bit, so change it to 2-digit bignum
           (inst mov :byte (ea (- 1 other-pointer-lowtag) result) 2)
           SKIP
-          (inst ret 16) ; pop args
+          (inst ret 16)                 ; pop args
           ONE-WORD-BIGNUM
           (alloc-other bignum-widetag (+ bignum-digits-offset 1) result)
-          (inst movq float0-tn (ea 8 rsp-tn))
-          (inst movq (object-slot-ea result 1 other-pointer-lowtag) float0-tn)
+          (inst movq (float-scratch) (ea 8 rsp-tn))
+          (inst movq (object-slot-ea result 1 other-pointer-lowtag) (float-scratch))
           (inst ret 16)))
      ;; The high bit is in the carry flag.
      (two-word-bignum (reg)
@@ -114,9 +116,9 @@
      (define (op)
        ;; R13 is usually the thread register, but might not be
        `(progn
-        ,@(loop for reg in ; can't cons into card-table or thread register
-                (remove (intern (aref +qword-register-names+ card-table-reg))
-                        '(rax rcx rdx rbx rsi rdi r8 r9 r10 r11 r12 #+gs-seg r13 r14 r15))
+          ,@(loop for reg in ; can't cons into card-table or thread register
+                  (remove (intern (aref +qword-register-names+ card-table-reg))
+                          '(rax rcx rdx rbx rsi rdi r8 r9 r10 r11 r12 #+gs-seg r13 r14 r15))
                   collect `(,op ,reg)))))
   (define from-digits)
   (define from-digits-unsigned)
@@ -127,8 +129,7 @@
 #+sb-thread
 (define-assembly-routine (alloc-tls-index
                           (:translate ensure-symbol-tls-index)
-                          (:result-types positive-fixnum)
-                          (:policy :fast-safe))
+                          (:result-types positive-fixnum))
     ;; The vop result is unsigned-reg because the assembly routine does not
     ;; fixnumize its answer, which is confusing because it looks like a fixnum.
     ;; But the result of the function ENSURE-SYMBOL-TLS-INDEX is a fixnum whose

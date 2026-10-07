@@ -13,6 +13,7 @@
 
 ;;; symbols to protect from tree-shaker, for some tests
 (export '(%thread-local-references
+          %thread-from-tid
           get-spinlock
           release-spinlock
           spinlock
@@ -38,7 +39,7 @@ COMPARE-AND-SWAP, and must initially hold NIL.
 WITH-CAS-LOCK is suitable mostly when the critical section needing protection
 is very small, and cost of allocating a separate lock object would be
 prohibitive. While it is the most lightweight locking constructed offered by
-SBCL, it is also the least scalable if the section is heavily contested or
+SBCL, it is also the least scalable if the section is heavily contended or
 long.
 
 WITH-CAS-LOCK can be entered recursively."
@@ -265,7 +266,7 @@ a simple-string (not necessarily unique) or NIL."
   (let ((name (mutex-name mutex)))
     (print-unreadable-object (mutex stream :type t :identity (not name))
       #+sb-futex
-      (format stream "~@[~S ~]~[free~;taken~;contested~:;err~] owner=~X"
+      (format stream "~@[~S ~]~[free~;taken~;contended~:;err~] owner=~X"
               name (mutex-state mutex) (vmthread-name (mutex-%owner mutex)))
       #-sb-futex
       (let ((owner (mutex-owner mutex))
@@ -294,6 +295,15 @@ an error in that case."
          (let ((new (avl-insert old addr ,thread)))
            (when (eq old (setq old (sb-ext:cas *all-threads* old new))) (return)))))))
 
+(defun %thread-from-tid (os-tid)
+  (declare (type (unsigned-byte 32) os-tid))
+  (avltree-filter (lambda (node &aux (thread (avlnode-data node)))
+                    (when (= (thread-os-tid thread) os-tid)
+                      (return-from %thread-from-tid thread)))
+                  *all-threads*))
+
+#-bitpacked-mutex
+(progn
 (defun vmthread-name (vmthread)
   (binding* ((node (avl-find (vmthread-id->addr vmthread) *all-threads*) :exit-if-null)
              (thread (avlnode-data node) :exit-if-null)
@@ -326,7 +336,17 @@ an error in that case."
          ;; If people don't like seeing it, we could return instead
          ;;   (LOAD-TIME-VALUE (%make-thread "dead-thread" nil nil))
          ;; indicating that you observed a value of %OWNER which no longer exists.
-         (t :thread-dead)))
+         (t :thread-dead))))
+
+#+bitpacked-mutex
+(progn
+(defmacro pack-mutex-state (state owner) `(logior (ash ,owner 32) ,state))
+(defun vmthread-name (os-tid)
+  (or (awhen (%thread-from-tid os-tid) (thread-name it)) os-tid))
+(defun mutex-owner-lookup (os-tid)
+  (cond ((%thread-from-tid os-tid))
+        ((= os-tid 0) nil)
+        (t :thread-dead))))
 
 (defun %list-all-threads ()
   ;; No lock needed, just an atomic read, since tree mutations can't happen.
@@ -428,9 +448,7 @@ If current thread is the main thread of the process (see
 MAIN-THREAD-P), signals an error unless ALLOW-EXIT is true, as
 terminating the main thread would terminate the entire process. If
 ALLOW-EXIT is true, returning from the main thread is equivalent to
-calling SB-EXT:EXIT with :CODE 0 and :ABORT NIL.
-
-See also: ABORT-THREAD and SB-EXT:EXIT."
+calling SB-EXT:EXIT with :CODE 0 and :ABORT NIL."
   `(%return-from-thread (multiple-value-call #'sys-tlab-list ,values-form) ,allow-exit))
 
 (defun %return-from-thread (values allow-exit)
@@ -462,9 +480,7 @@ equivalent to calling ABORT-THREAD in other than main threads.
 However, whereas ABORT restart may be rebound, ABORT-THREAD always
 unwinds the entire thread. (Behaviour of the initial ABORT restart for
 main thread depends on the :TOPLEVEL argument to
-SB-EXT:SAVE-LISP-AND-DIE.)
-
-See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
+SB-EXT:SAVE-LISP-AND-DIE.)"
   (let ((self *current-thread*))
     (cond ((main-thread-p self)
            (unless allow-exit
@@ -496,7 +512,7 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
         ;; which means 64-bit big-endian needs to add 4 bytes to get to the low half
         ;; of the slot, since we lack 32-bit raw slots.
         :structure mutex
-        :slot state
+        :slot %state
         :byte-offset (+ #+(and 64-bit big-endian) 4))
       (define-structure-slot-addressor waitqueue-token-address
         :structure waitqueue
@@ -542,8 +558,9 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 
 ;;;; Mutexes
 
-(setf (documentation 'make-mutex 'function) "Create a mutex."
-      (documentation 'mutex-name 'function) "The name of the mutex. Setfable.")
+(setf (documentation 'make-mutex 'function) "Create a MUTEX.")
+(setf (documentation 'mutex-name 'function)
+      "The name of the MUTEX. SETFable.")
 
 (sb-ext:define-load-time-global **deadlock-lock** nil)
 
@@ -559,10 +576,12 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
     (labels ((detect-deadlock (lock limit)
                (declare (fixnum limit))
                (barrier (:read))
-               (let ((other-vmthread-id (mutex-%owner lock)))
+               (let ((this-thread #+bitpacked-mutex (thread-os-tid *current-thread*)
+                                  #-bitpacked-mutex (current-vmthread-id))
+                     (other-vmthread-id (mutex-%owner lock)))
                  (cond ((= limit 0) nil)
                        ((= other-vmthread-id 0) nil)
-                       ((= (current-vmthread-id) other-vmthread-id)
+                       ((= this-thread other-vmthread-id)
                         ;; We're now committed to signaling the
                         ;; error and breaking the deadlock, so
                         ;; mark us as no longer waiting on the
@@ -725,7 +744,14 @@ returns NIL each time."
 (declaim (inline %try-mutex))
 (defun %try-mutex (mutex)
   (declare (type mutex mutex) (optimize (speed 3)))
-  #+sb-futex
+  #+bitpacked-mutex
+  (let* ((new (pack-mutex-state 1 (thread-os-tid *current-thread*)))
+         (old (sb-ext:cas (mutex-%state mutex) 0 new)))
+    (cond ((= old 0) t)
+          ((= (owner-tid-from-word old) (owner-tid-from-word new))
+           (error "Recursive lock attempt ~S." mutex))))
+
+  #+(and sb-futex (not bitpacked-mutex))
   ;; From the Mutex 2 algorithm from "Futexes are Tricky" by Ulrich Drepper.
   (let ((id (current-vmthread-id)))
     (cond ((= (sb-ext:cas (mutex-state mutex) 0 1) 0)
@@ -750,10 +776,11 @@ returns NIL each time."
 ;;; memory aid: this is "pthread_mutex_timedlock" without the pthread
 ;;; and no messing about with *DEADLINE* or deadlocks. It's just locking.
 #+sb-thread
-(defun %mutex-timedlock (mutex to-sec to-usec stop-sec stop-usec)
+(defun %mutex-timedlock (mutex to-sec to-usec stop-sec stop-usec
+                               &aux (os-tid (thread-os-tid *current-thread*)))
   (declare (type mutex mutex) (optimize (speed 3)))
   (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
-  (declare (ignorable to-sec to-usec))
+  (declare (ignorable to-sec to-usec os-tid))
     ;; This is a fairly direct translation of the Mutex 2 algorithm from
     ;; "Futexes are Tricky" by Ulrich Drepper.
     ;;
@@ -767,36 +794,43 @@ returns NIL each time."
     ;; }
     ;;
   #+sb-futex
-  (symbol-macrolet ((val (mutex-state mutex)))
-      (let ((c (sb-ext:cas val 0 1))) ; available -> taken
-        (unless (= c 0) ; Got it right off the bat?
+  (symbol-macrolet
+      ((val (mutex-%state mutex))
+       . #+bitpacked-mutex
+         ((cas-1->2 (sb-ext:cas (sap-ref-32 (int-sap (mutex-state-address mutex)) 0) 1 2))
+          (owned (pack-mutex-state 1 os-tid))
+          (contended (pack-mutex-state 2 os-tid))
+          (contended-p (eql (logand c 3) 2)))
+         #-bitpacked-mutex
+         ((cas-1->2 (sb-ext:cas (mutex-%state mutex) 1 2))
+          (owned 1) (contended 2) (contended-p (eql c 2))))
+    (let ((c (sb-ext:cas val 0 owned))) ; available -> taken
+      (unless (= c 0) ; Got it right off the bat?
+        (with-pinned-objects (mutex)
           (nlx-protect
            (if (not stop-sec)
                (loop                    ; untimed
-                     ;; Mark it as contested, and sleep, unless it is now in state 0.
-                     (when (or (eql c 2) (/= 0 (sb-ext:cas val 1 2)))
-                       (with-pinned-objects (mutex)
-                         (futex-wait (mutex-state-address mutex) 2 -1 0)))
-                     ;; Try to get it, still marking it as contested.
-                     (when (= 0 (setq c (sb-ext:cas val 0 2))) (return))) ; win
+                     ;; Mark it as contended, and sleep, unless it is now in state 0.
+                     (when (or contended-p (/= 0 cas-1->2))
+                       (futex-wait (mutex-state-address mutex) 2 -1 0))
+                     ;; Try to get it, still marking it as contended.
+                     (when (= 0 (setq c (sb-ext:cas val 0 contended))) (return))) ; win
                (loop             ; same as above but check for timeout
-                     (when (or (eql c 2) (/= 0 (sb-ext:cas val 1 2)))
-                       (if (eql 1 (with-pinned-objects (mutex)
-                                    (futex-wait (mutex-state-address mutex) 2 to-sec to-usec)))
+                     (when (or contended-p (/= 0 cas-1->2))
+                       (if (eql 1 (futex-wait (mutex-state-address mutex) 2 to-sec to-usec))
                            ;; -1 = EWOULDBLOCK, possibly spurious wakeup
                            ;;  0 = normal wakeup
                            ;;  1 = ETIMEDOUT ***DONE***
                            ;;  2 = EINTR, a spurious wakeup
                            (return-from %mutex-timedlock nil)))
-                     (when (= 0 (setq c (sb-ext:cas val 0 2))) (return)) ; win
+                     (when (= 0 (setq c (sb-ext:cas val 0 contended))) (return)) ; win
                      ;; Update timeout
                      (setf (values to-sec to-usec)
                            (sb-impl::relative-decoded-times stop-sec stop-usec))))
            ;; Unwinding because futex-wait allows interrupts, wake up another futex
-           (with-pinned-objects (mutex)
-             (futex-wake (mutex-state-address mutex) 1)))))
-      (setf (mutex-%owner mutex) (current-vmthread-id))
-      t)
+           (futex-wake (mutex-state-address mutex) 1)))))
+    #-bitpacked-mutex (setf (mutex-%owner mutex) (current-vmthread-id))
+    t)
 
   #-sb-futex
   (flet ((cas ()
@@ -859,11 +893,11 @@ returns NIL each time."
            (c (sb-ext:cas val 0 1))) ; available -> taken
       (unless (= c 0) ; Got it right off the bat?
         (loop
-          ;; Mark it as contested, and sleep, unless it is now in state 0.
+          ;; Mark it as contended, and sleep, unless it is now in state 0.
           (when (or (eql c 2) (/= 0 (sb-ext:cas val 1 2)))
             (with-pinned-objects (mutex)
               (fast-futex-wait (mutex-state-address mutex) 2 -1 0)))
-          ;; Try to get it, still marking it as contested.
+          ;; Try to get it, still marking it as contended.
           (when (= 0 (setq c (sb-ext:cas val 0 2))) (return)))))) ; win
 
   (defun wait-for-mutex-algorithm-2 (mutex)
@@ -935,7 +969,7 @@ returns NIL each time."
 the mutex is not immediately available, sleep until it is available.
 
 If TIMEOUT is given, it specifies a relative timeout, in seconds, on how long
-GRAB-MUTEX should try to acquire the lock in the contested case.
+GRAB-MUTEX should try to acquire the lock in the contended case.
 
 If GRAB-MUTEX returns T, the lock acquisition was successful. In case of WAITP
 being NIL, or an expired TIMEOUT, GRAB-MUTEX may also return NIL which denotes
@@ -945,26 +979,25 @@ Notes:
 
   - GRAB-MUTEX is not interrupt safe. The correct way to call it is:
 
-      (WITHOUT-INTERRUPTS
-        ...
-        (ALLOW-WITH-INTERRUPTS (GRAB-MUTEX ...))
-        ...)
+          (without-interrupts
+            ...
+            (allow-with-interrupts (grab-mutex ...))
+            ...)
 
     WITHOUT-INTERRUPTS is necessary to avoid an interrupt unwinding the call
     while the mutex is in an inconsistent state while ALLOW-WITH-INTERRUPTS
     allows the call to be interrupted from sleep.
 
-  - (GRAB-MUTEX <mutex> :timeout 0.0) differs from
-    (GRAB-MUTEX <mutex> :waitp nil) in that the former may signal a
-    DEADLINE-TIMEOUT if the global deadline was due already on entering
-    GRAB-MUTEX.
+  - `(GRAB-MUTEX <MUTEX> :TIMEOUT 0.0)` differs from
+    `(GRAB-MUTEX <MUTEX> :WAITP NIL)` in that the former may signal a
+    DEADLINE-TIMEOUT if the global deadline was due already on
+    entering GRAB-MUTEX.
 
     The exact interplay of GRAB-MUTEX and deadlines are reserved to change in
     future versions.
 
   - It is recommended that you use WITH-MUTEX instead of calling GRAB-MUTEX
-    directly.
-"
+    directly."
   (declare (ignorable waitp timeout))
   (or (%try-mutex mutex)
       #+sb-thread
@@ -991,6 +1024,37 @@ The IF-NOT-OWNER keyword dictates behavior when the current thread does not own 
 mutex. Do nothing and silently return if :PUNT, signal a WARNING or ERROR if :WARN
 or :ERROR respectively, or release the mutex anyway if :FORCE."
   (declare (type mutex mutex))
+  #+bitpacked-mutex
+  (with-pinned-objects (mutex)
+    ;; A read barrier is strictly needed only in an erroneous call to RELEASE. In the non-
+    ;; bitpacked logic, CAS of "self" to 0 avoids the problem of thinking that this thread
+    ;; is the owner when it isn't. Without the CAS, supposing I thought I was the owning
+    ;; thread due to failing to observe a different thread's store- that would be horrible.
+    (let ((owner (owner-tid-from-word (progn (barrier (:read)) (mutex-%state mutex)))))
+      (when (= owner (thread-os-tid *current-thread*))
+        (let* ((old (pack-mutex-state 1 owner))
+               (actual (sb-ext:atomic-decf (mutex-%state mutex) old)))
+          (unless (eql actual old)
+            (setf (mutex-%state mutex) 0)
+            ;; The compiler is not going to reorder the above store after the syscall,
+            ;; so this barrier is just technical pedantry / documentation.
+            (sb-thread:barrier (:write))
+            (futex-wake (mutex-state-address mutex) 1)))
+        (return-from release-mutex nil))
+      ;; srsly? why would you not even want to know that your code is bad???
+      (when (eq if-not-owner :punt) (return-from release-mutex nil))
+      (ecase if-not-owner
+        (:force)
+        ((:warn :error)
+         (funcall (if (eq if-not-owner :warn) 'warn 'error)
+                  "Releasing ~S, owned by another thread: ~S" mutex (vmthread-name owner))))
+      ;; Clear the whole control word and do a futex_wake. Don't bother trying to optimize
+      ;; the uncontended case because your code is already wrong if you get here.
+      (setf (mutex-%state mutex) 0) ; no guarantees about anything working now!!!
+      (sb-thread:barrier (:write))
+      (futex-wake (mutex-state-address mutex) 1)))
+
+  #-bitpacked-mutex
   ;; Order matters: set owner to NIL before releasing state.
   (let* ((self (current-vmthread-id))
          (old-owner (sb-ext:compare-and-swap (mutex-%owner mutex) self 0)))
@@ -1012,8 +1076,9 @@ or :ERROR respectively, or release the mutex anyway if :FORCE."
         (setf (mutex-state mutex) 0)
         (sb-thread:barrier (:write)) ; paranoid ?
         (with-pinned-objects (mutex)
-            (futex-wake (mutex-state-address mutex) 1)))
-      nil)))
+          (futex-wake (mutex-state-address mutex) 1)))))
+
+  nil)
 
 
 ;;;; Waitqueues/condition variables
@@ -1070,8 +1135,8 @@ or :ERROR respectively, or release the mutex anyway if :FORCE."
   (print-unreadable-object (waitqueue stream :type t :identity t)
     (format stream "~:[-~;~:*~S~]" (waitqueue-name waitqueue))))
 
-(setf (documentation 'waitqueue-name 'function) "The name of the waitqueue. Setfable."
-      (documentation 'make-waitqueue 'function) "Create a waitqueue.")
+(setf (documentation 'waitqueue-name 'function) "The name of the waitqueue. SETFable."
+      (documentation 'make-waitqueue 'function) "Create a WAITQUEUE.")
 
 (defmacro nlx-protect-futex (protected &body cleanup)
   (declare (ignorable cleanup))
@@ -1228,25 +1293,24 @@ CONDITION-BROADCAST having occurred, the correct way to write code
 that uses CONDITION-WAIT is to loop around the call, checking the
 associated data:
 
-  (defvar *data* nil)
-  (defvar *queue* (make-waitqueue))
-  (defvar *lock* (make-mutex))
+    (defvar *data* nil)
+    (defvar *queue* (make-waitqueue))
+    (defvar *lock* (make-mutex))
 
-  ;; Consumer
-  (defun pop-data (&optional timeout)
-    (with-mutex (*lock*)
-      (loop until *data*
-            do (or (condition-wait *queue* *lock* :timeout timeout)
-                   ;; Lock not held, must unwind without touching *data*.
-                   (return-from pop-data nil)))
-      (pop *data*)))
+    ;; Consumer
+    (defun pop-data (&optional timeout)
+      (with-mutex (*lock*)
+        (loop until *data*
+              do (or (condition-wait *queue* *lock* :timeout timeout)
+                     ;; Lock not held, must unwind without touching *data*.
+                     (return-from pop-data nil)))
+        (pop *data*)))
 
-  ;; Producer
-  (defun push-data (data)
-    (with-mutex (*lock*)
-      (push data *data*)
-      (condition-notify *queue*)))
-"
+    ;; Producer
+    (defun push-data (data)
+      (with-mutex (*lock*)
+        (push data *data*)
+        (condition-notify *queue*)))"
   (declare (explicit-check timeout))
   ;; %CONDITION-WAIT can return 3 values. In most situations the values are never used,
   ;; but the semaphore implementation uses them.
@@ -1307,7 +1371,7 @@ must be held by this thread during this call."
                    (make-waitqueue :name name)))
 
 (defun semaphore-name (semaphore)
-  "The name of the semaphore INSTANCE. Setfable."
+  "The name of the semaphore INSTANCE. SETFable."
   (waitqueue-name (semaphore-queue semaphore)))
 
 (defun (setf semaphore-name) (newval semaphore)
@@ -1341,10 +1405,10 @@ WAIT-ON-SEMAPHORE or TRY-SEMAPHORE."
     (setf (semaphore-notification-%status semaphore-notification) nil)))
 
 (declaim (inline semaphore-count))
-(defun semaphore-count (instance)
-  "Returns the current count of the semaphore INSTANCE."
+(defun semaphore-count (semaphore)
+  "Returns the current count of SEMAPHORE."
   (barrier (:read))
-  (semaphore-%count instance))
+  (semaphore-%count semaphore))
 
 (declaim (ftype (sfunction (semaphore (integer 1) (or boolean real)
                             (or null semaphore-notification) symbol)
@@ -1551,10 +1615,11 @@ on this semaphore, then N of them is woken up."
 
 (defvar sb-ext:*invoke-debugger-hook* nil
   "This is either NIL or a designator for a function of two arguments,
-   to be run when the debugger is about to be entered.  The function is
-   run with *INVOKE-DEBUGGER-HOOK* bound to NIL to minimize recursive
-   errors, and receives as arguments the condition that triggered
-   debugger entry and the previous value of *INVOKE-DEBUGGER-HOOK*
+   to be run when the debugger is about to be entered. The function is
+   run with `*INVOKE-DEBUGGER-HOOK*` bound to NIL to minimize
+   recursive errors, and receives as arguments the condition that
+   triggered debugger entry and the previous value of
+   `*INVOKE-DEBUGGER-HOOK*`.
 
    This mechanism is an SBCL extension similar to the standard *DEBUGGER-HOOK*.
    In contrast to *DEBUGGER-HOOK*, it is observed by INVOKE-DEBUGGER even when
@@ -2060,9 +2125,7 @@ the function returns. The return values of FUNCTION are kept around
 and can be retrieved by JOIN-THREAD.
 
 Invoking the initial ABORT restart established by MAKE-THREAD
-terminates the thread.
-
-See also: RETURN-FROM-THREAD, ABORT-THREAD."
+terminates the thread."
   #-sb-thread (declare (ignore function name arguments))
   #-sb-thread (error "Not supported in unithread builds.")
   #+sb-thread
@@ -2229,8 +2292,8 @@ than one other thread simultaneously. Future changes to JOIN-THREAD may
 directly call the underlying thread library, and not all threading
 implementations consider such usage to be well-defined.
 
-NOTE: Return convention in case of a timeout is experimental and
-subject to change."
+> _Note_: Return convention in case of a timeout is experimental and
+> subject to change."
   (when (eq thread *current-thread*)
     (error 'join-thread-error :thread thread :problem :self-join))
 
@@ -2348,34 +2411,37 @@ correctly.
 
 With those caveats in mind, what you need to know when using it:
 
- * If calling FUNCTION causes a non-local transfer of control (ie. an
-   unwind), all normal cleanup forms will be executed.
+* If calling FUNCTION causes a non-local transfer of control (ie. an
+  unwind), all normal cleanup forms will be executed.
 
-   However, if the interrupt occurs during cleanup forms of an UNWIND-PROTECT,
-   it is just as if that had happened due to a regular GO, THROW, or
-   RETURN-FROM: the interrupted cleanup form and those following it in the
-   same UNWIND-PROTECT do not get executed.
+    However, if the interrupt occurs during cleanup forms of an
+    UNWIND-PROTECT, it is just as if that had happened due to a
+    regular GO, THROW, or RETURN-FROM: the interrupted cleanup form
+    and those following it in the same UNWIND-PROTECT do not get
+    executed.
 
-   SBCL tries to keep its own internals asynch-unwind-safe, but this is
-   frankly an unreasonable expectation for third party libraries, especially
-   given that asynch-unwind-safety does not compose: a function calling
-   only asynch-unwind-safe function isn't automatically asynch-unwind-safe.
+    SBCL tries to keep its own internals asynch-unwind-safe, but this
+    is frankly an unreasonable expectation for third party libraries,
+    especially given that asynch-unwind-safety does not compose: a
+    function calling only asynch-unwind-safe function isn't
+    automatically asynch-unwind-safe.
 
-   This means that in order for an asynch unwind to be safe, the entire
-   callstack at the point of interruption needs to be asynch-unwind-safe.
+    This means that in order for an asynch unwind to be safe, the
+    entire callstack at the point of interruption needs to be
+    asynch-unwind-safe.
 
- * In addition to asynch-unwind-safety you must consider the issue of
-   reentrancy. INTERRUPT-THREAD can cause function that are never normally
-   called recursively to be re-entered during their dynamic contour,
-   which may cause them to misbehave. (Consider binding of special variables,
-   values of global variables, etc.)
+* In addition to asynch-unwind-safety you must consider the issue of
+  reentrancy. INTERRUPT-THREAD can cause function that are never
+  normally called recursively to be re-entered during their dynamic
+  contour, which may cause them to misbehave. (Consider binding of
+  special variables, values of global variables, etc.)
 
 Taken together, these two restrict the \"safe\" things to do using
 INTERRUPT-THREAD to a fairly minimal set. One useful one -- exclusively for
 interactive development use is using it to force entry to debugger to inspect
 the state of a thread:
 
-  (interrupt-thread thread #'break)
+    (interrupt-thread thread #'break)
 
 Short version: be careful out there."
   (unless (%interrupt-thread thread function)
@@ -2407,39 +2473,39 @@ Short version: be careful out there."
 
 (defun terminate-thread (thread)
   "Terminate the thread identified by THREAD, by interrupting it and
-causing it to call SB-EXT:ABORT-THREAD with :ALLOW-EXIT T.
+causing it to call SB-THREAD:ABORT-THREAD with :ALLOW-EXIT T.
 
 The unwind caused by TERMINATE-THREAD is asynchronous, meaning that
 eg. thread executing
 
-  (let (foo)
-     (unwind-protect
-         (progn
-            (setf foo (get-foo))
-            (work-on-foo foo))
-       (when foo
-         ;; An interrupt occurring inside the cleanup clause
-         ;; will cause cleanups from the current UNWIND-PROTECT
-         ;; to be dropped.
-         (release-foo foo))))
+    (let (foo)
+       (unwind-protect
+           (progn
+              (setf foo (get-foo))
+              (work-on-foo foo))
+         (when foo
+           ;; An interrupt occurring inside the cleanup clause
+           ;; will cause cleanups from the current UNWIND-PROTECT
+           ;; to be dropped.
+           (release-foo foo))))
 
-might miss calling RELEASE-FOO despite GET-FOO having returned true if
-the interrupt occurs inside the cleanup clause, eg. during execution
-of RELEASE-FOO.
+might miss calling `RELEASE-FOO` despite GET-FOO having returned true
+if the interrupt occurs inside the cleanup clause, eg. during
+execution of `RELEASE-FOO`.
 
 Thus, in order to write an asynch unwind safe UNWIND-PROTECT you need
 to use WITHOUT-INTERRUPTS:
 
-  (let (foo)
-    (sb-sys:without-interrupts
-      (unwind-protect
-          (progn
-            (setf foo (sb-sys:allow-with-interrupts
-                        (get-foo)))
-            (sb-sys:with-local-interrupts
-              (work-on-foo foo)))
-       (when foo
-         (release-foo foo)))))
+    (let (foo)
+      (sb-sys:without-interrupts
+        (unwind-protect
+            (progn
+              (setf foo (sb-sys:allow-with-interrupts
+                          (get-foo)))
+              (sb-sys:with-local-interrupts
+                (work-on-foo foo)))
+         (when foo
+           (release-foo foo)))))
 
 Since most libraries using UNWIND-PROTECT do not do this, you should never
 assume that unknown code can safely be terminated using TERMINATE-THREAD."
